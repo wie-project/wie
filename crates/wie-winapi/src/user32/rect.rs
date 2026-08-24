@@ -1,5 +1,6 @@
 //! USER32 rectangle helpers — pure rect math.
 
+use crate::gdi32::{ArgReg, read_arg};
 use anyhow::{Context, Result};
 
 use crate::guest_layout::WinRect;
@@ -15,15 +16,9 @@ use crate::{HandlerContext, WinApiHandlerResult};
 /// shrink its width by 2·dx, so the documented Win32 behavior wins.)
 pub fn handle_inflate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let rect_va = engine
-        .read_rcx()
-        .context("failed to read RCX for InflateRect")?;
-    let dx_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for InflateRect")?;
-    let dy_raw = engine
-        .read_r8()
-        .context("failed to read R8 for InflateRect")?;
+    let rect_va = read_arg(engine, ArgReg::Rcx, "InflateRect")?;
+    let dx_raw = read_arg(engine, ArgReg::Rdx, "InflateRect")?;
+    let dy_raw = read_arg(engine, ArgReg::R8, "InflateRect")?;
 
     let dx = low_i32(dx_raw, "InflateRect dx")?;
     let dy = low_i32(dy_raw, "InflateRect dy")?;

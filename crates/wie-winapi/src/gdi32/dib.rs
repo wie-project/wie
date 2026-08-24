@@ -5,6 +5,7 @@
 //! parameter is ignored — matching real GDI, which ignores the DC for DIB
 //! sections, and the micro-exes, which pass NULL.
 
+use crate::gdi32::{ArgReg, read_arg};
 use anyhow::{Context, Result};
 
 use crate::gdi32::blit::{IRect, resolve_dest_info};
@@ -175,18 +176,10 @@ fn read_dib_bits_args(
     api_name: &str,
 ) -> Result<(u64, u32, u32, u64, u64)> {
     let engine = &mut *ctx.engine;
-    let _hdc = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let hbm = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let start_raw = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
-    let c_lines_raw = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let _hdc = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let hbm = read_arg(engine, ArgReg::Rdx, api_name)?;
+    let start_raw = read_arg(engine, ArgReg::R8, api_name)?;
+    let c_lines_raw = read_arg(engine, ArgReg::R9, api_name)?;
     let rsp = engine
         .read_rsp()
         .with_context(|| format!("failed to read RSP for {api_name}"))?;

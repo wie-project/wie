@@ -1,9 +1,9 @@
 use super::{
     Context, DUPLICATE_CLOSE_SOURCE, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DRIVE,
-    ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND, HandlerContext, Result,
-    WinApiHandlerResult, WinApiState, checked_address, get_user_profile_dir_impl,
-    read_ansi_string_from_cpu, read_guest_utf16_lossy, read_u16, read_wide_string_from_cpu,
-    write_guest_u64, write_guest_utf16_units,
+    ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_PATH_NOT_FOUND, HandlerContext,
+    PATH_ARG_MAX, Result, WinApiHandlerResult, WinApiState, checked_address,
+    get_user_profile_dir_impl, read_ansi_string_from_cpu, read_guest_utf16_lossy, read_u16,
+    read_wide_string_from_cpu, write_guest_u64, write_guest_utf16_units,
 };
 
 /// Handles `KERNEL32.dll!GetCurrentDirectoryW`.
@@ -62,38 +62,47 @@ pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
 
     ctx.finish(return_value)
 }
-/// Handles `KERNEL32.dll!SetCurrentDirectoryW`.
+/// Shared body of `SetCurrentDirectoryA` / `SetCurrentDirectoryW`.
 ///
 /// Stores only a guest directory that (a) confines to a configured volume
 /// (C: bottle / D: bridge) and (b) exists as a host directory in that volume.
 /// Relative names resolve against the current cwd first (MSDN). Failure codes
 /// per real Windows: missing directory → `ERROR_PATH_NOT_FOUND`; unmapped
 /// drive → `ERROR_INVALID_DRIVE`.
-pub fn handle_set_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let directory_va = engine
+fn set_current_directory(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
+    let api = if wide {
+        "SetCurrentDirectoryW"
+    } else {
+        "SetCurrentDirectoryA"
+    };
+    let directory_va = ctx
+        .engine
         .read_rcx()
-        .context("failed to read RCX for SetCurrentDirectoryW")?;
+        .context("failed to read RCX for SetCurrentDirectory")?;
 
-    let success = if directory_va == 0 {
-        state.process.last_error = ERROR_PATH_NOT_FOUND;
+    // A NULL pointer reads back as "" and fails below like real Windows.
+    let directory = if wide {
+        read_wide_string_from_cpu(ctx.engine, directory_va, PATH_ARG_MAX)
+            .with_context(|| format!("failed to read {api} path"))?
+    } else {
+        read_ansi_string_from_cpu(ctx.engine, directory_va, PATH_ARG_MAX)
+            .with_context(|| format!("failed to read {api} path"))?
+    };
+
+    let success = if directory.is_empty() {
+        ctx.state.process.last_error = ERROR_PATH_NOT_FOUND;
         false
     } else {
-        let directory = read_wide_string_from_cpu(engine, directory_va, 32_768)
-            .context("failed to read SetCurrentDirectoryW path")?;
-
-        if directory.is_empty() {
-            state.process.last_error = ERROR_PATH_NOT_FOUND;
-            false
-        } else {
-            set_current_directory_impl(state, &directory)
-        }
+        set_current_directory_impl(&mut *ctx.state, &directory)
     };
 
     let return_value = u64::from(success);
 
     ctx.finish(return_value)
+}
+/// Handles `KERNEL32.dll!SetCurrentDirectoryW`.
+pub fn handle_set_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    set_current_directory(ctx, true)
 }
 /// Shared implementation for the GetLongPathName/GetShortPathName A/W quartet.
 ///
@@ -142,22 +151,20 @@ pub fn handle_get_user_profile_directory_w(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let _h_profile = engine.read_rcx()?;
     let name_va = engine.read_rdx()?;
     let size_va = engine.read_r8()?;
-    get_user_profile_dir_impl(engine, state, name_va, size_va, true)
+    get_user_profile_dir_impl(ctx, name_va, size_va, true)
 }
 /// Handles `KERNEL32.dll!GetUserProfileDirectoryA` — return profile path from bottle/env.
 pub fn handle_get_user_profile_directory_a(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let _h_profile = engine.read_rcx()?;
     let name_va = engine.read_rdx()?;
     let size_va = engine.read_r8()?;
-    get_user_profile_dir_impl(engine, state, name_va, size_va, false)
+    get_user_profile_dir_impl(ctx, name_va, size_va, false)
 }
 pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -292,7 +299,7 @@ pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
             state.process.last_error = ERROR_INVALID_PARAMETER;
             0
         } else {
-            let current_directory = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+            let current_directory = state.file_io.cwd_utf8();
 
             let full_path = resolve_full_windows_path(&current_directory, &input_path);
 
@@ -375,7 +382,7 @@ pub fn handle_get_full_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinAp
             state.process.last_error = ERROR_INVALID_PARAMETER;
             0
         } else {
-            let current_directory = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+            let current_directory = state.file_io.cwd_utf8();
             let full_path = resolve_full_windows_path(&current_directory, &input_path);
             let path_bytes = crate::vfs::encode_acp(&full_path);
             let path_length = path_bytes.len();
@@ -414,7 +421,7 @@ pub fn handle_get_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let state = &mut *ctx.state;
     let buffer_length = engine.read_rcx()?;
     let buffer_va = engine.read_rdx()?;
-    let directory = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let directory = state.file_io.cwd_utf8();
     let bytes = crate::vfs::encode_acp(&directory);
     let character_count =
         u64::try_from(bytes.len()).context("current directory byte length does not fit u64")?;
@@ -437,23 +444,7 @@ pub fn handle_get_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
 ///
 /// Same semantics as [`handle_set_current_directory_w`] (ANSI input).
 pub fn handle_set_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let directory_va = engine.read_rcx()?;
-    let success = if directory_va == 0 {
-        state.process.last_error = ERROR_PATH_NOT_FOUND;
-        false
-    } else {
-        let directory = read_ansi_string_from_cpu(engine, directory_va, 32_768)?;
-        if directory.is_empty() {
-            state.process.last_error = ERROR_PATH_NOT_FOUND;
-            false
-        } else {
-            set_current_directory_impl(state, &directory)
-        }
-    };
-    let return_value = u64::from(success);
-    ctx.finish(return_value)
+    set_current_directory(ctx, false)
 }
 /// Validate and store the guest current directory (shared by the W/A setters).
 ///
@@ -473,7 +464,7 @@ pub fn handle_set_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
 /// the stored cwd is left untouched (it never holds an unconfined path).
 fn set_current_directory_impl(state: &mut WinApiState, directory: &str) -> bool {
     // Relative directory names resolve against the current directory (MSDN).
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let cwd = state.file_io.cwd_utf8();
     let full = resolve_full_windows_path(&cwd, directory);
     let Some(confined) = crate::vfs::confine_guest_path(&state.file_io.volumes, &full) else {
         // Unmapped drive → ERROR_INVALID_DRIVE; a mapped drive that fails
@@ -672,10 +663,7 @@ pub(crate) fn write_mock_string_w(
         state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
         return Ok(0);
     }
-    let mut bytes = Vec::with_capacity(needed.saturating_add(1).saturating_mul(2));
-    for u in &units {
-        bytes.extend_from_slice(&u.to_le_bytes());
-    }
+    let mut bytes = crate::guest_string::utf16_units_to_le(&units);
     bytes.extend_from_slice(&0_u16.to_le_bytes());
     engine.mem_write(out_va, &bytes)?;
     state.process.last_error = 0;

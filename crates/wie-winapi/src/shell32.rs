@@ -483,8 +483,11 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     finish(ctx.engine, 1)
 }
 
-/// `HINSTANCE ShellExecuteW(HWND hwnd, LPCWSTR lpOperation, LPCWSTR lpFile,
-/// LPCWSTR lpParameters, LPCWSTR lpDirectory, INT nShowCmd)`.
+/// Decode one guest string for the `ShellExecute*` bodies.
+type ReadShellString = fn(&mut dyn wie_cpu::CpuEngine, u64, usize) -> anyhow::Result<String>;
+
+/// Shared `ShellExecuteW/A` body (`decode` picks UTF-16 vs ANSI, `label`
+/// names the variant for logs and error contexts).
 ///
 /// Implements the one operation notepad needs — "open" (or NULL) on the
 /// running PE (File → New Window). The guest path resolves to a host path: an
@@ -500,30 +503,33 @@ pub fn handle_shell_about_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 /// host process, not a Win32 process, so cross-process Windows semantics
 /// (waiting on the returned handle, exit codes, argv marshalling) do not
 /// carry over — this is a fire-and-forget relaunch.
-pub fn handle_shell_execute_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let (operation, file) = {
-        let engine = &mut *ctx.engine;
-        let _hwnd = engine
-            .read_rcx()
-            .context("failed to read RCX for ShellExecuteW")?;
-        let operation_va = engine
-            .read_rdx()
-            .context("failed to read RDX for ShellExecuteW")?;
-        let file_va = engine
-            .read_r8()
-            .context("failed to read R8 for ShellExecuteW")?;
-        let _parameters_va = engine
-            .read_r9()
-            .context("failed to read R9 for ShellExecuteW")?;
-        let rsp = engine
-            .read_rsp()
-            .context("failed to read RSP for ShellExecuteW")?;
-        let _directory_va = read_u64(engine, rsp.wrapping_add(0x28))?;
-        let _show_cmd = read_u64(engine, rsp.wrapping_add(0x30))?;
-        let operation = read_utf16_lossy(engine, operation_va, 64)?;
-        let file = read_utf16_lossy(engine, file_va, 1024)?;
-        (operation, file)
-    };
+fn shell_execute(
+    ctx: &mut HandlerContext<'_>,
+    decode: ReadShellString,
+    label: &str,
+) -> Result<WinApiHandlerResult> {
+    let _hwnd = ctx
+        .engine
+        .read_rcx()
+        .with_context(|| format!("failed to read RCX for {label}"))?;
+    let operation_va = ctx
+        .engine
+        .read_rdx()
+        .with_context(|| format!("failed to read RDX for {label}"))?;
+    let file_va = ctx
+        .engine
+        .read_r8()
+        .with_context(|| format!("failed to read R8 for {label}"))?;
+    let _parameters_va = ctx
+        .engine
+        .read_r9()
+        .with_context(|| format!("failed to read R9 for {label}"))?;
+    // The two stack arguments (lpDirectory, nShowCmd) are consumed and
+    // ignored — every variant shares this ABI shape.
+    let _directory_va = crate::kernel32::read_stack_u64(ctx.engine, 0x28)?;
+    let _show_cmd = crate::kernel32::read_stack_u64(ctx.engine, 0x30)?;
+    let operation = decode(ctx.engine, operation_va, 64)?;
+    let file = decode(ctx.engine, file_va, 1024)?;
 
     let return_value = if file.is_empty() {
         SE_ERR_FNF
@@ -540,20 +546,36 @@ pub fn handle_shell_execute_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         operation = %operation,
         file = %file,
         return_value,
-        "ShellExecuteW"
+        "{label}"
     );
     finish(ctx.engine, return_value)
 }
 
-/// `BOOL ShellExecuteExW(pExecInfo)` — mirrors [`handle_shell_execute_w`]
-/// through the SHELLEXECUTEINFOW indirection.
+/// `HINSTANCE ShellExecuteW(HWND hwnd, LPCWSTR lpOperation, LPCWSTR lpFile,
+/// LPCWSTR lpParameters, LPCWSTR lpDirectory, INT nShowCmd)`.
+pub fn handle_shell_execute_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    shell_execute(ctx, read_utf16_lossy, "ShellExecuteW")
+}
+
+/// `HINSTANCE ShellExecuteA(HWND, LPCSTR, LPCSTR, LPCSTR, LPCSTR, INT)` — the
+/// ANSI variant of [`handle_shell_execute_w`] (same detached-run semantics).
+fn handle_shell_execute_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    shell_execute(ctx, crate::guest_string::read_ansi_lossy, "ShellExecuteA")
+}
+
+/// `BOOL ShellExecuteExW/A(pExecInfo)` shared body — mirrors
+/// [`shell_execute`] through the `SHELLEXECUTEINFO*` indirection (`decode`
+/// picks UTF-16 vs ANSI; the A and W struct layouts match).
 ///
 /// Reads the struct pointed to by RCX (Win64 SDK layout: `lpVerb` @0x10,
 /// `lpFile` @0x18, `hInstApp` @0x38). Verb NULL/"open" on an existing guest
 /// path spawns a fresh WIE instance (fire-and-forget, same as
-/// [`handle_shell_execute_w`]) and returns TRUE; every other verb — or an
-/// empty file — writes the `SE_ERR_*` code into `hInstApp` and returns FALSE.
-fn handle_sh_execute_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+/// [`shell_execute`]) and returns TRUE; every other verb — or an empty file —
+/// writes the `SE_ERR_*` code into `hInstApp` and returns FALSE.
+fn sh_execute_ex(
+    ctx: &mut HandlerContext<'_>,
+    decode: ReadShellString,
+) -> Result<WinApiHandlerResult> {
     let (exec_info_va, verb, file) = {
         let engine = &mut *ctx.engine;
         let exec_info_va = engine.read_rcx()?;
@@ -562,8 +584,8 @@ fn handle_sh_execute_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         }
         let verb_va = read_u64(engine, exec_info_va.wrapping_add(0x10))?;
         let file_va = read_u64(engine, exec_info_va.wrapping_add(0x18))?;
-        let verb = read_utf16_lossy(engine, verb_va, 64)?;
-        let file = read_utf16_lossy(engine, file_va, 1024)?;
+        let verb = decode(engine, verb_va, 64)?;
+        let file = decode(engine, file_va, 1024)?;
         (exec_info_va, verb, file)
     };
     let (h_inst_app, ok) = if file.is_empty() {
@@ -576,6 +598,11 @@ fn handle_sh_execute_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     };
     write_guest_u64(ctx.engine, exec_info_va.wrapping_add(0x38), h_inst_app)?;
     finish(ctx.engine, if ok { 1 } else { 0 })
+}
+
+/// `BOOL ShellExecuteExW(pExecInfo)`.
+fn handle_sh_execute_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    sh_execute_ex(ctx, read_utf16_lossy)
 }
 
 /// Spawn a new WIE instance of the guest exe at `guest_path` (`wie-cli run`).
@@ -644,72 +671,11 @@ fn spill_main_module(state: &WinApiState) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-/// `HINSTANCE ShellExecuteA(HWND, LPCSTR, LPCSTR, LPCSTR, LPCSTR, INT)` — the
-/// ANSI variant of [`handle_shell_execute_w`] (same detached-run semantics).
-fn handle_shell_execute_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let (operation, file) = {
-        let engine = &mut *ctx.engine;
-        let _hwnd = engine
-            .read_rcx()
-            .context("failed to read RCX for ShellExecuteA")?;
-        let operation_va = engine
-            .read_rdx()
-            .context("failed to read RDX for ShellExecuteA")?;
-        let file_va = engine
-            .read_r8()
-            .context("failed to read R8 for ShellExecuteA")?;
-        let _parameters_va = engine
-            .read_r9()
-            .context("failed to read R9 for ShellExecuteA")?;
-        let operation = crate::guest_string::read_ansi_lossy(engine, operation_va, 64)?;
-        let file = crate::guest_string::read_ansi_lossy(engine, file_va, 1024)?;
-        (operation, file)
-    };
-
-    let return_value = if file.is_empty() {
-        SE_ERR_FNF
-    } else if operation.is_empty() || operation.eq_ignore_ascii_case("open") {
-        shell_execute_open(ctx.state, &file)
-    } else {
-        SE_ERR_NOASSOC
-    };
-
-    tracing::info!(
-        target: "wiegui",
-        operation = %operation,
-        file = %file,
-        return_value,
-        "ShellExecuteA"
-    );
-    finish(ctx.engine, return_value)
-}
-
 /// `BOOL ShellExecuteExA(pExecInfo)` — the ANSI variant of
 /// [`handle_sh_execute_ex_w`] (the `SHELLEXECUTEINFOA` layout matches the W
 /// struct; only the pointed-to strings are ANSI).
 fn handle_sh_execute_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let (exec_info_va, verb, file) = {
-        let engine = &mut *ctx.engine;
-        let exec_info_va = engine.read_rcx()?;
-        if exec_info_va == 0 {
-            return finish(engine, 0);
-        }
-        let verb_va = read_u64(engine, exec_info_va.wrapping_add(0x10))?;
-        let file_va = read_u64(engine, exec_info_va.wrapping_add(0x18))?;
-        let verb = crate::guest_string::read_ansi_lossy(engine, verb_va, 64)?;
-        let file = crate::guest_string::read_ansi_lossy(engine, file_va, 1024)?;
-        (exec_info_va, verb, file)
-    };
-    let (h_inst_app, ok) = if file.is_empty() {
-        (SE_ERR_FNF, false)
-    } else if verb.is_empty() || verb.eq_ignore_ascii_case("open") {
-        let launched = shell_execute_open(ctx.state, &file);
-        (launched, launched > 32)
-    } else {
-        (SE_ERR_NOASSOC, false)
-    };
-    write_guest_u64(ctx.engine, exec_info_va.wrapping_add(0x38), h_inst_app)?;
-    finish(ctx.engine, if ok { 1 } else { 0 })
+    sh_execute_ex(ctx, crate::guest_string::read_ansi_lossy)
 }
 
 #[cfg(test)]

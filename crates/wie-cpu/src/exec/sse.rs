@@ -465,16 +465,12 @@ pub(super) fn exec_sse_pshufd(
     let dst = instr.op_register(0);
     let src_val = read_sse_op(mem, regs, instr, 1, XMM_BYTES)?;
     let imm8 = instr.immediate(2) as u8;
-    let lanes: Vec<u32> = (0..F32_LANES)
-        .map(|i| {
-            let src_lane = ((imm8 >> (i * 2)) & 3) as usize;
-            ((src_val >> (src_lane * 32)) & 0xffff_ffff) as u32
-        })
-        .collect();
-    let result: u128 = lanes
-        .into_iter()
-        .enumerate()
-        .fold(0u128, |acc, (i, lane)| acc | (u128::from(lane) << (i * 32)));
+    let mut result: u128 = 0;
+    for i in 0..F32_LANES {
+        let src_lane = ((imm8 >> (i * 2)) & 3) as usize;
+        let lane = ((src_val >> (src_lane * 32)) & 0xffff_ffff) as u32;
+        result |= u128::from(lane) << (i * 32);
+    }
     regs.write_xmm(dst, result)?;
     Ok(())
 }
@@ -1635,16 +1631,10 @@ fn write_sse_op(
                 // Zero upper bits for full vector store of partial (non-merge).
                 value & xmm_low_mask(nbytes)
             };
-            // For movsd/movss scalar to xmm: merge low bits, keep upper (SSE legacy).
-            // For movaps full: replace all.
-            let final_v = if scalar_merge {
-                new
-            } else if nbytes < XMM_BYTES {
-                value & xmm_low_mask(nbytes)
-            } else {
-                value
-            };
-            regs.write_xmm(reg, final_v)?;
+            // The three branches above already produce the exact value to
+            // store: merged low bits for scalar forms, zero-masked low bits
+            // for partial non-merge stores, and the full value otherwise.
+            regs.write_xmm(reg, new)?;
             Ok(())
         }
         OpKind::Memory => {

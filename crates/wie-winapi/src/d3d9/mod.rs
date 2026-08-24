@@ -8,6 +8,7 @@
 //! lifecycle in [`texture`], vertex/index-buffer COM objects in [`buffer`],
 //! and blend/depth state in [`blend`].
 
+use crate::gdi32::{ArgReg, read_arg};
 use anyhow::{Context, Result};
 
 use crate::fake_va::{
@@ -196,9 +197,7 @@ pub fn idirect3ddevice9_method_va(slot: usize) -> Result<u64> {
 pub fn handle_direct3d_create9(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let sdk_version = engine
-        .read_rcx()
-        .context("failed to read RCX for Direct3DCreate9")?;
+    let sdk_version = read_arg(engine, ArgReg::Rcx, "Direct3DCreate9")?;
 
     let return_value = if sdk_version == D3D_SDK_VERSION {
         let vtable_address =
@@ -244,9 +243,7 @@ pub fn handle_direct3d_create9(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 /// Handles `IDirect3D9::GetAdapterCount`.
 pub fn handle_get_adapter_count(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3D9::GetAdapterCount")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3D9::GetAdapterCount")?;
 
     // Expose one deterministic display adapter.
     let return_value = 1;
@@ -257,13 +254,9 @@ pub fn handle_get_adapter_count(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 /// Handles `IDirect3D9::GetAdapterMonitor`.
 pub fn handle_get_adapter_monitor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3D9::GetAdapterMonitor")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3D9::GetAdapterMonitor")?;
 
-    let adapter = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3D9::GetAdapterMonitor")?;
+    let adapter = read_arg(engine, ArgReg::Rdx, "IDirect3D9::GetAdapterMonitor")?;
 
     let return_value = if adapter == 0 { FAKE_MONITOR_HANDLE } else { 0 };
 
@@ -288,21 +281,13 @@ fn write_caps_u32(
 /// Handles `IDirect3D9::GetDeviceCaps`.
 pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3D9::GetDeviceCaps")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3D9::GetDeviceCaps")?;
 
-    let adapter = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3D9::GetDeviceCaps")?;
+    let adapter = read_arg(engine, ArgReg::Rdx, "IDirect3D9::GetDeviceCaps")?;
 
-    let device_type = engine
-        .read_r8()
-        .context("failed to read R8 for IDirect3D9::GetDeviceCaps")?;
+    let device_type = read_arg(engine, ArgReg::R8, "IDirect3D9::GetDeviceCaps")?;
 
-    let caps_address = engine
-        .read_r9()
-        .context("failed to read R9 for IDirect3D9::GetDeviceCaps")?;
+    let caps_address = read_arg(engine, ArgReg::R9, "IDirect3D9::GetDeviceCaps")?;
 
     let valid_device_type = matches!(device_type, D3DDEVTYPE_HAL | D3DDEVTYPE_REF | D3DDEVTYPE_SW);
 
@@ -470,17 +455,11 @@ pub fn handle_get_adapter_display_mode(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3D9::GetAdapterDisplayMode")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3D9::GetAdapterDisplayMode")?;
 
-    let adapter = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3D9::GetAdapterDisplayMode")?;
+    let adapter = read_arg(engine, ArgReg::Rdx, "IDirect3D9::GetAdapterDisplayMode")?;
 
-    let display_mode_address = engine
-        .read_r8()
-        .context("failed to read R8 for IDirect3D9::GetAdapterDisplayMode")?;
+    let display_mode_address = read_arg(engine, ArgReg::R8, "IDirect3D9::GetAdapterDisplayMode")?;
 
     let return_value = if adapter != 0 || display_mode_address == 0 {
         D3DERR_INVALIDCALL
@@ -667,21 +646,13 @@ fn init_device_state(
 pub fn handle_create_device(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3D9::CreateDevice")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3D9::CreateDevice")?;
 
-    let adapter = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3D9::CreateDevice")?;
+    let adapter = read_arg(engine, ArgReg::Rdx, "IDirect3D9::CreateDevice")?;
 
-    let device_type = engine
-        .read_r8()
-        .context("failed to read R8 for IDirect3D9::CreateDevice")?;
+    let device_type = read_arg(engine, ArgReg::R8, "IDirect3D9::CreateDevice")?;
 
-    let focus_window = engine
-        .read_r9()
-        .context("failed to read R9 for IDirect3D9::CreateDevice")?;
+    let focus_window = read_arg(engine, ArgReg::R9, "IDirect3D9::CreateDevice")?;
 
     let behavior_flags_raw =
         read_stack_argument(engine, 0x28, "IDirect3D9::CreateDevice BehaviorFlags")?;

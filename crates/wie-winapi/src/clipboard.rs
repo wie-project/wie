@@ -29,6 +29,7 @@ use ahash::HashMapExt;
 
 use crate::HandlerContext;
 use crate::WinApiHandlerResult;
+use crate::gdi32::{ArgReg, read_arg};
 use crate::state::WinApiState;
 
 /// `CF_TEXT` — plain ANSI text (winuser.h). The edit-control clipboard
@@ -192,9 +193,7 @@ pub fn handle_is_clipboard_format_available(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let format = engine
-        .read_rcx()
-        .context("failed to read RCX for IsClipboardFormatAvailable")?;
+    let format = read_arg(engine, ArgReg::Rcx, "IsClipboardFormatAvailable")?;
     let format = u32::try_from(format & 0xffff_ffff).unwrap_or(0);
     let stored = { ctx.state.ole32().clipboard.has_format(format) };
     let legacy_text = format == CF_TEXT && ctx.state.clipboard().has_text();
@@ -209,9 +208,7 @@ pub fn handle_register_clipboard_format_w(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let name_va = engine
-        .read_rcx()
-        .context("failed to read RCX for RegisterClipboardFormatW")?;
+    let name_va = read_arg(engine, ArgReg::Rcx, "RegisterClipboardFormatW")?;
     let name = crate::guest_string::read_utf16_lossy(engine, name_va, 256)?;
     let id = register_format_name(ctx, &name);
     ctx.finish(u64::from(id))
@@ -225,9 +222,7 @@ pub fn handle_register_clipboard_format_a(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let name_va = engine
-        .read_rcx()
-        .context("failed to read RCX for RegisterClipboardFormatA")?;
+    let name_va = read_arg(engine, ArgReg::Rcx, "RegisterClipboardFormatA")?;
     let name = crate::guest_string::read_ansi_lossy(engine, name_va, 256)?;
     let id = register_format_name(ctx, &name);
     ctx.finish(u64::from(id))
@@ -249,9 +244,7 @@ fn register_format_name(ctx: &mut HandlerContext<'_>, name: &str) -> u16 {
 /// documented contract).
 pub fn handle_open_clipboard(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for OpenClipboard")?;
+    let hwnd = read_arg(engine, ArgReg::Rcx, "OpenClipboard")?;
     let opened = ctx.state.ole32().clipboard.open_with(hwnd);
     if !opened {
         ctx.state.process.last_error = ERROR_ACCESS_DENIED;
@@ -293,12 +286,8 @@ pub fn handle_empty_clipboard(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 /// `ERROR_ACCESS_DENIED` when the clipboard is not open.
 pub fn handle_set_clipboard_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let format = engine
-        .read_rcx()
-        .context("failed to read RCX for SetClipboardData")?;
-    let hmem = engine
-        .read_rdx()
-        .context("failed to read RDX for SetClipboardData")?;
+    let format = read_arg(engine, ArgReg::Rcx, "SetClipboardData")?;
+    let hmem = read_arg(engine, ArgReg::Rdx, "SetClipboardData")?;
     let format = u32::try_from(format & 0xffff_ffff).unwrap_or(0);
 
     let open = ctx.state.ole32().clipboard.is_open();
@@ -321,9 +310,7 @@ pub fn handle_set_clipboard_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 /// absent / the clipboard is not open (`ERROR_ACCESS_DENIED`).
 pub fn handle_get_clipboard_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let format = engine
-        .read_rcx()
-        .context("failed to read RCX for GetClipboardData")?;
+    let format = read_arg(engine, ArgReg::Rcx, "GetClipboardData")?;
     let format = u32::try_from(format & 0xffff_ffff).unwrap_or(0);
 
     let open = ctx.state.ole32().clipboard.is_open();
@@ -355,9 +342,7 @@ pub fn handle_get_clipboard_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 /// when the clipboard is not open.
 pub fn handle_enum_clipboard_formats(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let format = engine
-        .read_rcx()
-        .context("failed to read RCX for EnumClipboardFormats")?;
+    let format = read_arg(engine, ArgReg::Rcx, "EnumClipboardFormats")?;
     let format = u32::try_from(format & 0xffff_ffff).unwrap_or(0);
 
     let open = ctx.state.ole32().clipboard.is_open();

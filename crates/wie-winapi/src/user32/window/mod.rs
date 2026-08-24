@@ -12,6 +12,7 @@ use super::{
     Context, HandlerContext, Result, WinApiHandlerResult, with_typed_write,
     write_guest_ansi_c_string, write_guest_utf16_c_string,
 };
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::WinRect;
 
 mod class;
@@ -62,13 +63,9 @@ pub(crate) use text::{set_window_font, window_font};
 pub fn handle_get_window_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetWindowRect")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "GetWindowRect")?;
 
-    let rect_va = engine
-        .read_rdx()
-        .context("failed to read RDX for GetWindowRect")?;
+    let rect_va = read_arg(engine, ArgReg::Rdx, "GetWindowRect")?;
 
     let window = find_window(state, window_handle);
     let success = window.is_some() && rect_va != 0;
@@ -106,9 +103,7 @@ const USER_DEFAULT_SCREEN_DPI: u64 = 96;
 /// Handles dynamic `USER32.dll!GetDpiForWindow`.
 pub fn handle_get_dpi_for_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetDpiForWindow")?;
+    let _window_handle = read_arg(engine, ArgReg::Rcx, "GetDpiForWindow")?;
 
     // Standard 100% Windows DPI.
     let return_value = USER_DEFAULT_SCREEN_DPI;
@@ -120,21 +115,13 @@ pub fn handle_adjust_window_rect_ex_for_dpi(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let rect_va = engine
-        .read_rcx()
-        .context("failed to read RCX for AdjustWindowRectExForDpi")?;
+    let rect_va = read_arg(engine, ArgReg::Rcx, "AdjustWindowRectExForDpi")?;
 
-    let _style = engine
-        .read_rdx()
-        .context("failed to read RDX for AdjustWindowRectExForDpi")?;
+    let _style = read_arg(engine, ArgReg::Rdx, "AdjustWindowRectExForDpi")?;
 
-    let _has_menu = engine
-        .read_r8()
-        .context("failed to read R8 for AdjustWindowRectExForDpi")?;
+    let _has_menu = read_arg(engine, ArgReg::R8, "AdjustWindowRectExForDpi")?;
 
-    let _extended_style = engine
-        .read_r9()
-        .context("failed to read R9 for AdjustWindowRectExForDpi")?;
+    let _extended_style = read_arg(engine, ArgReg::R9, "AdjustWindowRectExForDpi")?;
 
     // The fifth argument, dpi, is on the Win64 stack. For now the fake desktop
     // uses 96 DPI, so preserving the supplied client rectangle is sufficient.
@@ -160,17 +147,11 @@ pub(crate) fn handle_get_class_name(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
 
-    let buffer_va = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let buffer_va = read_arg(engine, ArgReg::Rdx, api_name)?;
 
-    let max_count = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let max_count = read_arg(engine, ArgReg::R8, api_name)?;
 
     let class_name = state
         .window_state()

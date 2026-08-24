@@ -1,8 +1,9 @@
 //! Capture/mouse tracking, the window/class long-pointer accessors, and the
 //! window-lookup helpers (split from the former `window.rs`).
 
+use crate::gdi32::{ArgReg, read_arg};
 use crate::user32::{
-    Context, GWLP_WNDPROC, HandlerContext, Result, WinApiHandlerResult, WinApiState, WindowRecord,
+    GWLP_WNDPROC, HandlerContext, Result, WinApiHandlerResult, WinApiState, WindowRecord,
     get_window_long_ptr_value, is_known_window, set_window_long_ptr_value, window_long_ptr_index,
 };
 
@@ -30,17 +31,11 @@ fn handle_set_window_long_ptr_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
 
-    let index_raw = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let index_raw = read_arg(engine, ArgReg::Rdx, api_name)?;
 
-    let new_value = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let new_value = read_arg(engine, ArgReg::R8, api_name)?;
 
     let previous_value =
         set_window_long_ptr_value(window_handle, index_raw, new_value, state, api_name)?;
@@ -73,9 +68,7 @@ fn remember_subclass_original(
 pub fn handle_set_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for SetCapture")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "SetCapture")?;
 
     let previous_window = state.window_state().capture_window_handle;
 
@@ -108,13 +101,9 @@ pub fn handle_release_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 pub fn handle_get_window_long_ptr_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetWindowLongPtrA")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "GetWindowLongPtrA")?;
 
-    let index_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for GetWindowLongPtrA")?;
+    let index_raw = read_arg(engine, ArgReg::Rdx, "GetWindowLongPtrA")?;
 
     let value = get_window_long_ptr_value(window_handle, index_raw, state, "GetWindowLongPtrA")?;
 
@@ -124,13 +113,9 @@ pub fn handle_get_window_long_ptr_a(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_get_window_long_ptr_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetWindowLongPtrW")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "GetWindowLongPtrW")?;
 
-    let index_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for GetWindowLongPtrW")?;
+    let index_raw = read_arg(engine, ArgReg::Rdx, "GetWindowLongPtrW")?;
 
     let value = get_window_long_ptr_value(window_handle, index_raw, state, "GetWindowLongPtrW")?;
 
@@ -169,13 +154,9 @@ fn handle_get_class_long_ptr_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
 
-    let index_raw = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let index_raw = read_arg(engine, ArgReg::Rdx, api_name)?;
 
     let atom = window_class_atom(state, window_handle);
 
@@ -210,17 +191,11 @@ fn handle_set_class_long_ptr_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
 
-    let index_raw = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let index_raw = read_arg(engine, ArgReg::Rdx, api_name)?;
 
-    let new_value = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let new_value = read_arg(engine, ArgReg::R8, api_name)?;
 
     let atom = window_class_atom(state, window_handle);
 

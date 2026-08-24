@@ -8,6 +8,7 @@
 //! `ole_clipboard` submodule; the string arms below dispatch to it.
 
 use crate::clipboard::ClipboardStore;
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::Guid;
 use crate::guest_string::write_utf16_units;
 use crate::{HandlerContext, WinApiHandlerResult};
@@ -93,16 +94,6 @@ impl Default for OleState {
             drop_targets: HashMap::new(),
         }
     }
-}
-
-fn finish(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerResult> {
-    let return_address = engine
-        .return_from_win64_api(value)
-        .context("ole32 return")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: value,
-    })
 }
 
 /// Read the 5th Win64 stack argument (`[RSP+0x28]` at handler entry).
@@ -197,7 +188,7 @@ pub(crate) fn idataobject_method_va(slot: usize) -> Result<u64> {
 fn handle_co_initialize(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _reserved = engine.read_rcx()?;
-    finish(engine, S_OK)
+    ctx.finish(S_OK)
 }
 
 /// `HRESULT CoInitializeEx(LPVOID, DWORD)`
@@ -205,13 +196,12 @@ fn handle_co_initialize_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let engine = &mut *ctx.engine;
     let _reserved = engine.read_rcx()?;
     let _coinit = engine.read_rdx()?;
-    finish(engine, S_OK)
+    ctx.finish(S_OK)
 }
 
 /// `void CoUninitialize(void)`
 fn handle_co_uninitialize(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    finish(engine, 0)
+    ctx.finish(0)
 }
 
 /// `HRESULT CoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv)`
@@ -230,12 +220,12 @@ fn handle_co_create_instance(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         if ppv != 0 {
             engine.mem_write(ppv, &FAKE_IUNKNOWN.to_le_bytes())?;
         }
-        finish(engine, S_OK)
+        ctx.finish(S_OK)
     } else {
         if ppv != 0 {
             engine.mem_write(ppv, &0_u64.to_le_bytes())?;
         }
-        finish(engine, REGDB_E_CLASSNOTREG)
+        ctx.finish(REGDB_E_CLASSNOTREG)
     }
 }
 
@@ -257,7 +247,7 @@ fn handle_co_register_class_object(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     if lpdw_register != 0 {
         engine.mem_write(lpdw_register, &cookie.to_le_bytes())?;
     }
-    finish(engine, S_OK)
+    ctx.finish(S_OK)
 }
 
 /// `HRESULT CoRevokeClassObject(DWORD dwRegister)`
@@ -274,9 +264,9 @@ fn handle_co_revoke_class_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     }
     if let Some(key) = revoke_key {
         state.classes.remove(&key);
-        finish(engine, S_OK)
+        ctx.finish(S_OK)
     } else {
-        finish(engine, CO_E_OBJNOTREG)
+        ctx.finish(CO_E_OBJNOTREG)
     }
 }
 
@@ -290,7 +280,7 @@ fn handle_co_create_guid(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         rng.read_exact(&mut bytes).context("read /dev/urandom")?;
         engine.mem_write(pguid, &bytes)?;
     }
-    finish(engine, S_OK)
+    ctx.finish(S_OK)
 }
 
 /// `LPVOID CoTaskMemAlloc(SIZE_T cb)` — process-heap allocation, returned
@@ -299,7 +289,7 @@ fn handle_co_task_mem_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let engine = &mut *ctx.engine;
     let cb = engine.read_rcx()?;
     let va = ctx.state.heap_state.heap.alloc_coherent(engine, cb);
-    finish(engine, va)
+    ctx.finish(va)
 }
 
 /// `void CoTaskMemFree(LPVOID pv)`
@@ -309,7 +299,7 @@ fn handle_co_task_mem_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     if pv != 0 {
         let _ = ctx.state.heap_state.heap.free_coherent(engine, pv);
     }
-    finish(engine, 0)
+    ctx.finish(0)
 }
 
 /// `LPVOID CoTaskMemRealloc(LPVOID pv, SIZE_T cb)`
@@ -323,20 +313,20 @@ fn handle_co_task_mem_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let heap = &mut ctx.state.heap_state.heap;
     if pv == 0 {
         let va = heap.alloc_coherent(engine, cb);
-        return finish(engine, va);
+        return ctx.finish(va);
     }
     if cb == 0 {
         // Real CoTaskMemRealloc(pv, 0) frees and returns NULL.
         let _ = heap.free_coherent(engine, pv);
-        return finish(engine, 0);
+        return ctx.finish(0);
     }
     if let Some(same) = heap.try_realloc_in_place(pv, cb) {
-        return finish(engine, same);
+        return ctx.finish(same);
     }
     let old_size = heap.size_of(pv).unwrap_or(0);
     let new_va = heap.alloc_coherent(engine, cb);
     if new_va == 0 {
-        return finish(engine, 0);
+        return ctx.finish(0);
     }
     let copy_len = usize::try_from(old_size.min(cb)).unwrap_or(0);
     if copy_len > 0 {
@@ -345,7 +335,7 @@ fn handle_co_task_mem_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         engine.mem_write(new_va, &buf)?;
     }
     let _ = heap.free_coherent(engine, pv);
-    finish(engine, new_va)
+    ctx.finish(new_va)
 }
 
 /// `HRESULT StringFromCLSID(REFCLSID rclsid, LPOLESTR *lplpsz)`
@@ -371,7 +361,7 @@ fn handle_string_from_clsid(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
             engine.mem_write(lplpsz, &data.to_le_bytes())?;
         }
     }
-    finish(engine, S_OK)
+    ctx.finish(S_OK)
 }
 
 /// `HRESULT CLSIDFromString(LPCOLESTR lpsz, LPCLSID pclsid)`
@@ -381,12 +371,12 @@ fn handle_clsid_from_string(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let pclsid = engine.read_rdx()?;
     let s = crate::guest_string::read_utf16_lossy(engine, lpsz, 64).unwrap_or_default();
     let Some(guid) = parse_guid(&s) else {
-        return finish(engine, CO_E_CLASSSTRING);
+        return ctx.finish(CO_E_CLASSSTRING);
     };
     if pclsid != 0 {
         engine.mem_write(pclsid, &guid)?;
     }
-    finish(engine, S_OK)
+    ctx.finish(S_OK)
 }
 
 /// `HRESULT CoGetClassObject(rclsid, dwClsContext, reserved, riid, ppv)`
@@ -402,12 +392,12 @@ fn handle_co_get_class_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         if ppv != 0 {
             engine.mem_write(ppv, &FAKE_IUNKNOWN.to_le_bytes())?;
         }
-        finish(engine, S_OK)
+        ctx.finish(S_OK)
     } else {
         if ppv != 0 {
             engine.mem_write(ppv, &0_u64.to_le_bytes())?;
         }
-        finish(engine, REGDB_E_CLASSNOTREG)
+        ctx.finish(REGDB_E_CLASSNOTREG)
     }
 }
 
@@ -428,13 +418,11 @@ fn parse_guid(s: &str) -> Option<[u8; 16]> {
 /// `S_OK`. No heap payloads are owned, so the clear is a plain zero.
 fn handle_prop_variant_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let variant_va = engine
-        .read_rcx()
-        .context("failed to read RCX for PropVariantClear")?;
+    let variant_va = read_arg(engine, ArgReg::Rcx, "PropVariantClear")?;
     if variant_va != 0 {
         engine
             .mem_write(variant_va, &[0_u8; 16])
             .context("failed to zero PROPVARIANT")?;
     }
-    finish(engine, S_OK)
+    ctx.finish(S_OK)
 }

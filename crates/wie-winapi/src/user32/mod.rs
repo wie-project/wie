@@ -93,12 +93,8 @@ pub(crate) const WM_SYSCHAR: u32 = wm::WinMsg::WM_SYSCHAR.as_u32();
 pub(crate) const WM_SYSDEADCHAR: u32 = wm::WinMsg::WM_SYSDEADCHAR.as_u32();
 pub(crate) const WM_CREATE: u32 = wm::WinMsg::WM_CREATE.as_u32();
 pub(crate) const WM_DESTROY: u32 = wm::WinMsg::WM_DESTROY.as_u32();
-#[expect(dead_code)]
-pub(crate) const WM_MOVE: u32 = wm::WinMsg::WM_MOVE.as_u32();
 #[allow(dead_code)] // used only from cfg(test) state/tests.rs (status-bar WM_SIZE)
 pub(crate) const WM_SIZE: u32 = wm::WinMsg::WM_SIZE.as_u32();
-#[expect(dead_code)]
-pub(crate) const WM_ACTIVATE: u32 = wm::WinMsg::WM_ACTIVATE.as_u32();
 pub(crate) const WM_SETFOCUS: u32 = wm::WinMsg::WM_SETFOCUS.as_u32();
 pub(crate) const WM_KILLFOCUS: u32 = wm::WinMsg::WM_KILLFOCUS.as_u32();
 pub(crate) const WM_PAINT: u32 = wm::WinMsg::WM_PAINT.as_u32();
@@ -109,37 +105,11 @@ pub(crate) const WM_ERASEBKGND: u32 = wm::WinMsg::WM_ERASEBKGND.as_u32();
 pub(crate) const WM_SETFONT: u32 = wm::WinMsg::WM_SETFONT.as_u32();
 /// WM_GETFONT — the stored HFONT (0 when never set).
 pub(crate) const WM_GETFONT: u32 = wm::WinMsg::WM_GETFONT.as_u32();
-#[expect(dead_code)]
-pub(crate) const WM_SHOWWINDOW: u32 = wm::WinMsg::WM_SHOWWINDOW.as_u32();
-#[expect(dead_code)] // alias kept for crate users; dispatch uses WinMsg::WM_SETCURSOR
-pub(crate) const WM_SETCURSOR: u32 = wm::WinMsg::WM_SETCURSOR.as_u32();
-#[expect(dead_code)]
-pub(crate) const WM_GETMINMAXINFO: u32 = wm::WinMsg::WM_GETMINMAXINFO.as_u32();
 pub(crate) const WM_CONTEXTMENU: u32 = wm::WinMsg::WM_CONTEXTMENU.as_u32();
-#[expect(dead_code)]
-pub(crate) const WM_NCCREATE: u32 = wm::WinMsg::WM_NCCREATE.as_u32();
-#[expect(dead_code)]
-pub(crate) const WM_NCDESTROY: u32 = wm::WinMsg::WM_NCDESTROY.as_u32();
-#[expect(dead_code)]
-pub(crate) const WM_NCCALCSIZE: u32 = wm::WinMsg::WM_NCCALCSIZE.as_u32();
-#[expect(dead_code)] // alias kept for crate users; dispatch uses WinMsg::WM_SYSCOMMAND
-pub(crate) const WM_SYSCOMMAND: u32 = wm::WinMsg::WM_SYSCOMMAND.as_u32();
 pub(crate) const WM_COMMAND: u32 = wm::WinMsg::WM_COMMAND.as_u32();
 pub(crate) const WM_TIMER: u32 = wm::WinMsg::WM_TIMER.as_u32();
-#[expect(dead_code)]
-pub(crate) const WM_MOUSEMOVE: u32 = wm::WinMsg::WM_MOUSEMOVE.as_u32();
 #[cfg(test)]
 pub(crate) const WM_LBUTTONDOWN: u32 = wm::WinMsg::WM_LBUTTONDOWN.as_u32();
-#[expect(dead_code)]
-pub(crate) const WM_RBUTTONDOWN: u32 = wm::WinMsg::WM_RBUTTONDOWN.as_u32();
-#[expect(dead_code)]
-pub(crate) const WM_RBUTTONUP: u32 = wm::WinMsg::WM_RBUTTONUP.as_u32();
-#[expect(dead_code)]
-pub(crate) const WM_MBUTTONDOWN: u32 = wm::WinMsg::WM_MBUTTONDOWN.as_u32();
-#[expect(dead_code)]
-pub(crate) const WM_MBUTTONUP: u32 = wm::WinMsg::WM_MBUTTONUP.as_u32();
-#[expect(dead_code)]
-pub(crate) const WM_MOUSEWHEEL: u32 = wm::WinMsg::WM_MOUSEWHEEL.as_u32();
 // Clipboard edit messages (Task 2.6): `u32` aliases survive only for the lib
 // tests — the control dispatch matches these via `WinMsg`.
 #[cfg(test)]
@@ -152,11 +122,7 @@ pub(crate) const WM_PASTE: u32 = wm::WinMsg::WM_PASTE.as_u32();
 pub(crate) const WM_CLEAR: u32 = wm::WinMsg::WM_CLEAR.as_u32();
 #[cfg(test)]
 pub(crate) const WM_UNDO: u32 = wm::WinMsg::WM_UNDO.as_u32();
-#[expect(dead_code)]
-pub(crate) const SIZE_RESTORED: u64 = 0;
 pub(crate) const SC_CLOSE: u64 = 0xF060;
-#[expect(dead_code)]
-pub(crate) const SW_SHOW: u64 = 5;
 
 // List-box messages (winuser.h); the LISTBOX/COMBOBOX dispatch matches these
 // via `WinMsg` — the `u32` aliases survive only for the lib tests.

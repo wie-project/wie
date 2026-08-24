@@ -19,6 +19,7 @@ use super::{
     WM_SYSKEYDOWN, WinApiHandlerResult, WinApiState, make_command_wparam, with_typed_read,
 };
 use crate::HandlerContext;
+use crate::gdi32::{ArgReg, read_arg};
 use crate::handles::{Haccel, Hwnd};
 use crate::state::KeyboardState;
 use wie_pe::resources::AccelEntry;
@@ -83,12 +84,8 @@ fn handle_load_accelerators_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let instance_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let table_name_raw = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let instance_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let table_name_raw = read_arg(engine, ArgReg::Rdx, api_name)?;
 
     let table_id = if table_name_raw >> 16 == 0 {
         u16::try_from(table_name_raw & u64::from(u16::MAX)).unwrap_or(0)
@@ -162,9 +159,7 @@ pub fn handle_destroy_accelerator_table(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let accel_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for DestroyAcceleratorTable")?;
+    let accel_handle = read_arg(engine, ArgReg::Rcx, "DestroyAcceleratorTable")?;
 
     let ws = state.window_state();
     let before = ws.accel_tables.len();
@@ -196,15 +191,9 @@ fn handle_translate_accelerator_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let accel_handle = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let message_va = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let accel_handle = read_arg(engine, ArgReg::Rdx, api_name)?;
+    let message_va = read_arg(engine, ArgReg::R8, api_name)?;
 
     // One shared-lock borrow instead of two per-field reads; the MSG layout
     // + pinned offsets (message @8, wParam @16) live in

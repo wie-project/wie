@@ -3,6 +3,7 @@
 //! cheap; no-op success where the operation has no host counterpart.
 
 use super::{Context, HandlerContext, Result, WinApiHandlerResult, low_i32};
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_memory::write_u32;
 use zerocopy::IntoBytes;
 
@@ -21,9 +22,7 @@ pub fn handle_attach_thread_input(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 pub fn handle_bring_window_to_top(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for BringWindowToTop")?;
+    let hwnd = read_arg(engine, ArgReg::Rcx, "BringWindowToTop")?;
     if crate::user32::window::find_window(state, hwnd).is_some() {
         state
             .present()
@@ -83,12 +82,8 @@ pub fn handle_dialog_box_indirect_param_w(
 pub fn handle_enum_display_settings_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _device = engine.read_rcx()?;
-    let mode_index = engine
-        .read_rdx()
-        .context("failed to read RDX for EnumDisplaySettingsW")?;
-    let mode_va = engine
-        .read_r8()
-        .context("failed to read R8 for EnumDisplaySettingsW")?;
+    let mode_index = read_arg(engine, ArgReg::Rdx, "EnumDisplaySettingsW")?;
+    let mode_va = read_arg(engine, ArgReg::R8, "EnumDisplaySettingsW")?;
     // ENUM_CURRENT_SETTINGS is -1 (0xFFFFFFFF); ENUM_REGISTRY_SETTINGS is -2.
     if (mode_index != 0 && mode_index != 0xFFFF_FFFF) || mode_va == 0 {
         return ctx.finish(0);
@@ -141,12 +136,8 @@ pub fn handle_enum_display_settings_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_enum_display_settings_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _device = engine.read_rcx()?;
-    let mode_index = engine
-        .read_rdx()
-        .context("failed to read RDX for EnumDisplaySettingsA")?;
-    let mode_va = engine
-        .read_r8()
-        .context("failed to read R8 for EnumDisplaySettingsA")?;
+    let mode_index = read_arg(engine, ArgReg::Rdx, "EnumDisplaySettingsA")?;
+    let mode_va = read_arg(engine, ArgReg::R8, "EnumDisplaySettingsA")?;
     // ENUM_CURRENT_SETTINGS is -1 (0xFFFFFFFF); ENUM_REGISTRY_SETTINGS is -2.
     if (mode_index != 0 && mode_index != 0xFFFF_FFFF) || mode_va == 0 {
         return ctx.finish(0);
@@ -200,12 +191,8 @@ pub fn handle_get_class_info_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _instance = engine.read_rcx()?;
-    let class_name_va = engine
-        .read_rdx()
-        .context("failed to read RDX for GetClassInfoExW")?;
-    let out_va = engine
-        .read_r8()
-        .context("failed to read R8 for GetClassInfoExW")?;
+    let class_name_va = read_arg(engine, ArgReg::Rdx, "GetClassInfoExW")?;
+    let out_va = read_arg(engine, ArgReg::R8, "GetClassInfoExW")?;
     let class_name = super::read_guest_utf16_lossy(engine, class_name_va, 256)?;
     let identifier = super::WindowClassIdentifier::Name(class_name);
     let Some(record) = super::find_window_class(state, &identifier, true).cloned() else {
@@ -259,12 +246,8 @@ pub fn handle_get_message_time(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 pub fn handle_get_prop_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for GetPropW")?;
-    let name_va = engine
-        .read_rdx()
-        .context("failed to read RDX for GetPropW")?;
+    let hwnd = read_arg(engine, ArgReg::Rcx, "GetPropW")?;
+    let name_va = read_arg(engine, ArgReg::Rdx, "GetPropW")?;
     let name = super::read_guest_utf16_lossy(engine, name_va, 256)?;
     let value = state
         .window_state()
@@ -303,9 +286,7 @@ pub fn handle_get_raw_input_device_list(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let _list = engine.read_rcx()?;
-    let count_va = engine
-        .read_rdx()
-        .context("failed to read RDX for GetRawInputDeviceList")?;
+    let count_va = read_arg(engine, ArgReg::Rdx, "GetRawInputDeviceList")?;
     let _size = engine.read_r8()?;
     if count_va != 0 {
         write_u32(engine, count_va, 0)?;
@@ -326,15 +307,9 @@ pub fn handle_get_window_long_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 /// Handles `USER32.dll!IntersectRect` — real rectangle intersection.
 pub fn handle_intersect_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let out_va = engine
-        .read_rcx()
-        .context("failed to read RCX for IntersectRect")?;
-    let r1_va = engine
-        .read_rdx()
-        .context("failed to read RDX for IntersectRect")?;
-    let r2_va = engine
-        .read_r8()
-        .context("failed to read R8 for IntersectRect")?;
+    let out_va = read_arg(engine, ArgReg::Rcx, "IntersectRect")?;
+    let r1_va = read_arg(engine, ArgReg::Rdx, "IntersectRect")?;
+    let r2_va = read_arg(engine, ArgReg::R8, "IntersectRect")?;
     if out_va == 0 || r1_va == 0 || r2_va == 0 {
         ctx.state.process.last_error = ERROR_INVALID_PARAMETER;
         return ctx.finish(0);
@@ -398,9 +373,7 @@ pub fn handle_post_thread_message_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
 /// edges are exclusive, per Win32).
 pub fn handle_pt_in_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let rect_va = engine
-        .read_rcx()
-        .context("failed to read RCX for PtInRect")?;
+    let rect_va = read_arg(engine, ArgReg::Rcx, "PtInRect")?;
     let x = low_i32(engine.read_rdx()?, "PtInRect x")?;
     let y = low_i32(engine.read_r8()?, "PtInRect y")?;
     let mut b = [0_u8; 16];
@@ -445,12 +418,8 @@ pub fn handle_register_raw_input_devices(
 pub fn handle_remove_prop_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for RemovePropW")?;
-    let name_va = engine
-        .read_rdx()
-        .context("failed to read RDX for RemovePropW")?;
+    let hwnd = read_arg(engine, ArgReg::Rcx, "RemovePropW")?;
+    let name_va = read_arg(engine, ArgReg::Rdx, "RemovePropW")?;
     let name = super::read_guest_utf16_lossy(engine, name_va, 256)?;
     let props = &mut state.window_state().window_props;
     let idx = props.iter().position(|(h, n, _)| *h == hwnd && *n == name);
@@ -482,13 +451,9 @@ pub fn handle_set_layered_window_attributes(
 pub fn handle_set_prop_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for SetPropW")?;
-    let name_va = engine
-        .read_rdx()
-        .context("failed to read RDX for SetPropW")?;
-    let value = engine.read_r8().context("failed to read R8 for SetPropW")?;
+    let hwnd = read_arg(engine, ArgReg::Rcx, "SetPropW")?;
+    let name_va = read_arg(engine, ArgReg::Rdx, "SetPropW")?;
+    let value = read_arg(engine, ArgReg::R8, "SetPropW")?;
     let name = super::read_guest_utf16_lossy(engine, name_va, 256)?;
     let props = &mut state.window_state().window_props;
     match props.iter_mut().find(|(h, n, _)| *h == hwnd && *n == name) {
@@ -512,15 +477,9 @@ pub fn handle_system_parameters_info_impl(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let action = engine
-        .read_rcx()
-        .context("failed to read RCX for SystemParametersInfo")?;
-    let param = engine
-        .read_rdx()
-        .context("failed to read RDX for SystemParametersInfo")?;
-    let value_va = engine
-        .read_r8()
-        .context("failed to read R8 for SystemParametersInfo")?;
+    let action = read_arg(engine, ArgReg::Rcx, "SystemParametersInfo")?;
+    let param = read_arg(engine, ArgReg::Rdx, "SystemParametersInfo")?;
+    let value_va = read_arg(engine, ArgReg::R8, "SystemParametersInfo")?;
     let _modify = engine.read_r9()?;
     const SPI_GETWORKAREA: u64 = 0x0030;
     const SPI_GETSCREENSAVEACTIVE: u64 = 0x0010;

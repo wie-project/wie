@@ -55,25 +55,6 @@ pub fn alloc_small(n_bytes: u8) -> UnwindCode {
     }
 }
 
-/// `UWOP_SET_FPREG(register)` — set frame pointer.
-/// The offset is stored in `UNWIND_INFO.frame_offset`, not here.
-pub fn set_fpreg(reg: u8) -> UnwindCode {
-    UnwindCode {
-        code_offset: 0,
-        unwind_op: uwop::SET_FPREG,
-        op_info: reg,
-    }
-}
-
-/// `UWOP_SAVE_NONVOL(register)` — save register to stack slot.
-pub fn save_nonvol(reg: u8) -> UnwindCode {
-    UnwindCode {
-        code_offset: 0,
-        unwind_op: uwop::SAVE_NONVOL,
-        op_info: reg,
-    }
-}
-
 /// Set the prologue offset on a code entry. Returns `(offset, code)` for use with `unwind_info`.
 pub fn at(code: UnwindCode, off: u8) -> (u8, UnwindCode) {
     (off, code)

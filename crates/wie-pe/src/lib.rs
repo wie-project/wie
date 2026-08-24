@@ -476,24 +476,6 @@ pub struct PeLoadedImageSummary {
     pub section_count: usize,
 }
 
-impl PeLoadedImageSummary {
-    /// Loader identity view of this loaded image (path optional).
-    #[must_use]
-    pub fn identity(&self, path: &Path) -> PeIdentity {
-        PeIdentity {
-            path: path.display().to_string(),
-            image_base: self.image_base,
-            entry_rva: self.entry_rva,
-            entry_va: self.entry_point_va,
-            size_of_image: u64::try_from(self.image_size).unwrap_or(u64::MAX),
-            size_of_headers: u32::try_from(self.header_size).unwrap_or(u32::MAX),
-            machine: Machine::from(0),
-            is_pe64: true,
-            section_count: self.section_count,
-        }
-    }
-}
-
 /// Patched fake import entry.
 #[derive(Debug, Clone, Serialize)]
 pub struct PePatchedImport {
@@ -783,25 +765,38 @@ pub fn rva_to_file_offset(pe: &PE<'_>, rva: u32) -> Result<usize> {
     rva_to_file_offset_u64(pe, u64::from(rva))
 }
 
+/// Map an RVA inside one section onto its raw file offset (`None` when `rva`
+/// falls outside the section's mapped extent).
+///
+/// The mapped extent is `max(virtual_size, raw_size)`. Single source shared by
+/// the loader's section-table walk ([`rva_to_file_offset_u64`]) and the
+/// resource walker (`resources::common`), which previously duplicated this
+/// arithmetic.
+fn map_rva_in_section(
+    rva: u64,
+    section_rva: u32,
+    virtual_size: u32,
+    size_of_raw_data: u32,
+    pointer_to_raw_data: u32,
+) -> Option<u64> {
+    let section_rva = u64::from(section_rva);
+    let mapped_size = u64::from(virtual_size).max(u64::from(size_of_raw_data));
+    let delta = rva.checked_sub(section_rva)?;
+    if delta >= mapped_size {
+        return None;
+    }
+    u64::from(pointer_to_raw_data).checked_add(delta)
+}
+
 pub(crate) fn rva_to_file_offset_u64(pe: &PE<'_>, rva: u64) -> Result<usize> {
     for section in &pe.sections {
-        let section_rva = u64::from(section.virtual_address);
-        let virtual_size = u64::from(section.virtual_size);
-        let raw_size = u64::from(section.size_of_raw_data);
-        let mapped_size = virtual_size.max(raw_size);
-
-        let section_end = section_rva
-            .checked_add(mapped_size)
-            .context("section RVA range overflow")?;
-
-        if rva >= section_rva && rva < section_end {
-            let delta = rva
-                .checked_sub(section_rva)
-                .context("RVA delta underflow")?;
-            let raw_offset = u64::from(section.pointer_to_raw_data)
-                .checked_add(delta)
-                .context("raw file offset overflow")?;
-
+        if let Some(raw_offset) = map_rva_in_section(
+            rva,
+            section.virtual_address,
+            section.virtual_size,
+            section.size_of_raw_data,
+            section.pointer_to_raw_data,
+        ) {
             return usize::try_from(raw_offset).context("raw file offset does not fit usize");
         }
     }
@@ -897,128 +892,6 @@ pub(crate) fn read_array<const N: usize>(
 
 fn checked_add_usize(left: usize, right: usize) -> Result<usize> {
     left.checked_add(right).context("usize addition overflow")
-}
-
-/// Build a Windows-loader-like memory image from a `PE64` file.
-pub fn build_loaded_image(path: &Path) -> Result<(Vec<u8>, PeLoadedImageSummary)> {
-    let bytes = read_pe_file(path)?;
-
-    build_loaded_image_bytes(&bytes)
-}
-
-/// Build a Windows-loader-like memory image from `PE64` bytes.
-pub fn build_loaded_image_bytes(bytes: &[u8]) -> Result<(Vec<u8>, PeLoadedImageSummary)> {
-    let pe = PE::parse(bytes).context("failed to parse PE image")?;
-    build_loaded_image_from_parsed(&pe, bytes)
-}
-
-/// Private: build loaded image from a pre-parsed PE (no re-parse).
-fn build_loaded_image_from_parsed(
-    pe: &PE,
-    bytes: &[u8],
-) -> Result<(Vec<u8>, PeLoadedImageSummary)> {
-    ensure_pe64(pe)?;
-
-    // Path is only for diagnostics in identity; bytes carry all header fields.
-    let identity = pe_identity_from_parsed(pe, Path::new("<memory>"), bytes)?;
-
-    let image_size =
-        usize::try_from(identity.size_of_image).context("size_of_image does not fit usize")?;
-    let header_size =
-        usize::try_from(identity.size_of_headers).context("size_of_headers does not fit usize")?;
-
-    if header_size > bytes.len() {
-        bail!("size_of_headers is larger than file size");
-    }
-
-    let mut image = vec![0_u8; image_size];
-
-    let headers_dst = image
-        .get_mut(..header_size)
-        .context("failed to slice image headers")?;
-    let headers_src = bytes
-        .get(..header_size)
-        .context("failed to slice source headers")?;
-    headers_dst.copy_from_slice(headers_src);
-
-    for section in &pe.sections {
-        copy_section(bytes, &mut image, section)?;
-    }
-
-    let summary = PeLoadedImageSummary {
-        image_base: identity.image_base,
-        entry_rva: identity.entry_rva,
-        entry_point_va: identity.entry_va,
-        image_size,
-        header_size,
-        section_count: identity.section_count,
-    };
-
-    Ok((image, summary))
-}
-
-fn copy_section(
-    source: &[u8],
-    image: &mut [u8],
-    section: &goblin::pe::section_table::SectionTable,
-) -> Result<()> {
-    let raw_offset = usize::try_from(section.pointer_to_raw_data)
-        .context("section raw offset does not fit usize")?;
-    let raw_size =
-        usize::try_from(section.size_of_raw_data).context("section raw size does not fit usize")?;
-    let virtual_address = usize::try_from(section.virtual_address)
-        .context("section virtual address does not fit usize")?;
-
-    // The Windows loader copies `SizeOfRawData` bytes from the file into the
-    // section's virtual range; the remainder up to `VirtualSize` is
-    // zero-filled by the loader, and `image` is already zero-initialized, so
-    // only the raw bytes need copying.
-    let bytes_to_copy = raw_size;
-
-    if bytes_to_copy == 0 {
-        return Ok(());
-    }
-
-    let source_end = raw_offset
-        .checked_add(bytes_to_copy)
-        .context("section source range overflow")?;
-    let image_end = virtual_address
-        .checked_add(bytes_to_copy)
-        .context("section image range overflow")?;
-
-    let source_slice = source
-        .get(raw_offset..source_end)
-        .context("section raw range is outside file")?;
-    let image_slice = image
-        .get_mut(virtual_address..image_end)
-        .context("section virtual range is outside image")?;
-
-    image_slice.copy_from_slice(source_slice);
-
-    Ok(())
-}
-
-/// Build a loaded image and patch `IAT` slots with caller-provided fake VAs.
-///
-/// `fake_target` maps each import to a dense-encoded fake API address (see
-/// `wie_winapi::fake_va`). The resolver is invoked once per IAT slot.
-///
-/// Read the file once and pass bytes through to avoid a double read.
-pub fn build_loaded_image_with_fake_imports_with<F>(
-    path: &Path,
-    mut fake_target: F,
-) -> Result<(Vec<u8>, PeLoadedImageSummary, Vec<PePatchedImport>)>
-where
-    F: FnMut(&PeImportSummary) -> Result<u64>,
-{
-    let bytes = read_pe_file(path)?;
-    let pe = PE::parse(&bytes).context("failed to parse PE image")?;
-
-    let (mut image, summary) = build_loaded_image_from_parsed(&pe, &bytes)?;
-    let imports = inspect_pe_imports_from_parsed(&pe, &bytes)?;
-    let patched = patch_loaded_image_imports_with(&mut image, &imports, &mut fake_target)?;
-
-    Ok((image, summary, patched))
 }
 
 /// Load a PE64 image directly into guest memory through a writer callback.
@@ -1187,41 +1060,6 @@ where
 
         mem_write(slot_va, &fake_target_va.to_le_bytes())
             .context("failed to patch IAT slot in guest memory")?;
-
-        patched.push(patched_import_entry(import, fake_target_va));
-    }
-
-    Ok(patched)
-}
-
-/// Patch `IAT` slots using a dense fake-VA resolver.
-pub fn patch_loaded_image_imports_with<F>(
-    image: &mut [u8],
-    imports: &[PeImportSummary],
-    mut fake_target: F,
-) -> Result<Vec<PePatchedImport>>
-where
-    F: FnMut(&PeImportSummary) -> Result<u64>,
-{
-    let mut patched = Vec::with_capacity(imports.len());
-
-    for import in imports {
-        let fake_target_va = fake_target(import)?;
-
-        let slot_offset =
-            usize::try_from(import.iat_slot_rva).context("IAT slot RVA does not fit usize")?;
-
-        let slot_end = slot_offset
-            .checked_add(
-                usize::try_from(THUNK_ENTRY_SIZE).context("thunk size does not fit usize")?,
-            )
-            .context("IAT slot write range overflow")?;
-
-        let slot = image
-            .get_mut(slot_offset..slot_end)
-            .context("IAT slot is outside loaded image")?;
-
-        slot.copy_from_slice(&fake_target_va.to_le_bytes());
 
         patched.push(patched_import_entry(import, fake_target_va));
     }

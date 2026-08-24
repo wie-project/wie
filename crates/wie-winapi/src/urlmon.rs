@@ -44,16 +44,38 @@ pub fn dispatch_urlmon(
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
     let n = name.to_ascii_lowercase();
-    match n.as_str() {
-        "urldownloadtofilew" => Ok(Some(handle_url_download_to_file_w(ctx)?)),
-        "urldownloadtofilea" => Ok(Some(handle_url_download_to_file_a(ctx)?)),
-        "cointernetcreatesecuritymanager" => {
-            Ok(Some(handle_co_internet_create_security_manager(ctx)?))
-        }
-        "cointernetgetsession" => Ok(Some(handle_co_internet_get_session(ctx)?)),
-        _ => Ok(None),
-    }
+    let Some((_, handler)) = URLMON_EXPORTS
+        .iter()
+        .find(|(export, _)| *export == n.as_str())
+    else {
+        return Ok(None);
+    };
+    handler(ctx).map(Some)
 }
+
+/// Census oracle: which `urlmon.dll` exports are implemented.
+pub fn is_export(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    URLMON_EXPORTS
+        .iter()
+        .any(|(export, _)| *export == n.as_str())
+}
+
+/// One implemented export of a string-dispatched DLL: the census name
+/// (lowercase) plus its handler.
+type UrlmonHandler = fn(&mut HandlerContext<'_>) -> Result<WinApiHandlerResult>;
+
+/// Every implemented `urlmon.dll` export — the single source shared by
+/// [`dispatch_urlmon`] and the census oracle [`is_export`].
+const URLMON_EXPORTS: &[(&str, UrlmonHandler)] = &[
+    ("urldownloadtofilew", handle_url_download_to_file_w),
+    ("urldownloadtofilea", handle_url_download_to_file_a),
+    (
+        "cointernetcreatesecuritymanager",
+        handle_co_internet_create_security_manager,
+    ),
+    ("cointernetgetsession", handle_co_internet_get_session),
+];
 
 /// `HRESULT URLDownloadToFileW(LPUNKNOWN pCaller, LPCWSTR szURL,
 ///                             LPCWSTR szFileName, DWORD dwReserved,
@@ -159,16 +181,4 @@ fn handle_co_internet_get_session(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let _pp_session = engine.read_rdx()?;
     let _reserved = engine.read_r8()?;
     finish(engine, E_NOTIMPL)
-}
-
-/// Census oracle: which `urlmon.dll` exports are implemented.
-pub fn is_export(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    matches!(
-        n.as_str(),
-        "urldownloadtofilew"
-            | "urldownloadtofilea"
-            | "cointernetcreatesecuritymanager"
-            | "cointernetgetsession"
-    )
 }

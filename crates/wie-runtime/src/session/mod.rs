@@ -13,7 +13,7 @@ pub use self::menu::MenuNode;
 pub use self::profile::RuntimeProfile;
 pub use self::window::GuestHandle;
 
-pub(crate) use self::types::{GuestHwnd, GuestStackPtr, GuestTid, GuestVa};
+pub(crate) use self::types::{GuestStackPtr, GuestTid, GuestVa};
 
 use crate::memory::RuntimeMemoryLayout;
 use crate::mt_runtime::ProcessResources;
@@ -305,30 +305,6 @@ impl RuntimeSession {
         // parked threads their wake token — `queue.push` broadcasts on its
         // own; this path must do it explicitly.
         self.wake_hub.broadcast(wie_winapi::Wake::MessagePosted);
-    }
-
-    /// Queues one deterministic USER32 message for the guest.
-    ///
-    /// Internal seam for tests and future host automation; the interactive
-    /// presenter posts through [`GuestHandle::post_message`] instead.
-    /// No caller exists yet, so the newtyped signature is kept as the
-    /// reserved API (dead code under `-Dwarnings` until a caller lands).
-    #[allow(dead_code)]
-    pub(crate) fn post_window_message(
-        &mut self,
-        window_handle: GuestHwnd,
-        message: u32,
-        word_parameter: u64,
-        long_parameter: u64,
-    ) -> Result<()> {
-        let queue_arc = self.process.message_queue_arc();
-        let mut queue = queue_arc.lock().unwrap_or_else(|e| e.into_inner());
-        queue.push(
-            wie_winapi::handles::Hwnd::from(window_handle.0),
-            message,
-            word_parameter,
-            long_parameter,
-        )
     }
 
     /// Returns the first window backed by a guest WndProc.

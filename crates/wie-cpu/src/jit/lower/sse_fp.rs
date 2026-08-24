@@ -8,7 +8,7 @@ use super::emit::MemEnv;
 use super::flags::iconst_u64;
 use super::gpr::{bool_to_i64, effective_addr, is_imm_kind, read_gpr, write_gpr};
 use super::mem::call_load;
-use super::sse::{load_sse_mem, pair_to_vec, vec_to_pair};
+use super::sse::{load_sse_mem, pair_to_vec, read_sse_src_pair, vec_to_pair};
 
 use super::super::block::mem_width_bytes;
 
@@ -152,14 +152,7 @@ pub(super) fn lower_sse_shift(
         _ => None,
     };
     let (count_lo, count_hi) = if imm.is_none() {
-        match instr.op1_kind() {
-            OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-            OpKind::Memory => {
-                let addr = effective_addr(bcx, instr, gpr, mem)?;
-                load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
-            }
-            _ => return Err("sse shift src".into()),
-        }
+        read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "sse shift")?
     } else {
         (iconst_u64(bcx, 0), iconst_u64(bcx, 0))
     };
@@ -322,14 +315,7 @@ pub(super) fn lower_sse_cvtdq2pd(
 ) -> Result<(), String> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
-    let lo = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?.0,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            load_sse_mem(bcx, mem, gpr, rflags, addr, 8, instr.ip())?.0
-        }
-        _ => return Err("cvtdq2pd src".into()),
-    };
+    let lo = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 8, "cvtdq2pd")?.0;
     let shift = iconst_u64(bcx, 32);
     let d0 = bcx.ins().ireduce(types::I32, lo);
     let hi32 = bcx.ins().ushr(lo, shift);
@@ -358,14 +344,7 @@ pub(super) fn lower_sse_cvtps2pd(
 ) -> Result<(), String> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
-    let lo = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?.0,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            load_sse_mem(bcx, mem, gpr, rflags, addr, 8, instr.ip())?.0
-        }
-        _ => return Err("cvtps2pd src".into()),
-    };
+    let lo = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 8, "cvtps2pd")?.0;
     let shift = iconst_u64(bcx, 32);
     let lo32 = bcx.ins().ireduce(types::I32, lo);
     let hi32v = bcx.ins().ushr(lo, shift);
@@ -402,14 +381,7 @@ pub(super) fn lower_sse_cvtpd_packed(
 ) -> Result<(), String> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
-    let (s_lo, s_hi) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
-        }
-        _ => return Err("cvtpd src".into()),
-    };
+    let (s_lo, s_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "cvtpd")?;
     let cref = mem.sse_cvt_ref.ok_or("cvt helper missing")?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let c1 = bcx.ins().call(cref, &[op_v, s_lo]);
@@ -440,15 +412,8 @@ pub(super) fn lower_sse_cvt_scalar_preserve(
 ) -> Result<(), String> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
-    let lo = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?.0,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            let sz = u32::try_from(src_bytes).unwrap_or(8);
-            load_sse_mem(bcx, mem, gpr, rflags, addr, sz, instr.ip())?.0
-        }
-        _ => return Err("cvt scalar src".into()),
-    };
+    let sz = u32::try_from(src_bytes).unwrap_or(8);
+    let lo = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, sz, "cvt scalar")?.0;
     let (d_lo, d_hi) = read_xmm_pair(xmm, dst)?;
     let cref = mem.sse_cvt_ref.ok_or("cvt helper missing")?;
     let op_v = iconst_u64(bcx, op.to_abi());
@@ -481,14 +446,7 @@ pub(super) fn lower_sse_pshufb(
     let di = xmm_index(dst)?;
     // table = op0 (dst), mask = op1 (src).
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, b_hi) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
-        }
-        _ => return Err("pshufb src".into()),
-    };
+    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "pshufb")?;
     let lo_ref = mem.sse_pshufb_lo_ref.ok_or("pshufb helper missing")?;
     let hi_ref = mem.sse_pshufb_hi_ref.ok_or("pshufb helper missing")?;
     let c1 = bcx.ins().call(lo_ref, &[a_lo, a_hi, b_lo, b_hi]);
@@ -513,15 +471,8 @@ pub(super) fn lower_sse_fp_unop_scalar(
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (old_lo, old_hi) = read_xmm_pair(xmm, dst)?;
-    let (src_lo, _) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            let w = if is_double { 8 } else { 4 };
-            load_sse_mem(bcx, mem, gpr, rflags, addr, w, instr.ip())?
-        }
-        _ => return Err("fp unop scalar src".into()),
-    };
+    let w: u32 = if is_double { 8 } else { 4 };
+    let (src_lo, _) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, w, "fp unop scalar")?;
     let uref = mem.sse_fp_unop_ref.ok_or("fp unop helper missing")?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let call = bcx.ins().call(uref, &[op_v, src_lo]);
@@ -583,15 +534,8 @@ pub(super) fn lower_sse_fp_binop_scalar(
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (old_lo, old_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, _) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            let w = if is_double { 8 } else { 4 };
-            load_sse_mem(bcx, mem, gpr, rflags, addr, w, instr.ip())?
-        }
-        _ => return Err("fp binop scalar src".into()),
-    };
+    let w: u32 = if is_double { 8 } else { 4 };
+    let (b_lo, _) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, w, "fp binop scalar")?;
     let bref = mem.sse_fp_binop_ref.ok_or("fp binop helper missing")?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let call = bcx.ins().call(bref, &[op_v, old_lo, b_lo]);
@@ -622,14 +566,7 @@ pub(super) fn lower_sse_fp_binop_packed(
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, b_hi) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
-        }
-        _ => return Err("fp binop packed src".into()),
-    };
+    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "fp binop packed")?;
     let bref = mem.sse_fp_binop_ref.ok_or("fp binop helper missing")?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let c1 = bcx.ins().call(bref, &[op_v, a_lo, b_lo]);
@@ -653,17 +590,9 @@ pub(super) fn lower_sse_comis(
     xmm: &mut [Value; 32],
     is_double: bool,
 ) -> Result<(), String> {
-    let ip = instr.ip();
     let (a_lo, _) = read_xmm_pair(xmm, instr.op_register(0))?;
-    let (b_lo, _) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            let w = if is_double { 8 } else { 4 };
-            load_sse_mem(bcx, mem, gpr, *rflags, addr, w, ip)?
-        }
-        _ => return Err("comis src".into()),
-    };
+    let w: u32 = if is_double { 8 } else { 4 };
+    let (b_lo, _) = read_sse_src_pair(bcx, instr, gpr, *rflags, mem, xmm, w, "comis")?;
     let (fa, fb) = if is_double {
         (
             bcx.ins()
@@ -772,17 +701,9 @@ pub(super) fn lower_sse_cvt_fp_to_gpr(
     is_double: bool,
     trunc: bool,
 ) -> Result<(), String> {
-    let ip = instr.ip();
     let is64 = instr.op_register(0).size() == 8;
-    let (lo, _) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            let w = if is_double { 8 } else { 4 };
-            load_sse_mem(bcx, mem, gpr, rflags, addr, w, ip)?
-        }
-        _ => return Err("cvt fp src".into()),
-    };
+    let w: u32 = if is_double { 8 } else { 4 };
+    let (lo, _) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, w, "cvt fp")?;
     let op = match (is_double, is64, trunc) {
         (false, false, true) => exec::SseCvtOp::Cvttss2si32,
         (false, false, false) => exec::SseCvtOp::Cvtss2si32,
@@ -842,14 +763,7 @@ pub(super) fn lower_sse_bitwise(
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, b_hi) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
-        }
-        _ => return Err("sse bitwise src".into()),
-    };
+    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "sse bitwise")?;
     let (lo, hi) = if JitConfig::get().simd_enabled() {
         let a = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
         let b = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
@@ -914,15 +828,9 @@ pub(super) fn lower_sse_scalar_fp(
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, b_hi) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            let nbytes = if width == FloatWidth::F64 { 8 } else { 4 };
-            load_sse_mem(bcx, mem, gpr, rflags, addr, nbytes, instr.ip())?
-        }
-        _ => return Err("sse scalar fp src".into()),
-    };
+    let nbytes: u32 = if width == FloatWidth::F64 { 8 } else { 4 };
+    let (b_lo, b_hi) =
+        read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, nbytes, "sse scalar fp")?;
     let _ = b_hi;
     let (new_lo, new_hi) = if JitConfig::get().simd_enabled() {
         if width == FloatWidth::F64 {
@@ -994,14 +902,7 @@ pub(super) fn lower_sse_packed_fp(
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, b_hi) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
-        }
-        _ => return Err("sse packed fp src".into()),
-    };
+    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "sse packed fp")?;
     if JitConfig::get().simd_enabled() {
         let a8 = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
         let b8 = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);

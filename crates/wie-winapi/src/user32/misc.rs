@@ -6,7 +6,9 @@ use super::{
     read_guest_ansi_lossy, read_guest_utf16_lossy, read_i32, read_u64, register_window_class,
     with_typed_read, write_out_string,
 };
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::WndClassEx;
+use crate::kernel32::low_u32;
 use crate::state::{MessageBoxRequest, PendingNativeMessageBox};
 use crate::{GuestCallbackRequest, OuterReturn, WinApiControlSignal};
 
@@ -41,12 +43,8 @@ fn handle_load_image_like_impl(
     fake_handle: u64,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let instance_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let name_raw = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let instance_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let name_raw = read_arg(engine, ArgReg::Rdx, api_name)?;
 
     let (resource_id, name) = decode_name_or_resource(engine, name_raw, wide)?;
 
@@ -85,11 +83,28 @@ fn decode_name_or_resource(
 }
 /// Handles `USER32.dll!RegisterClassExW`.
 pub fn handle_register_class_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    register_class_ex_impl(ctx, true)
+}
+/// Handles `USER32.dll!RegisterClassExA`.
+pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    register_class_ex_impl(ctx, false)
+}
+
+/// Shared `RegisterClassExA/W` implementation.
+///
+/// Win64 ABI: `rcx` = `lpwcx` (guest `WNDCLASSEX`). Both variants share the
+/// struct layout; only the pointed-to strings differ in encoding.
+fn register_class_ex_impl(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_class_va = engine
-        .read_rcx()
-        .context("failed to read RCX for RegisterClassExW")?;
+    let api_name = if wide {
+        "RegisterClassExW"
+    } else {
+        "RegisterClassExA"
+    };
+    let struct_tag = if wide { "WNDCLASSEXW" } else { "WNDCLASSEXA" };
+
+    let window_class_va = read_arg(engine, ArgReg::Rcx, api_name)?;
 
     let return_value = if window_class_va == 0 {
         0
@@ -120,71 +135,15 @@ pub fn handle_register_class_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
                 wc.small_icon_handle,
             ))
         })
-        .context("failed to read WNDCLASSEXW for RegisterClassExW")?;
+        .with_context(|| format!("failed to read {struct_tag} for {api_name}"))?;
 
-        let class_name = read_guest_utf16_lossy(engine, class_name_va, 256)
-            .context("failed to read RegisterClassExW class name")?;
-
-        register_window_class(
-            state,
-            WindowClassRecord {
-                atom: 0,
-                class_name,
-                window_proc,
-                style,
-                instance_handle,
-                icon_handle,
-                cursor_handle,
-                background_brush,
-                small_icon_handle,
-                menu_name,
-                unicode: true,
-            },
-        )?
-    };
-
-    ctx.finish(return_value)
-}
-/// Handles `USER32.dll!RegisterClassExA`.
-pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let window_class_va = engine
-        .read_rcx()
-        .context("failed to read RCX for RegisterClassExA")?;
-
-    let return_value = if window_class_va == 0 {
-        0
-    } else {
-        // WNDCLASSEXA shares the WNDCLASSEXW layout; only the pointed-to
-        // strings are ANSI (see the W variant above).
-        let (
-            style,
-            window_proc,
-            instance_handle,
-            icon_handle,
-            cursor_handle,
-            background_brush,
-            menu_name,
-            class_name_va,
-            small_icon_handle,
-        ) = with_typed_read::<WndClassEx, _, _>(engine, window_class_va, |wc| {
-            Ok((
-                wc.style,
-                wc.window_proc,
-                wc.instance_handle,
-                wc.icon_handle,
-                wc.cursor_handle,
-                wc.background_brush,
-                wc.menu_name,
-                wc.class_name_ptr,
-                wc.small_icon_handle,
-            ))
-        })
-        .context("failed to read WNDCLASSEXA for RegisterClassExA")?;
-
-        let class_name = read_guest_ansi_lossy(engine, class_name_va, 256)
-            .context("failed to read RegisterClassExA class name")?;
+        let class_name = if wide {
+            read_guest_utf16_lossy(engine, class_name_va, 256)
+                .with_context(|| format!("failed to read {api_name} class name"))?
+        } else {
+            read_guest_ansi_lossy(engine, class_name_va, 256)
+                .with_context(|| format!("failed to read {api_name} class name"))?
+        };
 
         register_window_class(
             state,
@@ -199,7 +158,7 @@ pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
                 background_brush,
                 small_icon_handle,
                 menu_name,
-                unicode: false,
+                unicode: wide,
             },
         )?
     };
@@ -220,65 +179,46 @@ pub fn handle_register_class_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// host console and the handler returns IDOK so no guest ever hangs on a
 /// missing host.
 pub fn handle_message_box_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let (caption, text, message_box_type) = {
-        let engine = &mut *ctx.engine;
-        let _window_handle = engine
-            .read_rcx()
-            .context("failed to read RCX for MessageBoxW")?;
-
-        let text_va = engine
-            .read_rdx()
-            .context("failed to read RDX for MessageBoxW")?;
-
-        let caption_va = engine
-            .read_r8()
-            .context("failed to read R8 for MessageBoxW")?;
-
-        let message_box_type_raw = engine
-            .read_r9()
-            .context("failed to read R9 for MessageBoxW")?;
-
-        let text = read_guest_utf16_lossy(engine, text_va, 1024)
-            .context("failed to read MessageBoxW text")?;
-
-        let caption = read_guest_utf16_lossy(engine, caption_va, 256)
-            .context("failed to read MessageBoxW caption")?;
-
-        (
-            caption,
-            text,
-            u32::try_from(message_box_type_raw).unwrap_or(0),
-        )
-    };
-
-    tracing::info!(caption = %caption, text = %text, message_box_type, "MessageBoxW");
-    message_box_result(ctx, &caption, &text, message_box_type, "MessageBoxW")
+    handle_message_box_impl(ctx, true)
 }
 /// Handles `USER32.dll!MessageBoxA`.
 pub fn handle_message_box_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_message_box_impl(ctx, false)
+}
+
+/// Shared `MessageBoxA/W` implementation: read the four register arguments,
+/// decode text/caption (`lpText` @rdx, `lpCaption` @r8 — note the swap: the
+/// guest's second argument is the TEXT), and route to the bridge.
+fn handle_message_box_impl(
+    ctx: &mut HandlerContext<'_>,
+    wide: bool,
+) -> Result<WinApiHandlerResult> {
+    let api_name = if wide { "MessageBoxW" } else { "MessageBoxA" };
     let (caption, text, message_box_type) = {
         let engine = &mut *ctx.engine;
-        let _window_handle = engine
-            .read_rcx()
-            .context("failed to read RCX for MessageBoxA")?;
+        let _window_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
 
-        let text_va = engine
-            .read_rdx()
-            .context("failed to read RDX for MessageBoxA")?;
+        let text_va = read_arg(engine, ArgReg::Rdx, api_name)?;
 
-        let caption_va = engine
-            .read_r8()
-            .context("failed to read R8 for MessageBoxA")?;
+        let caption_va = read_arg(engine, ArgReg::R8, api_name)?;
 
-        let message_box_type_raw = engine
-            .read_r9()
-            .context("failed to read R9 for MessageBoxA")?;
+        let message_box_type_raw = read_arg(engine, ArgReg::R9, api_name)?;
 
-        let text = read_guest_ansi_lossy(engine, text_va, 1024)
-            .context("failed to read MessageBoxA text")?;
-
-        let caption = read_guest_ansi_lossy(engine, caption_va, 256)
-            .context("failed to read MessageBoxA caption")?;
+        let (text, caption) = if wide {
+            (
+                read_guest_utf16_lossy(engine, text_va, 1024)
+                    .with_context(|| format!("failed to read {api_name} text"))?,
+                read_guest_utf16_lossy(engine, caption_va, 256)
+                    .with_context(|| format!("failed to read {api_name} caption"))?,
+            )
+        } else {
+            (
+                read_guest_ansi_lossy(engine, text_va, 1024)
+                    .with_context(|| format!("failed to read {api_name} text"))?,
+                read_guest_ansi_lossy(engine, caption_va, 256)
+                    .with_context(|| format!("failed to read {api_name} caption"))?,
+            )
+        };
 
         (
             caption,
@@ -287,8 +227,8 @@ pub fn handle_message_box_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         )
     };
 
-    tracing::info!(caption = %caption, text = %text, message_box_type, "MessageBoxA");
-    message_box_result(ctx, &caption, &text, message_box_type, "MessageBoxA")
+    tracing::info!(caption = %caption, text = %text, message_box_type, "{api_name}");
+    message_box_result(ctx, &caption, &text, message_box_type, api_name)
 }
 
 /// Route a decoded MessageBox to the host bridge, or the console-echo fallback.
@@ -409,21 +349,13 @@ pub(crate) fn handle_load_image(
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _instance_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let _instance_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
 
-    let _image_name_va = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let _image_name_va = read_arg(engine, ArgReg::Rdx, api_name)?;
 
-    let _image_type = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let _image_type = read_arg(engine, ArgReg::R8, api_name)?;
 
-    let _desired_width = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let _desired_width = read_arg(engine, ArgReg::R9, api_name)?;
 
     // Win64 arguments 5 and 6 are desired height and load flags.
     // For bootstrap purposes, return a stable non-null image handle.
@@ -432,9 +364,7 @@ pub(crate) fn handle_load_image(
 /// Handles `USER32.dll!DestroyIcon`.
 pub fn handle_destroy_icon(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let icon_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for DestroyIcon")?;
+    let icon_handle = read_arg(engine, ArgReg::Rcx, "DestroyIcon")?;
 
     let return_value = u64::from(icon_handle != 0);
 
@@ -450,17 +380,13 @@ pub fn handle_get_dialog_base_units(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_set_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for SetTimer")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "SetTimer")?;
 
-    let requested_timer_id = engine
-        .read_rdx()
-        .context("failed to read RDX for SetTimer")?;
+    let requested_timer_id = read_arg(engine, ArgReg::Rdx, "SetTimer")?;
 
-    let interval_raw = engine.read_r8().context("failed to read R8 for SetTimer")?;
+    let interval_raw = read_arg(engine, ArgReg::R8, "SetTimer")?;
 
-    let callback_address = engine.read_r9().context("failed to read R9 for SetTimer")?;
+    let callback_address = read_arg(engine, ArgReg::R9, "SetTimer")?;
 
     // Thread timers (hwnd == 0) and any known window are accepted.
     let valid_window = window_handle == 0 || super::is_known_window(state, window_handle);
@@ -529,13 +455,9 @@ pub fn handle_set_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 pub fn handle_kill_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for KillTimer")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "KillTimer")?;
 
-    let timer_id = engine
-        .read_rdx()
-        .context("failed to read RDX for KillTimer")?;
+    let timer_id = read_arg(engine, ArgReg::Rdx, "KillTimer")?;
 
     let existed = state.window_state().timers.iter().any(|timer| {
         timer.window_handle == crate::handles::Hwnd::from(window_handle)
@@ -565,21 +487,13 @@ pub fn handle_kill_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 pub fn handle_set_windows_hook_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hook_type_raw = engine
-        .read_rcx()
-        .context("failed to read RCX for SetWindowsHookExW")?;
+    let hook_type_raw = read_arg(engine, ArgReg::Rcx, "SetWindowsHookExW")?;
 
-    let callback_address = engine
-        .read_rdx()
-        .context("failed to read RDX for SetWindowsHookExW")?;
+    let callback_address = read_arg(engine, ArgReg::Rdx, "SetWindowsHookExW")?;
 
-    let module_handle = engine
-        .read_r8()
-        .context("failed to read R8 for SetWindowsHookExW")?;
+    let module_handle = read_arg(engine, ArgReg::R8, "SetWindowsHookExW")?;
 
-    let thread_id_raw = engine
-        .read_r9()
-        .context("failed to read R9 for SetWindowsHookExW")?;
+    let thread_id_raw = read_arg(engine, ArgReg::R9, "SetWindowsHookExW")?;
 
     let hook_type = low_i32(hook_type_raw, "SetWindowsHookExW hook type")?;
 
@@ -618,9 +532,7 @@ pub fn handle_set_windows_hook_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_unhook_windows_hook_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hook_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for UnhookWindowsHookEx")?;
+    let hook_handle = read_arg(engine, ArgReg::Rcx, "UnhookWindowsHookEx")?;
 
     let existed = state
         .window_state()
@@ -642,21 +554,13 @@ pub fn handle_unhook_windows_hook_ex(ctx: &mut HandlerContext<'_>) -> Result<Win
 /// Handles `USER32.dll!SetScrollInfo`.
 pub fn handle_set_scroll_info(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for SetScrollInfo")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "SetScrollInfo")?;
 
-    let bar = engine
-        .read_rdx()
-        .context("failed to read RDX for SetScrollInfo")?;
+    let bar = read_arg(engine, ArgReg::Rdx, "SetScrollInfo")?;
 
-    let scroll_info_va = engine
-        .read_r8()
-        .context("failed to read R8 for SetScrollInfo")?;
+    let scroll_info_va = read_arg(engine, ArgReg::R8, "SetScrollInfo")?;
 
-    let _redraw = engine
-        .read_r9()
-        .context("failed to read R9 for SetScrollInfo")?;
+    let _redraw = read_arg(engine, ArgReg::R9, "SetScrollInfo")?;
 
     // SCROLLINFO (Win64):
     // UINT cbSize;    0
@@ -715,9 +619,7 @@ fn handle_register_window_message_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let name_va = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let name_va = read_arg(engine, ArgReg::Rcx, api_name)?;
 
     let name = if api_name.ends_with('W') {
         read_guest_utf16_lossy(engine, name_va, 256)
@@ -784,18 +686,10 @@ fn handle_load_string_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let instance_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let string_id_raw = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let buffer_va = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
-    let max_characters_raw = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let instance_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let string_id_raw = read_arg(engine, ArgReg::Rdx, api_name)?;
+    let buffer_va = read_arg(engine, ArgReg::R8, api_name)?;
+    let max_characters_raw = read_arg(engine, ArgReg::R9, api_name)?;
 
     // API contract: LoadString string ids are u16 (anything wider cannot
     // address a parsed block).
@@ -930,18 +824,10 @@ fn handle_call_window_proc_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let prev_wndfunc = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let window_handle = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let message_raw = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
-    let word_parameter = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let prev_wndfunc = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let window_handle = read_arg(engine, ArgReg::Rdx, api_name)?;
+    let message_raw = read_arg(engine, ArgReg::R8, api_name)?;
+    let word_parameter = read_arg(engine, ArgReg::R9, api_name)?;
     let rsp = engine
         .read_rsp()
         .with_context(|| format!("failed to read RSP for {api_name}"))?;
@@ -953,8 +839,7 @@ fn handle_call_window_proc_impl(
     .with_context(|| format!("failed to read {api_name} lParam"))?;
 
     // Only the low 32 bits carry the message id.
-    let message = u32::try_from(message_raw & u64::from(u32::MAX))
-        .context("CallWindowProc message does not fit u32")?;
+    let message = low_u32(message_raw, "CallWindowProc message")?;
 
     let (original, unicode, is_control) =
         super::find_window(state, window_handle).map_or((0, false, false), |window| {

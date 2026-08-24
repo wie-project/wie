@@ -14,6 +14,7 @@
 use anyhow::{Context, Result};
 
 use crate::OuterReturn;
+use crate::gdi32::{ArgReg, read_arg};
 use crate::user32::{
     BS_DEFPUSHBUTTON, CreateWindowRequest, GuestCallbackRequest, HandlerContext,
     QueuedWindowMessage, WM_INITDIALOG, WM_QUIT, WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP, WS_VISIBLE,
@@ -43,18 +44,10 @@ fn handle_create_dialog_param_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let instance_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let template_value = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let parent_handle = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
-    let dialog_proc = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let instance_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let template_value = read_arg(engine, ArgReg::Rdx, api_name)?;
+    let parent_handle = read_arg(engine, ArgReg::R8, api_name)?;
+    let dialog_proc = read_arg(engine, ArgReg::R9, api_name)?;
     let rsp = engine
         .read_rsp()
         .with_context(|| format!("failed to read RSP for {api_name}"))?;
@@ -305,12 +298,8 @@ fn center_in_owner(
 pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let dialog_hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for EndDialog")?;
-    let result = engine
-        .read_rdx()
-        .context("failed to read RDX for EndDialog")?;
+    let dialog_hwnd = read_arg(engine, ArgReg::Rcx, "EndDialog")?;
+    let result = read_arg(engine, ArgReg::Rdx, "EndDialog")?;
 
     let is_dialog = find_window(state, dialog_hwnd).is_some_and(|w| w.dialog_proc != 0);
     let return_value = if is_dialog {

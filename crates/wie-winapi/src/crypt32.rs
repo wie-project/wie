@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use sha1::{Digest, Sha1};
 use sha2::Sha256;
 
+use crate::kernel32::read_stack_u64;
 use crate::{HandlerContext, WinApiHandlerResult};
 
 /// `CALG_SHA1` — SHA-1 hash algorithm id.
@@ -120,7 +121,7 @@ fn handle_crypt_acquire_context(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let _container = engine.read_rdx()?;
     let _provider = engine.read_r8()?;
     let _prov_type = engine.read_r9()?;
-    let _flags = read_stack_arg5(engine)?;
+    let _flags = read_stack_u64(engine, 0x28)?;
     let handle = ctx.state.crypt32().alloc_provider();
     engine.mem_write(ph_prov, &handle.to_le_bytes())?;
     ctx.finish(1)
@@ -163,7 +164,7 @@ fn handle_crypt_create_hash(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let algid = engine.read_rdx()?;
     let _h_key = engine.read_r8()?;
     let _flags = engine.read_r9()?;
-    let ph_hash = read_stack_arg5(engine)?;
+    let ph_hash = read_stack_u64(engine, 0x28)?;
 
     let algorithm = match algid {
         CALG_SHA1 => HashAlgorithm::Sha1,
@@ -234,7 +235,7 @@ fn handle_crypt_get_hash_param(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let dw_param = engine.read_rdx()?;
     let pb_data = engine.read_r8()?;
     let pdw_data_len = engine.read_r9()?;
-    let _flags = read_stack_arg5(engine)?;
+    let _flags = read_stack_u64(engine, 0x28)?;
 
     if dw_param != HP_HASHVAL {
         ctx.state.process.last_error = NTE_BAD_PARAM;
@@ -284,15 +285,4 @@ fn fill_entropy(buf: &mut [u8]) -> Result<()> {
     let mut urandom = File::open("/dev/urandom").context("open /dev/urandom")?;
     urandom.read_exact(buf).context("read /dev/urandom")?;
     Ok(())
-}
-
-/// Read the 5th Win64 argument from the stack.
-///
-/// At handler entry `[RSP]` holds the return address and the caller's 0x20
-/// bytes of shadow space follow it, so the 5th parameter sits at `RSP + 0x28`.
-fn read_stack_arg5(engine: &mut dyn wie_cpu::CpuEngine) -> Result<u64> {
-    let rsp = engine.read_rsp()?;
-    let mut bytes = [0_u8; 8];
-    engine.mem_read(rsp.wrapping_add(0x28), &mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
 }

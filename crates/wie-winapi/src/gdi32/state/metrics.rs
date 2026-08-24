@@ -6,6 +6,8 @@ use crate::handles::Hdc;
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 use super::objects::dc_resolved_font;
+use crate::gdi32::{ArgReg, read_arg};
+use crate::kernel32::low_u32;
 
 /// Round an `f32` px metric to an `i32`.
 fn round_i32(value: f32) -> i32 {
@@ -104,13 +106,9 @@ fn resolve_text_metrics(state: &mut WinApiState, hdc: u64) -> TextMetrics {
 pub fn handle_get_text_metrics_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for GetTextMetricsA")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "GetTextMetricsA")?;
 
-    let metrics_va = engine
-        .read_rdx()
-        .context("failed to read RDX for GetTextMetricsA")?;
+    let metrics_va = read_arg(engine, ArgReg::Rdx, "GetTextMetricsA")?;
 
     let success = metrics_va != 0;
     if success {
@@ -154,13 +152,9 @@ pub fn handle_get_text_metrics_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_get_text_metrics_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for GetTextMetricsW")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "GetTextMetricsW")?;
 
-    let metrics_va = engine
-        .read_rdx()
-        .context("failed to read RDX for GetTextMetricsW")?;
+    let metrics_va = read_arg(engine, ArgReg::Rdx, "GetTextMetricsW")?;
 
     let success = metrics_va != 0;
     if success {
@@ -199,15 +193,10 @@ pub fn handle_get_text_metrics_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_set_text_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for SetTextColor")?;
-    let color_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for SetTextColor")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "SetTextColor")?;
+    let color_raw = read_arg(engine, ArgReg::Rdx, "SetTextColor")?;
 
-    let color = u32::try_from(color_raw & u64::from(u32::MAX))
-        .context("SetTextColor color does not fit u32")?;
+    let color = low_u32(color_raw, "SetTextColor color")?;
 
     let previous = state
         .gdi_state()
@@ -221,15 +210,10 @@ pub fn handle_set_text_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 pub fn handle_set_bk_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for SetBkColor")?;
-    let color_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for SetBkColor")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "SetBkColor")?;
+    let color_raw = read_arg(engine, ArgReg::Rdx, "SetBkColor")?;
 
-    let color = u32::try_from(color_raw & u64::from(u32::MAX))
-        .context("SetBkColor color does not fit u32")?;
+    let color = low_u32(color_raw, "SetBkColor color")?;
 
     let previous = state
         .gdi_state()
@@ -245,15 +229,10 @@ pub fn handle_set_bk_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 pub fn handle_set_bk_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for SetBkMode")?;
-    let mode_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for SetBkMode")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "SetBkMode")?;
+    let mode_raw = read_arg(engine, ArgReg::Rdx, "SetBkMode")?;
 
-    let mode =
-        u32::try_from(mode_raw & u64::from(u32::MAX)).context("SetBkMode mode does not fit u32")?;
+    let mode = low_u32(mode_raw, "SetBkMode mode")?;
 
     let previous = state
         .gdi_state()

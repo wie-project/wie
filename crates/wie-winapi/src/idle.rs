@@ -50,12 +50,6 @@ impl IdlePolicy {
         }
     }
 
-    /// Convenience: micro / library default (`WIE_IDLE` or Yield).
-    #[must_use]
-    pub fn from_env() -> Self {
-        Self::from_env_for(IdleContext::Micro)
-    }
-
     /// Short name for profiles / logs.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -91,23 +85,11 @@ pub fn idle_message_park_ms() -> u64 {
     parse_u64_env("WIE_IDLE_PARK_MS").unwrap_or(25).max(1)
 }
 
-/// Optional sleep between CPU slices when policy is Park (ms). Default 0 = off.
-#[must_use]
-pub fn idle_slice_ms() -> u64 {
-    parse_u64_env("WIE_IDLE_SLICE_MS").unwrap_or(0)
-}
-
 /// Duration for `Sleep(requested_ms)` under park policy (after cap).
 #[must_use]
 pub fn sleep_park_duration(requested_ms: u64) -> Duration {
     let ms = requested_ms.min(idle_sleep_cap_ms());
     Duration::from_millis(ms)
-}
-
-/// Duration for one empty-message park quantum.
-#[must_use]
-pub fn message_park_duration() -> Duration {
-    Duration::from_millis(idle_message_park_ms())
 }
 
 /// Park the host thread for a Sleep request when policy allows.
@@ -122,11 +104,6 @@ pub fn apply_sleep(policy: IdlePolicy, milliseconds: u64) {
     if policy.should_park_sleep() {
         std::thread::sleep(sleep_park_duration(milliseconds));
     }
-}
-
-/// Park once for an empty message queue (caller re-enters `GetMessage`).
-pub fn apply_message_park() {
-    std::thread::sleep(message_park_duration());
 }
 
 fn parse_wie_idle() -> Option<IdlePolicy> {

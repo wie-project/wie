@@ -20,11 +20,8 @@ mod trace;
 pub use gui_loop::{GuiControl, GuiOutcome, run_windowed};
 pub use hooks::RuntimeFakeApiEntry;
 pub use memory::{
-    CALLBACK_RETURN_TRAMPOLINE_VA, DEFAULT_LAYOUT, ENTRY_TRACE_INSTRUCTION_BUDGET,
-    ENTRY_TRACE_NO_HOOK_SLICE_LIMIT, FAKE_API_BASE, FAKE_API_SIZE, FAKE_RESOURCE_DATA_BASE,
-    FAKE_RESOURCE_DATA_SIZE, FAKE_TEB_LOW_BASE, FAKE_TEB_LOW_SIZE, FAST_API_STUB_BASE,
-    FAST_API_STUB_SIZE, FAST_VOID_RETURN_STUB_VA, PROCESS_HEAP_BASE, PROCESS_HEAP_HANDLE,
-    PROCESS_HEAP_SHADOW_BASE, PROCESS_HEAP_SHADOW_DELTA, PROCESS_HEAP_SIZE, RuntimeMemoryLayout,
+    DEFAULT_LAYOUT, FAKE_API_BASE, FAKE_API_SIZE, PROCESS_HEAP_BASE, PROCESS_HEAP_HANDLE,
+    PROCESS_HEAP_SIZE, RuntimeMemoryLayout,
 };
 pub use session::{GuestHandle, MenuNode, RuntimeProfile, RuntimeSession, SessionOptions};
 pub use trace::{
@@ -32,5 +29,5 @@ pub use trace::{
     RuntimeRunSummary, entry_trace, run_micro_exe, run_micro_exe_with_options,
     run_micro_exe_with_root, run_persistent_until_yield, run_persistent_until_yield_with_options,
 };
-pub use wie_cpu::{CpuEngine, CpuError, IcedCpu, JitCpu, active_backend_name, open_default_cpu};
+pub use wie_cpu::{CpuEngine, CpuError, IcedCpu, JitCpu, active_backend_name};
 pub use wie_winapi::{FileDialogPolicy, IdleContext, IdlePolicy};

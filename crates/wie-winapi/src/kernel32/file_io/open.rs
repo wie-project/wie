@@ -45,11 +45,9 @@ pub(crate) fn open_or_create_guest_path(
     }
 
     // Keep volumes.bottle_root in sync with legacy field.
-    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
-        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
-    }
+    state.file_io.sync_volumes();
 
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let cwd = state.file_io.cwd_utf8();
     let full_path = resolve_full_windows_path(&cwd, guest_path);
 
     let bottle_dir =

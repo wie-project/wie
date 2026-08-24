@@ -397,40 +397,33 @@ fn apply_encoding(
     Some(addr)
 }
 
-/// Parse the Itanium LSDA call-site table and find the landing pad for `control_pc`.
-///
-/// Clean-room Itanium C++ ABI §EH + GCC `dwarf2.h` encodings. Handles:
-/// - Embedded Mingw SEH LSDA (`ExceptionData` after personality RVA)
-/// - `DW_EH_PE_pcrel` / `datarel` / `funcrel` / `indirect` on LPStart and types
-/// - Call-site PC match with **IP−1** when `control_pc` is a return address
-///   (standard `_Unwind_GetIPInfo` adjustment for call sites)
-///
-/// When `thrown_typeinfo` is `Some`, walks the action table and picks the first
-/// matching catch (type pointer equality or catch-all). When `None`, accepts the
-/// first catch-all / any typed action (used when the throw payload is unknown).
-///
-/// Returns [`LandingPadMatch`] or `None` if no handler covers the PC.
-pub fn find_landing_pad(
-    read_mem: &mut MemRead<'_>,
-    lsda_va: u64,
-    image_base: u64,
-    func_start: u64,
-    _func_end: u64,
-    control_pc: u64,
-) -> Option<(u64, u64)> {
-    find_landing_pad_ex(read_mem, lsda_va, image_base, func_start, control_pc, None)
-        .map(|m| (m.landing_pad, m.action_index))
+/// Parsed Itanium LSDA header, shared by the catch and cleanup searches.
+struct LsdaHeader {
+    /// Resolved LPStart (`func_start` when the encoding omits it or yields 0).
+    lp_base: u64,
+    /// TType encoding byte.
+    ttype_enc: u8,
+    /// Type-table base (0 when the TType encoding is omitted).
+    ttype_base: u64,
+    /// Call-site table entry encoding byte.
+    cs_enc: u8,
+    /// First VA of the call-site records (right after the header).
+    cs_start: u64,
+    /// Exclusive end VA of the call-site table (the action table starts here).
+    cs_end: u64,
 }
 
-/// Extended LSDA match with optional thrown-typeinfo filtering and switch value.
-pub fn find_landing_pad_ex(
+/// Parse an Itanium LSDA header at `lsda_va`: LPStart, TType, call-site
+/// encoding and table length.
+///
+/// Returns `None` when the header cannot be read or the call-site table is
+/// empty.
+fn parse_lsda_header(
     read_mem: &mut MemRead<'_>,
     lsda_va: u64,
     image_base: u64,
     func_start: u64,
-    control_pc: u64,
-    thrown_typeinfo: Option<u64>,
-) -> Option<LandingPadMatch> {
+) -> Option<LsdaHeader> {
     let mut cursor = lsda_va;
 
     // LPStart encoding + value
@@ -467,7 +460,64 @@ pub fn find_landing_pad_ex(
     if cs_len == 0 {
         return None;
     }
-    let cs_end = cursor.saturating_add(cs_len);
+    Some(LsdaHeader {
+        lp_base,
+        ttype_enc,
+        ttype_base,
+        cs_enc,
+        cs_start: cursor,
+        cs_end: cursor.saturating_add(cs_len),
+    })
+}
+
+/// Read one call-site record: `(start, length, landing_pad_raw, action_index)`.
+///
+/// The first three fields use the table's own encoding; the action index is
+/// always ULEB128 in the Itanium LSDA.
+fn read_call_site(
+    read_mem: &mut MemRead<'_>,
+    format: u8,
+    cursor: &mut u64,
+) -> Option<(u64, u64, u64, u64)> {
+    if format == dw_eh_pe::ULEB128 {
+        return Some((
+            read_uleb128(read_mem, cursor)?,
+            read_uleb128(read_mem, cursor)?,
+            read_uleb128(read_mem, cursor)?,
+            read_uleb128(read_mem, cursor)?,
+        ));
+    }
+    // Validate fixed-width format before reading four fields.
+    let _sz = dw_format_size(format)?;
+    let mut raw_at = |c: &mut u64| -> Option<u64> {
+        let (raw, _) = read_encoded_value(read_mem, c, format)?;
+        Some(raw)
+    };
+    let start = raw_at(cursor)?;
+    let len = raw_at(cursor)?;
+    let landing_raw = raw_at(cursor)?;
+    // action_index is always ULEB128 in the Itanium LSDA.
+    Some((start, len, landing_raw, read_uleb128(read_mem, cursor)?))
+}
+
+/// Extended LSDA match with optional thrown-typeinfo filtering and switch value.
+pub fn find_landing_pad_ex(
+    read_mem: &mut MemRead<'_>,
+    lsda_va: u64,
+    image_base: u64,
+    func_start: u64,
+    control_pc: u64,
+    thrown_typeinfo: Option<u64>,
+) -> Option<LandingPadMatch> {
+    let header = parse_lsda_header(read_mem, lsda_va, image_base, func_start)?;
+    let LsdaHeader {
+        lp_base,
+        ttype_enc,
+        ttype_base,
+        cs_enc,
+        cs_start,
+        cs_end,
+    } = header;
     let action_table = cs_end;
 
     // IP-1: exception PC for a CALL is typically the return address (one past
@@ -477,31 +527,10 @@ pub fn find_landing_pad_ex(
 
     let format = cs_enc & 0x0f;
     let abs = format == dw_eh_pe::ABSPTR;
+    let mut cursor = cs_start;
 
     while cursor < cs_end {
-        let site_start_cursor = cursor;
-        let (cs_s, cs_len_v, lp_raw, aidx) = if format == dw_eh_pe::ULEB128 {
-            (
-                read_uleb128(read_mem, &mut cursor)?,
-                read_uleb128(read_mem, &mut cursor)?,
-                read_uleb128(read_mem, &mut cursor)?,
-                read_uleb128(read_mem, &mut cursor)?,
-            )
-        } else {
-            // Validate fixed-width format before reading four fields.
-            let _sz = dw_format_size(format)?;
-            let mut read_fix = |c: &mut u64| -> Option<u64> {
-                let (raw, _) = read_encoded_value(read_mem, c, format)?;
-                Some(raw)
-            };
-            let s = read_fix(&mut cursor)?;
-            let len = read_fix(&mut cursor)?;
-            let pad = read_fix(&mut cursor)?;
-            // action_index is always ULEB128 in the Itanium LSDA.
-            let a = read_uleb128(read_mem, &mut cursor)?;
-            let _ = site_start_cursor;
-            (s, len, pad, a)
-        };
+        let (cs_s, cs_len_v, lp_raw, aidx) = read_call_site(read_mem, format, &mut cursor)?;
 
         if lp_raw == 0 {
             continue;
@@ -573,61 +602,22 @@ pub fn find_cleanup_landing_pad(
     func_start: u64,
     control_pc: u64,
 ) -> Option<LandingPadMatch> {
-    let mut cursor = lsda_va;
-    let mut b1 = [0u8; 1];
-    read_mem(cursor, &mut b1).ok()?;
-    cursor = cursor.saturating_add(1);
-    let lp_enc = b1[0];
-    let mut lp_base = func_start;
-    if lp_enc != dw_eh_pe::OMIT {
-        let (raw, storage) = read_encoded_value(read_mem, &mut cursor, lp_enc)?;
-        lp_base = apply_encoding(
-            read_mem, lp_enc, raw, storage, image_base, func_start, image_base,
-        )?;
-        if lp_base == 0 {
-            lp_base = func_start;
-        }
-    }
-    read_mem(cursor, &mut b1).ok()?;
-    cursor = cursor.saturating_add(1);
-    let ttype_enc = b1[0];
-    if ttype_enc != dw_eh_pe::OMIT {
-        let _off = read_uleb128(read_mem, &mut cursor)?;
-    }
-    read_mem(cursor, &mut b1).ok()?;
-    cursor = cursor.saturating_add(1);
-    let cs_enc = b1[0];
-    let cs_len = read_uleb128(read_mem, &mut cursor)?;
-    if cs_len == 0 {
-        return None;
-    }
-    let cs_end = cursor.saturating_add(cs_len);
+    let header = parse_lsda_header(read_mem, lsda_va, image_base, func_start)?;
+    let LsdaHeader {
+        lp_base,
+        cs_enc,
+        cs_start,
+        cs_end,
+        ..
+    } = header;
     let match_pc = control_pc.saturating_sub(1);
     let pcs = [match_pc, control_pc];
     let format = cs_enc & 0x0f;
     let abs = format == dw_eh_pe::ABSPTR;
 
+    let mut cursor = cs_start;
     while cursor < cs_end {
-        let (cs_s, cs_len_v, lp_raw, aidx) = if format == dw_eh_pe::ULEB128 {
-            (
-                read_uleb128(read_mem, &mut cursor)?,
-                read_uleb128(read_mem, &mut cursor)?,
-                read_uleb128(read_mem, &mut cursor)?,
-                read_uleb128(read_mem, &mut cursor)?,
-            )
-        } else {
-            let _sz = dw_format_size(format)?;
-            let mut read_fix = |c: &mut u64| -> Option<u64> {
-                let (raw, _) = read_encoded_value(read_mem, c, format)?;
-                Some(raw)
-            };
-            (
-                read_fix(&mut cursor)?,
-                read_fix(&mut cursor)?,
-                read_fix(&mut cursor)?,
-                read_uleb128(read_mem, &mut cursor)?,
-            )
-        };
+        let (cs_s, cs_len_v, lp_raw, aidx) = read_call_site(read_mem, format, &mut cursor)?;
         if lp_raw == 0 || aidx != 0 {
             // Only pure cleanups (action 0). Catch sites are handled in search.
             continue;

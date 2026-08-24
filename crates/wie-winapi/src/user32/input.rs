@@ -2,15 +2,14 @@ use super::{
     Context, HandlerContext, Result, TME_CANCEL, TME_HOVER, TME_LEAVE, WinApiHandlerResult,
     read_guest_bytes, with_typed_read, with_typed_write, write_guest_bytes,
 };
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::{TrackMouseEvent, WinPoint};
 
 /// Handles `USER32.dll!GetAsyncKeyState`.
 pub fn handle_get_async_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let virtual_key_raw = engine
-        .read_rcx()
-        .context("failed to read RCX for GetAsyncKeyState")?;
+    let virtual_key_raw = read_arg(engine, ArgReg::Rcx, "GetAsyncKeyState")?;
 
     let virtual_key = usize::try_from(virtual_key_raw & 0xff).unwrap_or(0);
 
@@ -31,9 +30,7 @@ pub fn handle_get_async_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 pub fn handle_track_mouse_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let track_mouse_event_va = engine
-        .read_rcx()
-        .context("failed to read RCX for TrackMouseEvent")?;
+    let track_mouse_event_va = read_arg(engine, ArgReg::Rcx, "TrackMouseEvent")?;
 
     let mut tracking = false;
     if track_mouse_event_va != 0 {
@@ -68,9 +65,7 @@ pub fn handle_track_mouse_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 /// Handles `USER32.dll!GetCursorPos`.
 pub fn handle_get_cursor_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let point_va = engine
-        .read_rcx()
-        .context("failed to read RCX for GetCursorPos")?;
+    let point_va = read_arg(engine, ArgReg::Rcx, "GetCursorPos")?;
 
     if point_va != 0 {
         // One shared-lock borrow instead of two per-field writes; the POINT
@@ -88,9 +83,7 @@ pub fn handle_get_cursor_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 /// Handles `USER32.dll!ClipCursor` (accept clip rect or release when NULL).
 pub fn handle_clip_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let rect_va = engine
-        .read_rcx()
-        .context("failed to read RCX for ClipCursor")?;
+    let rect_va = read_arg(engine, ArgReg::Rcx, "ClipCursor")?;
 
     // No host cursor clipping; always succeed so editor drag paths continue.
     tracing::debug!(rect_va, "ClipCursor");
@@ -100,9 +93,7 @@ pub fn handle_clip_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 /// Handles `USER32.dll!GetClipCursor`.
 pub fn handle_get_clip_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let rect_va = engine
-        .read_rcx()
-        .context("failed to read RCX for GetClipCursor")?;
+    let rect_va = read_arg(engine, ArgReg::Rcx, "GetClipCursor")?;
 
     let success = rect_va != 0;
     if success {
@@ -117,9 +108,7 @@ pub fn handle_get_clip_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 pub fn handle_set_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let cursor_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for SetCursor")?;
+    let cursor_handle = read_arg(engine, ArgReg::Rcx, "SetCursor")?;
 
     let previous_cursor = state.window_state().cursor_handle;
     state.window_state().cursor_handle = cursor_handle;
@@ -137,9 +126,7 @@ pub fn handle_get_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 pub fn handle_set_keyboard_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let keyboard_state_va = engine
-        .read_rcx()
-        .context("failed to read RCX for SetKeyboardState")?;
+    let keyboard_state_va = read_arg(engine, ArgReg::Rcx, "SetKeyboardState")?;
 
     let success = keyboard_state_va != 0;
 
@@ -160,9 +147,7 @@ pub fn handle_set_keyboard_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_get_keyboard_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let keyboard_state_va = engine
-        .read_rcx()
-        .context("failed to read RCX for GetKeyboardState")?;
+    let keyboard_state_va = read_arg(engine, ArgReg::Rcx, "GetKeyboardState")?;
 
     let success = keyboard_state_va != 0;
 
@@ -183,9 +168,7 @@ pub fn handle_get_keyboard_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_get_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let virtual_key_raw = engine
-        .read_rcx()
-        .context("failed to read RCX for GetKeyState")?;
+    let virtual_key_raw = read_arg(engine, ArgReg::Rcx, "GetKeyState")?;
 
     let virtual_key = usize::try_from(virtual_key_raw & 0xff)
         .context("GetKeyState virtual key does not fit usize")?;
@@ -204,13 +187,9 @@ pub fn handle_get_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 /// Handles `USER32.dll!MapVirtualKeyA`.
 pub fn handle_map_virtual_key_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let code = engine
-        .read_rcx()
-        .context("failed to read RCX for MapVirtualKeyA")?;
+    let code = read_arg(engine, ArgReg::Rcx, "MapVirtualKeyA")?;
 
-    let map_type = engine
-        .read_rdx()
-        .context("failed to read RDX for MapVirtualKeyA")?;
+    let map_type = read_arg(engine, ArgReg::Rdx, "MapVirtualKeyA")?;
 
     let code_low = code & u64::from(u32::MAX);
 

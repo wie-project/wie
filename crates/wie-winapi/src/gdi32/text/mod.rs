@@ -9,10 +9,11 @@
 use anyhow::{Context, Result};
 
 use crate::gdi32::state::dc_resolved_font;
-use crate::gdi32::{FontEngine, FontKey, IRect, ResolvedFont};
+use crate::gdi32::{ArgReg, FontEngine, FontKey, IRect, ResolvedFont, read_arg};
 use crate::guest_layout::Rect;
 use crate::guest_memory::{checked_address, read_u32, read_u64, with_typed_read, with_typed_write};
 use crate::guest_string::{read_ansi_bytes as read_guest_ansi_bytes, read_utf16_lossy};
+use crate::kernel32::low_u32;
 use crate::user32::{low_i32, window_client_size};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState, gdi32::DcKind};
 
@@ -463,24 +464,10 @@ fn handle_text_out_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let x = low_i32(
-        engine
-            .read_rdx()
-            .with_context(|| format!("failed to read RDX for {api_name}"))?,
-        api_name,
-    )?;
-    let y = low_i32(
-        engine
-            .read_r8()
-            .with_context(|| format!("failed to read R8 for {api_name}"))?,
-        api_name,
-    )?;
-    let text_va = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let hdc = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let x = low_i32(read_arg(engine, ArgReg::Rdx, api_name)?, api_name)?;
+    let y = low_i32(read_arg(engine, ArgReg::R8, api_name)?, api_name)?;
+    let text_va = read_arg(engine, ArgReg::R9, api_name)?;
     // `cchString` is the 5th argument — first stack slot.
     let rsp = engine
         .read_rsp()
@@ -552,26 +539,11 @@ pub fn handle_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 pub fn handle_ext_text_out_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for ExtTextOutW")?;
-    let x = low_i32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for ExtTextOutW")?,
-        "ExtTextOutW",
-    )?;
-    let y = low_i32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for ExtTextOutW")?,
-        "ExtTextOutW",
-    )?;
-    let options_raw = engine
-        .read_r9()
-        .context("failed to read R9 for ExtTextOutW")?;
-    let options = u32::try_from(options_raw & u64::from(u32::MAX))
-        .context("ExtTextOutW options do not fit u32")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "ExtTextOutW")?;
+    let x = low_i32(read_arg(engine, ArgReg::Rdx, "ExtTextOutW")?, "ExtTextOutW")?;
+    let y = low_i32(read_arg(engine, ArgReg::R8, "ExtTextOutW")?, "ExtTextOutW")?;
+    let options_raw = read_arg(engine, ArgReg::R9, "ExtTextOutW")?;
+    let options = low_u32(options_raw, "ExtTextOutW options")?;
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for ExtTextOutW")?;
@@ -684,18 +656,10 @@ fn handle_draw_text_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let text_va = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let cch_raw = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
-    let rect_va = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let hdc = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let text_va = read_arg(engine, ArgReg::Rdx, api_name)?;
+    let cch_raw = read_arg(engine, ArgReg::R8, api_name)?;
+    let rect_va = read_arg(engine, ArgReg::R9, api_name)?;
     // `format` is the 5th argument — first stack slot.
     let rsp = engine
         .read_rsp()

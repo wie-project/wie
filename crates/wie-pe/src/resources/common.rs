@@ -374,20 +374,22 @@ fn resource_name(walk: &ResourceWalk<'_>, name: u32) -> Option<ResourceName> {
 
 /// Convert an RVA to a file offset via the section map.
 ///
-/// Uses the mapped extent (`max(virtual_size, raw_size)`) and rejects RVAs
-/// that fall outside the image bytes.
+/// Delegates the per-section extent mapping to [`crate::map_rva_in_section`]
+/// (the same `max(virtual_size, raw_size)` logic as the loader's section-table
+/// walk) and adds the image-bounds check the resource walker needs, since it
+/// reads directly out of the file bytes.
 fn rva_to_file(image: &[u8], sections: &[PeSectionMap], rva: u32) -> Option<usize> {
-    for sec in sections {
-        let start = sec.va;
-        let end = start.checked_add(sec.virtual_size.max(sec.size_of_raw_data))?;
-        if rva >= start && rva < end {
-            let delta = rva.checked_sub(start)?;
-            let raw = u64::from(sec.pointer_to_raw_data).checked_add(u64::from(delta))?;
-            let off = usize::try_from(raw).ok()?;
-            return (off < image.len()).then_some(off);
-        }
-    }
-    None
+    let raw = sections.iter().find_map(|sec| {
+        crate::map_rva_in_section(
+            u64::from(rva),
+            sec.va,
+            sec.virtual_size,
+            sec.size_of_raw_data,
+            sec.pointer_to_raw_data,
+        )
+    })?;
+    let off = usize::try_from(raw).ok()?;
+    (off < image.len()).then_some(off)
 }
 
 /// Read `N` raw bytes at `pos` (bounds-checked), like [`crate::read_array`]

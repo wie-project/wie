@@ -526,6 +526,40 @@ impl PresentState {
         }
     }
 
+    /// Blit a whole 0RGB frame into `hwnd`'s surface and publish it — the
+    /// shared tail of the D3D9 `Present` and `wglSwapBuffers` frame paths.
+    ///
+    /// A frame sized exactly like the ensured surface copies row-major;
+    /// anything else is nearest-neighbour stretched to the surface
+    /// dimensions. No allocation: pixels go straight into the retained
+    /// surface buffer.
+    pub(crate) fn blit_frame(
+        &mut self,
+        hwnd: crate::handles::Hwnd,
+        frame: &[u32],
+        frame_width: u32,
+        frame_height: u32,
+    ) {
+        if let Some(surface) = self.surfaces.get_mut(&hwnd) {
+            if frame_width == surface.width && frame_height == surface.height {
+                let n = surface.pixels.len().min(frame.len());
+                if let (Some(dst), Some(src)) = (surface.pixels.get_mut(..n), frame.get(..n)) {
+                    dst.copy_from_slice(src);
+                }
+            } else {
+                wie_cpu::stretch_nearest(
+                    &mut surface.pixels,
+                    frame,
+                    frame_width,
+                    frame_height,
+                    surface.width,
+                    surface.height,
+                );
+            }
+        }
+        self.publish(hwnd);
+    }
+
     /// Request a host-side registry sync without publishing a frame.
     ///
     /// The host reconciles its window registry on every publish wake; a guest

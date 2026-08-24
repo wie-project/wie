@@ -24,6 +24,79 @@ pub use regions::*;
 pub use state::*;
 pub use text::*;
 
+pub(crate) use blit::resolve_32bpp_dib;
+pub(crate) use pixel::clip_blit_rect;
+
+// ── Shared CPU argument marshalling ─────────────────────────────────────
+
+use anyhow::{Context, Result};
+use wie_cpu::CpuEngine;
+
+/// A Win64 integer-argument register (`RCX`, `RDX`, `R8`, `R9`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ArgReg {
+    /// First integer argument.
+    Rcx,
+    /// Second integer argument.
+    Rdx,
+    /// Third integer argument.
+    R8,
+    /// Fourth integer argument.
+    R9,
+}
+
+impl ArgReg {
+    /// The register's ABI name as it appears in handler error context strings.
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rcx => "RCX",
+            Self::Rdx => "RDX",
+            Self::R8 => "R8",
+            Self::R9 => "R9",
+        }
+    }
+}
+
+/// Read one integer-argument register from the CPU engine.
+fn read_reg(engine: &mut dyn CpuEngine, reg: ArgReg) -> Result<u64> {
+    Ok(match reg {
+        ArgReg::Rcx => engine.read_rcx()?,
+        ArgReg::Rdx => engine.read_rdx()?,
+        ArgReg::R8 => engine.read_r8()?,
+        ArgReg::R9 => engine.read_r9()?,
+    })
+}
+
+/// Read a Win64 integer argument register, wrapping failures in an
+/// `{api_name}`-scoping context (shared by the USER32/GDI32/D3D9/OpenGL32
+/// handler modules).
+///
+/// The formatting is lazy — no allocation on the success path.
+pub(crate) fn read_arg(engine: &mut dyn CpuEngine, reg: ArgReg, api_name: &str) -> Result<u64> {
+    read_reg(engine, reg).with_context(|| format!("failed to read {} for {api_name}", reg.as_str()))
+}
+
+/// Shared tail for benign no-op stub handlers: read and discard the first
+/// `n_args` integer arguments (so unread-register state is still validated),
+/// then finish with `retval`.
+pub(crate) fn finish_after_discarding(
+    ctx: &mut crate::HandlerContext<'_>,
+    n_args: usize,
+    retval: u64,
+) -> Result<crate::WinApiHandlerResult> {
+    for (index, reg) in [ArgReg::Rcx, ArgReg::Rdx, ArgReg::R8, ArgReg::R9]
+        .into_iter()
+        .enumerate()
+    {
+        if index >= n_args {
+            break;
+        }
+        read_reg(ctx.engine, reg)?;
+    }
+    ctx.finish(retval)
+}
+
 /// Soft dispatch for GDI32 exports beyond the dense table (DIB round-trips,
 /// regions, font enumeration, SetPixel). String path only — hot APIs stay
 /// dense.

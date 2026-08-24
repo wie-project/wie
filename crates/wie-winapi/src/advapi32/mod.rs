@@ -19,33 +19,53 @@ const ERROR_INSUFFICIENT_BUFFER: u64 = 122;
 const REG_CREATED_NEW_KEY: u32 = 1;
 const REG_OPENED_EXISTING_KEY: u32 = 2;
 
-/// Handles `ADVAPI32.dll!RegCreateKeyExA`.
-pub fn handle_reg_create_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+/// Where a handler reads its `phkResult` out-pointer from.
+///
+/// The Win64 ABI position differs by API shape: `RegOpenKeyEx*` takes five
+/// parameters, so `phkResult` is the first stack slot past the shadow space,
+/// while legacy `RegOpenKey*` takes only three and carries it in R8.
+enum PhkSource {
+    /// First stack argument (`RSP + 0x28`) — the Ex variants.
+    Stack,
+    /// Register argument (`R8`) — the legacy variants.
+    Register,
+}
+
+/// Shared `RegCreateKeyEx*` body.
+fn reg_create_key_ex(
+    ctx: &mut HandlerContext<'_>,
+    wide: bool,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let parent_key = engine
         .read_rcx()
-        .context("failed to read RCX for RegCreateKeyExA")?;
+        .with_context(|| format!("failed to read RCX for {api}"))?;
 
     let subkey_va = engine
         .read_rdx()
-        .context("failed to read RDX for RegCreateKeyExA")?;
+        .with_context(|| format!("failed to read RDX for {api}"))?;
 
     let rsp = engine
         .read_rsp()
-        .context("failed to read RSP for RegCreateKeyExA")?;
+        .with_context(|| format!("failed to read RSP for {api}"))?;
 
-    let phk_result_address = checked_address(rsp, 0x40, "RegCreateKeyExA phkResult");
-    let disposition_address = checked_address(rsp, 0x48, "RegCreateKeyExA lpdwDisposition");
+    let phk_result_address = checked_address(rsp, 0x40, &format!("{api} phkResult"));
+    let disposition_address = checked_address(rsp, 0x48, &format!("{api} lpdwDisposition"));
 
     let phk_result = read_u64(engine, phk_result_address)?;
     let disposition_va = read_u64(engine, disposition_address)?;
 
-    let subkey = read_optional_ansi_string(engine, subkey_va)?;
+    let subkey = if wide {
+        read_optional_utf16_string(engine, subkey_va)?
+    } else {
+        read_optional_ansi_string(engine, subkey_va)?
+    };
 
     // RegCreateKeyEx is the only entry point permitted to create a key.
     let (handle, disposition) = open_or_create_registry_key(state, parent_key, subkey, true)?
-        .context("RegCreateKeyExA: allow_create is set, key must be created")?;
+        .with_context(|| format!("{api}: allow_create is set, key must be created"))?;
 
     if phk_result != 0 {
         write_guest_u64(engine, phk_result, handle)?;
@@ -58,28 +78,56 @@ pub fn handle_reg_create_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     return_status(engine, ERROR_SUCCESS)
 }
 
-/// Handles `ADVAPI32.dll!RegOpenKeyExA`.
-pub fn handle_reg_open_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+/// Handles `ADVAPI32.dll!RegCreateKeyExA`.
+pub fn handle_reg_create_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    reg_create_key_ex(ctx, false, "RegCreateKeyExA")
+}
+
+/// Handles `ADVAPI32.dll!RegCreateKeyExW`.
+pub fn handle_reg_create_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    reg_create_key_ex(ctx, true, "RegCreateKeyExW")
+}
+
+/// Shared `RegOpenKeyEx*` / legacy `RegOpenKey*` body.
+///
+/// RegOpenKey opens only: a missing key is `ERROR_FILE_NOT_FOUND` and must not
+/// be materialized (that is `RegCreateKeyEx`'s job).
+fn reg_open_key(
+    ctx: &mut HandlerContext<'_>,
+    wide: bool,
+    phk_source: PhkSource,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let parent_key = engine
         .read_rcx()
-        .context("failed to read RCX for RegOpenKeyExA")?;
+        .with_context(|| format!("failed to read RCX for {api}"))?;
 
     let subkey_va = engine
         .read_rdx()
-        .context("failed to read RDX for RegOpenKeyExA")?;
+        .with_context(|| format!("failed to read RDX for {api}"))?;
 
-    let rsp = engine
-        .read_rsp()
-        .context("failed to read RSP for RegOpenKeyExA")?;
+    let phk_result = match phk_source {
+        // The legacy ABI takes only hKey / lpSubKey / phkResult — no
+        // samDesired / options / reserved args, so phkResult travels in R8.
+        PhkSource::Register => engine
+            .read_r8()
+            .with_context(|| format!("failed to read R8 for {api}"))?,
+        PhkSource::Stack => {
+            let rsp = engine
+                .read_rsp()
+                .with_context(|| format!("failed to read RSP for {api}"))?;
+            let address = checked_address(rsp, 0x28, &format!("{api} phkResult"));
+            read_u64(engine, address)?
+        }
+    };
 
-    let phk_result_address = checked_address(rsp, 0x28, "RegOpenKeyExA phkResult");
-    let phk_result = read_u64(engine, phk_result_address)?;
-
-    let subkey = read_optional_ansi_string(engine, subkey_va)?;
-    // RegOpenKeyEx opens only: a missing key is ERROR_FILE_NOT_FOUND and
-    // must not be materialized (that is RegCreateKeyEx's job).
+    let subkey = if wide {
+        read_optional_utf16_string(engine, subkey_va)?
+    } else {
+        read_optional_ansi_string(engine, subkey_va)?
+    };
     let Some((handle, _disposition)) =
         open_or_create_registry_key(state, parent_key, subkey, false)?
     else {
@@ -96,42 +144,14 @@ pub fn handle_reg_open_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     return_status(engine, ERROR_SUCCESS)
 }
 
+/// Handles `ADVAPI32.dll!RegOpenKeyExA`.
+pub fn handle_reg_open_key_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    reg_open_key(ctx, false, PhkSource::Stack, "RegOpenKeyExA")
+}
+
 /// Handles `ADVAPI32.dll!RegOpenKeyExW`.
 pub fn handle_reg_open_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let parent_key = engine
-        .read_rcx()
-        .context("failed to read RCX for RegOpenKeyExW")?;
-
-    let subkey_va = engine
-        .read_rdx()
-        .context("failed to read RDX for RegOpenKeyExW")?;
-
-    let rsp = engine
-        .read_rsp()
-        .context("failed to read RSP for RegOpenKeyExW")?;
-
-    let phk_result_address = checked_address(rsp, 0x28, "RegOpenKeyExW phkResult");
-    let phk_result = read_u64(engine, phk_result_address)?;
-
-    let subkey = read_optional_utf16_string(engine, subkey_va)?;
-    // RegOpenKeyEx opens only: a missing key is ERROR_FILE_NOT_FOUND and
-    // must not be materialized (that is RegCreateKeyEx's job).
-    let Some((handle, _disposition)) =
-        open_or_create_registry_key(state, parent_key, subkey, false)?
-    else {
-        if phk_result != 0 {
-            write_guest_u64(engine, phk_result, 0)?;
-        }
-        return return_status(engine, ERROR_FILE_NOT_FOUND);
-    };
-
-    if phk_result != 0 {
-        write_guest_u64(engine, phk_result, handle)?;
-    }
-
-    return_status(engine, ERROR_SUCCESS)
+    reg_open_key(ctx, true, PhkSource::Stack, "RegOpenKeyExW")
 }
 
 /// Handles `ADVAPI32.dll!RegOpenKeyA` (legacy; ≡ RegOpenKeyExA with `KEY_READ`).
@@ -140,37 +160,7 @@ pub fn handle_reg_open_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 /// `ERROR_FILE_NOT_FOUND` and leaves `*phkResult` as 0, matching the
 /// open-only semantics of the Ex pair.
 pub fn handle_reg_open_key_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let parent_key = engine
-        .read_rcx()
-        .context("failed to read RCX for RegOpenKeyA")?;
-
-    let subkey_va = engine
-        .read_rdx()
-        .context("failed to read RDX for RegOpenKeyA")?;
-
-    // Third parameter (phkResult) travels in R8: the legacy ABI takes only
-    // hKey, lpSubKey, phkResult — no samDesired / options / reserved args.
-    let phk_result = engine
-        .read_r8()
-        .context("failed to read R8 for RegOpenKeyA")?;
-
-    let subkey = read_optional_ansi_string(engine, subkey_va)?;
-    // Legacy RegOpenKey is open-only, same as RegOpenKeyEx: a missing key is
-    // ERROR_FILE_NOT_FOUND and is not materialized.
-    let Some((handle, _disposition)) =
-        open_or_create_registry_key(state, parent_key, subkey, false)?
-    else {
-        if phk_result != 0 {
-            write_guest_u64(engine, phk_result, 0)?;
-        }
-        return return_status(engine, ERROR_FILE_NOT_FOUND);
-    };
-    if phk_result != 0 {
-        write_guest_u64(engine, phk_result, handle)?;
-    }
-    return_status(engine, ERROR_SUCCESS)
+    reg_open_key(ctx, false, PhkSource::Register, "RegOpenKeyA")
 }
 
 /// Handles `ADVAPI32.dll!RegOpenKeyW` (legacy; ≡ RegOpenKeyExW with `KEY_READ`).
@@ -179,74 +169,7 @@ pub fn handle_reg_open_key_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 /// `ERROR_FILE_NOT_FOUND` and leaves `*phkResult` as 0, matching the
 /// open-only semantics of the Ex pair.
 pub fn handle_reg_open_key_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let parent_key = engine
-        .read_rcx()
-        .context("failed to read RCX for RegOpenKeyW")?;
-
-    let subkey_va = engine
-        .read_rdx()
-        .context("failed to read RDX for RegOpenKeyW")?;
-
-    let phk_result = engine
-        .read_r8()
-        .context("failed to read R8 for RegOpenKeyW")?;
-
-    let subkey = read_optional_utf16_string(engine, subkey_va)?;
-    // Legacy RegOpenKey is open-only, same as RegOpenKeyEx: a missing key is
-    // ERROR_FILE_NOT_FOUND and is not materialized.
-    let Some((handle, _disposition)) =
-        open_or_create_registry_key(state, parent_key, subkey, false)?
-    else {
-        if phk_result != 0 {
-            write_guest_u64(engine, phk_result, 0)?;
-        }
-        return return_status(engine, ERROR_FILE_NOT_FOUND);
-    };
-    if phk_result != 0 {
-        write_guest_u64(engine, phk_result, handle)?;
-    }
-    return_status(engine, ERROR_SUCCESS)
-}
-
-/// Handles `ADVAPI32.dll!RegCreateKeyExW`.
-pub fn handle_reg_create_key_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let parent_key = engine
-        .read_rcx()
-        .context("failed to read RCX for RegCreateKeyExW")?;
-
-    let subkey_va = engine
-        .read_rdx()
-        .context("failed to read RDX for RegCreateKeyExW")?;
-
-    let rsp = engine
-        .read_rsp()
-        .context("failed to read RSP for RegCreateKeyExW")?;
-
-    let phk_result_address = checked_address(rsp, 0x40, "RegCreateKeyExW phkResult");
-    let disposition_address = checked_address(rsp, 0x48, "RegCreateKeyExW lpdwDisposition");
-
-    let phk_result = read_u64(engine, phk_result_address)?;
-    let disposition_va = read_u64(engine, disposition_address)?;
-
-    let subkey = read_optional_utf16_string(engine, subkey_va)?;
-
-    // RegCreateKeyEx is the only entry point permitted to create a key.
-    let (handle, disposition) = open_or_create_registry_key(state, parent_key, subkey, true)?
-        .context("RegCreateKeyExW: allow_create is set, key must be created")?;
-
-    if phk_result != 0 {
-        write_guest_u64(engine, phk_result, handle)?;
-    }
-
-    if disposition_va != 0 {
-        write_guest_u32(engine, disposition_va, disposition)?;
-    }
-
-    return_status(engine, ERROR_SUCCESS)
+    reg_open_key(ctx, true, PhkSource::Register, "RegOpenKeyW")
 }
 
 /// Soft-dispatch path for ADVAPI32 exports not yet in the dense `WinApiId` table.

@@ -65,49 +65,28 @@ pub fn handle_heap_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     } else if new_size == 0 {
         let _ = state.heap_state.heap.free_coherent(engine, memory);
         0
-    } else if let Some(same) = state.heap_state.heap.try_realloc_in_place(memory, new_size) {
-        // In-place only succeeds when the block already fits; no new bytes to zero.
-        same
     } else {
-        let old_size = state
+        // Move/copy/free shared with CRT realloc; zero-fill stays handler-local.
+        let (new_addr, old_size) = state
             .heap_state
             .heap
-            .size_of(memory)
-            .or_else(|| {
-                let mut hb = [0_u8; 8];
-                engine
-                    .mem_read(memory.wrapping_sub(HEAP_BLOCK_HEADER_BYTES), &mut hb)
-                    .ok()
-                    .map(|()| u64::from_le_bytes(hb))
-            })
-            .unwrap_or(0);
-        let new_addr = state.heap_state.heap.alloc_coherent(engine, new_size);
+            .realloc_coherent(engine, memory, new_size)?;
+        let needs_zero_tail = (flags & HEAP_ZERO_MEMORY) != 0 && new_size > old_size;
         if new_addr == 0 {
-            // Failure must leave the original block live (Microsoft Learn).
+            // Allocation failed; the original block stays live (Microsoft Learn).
             0
+        } else if !needs_zero_tail {
+            new_addr
         } else {
-            let copy_len = usize::try_from(old_size.min(new_size)).unwrap_or(0);
-            if copy_len > 0 {
-                // memmove semantics inside wie-cpu; no overlap analysis needed
-                // here, and no host bounce buffer on the fast path.
-                if !engine.mem_copy(new_addr, memory, copy_len) {
-                    let mut bytes = vec![0_u8; copy_len];
-                    engine.mem_read(memory, &mut bytes)?;
-                    engine.mem_write(new_addr, &bytes)?;
+            let zero_start = old_size;
+            let zero_len = usize::try_from(new_size.saturating_sub(old_size)).unwrap_or(0);
+            if zero_len > 0 {
+                let dst_addr = new_addr.wrapping_add(zero_start);
+                if !engine.mem_fill(dst_addr, 0, zero_len) {
+                    let zeros = vec![0_u8; zero_len];
+                    engine.mem_write(dst_addr, &zeros)?;
                 }
             }
-            if (flags & HEAP_ZERO_MEMORY) != 0 && new_size > old_size {
-                let zero_start = old_size;
-                let zero_len = usize::try_from(new_size.saturating_sub(old_size)).unwrap_or(0);
-                if zero_len > 0 {
-                    let dst_addr = new_addr.wrapping_add(zero_start);
-                    if !engine.mem_fill(dst_addr, 0, zero_len) {
-                        let zeros = vec![0_u8; zero_len];
-                        engine.mem_write(dst_addr, &zeros)?;
-                    }
-                }
-            }
-            let _ = state.heap_state.heap.free_coherent(engine, memory);
             new_addr
         }
     };
@@ -160,26 +139,12 @@ pub fn handle_heap_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     let return_value = state
         .heap_state
         .heap
-        .size_of(memory)
-        .or_else(|| {
-            if memory == 0 {
-                return None;
-            }
-            let mut hb = [0_u8; 8];
-            engine
-                .mem_read(memory.wrapping_sub(HEAP_BLOCK_HEADER_BYTES), &mut hb)
-                .ok()
-                .map(|()| u64::from_le_bytes(hb))
-                .filter(|&s| s != 0)
-        })
+        .size_from_header(engine, memory)
+        .filter(|&size| size != 0)
         .unwrap_or(HEAP_SIZE_FAILURE);
 
     ctx.finish(return_value)
 }
-/// Bytes of guest-heap block header stored immediately before the payload
-/// (used to recover a block's size from its pointer).
-const HEAP_BLOCK_HEADER_BYTES: u64 = 8;
-
 /// Mock `dwMemoryLoad` reported by the memory-status structs (25% busy).
 const MEM_LOAD_PERCENT: u32 = 25;
 /// Mock `dwTotalPhys`: 8 GiB of physical memory.

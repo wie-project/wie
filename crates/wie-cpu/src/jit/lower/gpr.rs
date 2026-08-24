@@ -99,12 +99,12 @@ pub(super) fn read_gpr(gpr: &[Value; 16], reg: Register) -> Result<Value, String
     Ok(gpr[i])
 }
 
-/// Compose the value a `mov r/m8..64, reg` store must write for `reg`.
+/// Read the logical value of `reg` from the cached GPR pair array.
 ///
 /// Legacy high-byte registers (AH/BH/CH/DH) live at bits 8..15 of the full
-/// register; helpers consume the LOW bytes of `value`, so their byte must be
-/// shifted down before the store. Without this, `movb %ah, mem` stores AL.
-pub(super) fn store_value_from_gpr(
+/// register: shift down so the logical byte value surfaces (plain `read_gpr`
+/// would expose AL's lane). Shared by store paths and operand reads.
+pub(super) fn read_gpr_logical(
     bcx: &mut FunctionBuilder<'_>,
     reg: Register,
     gpr: &[Value; 16],
@@ -121,6 +121,18 @@ pub(super) fn store_value_from_gpr(
     } else {
         Ok(v)
     }
+}
+
+/// Compose the value a `mov r/m8..64, reg` store must write for `reg`.
+///
+/// Helpers consume the LOW bytes of `value`, so a high byte must be shifted
+/// down before the store. Without this, `movb %ah, mem` stores AL.
+pub(super) fn store_value_from_gpr(
+    bcx: &mut FunctionBuilder<'_>,
+    reg: Register,
+    gpr: &[Value; 16],
+) -> Result<Value, String> {
+    read_gpr_logical(bcx, reg, gpr)
 }
 
 pub(super) fn write_gpr(
@@ -211,21 +223,9 @@ pub(super) fn read_op(
     match instr.op_kind(op) {
         OpKind::Register => {
             let reg = instr.op_register(op);
-            // Legacy high-byte regs (AH/BH/CH/DH) live at bits 8..15 of the
-            // full register: shift down so the logical byte value surfaces
-            // (mirrors read_op_mem's register handling).
-            if reg.size() == 1
-                && matches!(
-                    reg,
-                    Register::AH | Register::BH | Register::CH | Register::DH
-                )
-            {
-                let full = read_gpr(gpr, reg)?;
-                let sh = bcx.ins().iconst(types::I64, 8);
-                Ok(bcx.ins().ushr(full, sh))
-            } else {
-                read_gpr(gpr, reg)
-            }
+            // read_gpr_logical shifts AH/BH/CH/DH down so the logical byte
+            // value surfaces (mirrors read_op_mem's register handling).
+            read_gpr_logical(bcx, reg, gpr)
         }
         OpKind::Immediate8
         | OpKind::Immediate8_2nd
@@ -327,20 +327,9 @@ pub(super) fn read_op_mem(
     match instr.op_kind(op) {
         OpKind::Register => {
             let reg = instr.op_register(op);
-            // Legacy high-byte regs (AH/BH/CH/DH) live at bits 8..15 of the
-            // full register: shift down so width masking selects them.
-            if reg.size() == 1
-                && matches!(
-                    reg,
-                    Register::AH | Register::BH | Register::CH | Register::DH
-                )
-            {
-                let full = read_gpr(gpr, reg)?;
-                let sh = bcx.ins().iconst(types::I64, 8);
-                Ok(bcx.ins().ushr(full, sh))
-            } else {
-                read_gpr(gpr, reg)
-            }
+            // read_gpr_logical shifts AH/BH/CH/DH down so width masking
+            // selects them.
+            read_gpr_logical(bcx, reg, gpr)
         }
         OpKind::Memory => {
             let addr = effective_addr(bcx, instr, gpr, mem)?;
@@ -517,21 +506,7 @@ pub(super) fn extend_value(
     signed: bool,
 ) -> Value {
     if signed {
-        match src_bits {
-            8 => {
-                let t = bcx.ins().ireduce(types::I8, src);
-                bcx.ins().sextend(types::I64, t)
-            }
-            16 => {
-                let t = bcx.ins().ireduce(types::I16, src);
-                bcx.ins().sextend(types::I64, t)
-            }
-            32 => {
-                let t = bcx.ins().ireduce(types::I32, src);
-                bcx.ins().sextend(types::I64, t)
-            }
-            _ => src,
-        }
+        sext_to_i64(bcx, src, src_bits)
     } else {
         match src_bits {
             8 => {

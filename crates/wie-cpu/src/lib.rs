@@ -27,7 +27,7 @@ mod teb;
 pub type ConcurrentHashMap<K, V> = papaya::HashMap<K, V>;
 
 /// Dump residual iced-interpreter mnemonic histogram (`WIE_EXEC_TRACE=1`).
-pub use exec::{dump_iced_counters, reset_iced_counters};
+pub use exec::dump_iced_counters;
 pub use iced_cpu::IcedCpu;
 pub use jit::{
     BgCompileProfile, FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitProfile, JitShared,
@@ -129,9 +129,6 @@ impl RwxPerms {
         self.0 & perm::EXEC != 0
     }
 }
-
-/// Re-export for call sites that used the old Unicorn-shaped name.
-pub const PROT_ALL: u32 = perm::ALL;
 
 /// Result of stopping on a code-hook / stop-bitmap hit.
 #[derive(Debug, Clone, Copy, Default)]
@@ -688,19 +685,6 @@ pub fn active_backend_name() -> &'static str {
         Ok(v) if v.eq_ignore_ascii_case("iced") => "iced",
         Ok(v) if v.eq_ignore_ascii_case("jit") => "jit",
         _ => "jit",
-    }
-}
-
-/// Open the CPU backend selected by `WIE_CPU` (default: **jit**).
-///
-/// # Errors
-/// Backend open failure.
-pub fn open_default_cpu() -> Result<Box<dyn CpuEngine>, CpuError> {
-    let name = active_backend_name();
-    tracing::debug!(backend = name, "opening WIE CPU backend");
-    match name {
-        "iced" => Ok(Box::new(IcedCpu::open_x86_64())),
-        _ => Ok(Box::new(JitCpu::open_x86_64())),
     }
 }
 

@@ -2,6 +2,7 @@
 //! (split from the former `window.rs`).
 
 use super::class::{find_window, find_window_mut};
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::{WinPoint, WinRect};
 use crate::state::WindowFlags;
 use crate::user32::{
@@ -19,13 +20,9 @@ use crate::user32::{
 pub fn handle_get_client_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetClientRect")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "GetClientRect")?;
 
-    let rect_va = engine
-        .read_rdx()
-        .context("failed to read RDX for GetClientRect")?;
+    let rect_va = read_arg(engine, ArgReg::Rdx, "GetClientRect")?;
 
     let success = is_known_window(state, window_handle) && rect_va != 0;
 
@@ -51,13 +48,9 @@ pub fn handle_get_client_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 pub fn handle_screen_to_client(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for ScreenToClient")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "ScreenToClient")?;
 
-    let point_va = engine
-        .read_rdx()
-        .context("failed to read RDX for ScreenToClient")?;
+    let point_va = read_arg(engine, ArgReg::Rdx, "ScreenToClient")?;
 
     let success = window_handle == FAKE_WINDOW_HANDLE && point_va != 0;
 
@@ -90,13 +83,9 @@ pub fn handle_screen_to_client(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 pub fn handle_client_to_screen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for ClientToScreen")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "ClientToScreen")?;
 
-    let point_va = engine
-        .read_rdx()
-        .context("failed to read RDX for ClientToScreen")?;
+    let point_va = read_arg(engine, ArgReg::Rdx, "ClientToScreen")?;
 
     let success = window_handle == FAKE_WINDOW_HANDLE && point_va != 0;
 
@@ -132,9 +121,7 @@ pub fn handle_get_desktop_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 /// Handles `USER32.dll!GetSysColor`.
 pub fn handle_get_sys_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let color_index = engine
-        .read_rcx()
-        .context("failed to read RCX for GetSysColor")?;
+    let color_index = read_arg(engine, ArgReg::Rcx, "GetSysColor")?;
 
     let return_value = u64::from(sys_color(u32::try_from(color_index).unwrap_or(u32::MAX)));
 
@@ -191,9 +178,7 @@ pub(crate) fn sys_color(color_index: u32) -> u32 {
 /// Handles `USER32.dll!GetSysColorBrush`.
 pub fn handle_get_sys_color_brush(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let color_index = engine
-        .read_rcx()
-        .context("failed to read RCX for GetSysColorBrush")?;
+    let color_index = read_arg(engine, ArgReg::Rcx, "GetSysColorBrush")?;
 
     let return_value = FAKE_SYSTEM_COLOR_BRUSH_BASE
         .checked_add(color_index)
@@ -204,17 +189,13 @@ pub fn handle_get_sys_color_brush(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// Handles `USER32.dll!SetRect`.
 pub fn handle_set_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let rect_va = engine
-        .read_rcx()
-        .context("failed to read RCX for SetRect")?;
+    let rect_va = read_arg(engine, ArgReg::Rcx, "SetRect")?;
 
-    let left_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for SetRect")?;
+    let left_raw = read_arg(engine, ArgReg::Rdx, "SetRect")?;
 
-    let top_raw = engine.read_r8().context("failed to read R8 for SetRect")?;
+    let top_raw = read_arg(engine, ArgReg::R8, "SetRect")?;
 
-    let right_raw = engine.read_r9().context("failed to read R9 for SetRect")?;
+    let right_raw = read_arg(engine, ArgReg::R9, "SetRect")?;
 
     let rsp = engine
         .read_rsp()
@@ -246,9 +227,7 @@ pub fn handle_set_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
 /// Handles `USER32.dll!IsIconic`.
 pub fn handle_is_iconic(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for IsIconic")?;
+    let _window_handle = read_arg(engine, ArgReg::Rcx, "IsIconic")?;
 
     let return_value = 0;
 
@@ -257,9 +236,7 @@ pub fn handle_is_iconic(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 /// Handles `USER32.dll!IsZoomed`.
 pub fn handle_is_zoomed(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for IsZoomed")?;
+    let _window_handle = read_arg(engine, ArgReg::Rcx, "IsZoomed")?;
 
     let return_value = 0;
 
@@ -270,13 +247,9 @@ pub fn handle_get_window_thread_process_id(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetWindowThreadProcessId")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "GetWindowThreadProcessId")?;
 
-    let process_id_va = engine
-        .read_rdx()
-        .context("failed to read RDX for GetWindowThreadProcessId")?;
+    let process_id_va = read_arg(engine, ArgReg::Rdx, "GetWindowThreadProcessId")?;
 
     let valid_window =
         window_handle == FAKE_WINDOW_HANDLE || window_handle == FAKE_DESKTOP_WINDOW_HANDLE;
@@ -293,9 +266,7 @@ pub fn handle_get_window_thread_process_id(
 pub fn handle_get_dlg_ctrl_id(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetDlgCtrlID")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "GetDlgCtrlID")?;
 
     // A child window's control identifier is its menu handle (CreateWindowEx
     // stores the ID there). Unknown windows report -1 like real Windows.
@@ -311,13 +282,9 @@ pub fn handle_get_dlg_ctrl_id(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 pub fn handle_is_child(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let parent_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for IsChild")?;
+    let parent_handle = read_arg(engine, ArgReg::Rcx, "IsChild")?;
 
-    let child_handle = engine
-        .read_rdx()
-        .context("failed to read RDX for IsChild")?;
+    let child_handle = read_arg(engine, ArgReg::Rdx, "IsChild")?;
 
     let return_value = u64::from(descends_from(state, child_handle, parent_handle));
 
@@ -348,13 +315,9 @@ fn descends_from(state: &mut WinApiState, child: u64, parent: u64) -> bool {
 /// Handles `USER32.dll!GetWindow`.
 pub fn handle_get_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetWindow")?;
+    let _window_handle = read_arg(engine, ArgReg::Rcx, "GetWindow")?;
 
-    let _command = engine
-        .read_rdx()
-        .context("failed to read RDX for GetWindow")?;
+    let _command = read_arg(engine, ArgReg::Rdx, "GetWindow")?;
 
     let return_value = 0;
 
@@ -371,21 +334,13 @@ const NC_MENU_PX: i32 = 20;
 /// Handles `USER32.dll!AdjustWindowRectEx`.
 pub fn handle_adjust_window_rect_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let rect_va = engine
-        .read_rcx()
-        .context("failed to read RCX for AdjustWindowRectEx")?;
+    let rect_va = read_arg(engine, ArgReg::Rcx, "AdjustWindowRectEx")?;
 
-    let _style = engine
-        .read_rdx()
-        .context("failed to read RDX for AdjustWindowRectEx")?;
+    let _style = read_arg(engine, ArgReg::Rdx, "AdjustWindowRectEx")?;
 
-    let has_menu = engine
-        .read_r8()
-        .context("failed to read R8 for AdjustWindowRectEx")?;
+    let has_menu = read_arg(engine, ArgReg::R8, "AdjustWindowRectEx")?;
 
-    let _extended_style = engine
-        .read_r9()
-        .context("failed to read R9 for AdjustWindowRectEx")?;
+    let _extended_style = read_arg(engine, ArgReg::R9, "AdjustWindowRectEx")?;
 
     let success = rect_va != 0;
 
@@ -439,17 +394,11 @@ pub fn handle_adjust_window_rect_ex(ctx: &mut HandlerContext<'_>) -> Result<WinA
 /// added to the passed client `RECT`.
 pub fn handle_adjust_window_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let rect_va = engine
-        .read_rcx()
-        .context("failed to read RCX for AdjustWindowRect")?;
+    let rect_va = read_arg(engine, ArgReg::Rcx, "AdjustWindowRect")?;
 
-    let _style = engine
-        .read_rdx()
-        .context("failed to read RDX for AdjustWindowRect")?;
+    let _style = read_arg(engine, ArgReg::Rdx, "AdjustWindowRect")?;
 
-    let has_menu = engine
-        .read_r8()
-        .context("failed to read R8 for AdjustWindowRect")?;
+    let has_menu = read_arg(engine, ArgReg::R8, "AdjustWindowRect")?;
 
     let success = rect_va != 0;
 
@@ -499,9 +448,7 @@ pub fn handle_adjust_window_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 /// Handles `USER32.dll!ScrollWindowEx` (no-op success stub).
 pub fn handle_scroll_window_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for ScrollWindowEx")?;
+    let _hwnd = read_arg(engine, ArgReg::Rcx, "ScrollWindowEx")?;
 
     // Returns TRUE on success.
     ctx.finish(1)
@@ -518,13 +465,9 @@ pub(crate) const WINDOWPLACEMENT_LENGTH: u32 = 44;
 pub fn handle_get_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetWindowPlacement")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "GetWindowPlacement")?;
 
-    let placement_va = engine
-        .read_rdx()
-        .context("failed to read RDX for GetWindowPlacement")?;
+    let placement_va = read_arg(engine, ArgReg::Rdx, "GetWindowPlacement")?;
 
     // Geometry comes from the window record when one exists; the legacy fake
     // window reads the single-window state fields (like MoveWindow).
@@ -595,13 +538,9 @@ pub fn handle_get_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for SetWindowPlacement")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "SetWindowPlacement")?;
 
-    let placement_va = engine
-        .read_rdx()
-        .context("failed to read RDX for SetWindowPlacement")?;
+    let placement_va = read_arg(engine, ArgReg::Rdx, "SetWindowPlacement")?;
 
     let known = window_handle == FAKE_WINDOW_HANDLE || find_window(state, window_handle).is_some();
     let mut success = known && placement_va != 0;

@@ -4,8 +4,8 @@
 
 use anyhow::{Context, Result};
 
+use crate::gdi32::{ArgReg, clip_blit_rect, read_arg};
 use crate::guest_memory::{checked_address, read_i32, read_u16, read_u32, read_u64, read_uint_at};
-use crate::handles::Hdc;
 use crate::user32::low_i32;
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
@@ -17,6 +17,11 @@ const GRADIENT_FILL_RECT_H: u32 = 0;
 const GRADIENT_FILL_RECT_V: u32 = 1;
 
 /// A 32-bpp DIB pixel surface resolved from an HDC.
+///
+/// Wraps the shared [`crate::gdi32`] resolver: the DC record must have a
+/// bitmap selected and that bitmap must be a 32-bpp `CreateDIBSection`
+/// record. Returns `None` (callers return FALSE) for window/screen/print
+/// DCs, non-32-bpp bitmaps, and unknown handles.
 #[derive(Debug, Clone, Copy)]
 struct DibSurface {
     /// Guest VA of the pixel buffer.
@@ -32,37 +37,14 @@ struct DibSurface {
 }
 
 /// Resolve an HDC to the 32-bpp DIB surface selected into it.
-///
-/// Mirrors `gdi32::blit::resolve_src_info`: the DC record must have a bitmap
-/// selected and that bitmap must be a 32-bpp `CreateDIBSection` record.
-/// Returns `None` (callers return FALSE) for window/screen/print DCs,
-/// non-32-bpp bitmaps, and unknown handles.
 fn resolve_dib_surface(state: &mut WinApiState, dc_handle: u64) -> Option<DibSurface> {
-    let (bits_va, stride, width, height, top_down, bit_count) = {
-        let gdi = state.gdi_state();
-        let dc = gdi.find_dc(Hdc::from(dc_handle))?;
-        let dib = gdi.find_dib(dc.selected_bitmap?)?;
-        (
-            dib.bits_va,
-            dib.stride,
-            dib.width,
-            dib.height,
-            dib.height < 0,
-            dib.bit_count,
-        )
-    };
-    if bit_count != 32 {
-        return None;
-    }
-    // Saturate at i32::MAX: the old `as` wrapped i32::MIN's magnitude negative.
-    let w = i32::try_from(width.unsigned_abs()).unwrap_or(i32::MAX);
-    let h = i32::try_from(height.unsigned_abs()).unwrap_or(i32::MAX);
+    let dib = crate::gdi32::resolve_32bpp_dib(state, dc_handle)?;
     Some(DibSurface {
-        bits_va,
-        stride,
-        width: w,
-        height: h,
-        top_down,
+        bits_va: dib.bits_va,
+        stride: dib.stride,
+        width: dib.width,
+        height: dib.height,
+        top_down: dib.top_down,
     })
 }
 
@@ -81,67 +63,6 @@ fn buffer_row(surf: &DibSurface, guest_y: i32) -> Option<usize> {
         surf.height - 1 - guest_y
     };
     usize::try_from(idx).ok()
-}
-
-/// Clip a copy rect to the intersection of both DIB surfaces' bounds.
-///
-/// Returns the adjusted `(dest_x, dest_y, src_x, src_y, width, height)` or
-/// `None` when the rect is fully outside either surface.
-#[must_use]
-#[allow(clippy::too_many_arguments)]
-fn clip_copy_rect(
-    dst: &DibSurface,
-    src: &DibSurface,
-    dest_x: i32,
-    dest_y: i32,
-    src_x: i32,
-    src_y: i32,
-    width: i32,
-    height: i32,
-) -> Option<(i32, i32, i32, i32, i32, i32)> {
-    let mut dest_x = dest_x;
-    let mut dest_y = dest_y;
-    let mut src_x = src_x;
-    let mut src_y = src_y;
-    let mut width = width;
-    let mut height = height;
-
-    // Clip left: a negative dest_x shifts the source right by the same amount.
-    if dest_x < 0 {
-        src_x = src_x.saturating_sub(dest_x);
-        width = width.saturating_add(dest_x);
-        dest_x = 0;
-    }
-    if src_x < 0 {
-        dest_x = dest_x.saturating_sub(src_x);
-        width = width.saturating_add(src_x);
-        src_x = 0;
-    }
-    // Clip top.
-    if dest_y < 0 {
-        src_y = src_y.saturating_sub(dest_y);
-        height = height.saturating_add(dest_y);
-        dest_y = 0;
-    }
-    if src_y < 0 {
-        dest_y = dest_y.saturating_sub(src_y);
-        height = height.saturating_add(src_y);
-        src_y = 0;
-    }
-    // Clip right / bottom against both surfaces.
-    let dest_right = dest_x.saturating_add(width).min(dst.width);
-    width = dest_right.saturating_sub(dest_x);
-    let src_right = src_x.saturating_add(width).min(src.width);
-    width = src_right.saturating_sub(src_x);
-    let dest_bottom = dest_y.saturating_add(height).min(dst.height);
-    height = dest_bottom.saturating_sub(dest_y);
-    let src_bottom = src_y.saturating_add(height).min(src.height);
-    height = src_bottom.saturating_sub(src_y);
-
-    if width <= 0 || height <= 0 {
-        return None;
-    }
-    Some((dest_x, dest_y, src_x, src_y, width, height))
 }
 
 // Reusable scratch buffer for the per-row src/dst spans of an MSIMG32 copy.
@@ -292,6 +213,85 @@ pub fn dispatch_msimg32(
     }
 }
 
+/// Handles `MSIMG32.dll!TransparentBlt` — color-keyed copy.
+///
+/// `BOOL TransparentBlt(hdcDst, xDst, yDst, wDst, hDst, hdcSrc, xSrc, ySrc,
+/// wSrc, hSrc, COLORREF crTransparent)` — 11 args, `crTransparent` at
+/// `[rsp+0x58]`. Source pixels equal to the key are skipped; everything else
+/// is copied with an opaque alpha (the color key, not alpha, decides
+/// transparency — matching real GDI, which ignores the source alpha here).
+/// Per-API context names for the shared blit marshalling (static, so the
+/// shared body stays allocation-free).
+struct BltArgNames {
+    /// `[rsp+0x28]`.
+    h_dst: &'static str,
+    /// `[rsp+0x30]`.
+    hdc_src: &'static str,
+    /// `[rsp+0x38]`.
+    x_src: &'static str,
+    /// `[rsp+0x40]`.
+    y_src: &'static str,
+    /// `[rsp+0x48]` (read and discarded).
+    w_src: &'static str,
+    /// `[rsp+0x50]` (read and discarded).
+    h_src: &'static str,
+}
+
+const ALPHABLEND_NAMES: BltArgNames = BltArgNames {
+    h_dst: "AlphaBlend hDst",
+    hdc_src: "AlphaBlend hdcSrc",
+    x_src: "AlphaBlend xSrc",
+    y_src: "AlphaBlend ySrc",
+    w_src: "AlphaBlend wSrc",
+    h_src: "AlphaBlend hSrc",
+};
+
+const TRANSPARENTBLT_NAMES: BltArgNames = BltArgNames {
+    h_dst: "TransparentBlt hDst",
+    hdc_src: "TransparentBlt hdcSrc",
+    x_src: "TransparentBlt xSrc",
+    y_src: "TransparentBlt ySrc",
+    w_src: "TransparentBlt wSrc",
+    h_src: "TransparentBlt hSrc",
+};
+
+/// The per-pixel operation derived from each handler's final `[rsp+0x58]`
+/// argument.
+#[derive(Clone, Copy)]
+enum BltPixelOp {
+    /// `AlphaBlend`: source-over composite with an optional constant alpha
+    /// and the source's own alpha channel.
+    Blend {
+        /// `BLENDFUNCTION.SourceConstantAlpha`.
+        const_alpha: u32,
+        /// Whether the `AC_SRC_ALPHA` format bit is set.
+        use_src_alpha: bool,
+    },
+    /// `TransparentBlt`: copy unless the pixel matches the color key.
+    ColorKey {
+        /// The 0RGB key (`COLORREF` low 24 bits).
+        key: u32,
+    },
+}
+
+impl BltPixelOp {
+    fn apply(self, sp: u32, dp: u32) -> u32 {
+        match self {
+            Self::Blend {
+                const_alpha,
+                use_src_alpha,
+            } => blend_pixel(sp, dp, const_alpha, use_src_alpha),
+            Self::ColorKey { key } => {
+                if sp & 0x00FF_FFFF == key {
+                    dp
+                } else {
+                    (sp & 0x00FF_FFFF) | 0xFF00_0000
+                }
+            }
+        }
+    }
+}
+
 /// Handles `MSIMG32.dll!AlphaBlend` — per-pixel source-alpha compositing.
 ///
 /// `BOOL AlphaBlend(hdcDst, xDst, yDst, wDst, hDst, hdcSrc, xSrc, ySrc, wSrc,
@@ -300,75 +300,21 @@ pub fn dispatch_msimg32(
 /// by the destination rect; the source rect offset is honored. Returns FALSE
 /// (0) when either HDC does not resolve to a 32-bpp DIB surface.
 fn handle_alpha_blend(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let hdc_dst = engine
-        .read_rcx()
-        .context("failed to read RCX for AlphaBlend")?;
-    let x_dst = low_i32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for AlphaBlend")?,
-        "AlphaBlend xDst",
-    )?;
-    let y_dst = low_i32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for AlphaBlend")?,
-        "AlphaBlend yDst",
-    )?;
-    let w_dst = low_i32(
-        engine
-            .read_r9()
-            .context("failed to read R9 for AlphaBlend")?,
-        "AlphaBlend wDst",
-    )?;
-    let rsp = engine
-        .read_rsp()
-        .context("failed to read RSP for AlphaBlend")?;
-    let h_dst = read_i32(engine, checked_address(rsp, 0x28, "AlphaBlend hDst"))
-        .context("failed to read AlphaBlend hDst")?;
-    let hdc_src = read_u64(engine, checked_address(rsp, 0x30, "AlphaBlend hdcSrc"))
-        .context("failed to read AlphaBlend hdcSrc")?;
-    let x_src = read_i32(engine, checked_address(rsp, 0x38, "AlphaBlend xSrc"))
-        .context("failed to read AlphaBlend xSrc")?;
-    let y_src = read_i32(engine, checked_address(rsp, 0x40, "AlphaBlend ySrc"))
-        .context("failed to read AlphaBlend ySrc")?;
-    // wSrc/hSrc are ignored: the source and destination rects have the same
-    // size by contract, so the destination size drives the copy.
-    let _w_src = read_i32(engine, checked_address(rsp, 0x48, "AlphaBlend wSrc"))
-        .context("failed to read AlphaBlend wSrc")?;
-    let _h_src = read_i32(engine, checked_address(rsp, 0x50, "AlphaBlend hSrc"))
-        .context("failed to read AlphaBlend hSrc")?;
-    let blend_bytes = read_uint_at::<4>(
-        engine,
-        checked_address(rsp, 0x58, "AlphaBlend BLENDFUNCTION"),
-    )
-    .context("failed to read AlphaBlend BLENDFUNCTION")?;
-    // BLENDFUNCTION layout: { BlendOp, BlendFlags, SourceConstantAlpha,
-    // AlphaFormat } — the AlphaFormat byte selects per-pixel alpha.
-    let const_alpha = u32::from(blend_bytes.get(2).copied().unwrap_or(0));
-    let alpha_format = u32::from(blend_bytes.get(3).copied().unwrap_or(0));
-    let use_src_alpha = alpha_format & AC_SRC_ALPHA != 0;
-
-    let Some(src) = resolve_dib_surface(state, hdc_src) else {
-        tracing::debug!("AlphaBlend: invalid source HDC");
-        return ctx.finish(0);
-    };
-    let Some(dst) = resolve_dib_surface(state, hdc_dst) else {
-        tracing::debug!("AlphaBlend: invalid destination HDC");
-        return ctx.finish(0);
-    };
-    let Some((dx, dy, sx, sy, cw, ch)) =
-        clip_copy_rect(&dst, &src, x_dst, y_dst, x_src, y_src, w_dst, h_dst)
-    else {
-        // Fully clipped: nothing to blend, but the call still succeeds.
-        return ctx.finish(1);
-    };
-    map_pixels(engine, &src, &dst, dx, dy, sx, sy, cw, ch, |sp, dp| {
-        blend_pixel(sp, dp, const_alpha, use_src_alpha)
-    })?;
-    ctx.finish(1)
+    blit_dib_to_dib(ctx, "AlphaBlend", &ALPHABLEND_NAMES, |engine, rsp| {
+        let blend_bytes = read_uint_at::<4>(
+            engine,
+            checked_address(rsp, 0x58, "AlphaBlend BLENDFUNCTION"),
+        )
+        .context("failed to read AlphaBlend BLENDFUNCTION")?;
+        // BLENDFUNCTION layout: { BlendOp, BlendFlags, SourceConstantAlpha,
+        // AlphaFormat } — the AlphaFormat byte selects per-pixel alpha.
+        let const_alpha = u32::from(blend_bytes.get(2).copied().unwrap_or(0));
+        let alpha_format = u32::from(blend_bytes.get(3).copied().unwrap_or(0));
+        Ok(BltPixelOp::Blend {
+            const_alpha,
+            use_src_alpha: alpha_format & AC_SRC_ALPHA != 0,
+        })
+    })
 }
 
 /// Handles `MSIMG32.dll!TransparentBlt` — color-keyed copy.
@@ -379,71 +325,79 @@ fn handle_alpha_blend(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
 /// is copied with an opaque alpha (the color key, not alpha, decides
 /// transparency — matching real GDI, which ignores the source alpha here).
 fn handle_transparent_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    blit_dib_to_dib(
+        ctx,
+        "TransparentBlt",
+        &TRANSPARENTBLT_NAMES,
+        |engine, rsp| {
+            let cr_transparent = read_u32(
+                engine,
+                checked_address(rsp, 0x58, "TransparentBlt crTransparent"),
+            )
+            .context("failed to read TransparentBlt crTransparent")?;
+            // COLORREF is 0x00RRGGBB; the DIB pixel's low 24 bits are the
+            // same fields.
+            Ok(BltPixelOp::ColorKey {
+                key: cr_transparent & 0x00FF_FFFF,
+            })
+        },
+    )
+}
+
+/// Shared `AlphaBlend`/`TransparentBlt` body.
+///
+/// Marshals the identical ten leading arguments (`rcx`..r9 registers, then
+/// six stack slots), resolves both HDCs to 32-bpp DIB surfaces, clips, and
+/// runs the caller's pixel operation over the clipped rect. Only the final
+/// `[rsp+0x58]` slot read (via `read_pixel_op`) differs per handler.
+fn blit_dib_to_dib(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &'static str,
+    names: &BltArgNames,
+    read_pixel_op: impl FnOnce(&mut dyn wie_cpu::CpuEngine, u64) -> Result<BltPixelOp>,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc_dst = engine
-        .read_rcx()
-        .context("failed to read RCX for TransparentBlt")?;
-    let x_dst = low_i32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for TransparentBlt")?,
-        "TransparentBlt xDst",
-    )?;
-    let y_dst = low_i32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for TransparentBlt")?,
-        "TransparentBlt yDst",
-    )?;
-    let w_dst = low_i32(
-        engine
-            .read_r9()
-            .context("failed to read R9 for TransparentBlt")?,
-        "TransparentBlt wDst",
-    )?;
+    let hdc_dst = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let x_dst = low_i32(read_arg(engine, ArgReg::Rdx, api_name)?, "blit xDst")?;
+    let y_dst = low_i32(read_arg(engine, ArgReg::R8, api_name)?, "blit yDst")?;
+    let w_dst = low_i32(read_arg(engine, ArgReg::R9, api_name)?, "blit wDst")?;
     let rsp = engine
         .read_rsp()
-        .context("failed to read RSP for TransparentBlt")?;
-    let h_dst = read_i32(engine, checked_address(rsp, 0x28, "TransparentBlt hDst"))
-        .context("failed to read TransparentBlt hDst")?;
-    let hdc_src = read_u64(engine, checked_address(rsp, 0x30, "TransparentBlt hdcSrc"))
-        .context("failed to read TransparentBlt hdcSrc")?;
-    let x_src = read_i32(engine, checked_address(rsp, 0x38, "TransparentBlt xSrc"))
-        .context("failed to read TransparentBlt xSrc")?;
-    let y_src = read_i32(engine, checked_address(rsp, 0x40, "TransparentBlt ySrc"))
-        .context("failed to read TransparentBlt ySrc")?;
-    let _w_src = read_i32(engine, checked_address(rsp, 0x48, "TransparentBlt wSrc"))
-        .context("failed to read TransparentBlt wSrc")?;
-    let _h_src = read_i32(engine, checked_address(rsp, 0x50, "TransparentBlt hSrc"))
-        .context("failed to read TransparentBlt hSrc")?;
-    let cr_transparent = read_u32(
-        engine,
-        checked_address(rsp, 0x58, "TransparentBlt crTransparent"),
-    )
-    .context("failed to read TransparentBlt crTransparent")?;
-    // COLORREF is 0x00RRGGBB; the DIB pixel's low 24 bits are the same fields.
-    let key = cr_transparent & 0x00FF_FFFF;
+        .with_context(|| format!("failed to read RSP for {api_name}"))?;
+    let h_dst = read_i32(engine, checked_address(rsp, 0x28, names.h_dst))
+        .with_context(|| format!("failed to read {}", names.h_dst))?;
+    let hdc_src = read_u64(engine, checked_address(rsp, 0x30, names.hdc_src))
+        .with_context(|| format!("failed to read {}", names.hdc_src))?;
+    let x_src = read_i32(engine, checked_address(rsp, 0x38, names.x_src))
+        .with_context(|| format!("failed to read {}", names.x_src))?;
+    let y_src = read_i32(engine, checked_address(rsp, 0x40, names.y_src))
+        .with_context(|| format!("failed to read {}", names.y_src))?;
+    // wSrc/hSrc are ignored: the source and destination rects have the same
+    // size by contract, so the destination size drives the copy.
+    let _w_src = read_i32(engine, checked_address(rsp, 0x48, names.w_src))
+        .with_context(|| format!("failed to read {}", names.w_src))?;
+    let _h_src = read_i32(engine, checked_address(rsp, 0x50, names.h_src))
+        .with_context(|| format!("failed to read {}", names.h_src))?;
+    // The 11th argument differs per handler and yields its pixel operation.
+    let op = read_pixel_op(engine, rsp)?;
 
     let Some(src) = resolve_dib_surface(state, hdc_src) else {
-        tracing::debug!("TransparentBlt: invalid source HDC");
+        tracing::debug!("{api_name}: invalid source HDC");
         return ctx.finish(0);
     };
     let Some(dst) = resolve_dib_surface(state, hdc_dst) else {
-        tracing::debug!("TransparentBlt: invalid destination HDC");
+        tracing::debug!("{api_name}: invalid destination HDC");
         return ctx.finish(0);
     };
-    let Some((dx, dy, sx, sy, cw, ch)) =
-        clip_copy_rect(&dst, &src, x_dst, y_dst, x_src, y_src, w_dst, h_dst)
-    else {
+    let Some((dx, dy, sx, sy, cw, ch)) = clip_blit_rect(
+        dst.width, dst.height, src.width, src.height, x_dst, y_dst, x_src, y_src, w_dst, h_dst,
+    ) else {
+        // Fully clipped: nothing to blend, but the call still succeeds.
         return ctx.finish(1);
     };
     map_pixels(engine, &src, &dst, dx, dy, sx, sy, cw, ch, |sp, dp| {
-        if sp & 0x00FF_FFFF == key {
-            dp
-        } else {
-            (sp & 0x00FF_FFFF) | 0xFF00_0000
-        }
+        op.apply(sp, dp)
     })?;
     ctx.finish(1)
 }
@@ -570,21 +524,13 @@ fn fill_gradient_rect(
 fn handle_gradient_fill(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for GradientFill")?;
-    let p_vertex = engine
-        .read_rdx()
-        .context("failed to read RDX for GradientFill")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "GradientFill")?;
+    let p_vertex = read_arg(engine, ArgReg::Rdx, "GradientFill")?;
     let n_vertex = low_i32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for GradientFill")?,
+        read_arg(engine, ArgReg::R8, "GradientFill")?,
         "GradientFill nVertex",
     )?;
-    let p_mesh = engine
-        .read_r9()
-        .context("failed to read R9 for GradientFill")?;
+    let p_mesh = read_arg(engine, ArgReg::R9, "GradientFill")?;
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for GradientFill")?;

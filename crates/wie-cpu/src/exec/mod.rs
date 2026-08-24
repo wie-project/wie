@@ -20,14 +20,14 @@ use crate::consts::{DWORD_BYTES, QWORD_BITS, SHIFT_MASK_32, SHIFT_MASK_64, XMM_B
 use crate::mem::GuestMemory;
 use crate::regs::{self, RegFile, Rflags};
 use iced_x86::{Instruction, MemorySize, Mnemonic, OpKind, Register};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cache::{ICED_COUNTERS, ICED_TRACE_ENABLED, decode_at};
 use gpr::{
     exec_arith, exec_bit, exec_bswap, exec_cmov, exec_div, exec_imul, exec_lea, exec_mov,
     exec_movzx, exec_mul, exec_pop, exec_push, exec_setcc,
 };
-use ops::{ArithOp, BitOp, ShiftKind, cond_from_cmov, cond_from_jcc, cond_from_setcc};
+use ops::{ArithOp, BitOp, ShiftKind, cond_from};
 use sse::{
     exec_sse_bitwise, exec_sse_byte_shift, exec_sse_cmp_fp, exec_sse_comis, exec_sse_cvt_fp_to_gpr,
     exec_sse_cvt_gpr_to_fp, exec_sse_cvt_packed, exec_sse_cvtdq2pd, exec_sse_cvtpd2dq,
@@ -307,7 +307,7 @@ fn execute_one(
         | Mnemonic::Jns
         | Mnemonic::Jp
         | Mnemonic::Jnp) => {
-            exec_jcc(regs, instr, cond_from_jcc(m, regs));
+            exec_jcc(regs, instr, cond_from(m, regs));
             Ok(())
         }
 
@@ -326,7 +326,7 @@ fn execute_one(
         | Mnemonic::Cmovs
         | Mnemonic::Cmovns
         | Mnemonic::Cmovp
-        | Mnemonic::Cmovnp) => exec_cmov(mem, regs, instr, cond_from_cmov(m, regs)),
+        | Mnemonic::Cmovnp) => exec_cmov(mem, regs, instr, cond_from(m, regs)),
 
         m @ (Mnemonic::Sete
         | Mnemonic::Setne
@@ -343,7 +343,7 @@ fn execute_one(
         | Mnemonic::Sets
         | Mnemonic::Setns
         | Mnemonic::Setp
-        | Mnemonic::Setnp) => exec_setcc(mem, regs, instr, cond_from_setcc(m, regs)),
+        | Mnemonic::Setnp) => exec_setcc(mem, regs, instr, cond_from(m, regs)),
 
         Mnemonic::Xchg => exec_xchg(mem, regs, instr),
         Mnemonic::Xadd => exec_xadd(mem, regs, instr),
@@ -1058,46 +1058,58 @@ fn write_accumulator(regs: &mut RegFile, size: usize, value: u64) -> Result<(), 
     }
 }
 
-/// Dump iced-interpreter mnemonic counters to stderr (sorted by count).
-/// Activated by `WIE_EXEC_TRACE=1`. Call after a guest session ends.
-pub fn dump_iced_counters() {
-    if !*ICED_TRACE_ENABLED {
-        return;
-    }
+/// Shared renderer for mnemonic-keyed diagnostic histograms.
+///
+/// Scans `counts` (indexed by iced mnemonic discriminant), sorts nonzero
+/// entries by count descending, and renders up to 60 rows
+/// (`count  tenths-of-a-percent%  name`), an overflow note, and the
+/// `--- end ---` footer, bracketed by `make_header(total)`. Returns an empty
+/// Vec when every counter is zero and `omit_if_empty` is set (the sampled JIT
+/// histogram stays quiet until samples exist; the interpreter dump always
+/// prints its bracket lines).
+pub(crate) fn render_mnemonic_histogram(
+    counts: &[AtomicU64],
+    omit_if_empty: bool,
+    make_header: impl FnOnce(u64) -> String,
+) -> Vec<String> {
     let mut pairs: Vec<(u64, usize)> = Vec::new();
-    for (i, c) in ICED_COUNTERS.iter().enumerate() {
+    for (i, c) in counts.iter().enumerate() {
         let count = c.load(Ordering::Relaxed);
-        if count == 0 {
-            continue;
+        if count > 0 {
+            pairs.push((count, i));
         }
-        pairs.push((count, i));
+    }
+    if omit_if_empty && pairs.is_empty() {
+        return Vec::new();
     }
     pairs.sort_by_key(|a| std::cmp::Reverse(a.0));
     let total: u64 = pairs.iter().map(|(c, _)| *c).sum();
-    tracing::error!("--- iced-interp mnemonic counts (total={total}) ---");
+    let mut lines = vec![make_header(total)];
     let show = pairs.len().min(60);
     for (count, idx) in pairs.iter().take(show) {
         let name = Mnemonic::try_from(*idx)
             .map_or_else(|_| format!("Mnemonic({idx})"), |m| format!("{m:?}"));
         // Integer tenths of a percent (avoid f64 cast_precision_loss).
         let pct = count.saturating_mul(1000).checked_div(total).unwrap_or(0);
-        let pct_whole = pct / 10;
-        let pct_frac = pct % 10;
-        tracing::error!("{count:>10}  {pct_whole:3}.{pct_frac}%  {name}");
+        lines.push(format!("{count:>10}  {:3}.{}%  {name}", pct / 10, pct % 10));
     }
     if pairs.len() > show {
-        tracing::error!("  … {} more mnemonics", pairs.len() - show);
+        lines.push(format!("  … {} more mnemonics", pairs.len() - show));
     }
-    tracing::error!("--- end ---");
+    lines.push("--- end ---".to_owned());
+    lines
 }
 
-/// Zero counters (for multi-run tooling). No-op when trace is disabled.
-pub fn reset_iced_counters() {
+/// Dump iced-interpreter mnemonic counters to stderr (sorted by count).
+/// Activated by `WIE_EXEC_TRACE=1`. Call after a guest session ends.
+pub fn dump_iced_counters() {
     if !*ICED_TRACE_ENABLED {
         return;
     }
-    for c in ICED_COUNTERS.iter() {
-        c.store(0, Ordering::Relaxed);
+    for line in render_mnemonic_histogram(&ICED_COUNTERS, false, |total| {
+        format!("--- iced-interp mnemonic counts (total={total}) ---")
+    }) {
+        tracing::error!("{line}");
     }
 }
 

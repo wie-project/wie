@@ -4,8 +4,11 @@ mod bmp;
 mod commands;
 mod gui;
 
+#[cfg(test)]
+mod test_support;
+
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 /// Default host-API-stop cap for micro runs (freestanding PEs until
@@ -37,6 +40,74 @@ Guest memory: mmap arenas only (soft translate).\
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// Run flags shared by both run entries (`run` and `bottle run`).
+///
+/// Flattened into each variant so the flag surface, defaults and help text
+/// cannot drift apart. `guest_args` stays per-variant: its doc text names the
+/// entry (`module name` vs `exe`) and must keep rendering each command's help
+/// exactly as before.
+#[derive(Args, Debug, Default)]
+struct RunArgs {
+    /// Cap host API stops (defaults: 2,000 micro; 5,000,000 persistent;
+    /// 1,000,000 per quantum console).
+    #[arg(long)]
+    max_api: Option<usize>,
+
+    /// Expected ExitProcess code (micro mode only; default 0).
+    #[arg(long, default_value_t = 0)]
+    expect_code: u32,
+
+    /// Host root for guest `D:\…` bridge (env `WIE_DRIVE_D`; `auto` =
+    /// host cwd). Micro / `--gui` / `--screenshot` entries only — rejected
+    /// with `--console` / `--persistent`.
+    #[arg(long)]
+    drive_d: Option<PathBuf>,
+
+    /// Host file whose bytes are injected as guest console stdin (micro
+    /// mode only; `/dev/stdin`, `/dev/tty` or `-` read live from the
+    /// terminal).
+    #[arg(long)]
+    stdin: Option<PathBuf>,
+
+    /// Stage this complete host folder into the bottle instead of just
+    /// the executable: relative paths, DLLs, plugins and data files are
+    /// preserved under `C:\Program Files\<name>\`. The run source must
+    /// live inside this folder. Micro / `--gui` / `--screenshot` entries
+    /// only — rejected with `--console` / `--persistent`.
+    #[arg(long)]
+    app_dir: Option<PathBuf>,
+
+    /// Persistent run loop: run the guest session as a message-driven
+    /// loop that yields on idle instead of gating on `ExitProcess`. For
+    /// message-loop guests (games, GUI apps). Bounded by `--max-api`.
+    #[arg(long)]
+    persistent: bool,
+
+    /// Raw-mode interactive console run for terminal games: every
+    /// keystroke reaches the guest immediately (no Enter), terminal
+    /// restored on exit. Runs until the guest exits.
+    #[arg(long)]
+    console: bool,
+
+    /// Native windowed GUI run: guest windows render in a macOS window
+    /// (winit + wgpu/Metal), the loop yields on idle, and guest menu bar
+    /// and dialogs are bridged to native UI.
+    #[arg(long)]
+    gui: bool,
+
+    /// Headless GUI run: render the guest without a window and write the
+    /// first captured frame to this BMP file.
+    #[arg(long)]
+    screenshot: Option<PathBuf>,
+
+    /// Drive a `--gui` guest with a scripted input file (lines: sleep
+    /// <ms> | key <vk> [shift|ctrl] | type <text> | menu <id> | click
+    /// <x> <y> | snapshot <file>). Requires --gui. The `WIE_INPUT_SCRIPT`
+    /// env var names a script too.
+    #[arg(long)]
+    input_script: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -76,15 +147,6 @@ enum Command {
     Run {
         path: PathBuf,
 
-        /// Cap host API stops (defaults: 2,000 micro; 5,000,000 persistent;
-        /// 1,000,000 per quantum console).
-        #[arg(long)]
-        max_api: Option<usize>,
-
-        /// Expected ExitProcess code (micro mode only; default 0).
-        #[arg(long, default_value_t = 0)]
-        expect_code: u32,
-
         /// Bottle override: guest `C:\…` maps to `{root}/drive_c/…` (env
         /// `WIE_ROOT`; default: per-user app-data bottle
         /// `~/Library/Application Support/WIE/bottle`, created on demand).
@@ -102,55 +164,9 @@ enum Command {
         #[arg(long, conflicts_with = "root")]
         bottle: Option<String>,
 
-        /// Host root for guest `D:\…` bridge (env `WIE_DRIVE_D`; `auto` =
-        /// host cwd). Micro / `--gui` / `--screenshot` entries only — rejected
-        /// with `--console` / `--persistent`.
-        #[arg(long)]
-        drive_d: Option<PathBuf>,
-
-        /// Host file whose bytes are injected as guest console stdin (micro
-        /// mode only; `/dev/stdin`, `/dev/tty` or `-` read live from the
-        /// terminal).
-        #[arg(long)]
-        stdin: Option<PathBuf>,
-
-        /// Stage this complete host folder into the bottle instead of just
-        /// the executable: relative paths, DLLs, plugins and data files are
-        /// preserved under `C:\Program Files\<name>\`. The run source must
-        /// live inside this folder. Micro / `--gui` / `--screenshot` entries
-        /// only — rejected with `--console` / `--persistent`.
-        #[arg(long)]
-        app_dir: Option<PathBuf>,
-
-        /// Persistent run loop: run the guest session as a message-driven
-        /// loop that yields on idle instead of gating on `ExitProcess`. For
-        /// message-loop guests (games, GUI apps). Bounded by `--max-api`.
-        #[arg(long)]
-        persistent: bool,
-
-        /// Raw-mode interactive console run for terminal games: every
-        /// keystroke reaches the guest immediately (no Enter), terminal
-        /// restored on exit. Runs until the guest exits.
-        #[arg(long)]
-        console: bool,
-
-        /// Native windowed GUI run: guest windows render in a macOS window
-        /// (winit + wgpu/Metal), the loop yields on idle, and guest menu bar
-        /// and dialogs are bridged to native UI.
-        #[arg(long)]
-        gui: bool,
-
-        /// Headless GUI run: render the guest without a window and write the
-        /// first captured frame to this BMP file.
-        #[arg(long)]
-        screenshot: Option<PathBuf>,
-
-        /// Drive a `--gui` guest with a scripted input file (lines: sleep
-        /// <ms> | key <vk> [shift|ctrl] | type <text> | menu <id> | click
-        /// <x> <y> | snapshot <file>). Requires --gui. The `WIE_INPUT_SCRIPT`
-        /// env var names a script too.
-        #[arg(long)]
-        input_script: Option<PathBuf>,
+        /// Run-mode flags shared with `bottle run`.
+        #[command(flatten)]
+        args: RunArgs,
 
         /// Guest argv after the module name: everything after `--` passes
         /// verbatim (`wie run app.exe -- -n 3 -m hi`). Micro and `--gui`
@@ -218,64 +234,9 @@ pub(crate) enum BottleCommand {
         /// bottle's `drive_c` (unique match required).
         exe: String,
 
-        /// Cap host API stops (defaults: 2,000 micro; 5,000,000 persistent;
-        /// 1,000,000 per quantum console).
-        #[arg(long)]
-        max_api: Option<usize>,
-
-        /// Expected ExitProcess code (micro mode only; default 0).
-        #[arg(long, default_value_t = 0)]
-        expect_code: u32,
-
-        /// Host root for guest `D:\…` bridge (env `WIE_DRIVE_D`; `auto` =
-        /// host cwd). Micro / `--gui` / `--screenshot` entries only — rejected
-        /// with `--console` / `--persistent`.
-        #[arg(long)]
-        drive_d: Option<PathBuf>,
-
-        /// Host file whose bytes are injected as guest console stdin (micro
-        /// mode only; `/dev/stdin`, `/dev/tty` or `-` read live from the
-        /// terminal).
-        #[arg(long)]
-        stdin: Option<PathBuf>,
-
-        /// Stage this complete host folder into the bottle instead of just
-        /// the executable: relative paths, DLLs, plugins and data files are
-        /// preserved under `C:\Program Files\<name>\`. The run source must
-        /// live inside this folder. Micro / `--gui` / `--screenshot` entries
-        /// only — rejected with `--console` / `--persistent`.
-        #[arg(long)]
-        app_dir: Option<PathBuf>,
-
-        /// Persistent run loop: run the guest session as a message-driven
-        /// loop that yields on idle instead of gating on `ExitProcess`. For
-        /// message-loop guests (games, GUI apps). Bounded by `--max-api`.
-        #[arg(long)]
-        persistent: bool,
-
-        /// Raw-mode interactive console run for terminal games: every
-        /// keystroke reaches the guest immediately (no Enter), terminal
-        /// restored on exit. Runs until the guest exits.
-        #[arg(long)]
-        console: bool,
-
-        /// Native windowed GUI run: guest windows render in a macOS window
-        /// (winit + wgpu/Metal), the loop yields on idle, and guest menu bar
-        /// and dialogs are bridged to native UI.
-        #[arg(long)]
-        gui: bool,
-
-        /// Headless GUI run: render the guest without a window and write the
-        /// first captured frame to this BMP file.
-        #[arg(long)]
-        screenshot: Option<PathBuf>,
-
-        /// Drive a `--gui` guest with a scripted input file (lines: sleep
-        /// <ms> | key <vk> [shift|ctrl] | type <text> | menu <id> | click
-        /// <x> <y> | snapshot <file>). Requires --gui. The `WIE_INPUT_SCRIPT`
-        /// env var names a script too.
-        #[arg(long)]
-        input_script: Option<PathBuf>,
+        /// Run-mode flags shared with `run`.
+        #[command(flatten)]
+        args: RunArgs,
 
         /// Guest argv after the exe: everything after `--` passes verbatim.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -322,23 +283,25 @@ fn reject_micro_only_flags(
 /// and the micro-only flag rejections, then dispatches to the runtime. A
 /// single source of truth so `bottle run` behaves identically to
 /// `run --bottle`.
-#[allow(clippy::too_many_arguments)]
 fn run_entry(
     path: &std::path::Path,
     root: Option<PathBuf>,
     root_flag: Option<PathBuf>,
-    max_api: Option<usize>,
-    expect_code: u32,
-    drive_d: Option<PathBuf>,
-    stdin: Option<PathBuf>,
-    app_dir: Option<PathBuf>,
-    persistent: bool,
-    console: bool,
-    gui: bool,
-    screenshot: Option<PathBuf>,
-    input_script: Option<PathBuf>,
+    args: RunArgs,
     guest_args: Vec<String>,
 ) -> Result<()> {
+    let RunArgs {
+        max_api,
+        expect_code,
+        drive_d,
+        stdin,
+        app_dir,
+        persistent,
+        console,
+        gui,
+        screenshot,
+        input_script,
+    } = args;
     // Profiling Ctrl+C (`WIE_RUNTIME_PROFILE` armed): install the signal
     // hooks BEFORE anything runs. Lazy installation happens only when a
     // console session enters cbreak mode, which micro and `--gui` runs never
@@ -491,18 +454,9 @@ fn main() -> Result<()> {
         }
         Command::Run {
             path,
-            max_api,
-            expect_code,
             root,
             bottle,
-            drive_d,
-            stdin,
-            app_dir,
-            persistent,
-            console,
-            gui,
-            screenshot,
-            input_script,
+            args,
             guest_args,
         } => {
             // The raw `--root` flag stays separate from the effective root:
@@ -523,22 +477,7 @@ fn main() -> Result<()> {
                 _ => path,
             };
 
-            run_entry(
-                &path,
-                root,
-                root_flag,
-                max_api,
-                expect_code,
-                drive_d,
-                stdin,
-                app_dir,
-                persistent,
-                console,
-                gui,
-                screenshot,
-                input_script,
-                guest_args,
-            )?;
+            run_entry(&path, root, root_flag, args, guest_args)?;
         }
         Command::Trace { path, max_api } => {
             commands::entry_trace(&path, max_api)?;
@@ -580,7 +519,10 @@ mod tests {
         assert!(matches!(
             parse_run(&["--app-dir", "/tmp/MyApp"]),
             Command::Run {
-                app_dir: Some(ref dir),
+                args: RunArgs {
+                    app_dir: Some(ref dir),
+                    ..
+                },
                 ..
             } if dir == std::path::Path::new("/tmp/MyApp")
         ));
@@ -593,16 +535,23 @@ mod tests {
         assert!(matches!(
             parse_run(&["--gui", "--app-dir", "/tmp/MyApp"]),
             Command::Run {
-                gui: true,
-                app_dir: Some(ref dir),
+                args: RunArgs {
+                    gui: true,
+                    app_dir: Some(ref dir),
+                    ..
+                },
                 ..
             } if dir == std::path::Path::new("/tmp/MyApp")
         ));
         assert!(matches!(
             parse_run(&["--screenshot", "out.bmp", "--app-dir", "/tmp/MyApp"]),
             Command::Run {
-                screenshot: Some(ref out),
-                app_dir: Some(ref dir),
+                args:
+                    RunArgs {
+                        screenshot: Some(ref out),
+                        app_dir: Some(ref dir),
+                        ..
+                    },
                 ..
             } if out == std::path::Path::new("out.bmp")
                 && dir == std::path::Path::new("/tmp/MyApp")
@@ -627,8 +576,11 @@ mod tests {
         assert!(matches!(
             parse_run(&["--console", "--app-dir", "/tmp/MyApp"]),
             Command::Run {
-                console: true,
-                app_dir: Some(_),
+                args: RunArgs {
+                    console: true,
+                    app_dir: Some(_),
+                    ..
+                },
                 ..
             }
         ));
@@ -660,7 +612,7 @@ mod tests {
         assert!(matches!(
             parse_run(&["--console", "--bottle", "games"]),
             Command::Run {
-                console: true,
+                args: RunArgs { console: true, .. },
                 bottle: Some(ref name),
                 root: None,
                 ..
@@ -670,7 +622,10 @@ mod tests {
         assert!(matches!(
             parse_run(&["--screenshot", "out.bmp", "--bottle", "games"]),
             Command::Run {
-                screenshot: Some(ref out),
+                args: RunArgs {
+                    screenshot: Some(ref out),
+                    ..
+                },
                 bottle: Some(ref name),
                 ..
             } if out == std::path::Path::new("out.bmp") && name.as_str() == "games"
@@ -679,7 +634,7 @@ mod tests {
         assert!(matches!(
             parse_run(&["--gui", "--bottle", "games"]),
             Command::Run {
-                gui: true,
+                args: RunArgs { gui: true, .. },
                 bottle: Some(ref name),
                 ..
             } if name.as_str() == "games"
@@ -873,8 +828,11 @@ mod tests {
                 "freedoom1.wad",
             ]),
             Command::Run {
+                args: RunArgs {
+                    screenshot: Some(ref out),
+                    ..
+                },
                 bottle: Some(ref name),
-                screenshot: Some(ref out),
                 guest_args,
                 ..
             } if name.as_str() == "doomretro"
@@ -909,9 +867,12 @@ mod tests {
                 &["--gui", "--app-dir", "/tmp/MyApp", "--max-api", "500", "--", "-n", "3"],
             ),
             BottleCommand::Run {
-                gui: true,
-                app_dir: Some(ref dir),
-                max_api: Some(500),
+                args: RunArgs {
+                    gui: true,
+                    app_dir: Some(ref dir),
+                    max_api: Some(500),
+                    ..
+                },
                 guest_args,
                 ..
             } if dir == std::path::Path::new("/tmp/MyApp")
@@ -926,7 +887,7 @@ mod tests {
         assert!(matches!(
             parse_bottle_run("doom", "doom.exe", &["--gui"]),
             BottleCommand::Run {
-                gui: true,
+                args: RunArgs { gui: true, .. },
                 guest_args,
                 ..
             } if guest_args.is_empty()
@@ -939,21 +900,30 @@ mod tests {
         assert!(matches!(
             parse_bottle_run("doom", "doom.exe", &["--persistent", "--max-api", "1000"]),
             BottleCommand::Run {
-                persistent: true,
-                max_api: Some(1000),
+                args: RunArgs {
+                    persistent: true,
+                    max_api: Some(1000),
+                    ..
+                },
                 ..
             }
         ));
         assert!(matches!(
             parse_bottle_run("doom", "doom.exe", &["--screenshot", "out.bmp"]),
             BottleCommand::Run {
-                screenshot: Some(ref out),
+                args: RunArgs {
+                    screenshot: Some(ref out),
+                    ..
+                },
                 ..
             } if out == std::path::Path::new("out.bmp")
         ));
         assert!(matches!(
             parse_bottle_run("doom", "doom.exe", &["--expect-code", "7"]),
-            BottleCommand::Run { expect_code: 7, .. }
+            BottleCommand::Run {
+                args: RunArgs { expect_code: 7, .. },
+                ..
+            }
         ));
     }
 
@@ -964,12 +934,15 @@ mod tests {
         assert!(matches!(
             parse_bottle_run("doom", "doom.exe", &[]),
             BottleCommand::Run {
-                gui: false,
-                console: false,
-                persistent: false,
-                screenshot: None,
-                max_api: None,
-                expect_code: 0,
+                args: RunArgs {
+                    gui: false,
+                    console: false,
+                    persistent: false,
+                    screenshot: None,
+                    max_api: None,
+                    expect_code: 0,
+                    ..
+                },
                 ..
             }
         ));
@@ -987,16 +960,12 @@ mod tests {
             std::path::Path::new("app.exe"),
             None,
             None,
-            Some(100),
-            0,
-            None,
-            None,
-            None,
-            false,
-            false,
-            true, // gui
-            None,
-            Some(script.clone()),
+            RunArgs {
+                max_api: Some(100),
+                gui: true,
+                input_script: Some(script.clone()),
+                ..RunArgs::default()
+            },
             Vec::new(),
         )
         .expect_err("gui with a missing input script must fail");
@@ -1009,16 +978,11 @@ mod tests {
             std::path::Path::new("app.exe"),
             None,
             None,
-            Some(100),
-            0,
-            None,
-            None,
-            None,
-            false,
-            false,
-            false,
-            None,
-            Some(script),
+            RunArgs {
+                max_api: Some(100),
+                input_script: Some(script),
+                ..RunArgs::default()
+            },
             Vec::new(),
         )
         .expect_err("--input-script without --gui must fail");
@@ -1031,16 +995,11 @@ mod tests {
             std::path::Path::new("app.exe"),
             None,
             None,
-            None,
-            0,
-            Some(std::path::PathBuf::from("/tmp/d")),
-            None,
-            None,
-            false,
-            true, // console
-            false,
-            None,
-            None,
+            RunArgs {
+                console: true,
+                drive_d: Some(std::path::PathBuf::from("/tmp/d")),
+                ..RunArgs::default()
+            },
             Vec::new(),
         )
         .expect_err("console mode must reject --drive-d");
@@ -1054,16 +1013,10 @@ mod tests {
             std::path::Path::new(&root.join("app.exe")),
             Some(root.clone()),
             None, // no raw --root flag
-            None,
-            0,
-            None,
-            None,
-            None,
-            false,
-            true, // console
-            false,
-            None,
-            None,
+            RunArgs {
+                console: true,
+                ..RunArgs::default()
+            },
             Vec::new(),
         )
         .expect_err("console run with a missing exe must fail at staging");
@@ -1081,16 +1034,22 @@ mod tests {
         assert!(matches!(
             parse_run(&["--console", "--persistent"]),
             Command::Run {
-                console: true,
-                persistent: true,
+                args: RunArgs {
+                    console: true,
+                    persistent: true,
+                    ..
+                },
                 ..
             }
         ));
         assert!(matches!(
             parse_run(&["--gui", "--persistent"]),
             Command::Run {
-                gui: true,
-                persistent: true,
+                args: RunArgs {
+                    gui: true,
+                    persistent: true,
+                    ..
+                },
                 ..
             }
         ));

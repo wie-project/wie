@@ -422,16 +422,7 @@ pub(crate) fn bottle(command: BottleCommand) -> Result<()> {
         BottleCommand::Run {
             name,
             exe,
-            max_api,
-            expect_code,
-            drive_d,
-            stdin,
-            app_dir,
-            persistent,
-            console,
-            gui,
-            screenshot,
-            input_script,
+            args,
             guest_args,
         } => {
             let root = require_bottle(&bottles_dir(), &name)?;
@@ -443,22 +434,7 @@ pub(crate) fn bottle(command: BottleCommand) -> Result<()> {
             // `root` is the effective bottle root (no `--root` flag), so the
             // micro-only rejection sees no raw flag while the bottle-derived
             // root is allowed on console/persistent.
-            crate::run_entry(
-                &host_exe,
-                Some(root),
-                None,
-                max_api,
-                expect_code,
-                drive_d,
-                stdin,
-                app_dir,
-                persistent,
-                console,
-                gui,
-                screenshot,
-                input_script,
-                guest_args,
-            )?;
+            crate::run_entry(&host_exe, Some(root), None, args, guest_args)?;
         }
     }
     Ok(())
@@ -473,14 +449,11 @@ mod tests {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     /// Fresh temp dir unique per test call (parallel tests must not collide).
-    /// PID-scoped + pre-emptive cleanup: a crashed earlier run leaves stale
-    /// `wie-bottle-test-*` dirs that would otherwise break later runs.
-    fn temp_dir() -> PathBuf {
+    /// The counter keeps the tag unique within this process; the shared RAII
+    /// helper removes the dir on drop.
+    fn temp_dir() -> crate::test_support::TempDir {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("wie-bottle-test-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::test_support::TempDir::new(&format!("bottle-test-{n}"))
     }
 
     #[test]
@@ -489,7 +462,6 @@ mod tests {
         create(&dir, "games").unwrap();
         assert!(drive_c_dir(&bottle_root(&dir, "games")).is_dir());
         assert_eq!(list(&dir).unwrap(), vec!["games".to_owned()]);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -515,7 +487,6 @@ mod tests {
                 path.display()
             );
         }
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -523,7 +494,6 @@ mod tests {
         let dir = temp_dir();
         create(&dir, "dup").unwrap();
         assert!(create(&dir, "dup").is_err());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -539,7 +509,6 @@ mod tests {
         // Nothing may be created outside the bottles dir.
         assert!(!dir.join("..").join("evil").exists());
         assert!(!std::path::Path::new("/tmp/evil").exists());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -552,7 +521,6 @@ mod tests {
         // Valid name + existing bottle resolves; missing bottle errors.
         assert!(require_bottle(&dir, "ok").is_ok());
         assert!(require_bottle(&dir, "missing").is_err());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -580,7 +548,6 @@ mod tests {
         let dir = temp_dir();
         let missing = dir.join("does-not-exist");
         assert_eq!(list(&missing).unwrap(), Vec::<String>::new());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -589,7 +556,6 @@ mod tests {
         create(&dir, "real").unwrap();
         fs::create_dir_all(dir.join("junk")).unwrap(); // no drive_c inside
         assert_eq!(list(&dir).unwrap(), vec!["real".to_owned()]);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -617,7 +583,6 @@ mod tests {
         .unwrap();
         let root = bottle_root(&dir, "apps");
         assert_eq!(dir_size(&root), 30);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(unix)]
@@ -633,7 +598,6 @@ mod tests {
         std::os::unix::fs::symlink(&real, root.join("file-link")).unwrap();
         std::os::unix::fs::symlink(&root, root.join("root-loop")).unwrap();
         assert_eq!(dir_size(&root), 5);
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -648,7 +612,6 @@ mod tests {
             dir.is_dir(),
             "bottles dir itself must survive a bottle delete"
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -658,7 +621,6 @@ mod tests {
         let root = bottle_root(&dir, "b");
         let host = resolve_guest_path(&root, r"C:\Apps\Foo\a.txt").unwrap();
         assert_eq!(host, drive_c_dir(&root).join("Apps/Foo/a.txt"));
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -668,7 +630,6 @@ mod tests {
         let root = bottle_root(&dir, "b");
         assert!(resolve_guest_path(&root, r"C:\..\escape").is_err());
         assert!(resolve_guest_path(&root, r"D:\other").is_err());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -685,7 +646,6 @@ mod tests {
         copy_into(&src_dir, &dst.join("tree")).unwrap();
         assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"hi");
         assert_eq!(fs::read(dst.join("tree/sub/b.txt")).unwrap(), b"yo");
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -706,7 +666,6 @@ mod tests {
             !dst.join("loop").exists(),
             "symlinks must be skipped, not followed"
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -718,7 +677,6 @@ mod tests {
             resolve_exe(&root, r"C:\App\app.exe").unwrap(),
             drive_c_dir(&root).join("App/app.exe")
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -745,12 +703,11 @@ mod tests {
         assert_eq!(fs::read(&copied).unwrap(), b"xyz");
 
         delete(&bottles_dir(), &name).unwrap();
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A temp bottles dir with a `b` bottle whose `drive_c` holds a small
     /// exe tree; returns `(dir, root)`.
-    fn exe_tree_bottle() -> (PathBuf, PathBuf) {
+    fn exe_tree_bottle() -> (crate::test_support::TempDir, PathBuf) {
         let dir = temp_dir();
         create(&dir, "b").unwrap();
         let root = bottle_root(&dir, "b");
@@ -766,7 +723,7 @@ mod tests {
     /// case-insensitively (Windows path semantics).
     #[test]
     fn resolve_bottle_exe_finds_unique_basename_match() {
-        let (dir, root) = exe_tree_bottle();
+        let (_dir, root) = exe_tree_bottle();
         let expected = drive_c_dir(&root).join("DoomRetro/doomretro.exe");
         assert_eq!(
             resolve_bottle_exe(&root, Path::new("doomretro.exe")).unwrap(),
@@ -777,14 +734,13 @@ mod tests {
             resolve_bottle_exe(&root, Path::new("DOOMRETRO.EXE")).unwrap(),
             expected
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A relative path (either separator) resolves to the exact
     /// drive_c-relative location.
     #[test]
     fn resolve_bottle_exe_matches_relative_path() {
-        let (dir, root) = exe_tree_bottle();
+        let (_dir, root) = exe_tree_bottle();
         let expected = drive_c_dir(&root).join("DoomRetro/doomretro.exe");
         assert_eq!(
             resolve_bottle_exe(&root, Path::new("DoomRetro/doomretro.exe")).unwrap(),
@@ -794,13 +750,12 @@ mod tests {
             resolve_bottle_exe(&root, Path::new(r"DoomRetro\doomretro.exe")).unwrap(),
             expected
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// No drive_c match is a clear error naming the searched exe and bottle.
     #[test]
     fn resolve_bottle_exe_missing_match_errors() {
-        let (dir, root) = exe_tree_bottle();
+        let (_dir, root) = exe_tree_bottle();
         let err =
             resolve_bottle_exe(&root, Path::new("ghost.exe")).expect_err("missing exe must fail");
         assert!(
@@ -815,14 +770,13 @@ mod tests {
             err.to_string().contains('b'),
             "error names the bottle: {err}"
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Several drive_c matches for the same basename are an ambiguity error
     /// listing the candidate guest paths and suggesting a full path.
     #[test]
     fn resolve_bottle_exe_ambiguous_match_errors() {
-        let (dir, root) = exe_tree_bottle();
+        let (_dir, root) = exe_tree_bottle();
         let drive_c = drive_c_dir(&root);
         fs::create_dir_all(drive_c.join("Other")).unwrap();
         fs::write(drive_c.join("Other/doomretro.exe"), b"MZ").unwrap();
@@ -846,14 +800,13 @@ mod tests {
             message.contains("pass a full guest path"),
             "error suggests a full guest path: {message}"
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// An explicit guest path passes through the mapping unchanged (the
     /// `bottle run` contract): an existing exe resolves, a missing one fails.
     #[test]
     fn resolve_bottle_exe_explicit_guest_path_passthrough() {
-        let (dir, root) = exe_tree_bottle();
+        let (_dir, root) = exe_tree_bottle();
         assert_eq!(
             resolve_bottle_exe(&root, Path::new(r"C:\DoomRetro\doomretro.exe")).unwrap(),
             drive_c_dir(&root).join("DoomRetro/doomretro.exe")
@@ -864,7 +817,6 @@ mod tests {
             err.to_string().contains("guest exe not found"),
             "error is the explicit-path missing-file error: {err}"
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// An existing host path passes through unchanged — the bottle is never
@@ -879,6 +831,5 @@ mod tests {
             host_exe,
             "an existing host path is its own run source"
         );
-        fs::remove_dir_all(&dir).unwrap();
     }
 }

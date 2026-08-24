@@ -45,16 +45,6 @@ pub(super) fn analyze_def_xmm(insns: &[DecodedInsn]) -> [bool; 16] {
     defs
 }
 
-pub(super) fn xmm_mask_from(bits: &[bool; 16]) -> u16 {
-    let mut m = 0_u16;
-    for (i, &b) in bits.iter().enumerate() {
-        if b {
-            m |= 1_u16 << i;
-        }
-    }
-    m
-}
-
 pub(super) fn mark_insn_xmm(instr: &Instruction, live: &mut [bool; 16]) {
     for i in 0..instr.op_count() {
         if instr.op_kind(i) == OpKind::Register {

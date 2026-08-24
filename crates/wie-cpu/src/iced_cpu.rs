@@ -125,27 +125,6 @@ impl IcedCpu {
         &mut self.regs
     }
 
-    #[must_use]
-    #[expect(dead_code)]
-    pub(crate) fn hooks_ref(&self) -> Option<&HookWindow> {
-        self.hooks.as_ref()
-    }
-
-    #[expect(dead_code)]
-    pub(crate) fn mem_read_into(&self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
-        lock_rd(&self.mem).read(address, bytes)
-    }
-
-    #[expect(dead_code)]
-    pub(crate) fn guest_mem_mut(&mut self) -> impl std::ops::DerefMut<Target = GuestMemory> + '_ {
-        lock_wr(&self.mem)
-    }
-
-    #[expect(dead_code)]
-    pub(crate) fn guest_mem(&self) -> impl std::ops::Deref<Target = GuestMemory> + '_ {
-        lock_rd(&self.mem)
-    }
-
     pub(crate) fn step_once_result(&mut self) -> Result<StepResult, CpuError> {
         self.push_rip_trace(self.regs.rip);
         let hook = self.hooks.as_ref();

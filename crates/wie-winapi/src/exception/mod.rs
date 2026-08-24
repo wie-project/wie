@@ -321,6 +321,5 @@ mod unwind;
 
 pub use dwarf::LandingPadMatch;
 pub use unwind::{
-    MemRead, ReadError, find_cleanup_landing_pad, find_landing_pad, find_landing_pad_ex,
-    virtual_unwind,
+    MemRead, ReadError, find_cleanup_landing_pad, find_landing_pad_ex, virtual_unwind,
 };

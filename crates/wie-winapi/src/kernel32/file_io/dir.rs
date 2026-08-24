@@ -5,131 +5,99 @@ use super::{
     resolve_full_windows_path,
 };
 
+/// Cap for a guest path-argument read (bytes for the A path, UTF-16 units for
+/// the W path) — the Win32 max long-path window.
+const PATH_ARG_MAX: usize = 32_768;
+
+/// Shared body of `CreateDirectoryA` / `CreateDirectoryW`.
+fn create_directory(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
+    let path_va = ctx.engine.read_rcx()?;
+    let path = if wide {
+        read_wide_string_from_cpu(ctx.engine, path_va, PATH_ARG_MAX)?
+    } else {
+        read_ansi_string_from_cpu(ctx.engine, path_va, PATH_ARG_MAX)?
+    };
+    let return_value = finish_create_directory(&mut *ctx.state, &path);
+    ctx.finish(return_value)
+}
 /// Handles `KERNEL32.dll!CreateDirectoryW`.
 pub fn handle_create_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let path_va = engine.read_rcx()?;
-    let path = if path_va == 0 {
-        String::new()
-    } else {
-        read_wide_string_from_cpu(engine, path_va, 32_768)?
-    };
-    let return_value = finish_create_directory(state, &path);
-    ctx.finish(return_value)
+    create_directory(ctx, true)
 }
 /// Handles `KERNEL32.dll!CreateDirectoryA`.
 pub fn handle_create_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let path_va = engine.read_rcx()?;
-    let path = if path_va == 0 {
-        String::new()
+    create_directory(ctx, false)
+}
+/// Shared body of `DeleteFileA` / `DeleteFileW`.
+fn delete_file(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
+    let path_va = ctx.engine.read_rcx()?;
+    let path = if wide {
+        read_wide_string_from_cpu(ctx.engine, path_va, PATH_ARG_MAX)?
     } else {
-        read_ansi_string_from_cpu(engine, path_va, 32_768)?
+        read_ansi_string_from_cpu(ctx.engine, path_va, PATH_ARG_MAX)?
     };
-    let return_value = finish_create_directory(state, &path);
+    let return_value = finish_delete_file(&mut *ctx.state, &path);
     ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!DeleteFileW`.
 pub fn handle_delete_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let path_va = engine.read_rcx()?;
-    let path = if path_va == 0 {
-        String::new()
-    } else {
-        read_wide_string_from_cpu(engine, path_va, 32_768)?
-    };
-    let return_value = finish_delete_file(state, &path);
-    ctx.finish(return_value)
+    delete_file(ctx, true)
 }
 /// Handles `KERNEL32.dll!DeleteFileA`.
 pub fn handle_delete_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let path_va = engine.read_rcx()?;
-    let path = if path_va == 0 {
-        String::new()
+    delete_file(ctx, false)
+}
+/// Shared body of `RemoveDirectoryA` / `RemoveDirectoryW`.
+fn remove_directory(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
+    let path_va = ctx.engine.read_rcx()?;
+    let path = if wide {
+        read_wide_string_from_cpu(ctx.engine, path_va, PATH_ARG_MAX)?
     } else {
-        read_ansi_string_from_cpu(engine, path_va, 32_768)?
+        read_ansi_string_from_cpu(ctx.engine, path_va, PATH_ARG_MAX)?
     };
-    let return_value = finish_delete_file(state, &path);
+    let return_value = finish_remove_directory(&mut *ctx.state, &path);
     ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!RemoveDirectoryW`.
 pub fn handle_remove_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let path_va = engine.read_rcx()?;
-    let path = if path_va == 0 {
-        String::new()
-    } else {
-        read_wide_string_from_cpu(engine, path_va, 32_768)?
-    };
-    let return_value = finish_remove_directory(state, &path);
-    ctx.finish(return_value)
+    remove_directory(ctx, true)
 }
 /// Handles `KERNEL32.dll!RemoveDirectoryA`.
 pub fn handle_remove_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let path_va = engine.read_rcx()?;
-    let path = if path_va == 0 {
-        String::new()
+    remove_directory(ctx, false)
+}
+/// Shared body of the `MoveFile*` family (two path arguments).
+fn move_file(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
+    let from_va = ctx.engine.read_rcx()?;
+    let to_va = ctx.engine.read_rdx()?;
+    let from = if wide {
+        read_wide_string_from_cpu(ctx.engine, from_va, PATH_ARG_MAX)?
     } else {
-        read_ansi_string_from_cpu(engine, path_va, 32_768)?
+        read_ansi_string_from_cpu(ctx.engine, from_va, PATH_ARG_MAX)?
     };
-    let return_value = finish_remove_directory(state, &path);
+    let to = if wide {
+        read_wide_string_from_cpu(ctx.engine, to_va, PATH_ARG_MAX)?
+    } else {
+        read_ansi_string_from_cpu(ctx.engine, to_va, PATH_ARG_MAX)?
+    };
+    let return_value = finish_move_file(&mut *ctx.state, &from, &to);
     ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!MoveFileW`.
 pub fn handle_move_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let from_va = engine.read_rcx()?;
-    let to_va = engine.read_rdx()?;
-    let from = if from_va == 0 {
-        String::new()
-    } else {
-        read_wide_string_from_cpu(engine, from_va, 32_768)?
-    };
-    let to = if to_va == 0 {
-        String::new()
-    } else {
-        read_wide_string_from_cpu(engine, to_va, 32_768)?
-    };
-    let return_value = finish_move_file(state, &from, &to);
-    ctx.finish(return_value)
+    move_file(ctx, true)
 }
 /// Handles `KERNEL32.dll!MoveFileA`.
 pub fn handle_move_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let from_va = engine.read_rcx()?;
-    let to_va = engine.read_rdx()?;
-    let from = if from_va == 0 {
-        String::new()
-    } else {
-        read_ansi_string_from_cpu(engine, from_va, 32_768)?
-    };
-    let to = if to_va == 0 {
-        String::new()
-    } else {
-        read_ansi_string_from_cpu(engine, to_va, 32_768)?
-    };
-    let return_value = finish_move_file(state, &from, &to);
-    ctx.finish(return_value)
+    move_file(ctx, false)
 }
 pub(crate) fn finish_create_directory(state: &mut WinApiState, path: &str) -> u64 {
     if path.is_empty() {
         state.process.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     }
-    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
-        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
-    }
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    state.file_io.sync_volumes();
+    let cwd = state.file_io.cwd_utf8();
     let full = resolve_full_windows_path(&cwd, path);
     if guest_dir_exists(state, &full) {
         state.process.last_error = ERROR_ALREADY_EXISTS;
@@ -153,10 +121,8 @@ pub(crate) fn finish_delete_file(state: &mut WinApiState, path: &str) -> u64 {
         state.process.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     }
-    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
-        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
-    }
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    state.file_io.sync_volumes();
+    let cwd = state.file_io.cwd_utf8();
     let full = resolve_full_windows_path(&cwd, path);
     state
         .file_io
@@ -179,10 +145,8 @@ pub(crate) fn finish_remove_directory(state: &mut WinApiState, path: &str) -> u6
         state.process.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     }
-    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
-        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
-    }
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    state.file_io.sync_volumes();
+    let cwd = state.file_io.cwd_utf8();
     let full = resolve_full_windows_path(&cwd, path);
     let Some(map) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full) else {
         state.process.last_error = ERROR_PATH_NOT_FOUND;
@@ -209,10 +173,8 @@ pub(crate) fn finish_move_file(state: &mut WinApiState, from: &str, to: &str) ->
         state.process.last_error = ERROR_PATH_NOT_FOUND;
         return 0;
     }
-    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
-        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
-    }
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    state.file_io.sync_volumes();
+    let cwd = state.file_io.cwd_utf8();
     let full_from = resolve_full_windows_path(&cwd, from);
     let full_to = resolve_full_windows_path(&cwd, to);
     let Some(src) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full_from) else {
@@ -232,24 +194,8 @@ pub(crate) fn finish_move_file(state: &mut WinApiState, from: &str, to: &str) ->
     }
 }
 /// Handles `KERNEL32.dll!MoveFileExW` — `MoveFileW` semantics; the flags
-/// (`MOVEFILE_REPLACE_EXISTING` etc.) are accepted; plain overwrite is
-/// already the behaviour of `finish_move_file`.
+/// (`MOVEFILE_REPLACE_EXISTING` etc.) are accepted and ignored — plain
+/// overwrite is already the behaviour of `finish_move_file`.
 pub fn handle_move_file_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let from_va = engine.read_rcx()?;
-    let to_va = engine.read_rdx()?;
-    let _flags = engine.read_r8()?;
-    let from = if from_va == 0 {
-        String::new()
-    } else {
-        read_wide_string_from_cpu(engine, from_va, 32_768)?
-    };
-    let to = if to_va == 0 {
-        String::new()
-    } else {
-        read_wide_string_from_cpu(engine, to_va, 32_768)?
-    };
-    let return_value = finish_move_file(state, &from, &to);
-    ctx.finish(return_value)
+    move_file(ctx, true)
 }

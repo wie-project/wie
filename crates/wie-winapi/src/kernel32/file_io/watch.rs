@@ -63,11 +63,7 @@ pub fn handle_find_first_change_notification_w(
         engine.read_r8()?,
         "FindFirstChangeNotificationW notify filter",
     )?;
-    let path = if path_va == 0 {
-        String::new()
-    } else {
-        read_wide_string_from_cpu(engine, path_va, 1024)?
-    };
+    let path = read_wide_string_from_cpu(engine, path_va, 1024)?;
     let return_value = finish_find_first_change(state, &path, watch_subtree, filter);
     ctx.finish(return_value)
 }
@@ -85,11 +81,7 @@ pub fn handle_find_first_change_notification_a(
         engine.read_r8()?,
         "FindFirstChangeNotificationA notify filter",
     )?;
-    let path = if path_va == 0 {
-        String::new()
-    } else {
-        read_ansi_string_from_cpu(engine, path_va, 1024)?
-    };
+    let path = read_ansi_string_from_cpu(engine, path_va, 1024)?;
     let return_value = finish_find_first_change(state, &path, watch_subtree, filter);
     ctx.finish(return_value)
 }
@@ -235,10 +227,8 @@ fn finish_find_first_change(
         state.process.last_error = ERROR_PATH_NOT_FOUND;
         return INVALID_HANDLE_VALUE;
     }
-    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
-        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
-    }
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    state.file_io.sync_volumes();
+    let cwd = state.file_io.cwd_utf8();
     let full_path = resolve_full_windows_path(&cwd, path);
     let Some(host_path) = resolve_watch_host_path(state, &full_path) else {
         state.process.last_error = ERROR_PATH_NOT_FOUND;

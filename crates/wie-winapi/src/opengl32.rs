@@ -16,6 +16,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 use anyhow::{Context, Result};
 
 use crate::gdi32::resolve_dest_info;
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_memory::{write_u16, write_u32};
 use crate::kernel32::low_u32;
 use crate::state::WinApiState;
@@ -395,24 +396,14 @@ fn handle_gl_clear_depth(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 
 fn handle_gl_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let mask = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glClear")?,
-        "glClear mask",
-    )?;
+    let mask = low_u32(read_arg(engine, ArgReg::Rcx, "glClear")?, "glClear mask")?;
     with_current_gl(|c| render::gl_clear(c, mask));
     ctx.finish(0)
 }
 
 fn handle_gl_begin(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let mode = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glBegin")?,
-        "glBegin mode",
-    )?;
+    let mode = low_u32(read_arg(engine, ArgReg::Rcx, "glBegin")?, "glBegin mode")?;
     with_current_gl(|c| render::gl_begin(c, mode));
     ctx.finish(0)
 }
@@ -456,9 +447,7 @@ fn vertex_fv(
     name: &str,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let va = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {name}"))?;
+    let va = read_arg(engine, ArgReg::Rcx, name)?;
     let mut bytes = [0_u8; 16];
     if engine.mem_read(va, &mut bytes).is_ok() {
         let x = read_f32_from(&bytes, 0);
@@ -507,9 +496,7 @@ fn handle_gl_color4f(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult
 /// Shared body for the `glColor*fv` forms (3 or 4 floats at `va`).
 fn color_fv(ctx: &mut HandlerContext<'_>, count: usize, name: &str) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let va = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {name}"))?;
+    let va = read_arg(engine, ArgReg::Rcx, name)?;
     let mut bytes = [0_u8; 16];
     if engine.mem_read(va, &mut bytes).is_ok() {
         let r = read_f32_from(&bytes, 0);
@@ -534,61 +521,19 @@ fn handle_gl_color4fv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
 
 fn handle_gl_color3ub(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let r = u8::try_from(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glColor3ub")?
-            & 0xFF,
-    )
-    .unwrap_or(0);
-    let g = u8::try_from(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glColor3ub")?
-            & 0xFF,
-    )
-    .unwrap_or(0);
-    let b = u8::try_from(
-        engine
-            .read_r8()
-            .context("failed to read R8 for glColor3ub")?
-            & 0xFF,
-    )
-    .unwrap_or(0);
+    let r = u8::try_from(read_arg(engine, ArgReg::Rcx, "glColor3ub")? & 0xFF).unwrap_or(0);
+    let g = u8::try_from(read_arg(engine, ArgReg::Rdx, "glColor3ub")? & 0xFF).unwrap_or(0);
+    let b = u8::try_from(read_arg(engine, ArgReg::R8, "glColor3ub")? & 0xFF).unwrap_or(0);
     with_current_gl(|c| render::gl_color_ub(c, r, g, b, 255));
     ctx.finish(0)
 }
 
 fn handle_gl_color4ub(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let r = u8::try_from(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glColor4ub")?
-            & 0xFF,
-    )
-    .unwrap_or(0);
-    let g = u8::try_from(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glColor4ub")?
-            & 0xFF,
-    )
-    .unwrap_or(0);
-    let b = u8::try_from(
-        engine
-            .read_r8()
-            .context("failed to read R8 for glColor4ub")?
-            & 0xFF,
-    )
-    .unwrap_or(0);
-    let a = u8::try_from(
-        engine
-            .read_r9()
-            .context("failed to read R9 for glColor4ub")?
-            & 0xFF,
-    )
-    .unwrap_or(0);
+    let r = u8::try_from(read_arg(engine, ArgReg::Rcx, "glColor4ub")? & 0xFF).unwrap_or(0);
+    let g = u8::try_from(read_arg(engine, ArgReg::Rdx, "glColor4ub")? & 0xFF).unwrap_or(0);
+    let b = u8::try_from(read_arg(engine, ArgReg::R8, "glColor4ub")? & 0xFF).unwrap_or(0);
+    let a = u8::try_from(read_arg(engine, ArgReg::R9, "glColor4ub")? & 0xFF).unwrap_or(0);
     with_current_gl(|c| render::gl_color_ub(c, r, g, b, a));
     ctx.finish(0)
 }
@@ -600,9 +545,7 @@ fn color_ubv(
     name: &str,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let va = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {name}"))?;
+    let va = read_arg(engine, ArgReg::Rcx, name)?;
     let mut bytes = [0_u8; 4];
     if engine.mem_read(va, &mut bytes).is_ok() {
         let r = bytes.first().copied().unwrap_or(0);
@@ -666,9 +609,7 @@ fn texcoord_fv(
     name: &str,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let va = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {name}"))?;
+    let va = read_arg(engine, ArgReg::Rcx, name)?;
     let mut bytes = [0_u8; 16];
     if engine.mem_read(va, &mut bytes).is_ok() {
         let s = read_f32_from(&bytes, 0);
@@ -702,9 +643,7 @@ fn handle_gl_texcoord4fv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 fn handle_gl_matrix_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let mode = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glMatrixMode")?,
+        read_arg(engine, ArgReg::Rcx, "glMatrixMode")?,
         "glMatrixMode mode",
     )?;
     with_current_gl(|c| render::gl_matrix_mode(c, mode));
@@ -718,9 +657,7 @@ fn handle_gl_load_identity(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 
 fn handle_gl_load_matrixf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let va = engine
-        .read_rcx()
-        .context("failed to read RCX for glLoadMatrixf")?;
+    let va = read_arg(engine, ArgReg::Rcx, "glLoadMatrixf")?;
     if let Some(m) = read_guest_mat4(engine, va) {
         with_current_gl(|c| render::gl_load_matrix(c, &m));
     }
@@ -729,9 +666,7 @@ fn handle_gl_load_matrixf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 
 fn handle_gl_mult_matrixf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let va = engine
-        .read_rcx()
-        .context("failed to read RCX for glMultMatrixf")?;
+    let va = read_arg(engine, ArgReg::Rcx, "glMultMatrixf")?;
     if let Some(m) = read_guest_mat4(engine, va) {
         with_current_gl(|c| render::gl_mult_matrix(c, &m));
     }
@@ -807,26 +742,10 @@ fn handle_gl_pop_matrix(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
 fn handle_gl_viewport(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let x = low_i32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glViewport")?,
-    );
-    let y = low_i32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glViewport")?,
-    );
-    let w = low_i32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for glViewport")?,
-    );
-    let h = low_i32(
-        engine
-            .read_r9()
-            .context("failed to read R9 for glViewport")?,
-    );
+    let x = low_i32(read_arg(engine, ArgReg::Rcx, "glViewport")?);
+    let y = low_i32(read_arg(engine, ArgReg::Rdx, "glViewport")?);
+    let w = low_i32(read_arg(engine, ArgReg::R8, "glViewport")?);
+    let h = low_i32(read_arg(engine, ArgReg::R9, "glViewport")?);
     with_current_gl(|c| render::gl_viewport(c, x, y, w, h));
     // The default framebuffer follows the window: glViewport is called at the
     // start of every frame with the client size, so size the backbuffer here
@@ -838,9 +757,7 @@ fn handle_gl_viewport(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
 fn handle_gl_depth_func(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let func = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glDepthFunc")?,
+        read_arg(engine, ArgReg::Rcx, "glDepthFunc")?,
         "glDepthFunc func",
     )?;
     with_current_gl(|c| render::gl_depth_func(c, func));
@@ -850,9 +767,7 @@ fn handle_gl_depth_func(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 fn handle_gl_depth_mask(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let flag = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glDepthMask")?,
+        read_arg(engine, ArgReg::Rcx, "glDepthMask")?,
         "glDepthMask flag",
     )?;
     with_current_gl(|c| render::gl_depth_mask(c, flag));
@@ -861,24 +776,14 @@ fn handle_gl_depth_mask(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
 fn handle_gl_enable(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let cap = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glEnable")?,
-        "glEnable cap",
-    )?;
+    let cap = low_u32(read_arg(engine, ArgReg::Rcx, "glEnable")?, "glEnable cap")?;
     with_current_gl(|c| render::gl_enable(c, cap));
     ctx.finish(0)
 }
 
 fn handle_gl_disable(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let cap = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glDisable")?,
-        "glDisable cap",
-    )?;
+    let cap = low_u32(read_arg(engine, ArgReg::Rcx, "glDisable")?, "glDisable cap")?;
     with_current_gl(|c| render::gl_disable(c, cap));
     ctx.finish(0)
 }
@@ -886,15 +791,11 @@ fn handle_gl_disable(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult
 fn handle_gl_blend_func(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let src = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glBlendFunc")?,
+        read_arg(engine, ArgReg::Rcx, "glBlendFunc")?,
         "glBlendFunc src",
     )?;
     let dst = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glBlendFunc")?,
+        read_arg(engine, ArgReg::Rdx, "glBlendFunc")?,
         "glBlendFunc dst",
     )?;
     with_current_gl(|c| render::gl_blend_func(c, src, dst));
@@ -904,15 +805,11 @@ fn handle_gl_blend_func(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 fn handle_gl_polygon_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let face = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glPolygonMode")?,
+        read_arg(engine, ArgReg::Rcx, "glPolygonMode")?,
         "glPolygonMode face",
     )?;
     let mode = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glPolygonMode")?,
+        read_arg(engine, ArgReg::Rdx, "glPolygonMode")?,
         "glPolygonMode mode",
     )?;
     with_current_gl(|c| render::gl_polygon_mode(c, face, mode));
@@ -924,14 +821,10 @@ fn handle_gl_polygon_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 fn handle_gl_gen_textures(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let count = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glGenTextures")?,
+        read_arg(engine, ArgReg::Rcx, "glGenTextures")?,
         "glGenTextures count",
     )?;
-    let names_va = engine
-        .read_rdx()
-        .context("failed to read RDX for glGenTextures")?;
+    let names_va = read_arg(engine, ArgReg::Rdx, "glGenTextures")?;
     let names = with_current_gl(|c| render::gl_gen_textures(c, count)).unwrap_or_default();
     if names_va != 0 {
         for (i, name) in names.iter().enumerate() {
@@ -945,14 +838,10 @@ fn handle_gl_gen_textures(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 fn handle_gl_delete_textures(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let count = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glDeleteTextures")?,
+        read_arg(engine, ArgReg::Rcx, "glDeleteTextures")?,
         "glDeleteTextures count",
     )?;
-    let names_va = engine
-        .read_rdx()
-        .context("failed to read RDX for glDeleteTextures")?;
+    let names_va = read_arg(engine, ArgReg::Rdx, "glDeleteTextures")?;
     if names_va != 0 {
         let mut names = Vec::new();
         let mut bytes = vec![0_u8; usize::try_from(count.saturating_mul(4)).unwrap_or(0)];
@@ -970,15 +859,11 @@ fn handle_gl_delete_textures(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 fn handle_gl_bind_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let target = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glBindTexture")?,
+        read_arg(engine, ArgReg::Rcx, "glBindTexture")?,
         "glBindTexture target",
     )?;
     let name = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glBindTexture")?,
+        read_arg(engine, ArgReg::Rdx, "glBindTexture")?,
         "glBindTexture name",
     )?;
     with_current_gl(|c| render::gl_bind_texture(c, target, name));
@@ -991,27 +876,19 @@ fn handle_gl_bind_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 fn handle_gl_tex_image_2d(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let target = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glTexImage2D")?,
+        read_arg(engine, ArgReg::Rcx, "glTexImage2D")?,
         "glTexImage2D target",
     )?;
     let level = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glTexImage2D")?,
+        read_arg(engine, ArgReg::Rdx, "glTexImage2D")?,
         "glTexImage2D level",
     )?;
     let internal_format = low_u32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for glTexImage2D")?,
+        read_arg(engine, ArgReg::R8, "glTexImage2D")?,
         "glTexImage2D internalformat",
     )?;
     let width = low_u32(
-        engine
-            .read_r9()
-            .context("failed to read R9 for glTexImage2D")?,
+        read_arg(engine, ArgReg::R9, "glTexImage2D")?,
         "glTexImage2D width",
     )?;
     let height = low_u32(
@@ -1075,21 +952,15 @@ fn handle_gl_tex_image_2d(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 fn handle_gl_tex_parameter_i(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let target = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glTexParameteri")?,
+        read_arg(engine, ArgReg::Rcx, "glTexParameteri")?,
         "glTexParameteri target",
     )?;
     let pname = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glTexParameteri")?,
+        read_arg(engine, ArgReg::Rdx, "glTexParameteri")?,
         "glTexParameteri pname",
     )?;
     let param = low_u32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for glTexParameteri")?,
+        read_arg(engine, ArgReg::R8, "glTexParameteri")?,
         "glTexParameteri param",
     )?;
     with_current_gl(|c| render::gl_tex_parameter_i(c, target, pname, param));
@@ -1099,21 +970,15 @@ fn handle_gl_tex_parameter_i(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 fn handle_gl_tex_env_i(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let target = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glTexEnvi")?,
+        read_arg(engine, ArgReg::Rcx, "glTexEnvi")?,
         "glTexEnvi target",
     )?;
     let pname = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glTexEnvi")?,
+        read_arg(engine, ArgReg::Rdx, "glTexEnvi")?,
         "glTexEnvi pname",
     )?;
     let param = low_u32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for glTexEnvi")?,
+        read_arg(engine, ArgReg::R8, "glTexEnvi")?,
         "glTexEnvi param",
     )?;
     with_current_gl(|c| render::gl_tex_env_i(c, target, pname, param));
@@ -1123,15 +988,11 @@ fn handle_gl_tex_env_i(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
 fn handle_gl_tex_env_f(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let target = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glTexEnvf")?,
+        read_arg(engine, ArgReg::Rcx, "glTexEnvf")?,
         "glTexEnvf target",
     )?;
     let pname = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glTexEnvf")?,
+        read_arg(engine, ArgReg::Rdx, "glTexEnvf")?,
         "glTexEnvf pname",
     )?;
     let param = read_xmm_f32(engine, 2).context("failed to read XMM2 for glTexEnvf")?;
@@ -1142,15 +1003,11 @@ fn handle_gl_tex_env_f(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
 fn handle_gl_pixel_store_i(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let pname = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glPixelStorei")?,
+        read_arg(engine, ArgReg::Rcx, "glPixelStorei")?,
         "glPixelStorei pname",
     )?;
     let param = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glPixelStorei")?,
+        read_arg(engine, ArgReg::Rdx, "glPixelStorei")?,
         "glPixelStorei param",
     )?;
     with_current_gl(|c| render::gl_pixel_store_i(c, pname, param));
@@ -1163,26 +1020,10 @@ fn handle_gl_pixel_store_i(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 /// GLenum format, GLenum type, void *pixels)`.
 fn handle_gl_read_pixels(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let x = low_i32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glReadPixels")?,
-    );
-    let y = low_i32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glReadPixels")?,
-    );
-    let width = low_i32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for glReadPixels")?,
-    );
-    let height = low_i32(
-        engine
-            .read_r9()
-            .context("failed to read R9 for glReadPixels")?,
-    );
+    let x = low_i32(read_arg(engine, ArgReg::Rcx, "glReadPixels")?);
+    let y = low_i32(read_arg(engine, ArgReg::Rdx, "glReadPixels")?);
+    let width = low_i32(read_arg(engine, ArgReg::R8, "glReadPixels")?);
+    let height = low_i32(read_arg(engine, ArgReg::R9, "glReadPixels")?);
     let format = low_u32(
         crate::d3d9::read_stack_argument(engine, 0x28, "glReadPixels format")?,
         "glReadPixels format",
@@ -1223,9 +1064,7 @@ fn handle_gl_get_error(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
 fn handle_gl_get_string(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let name = engine
-        .read_rcx()
-        .context("failed to read RCX for glGetString")?;
+    let name = read_arg(engine, ArgReg::Rcx, "glGetString")?;
     let text: &[u8] = match name {
         GL_VENDOR => b"WIE",
         GL_RENDERER => b"WIE Software Rasterizer",
@@ -1258,12 +1097,8 @@ fn handle_gl_get_string(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 /// one zero (the scalar-query fallback).
 fn handle_gl_get_integerv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let pname = engine
-        .read_rcx()
-        .context("failed to read RCX for glGetIntegerv")?;
-    let params_va = engine
-        .read_rdx()
-        .context("failed to read RDX for glGetIntegerv")?;
+    let pname = read_arg(engine, ArgReg::Rcx, "glGetIntegerv")?;
+    let params_va = read_arg(engine, ArgReg::Rdx, "glGetIntegerv")?;
     if params_va != 0 {
         let pname_u32 = low_u32(pname, "glGetIntegerv pname").unwrap_or(u32::MAX);
         let values = with_current_gl(|c| render::gl_integerv(c, pname_u32)).unwrap_or_default();
@@ -1283,12 +1118,8 @@ fn handle_gl_get_integerv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 /// and current color/texcoord; unknown pnames write nothing.
 fn handle_gl_get_floatv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let pname = engine
-        .read_rcx()
-        .context("failed to read RCX for glGetFloatv")?;
-    let params_va = engine
-        .read_rdx()
-        .context("failed to read RDX for glGetFloatv")?;
+    let pname = read_arg(engine, ArgReg::Rcx, "glGetFloatv")?;
+    let params_va = read_arg(engine, ArgReg::Rdx, "glGetFloatv")?;
     if params_va != 0 {
         let pname_u32 = low_u32(pname, "glGetFloatv pname").unwrap_or(u32::MAX);
         let values = with_current_gl(|c| render::gl_floatv(c, pname_u32)).unwrap_or_default();
@@ -1302,12 +1133,8 @@ fn handle_gl_get_floatv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
 fn handle_gl_get_booleanv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _pname = engine
-        .read_rcx()
-        .context("failed to read RCX for glGetBooleanv")?;
-    let params_va = engine
-        .read_rdx()
-        .context("failed to read RDX for glGetBooleanv")?;
+    let _pname = read_arg(engine, ArgReg::Rcx, "glGetBooleanv")?;
+    let params_va = read_arg(engine, ArgReg::Rdx, "glGetBooleanv")?;
     if params_va != 0 {
         engine.mem_write(params_va, &[0_u8])?;
     }

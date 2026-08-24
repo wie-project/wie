@@ -31,20 +31,18 @@ use crate::d3d9_render::{
     D3dCmpFunc, D3dZBufferType, RenderState, TextureStageState, mat4_mul, parse_fvf,
 };
 use crate::fake_va::D3d9Iface;
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_memory::{write_u32 as write_guest_u32, write_u64 as write_guest_u64};
+use crate::kernel32::low_u32;
 use crate::{HandlerContext, WinApiHandlerResult};
 
 /// Handles `IDirect3DDevice9::SetFVF`.
 pub fn handle_set_fvf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::SetFVF")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::SetFVF")?;
 
-    let fvf_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DDevice9::SetFVF")?;
+    let fvf_raw = read_arg(engine, ArgReg::Rdx, "IDirect3DDevice9::SetFVF")?;
 
     let fvf_low = fvf_raw & u64::from(u32::MAX);
 
@@ -61,23 +59,15 @@ pub fn handle_set_fvf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
 pub fn handle_set_render_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::SetRenderState")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::SetRenderState")?;
 
-    let render_state_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DDevice9::SetRenderState")?;
+    let render_state_raw = read_arg(engine, ArgReg::Rdx, "IDirect3DDevice9::SetRenderState")?;
 
-    let value_raw = engine
-        .read_r8()
-        .context("failed to read R8 for IDirect3DDevice9::SetRenderState")?;
+    let value_raw = read_arg(engine, ArgReg::R8, "IDirect3DDevice9::SetRenderState")?;
 
-    let render_state = u32::try_from(render_state_raw & u64::from(u32::MAX))
-        .context("SetRenderState state identifier does not fit u32")?;
+    let render_state = low_u32(render_state_raw, "SetRenderState state identifier")?;
 
-    let value = u32::try_from(value_raw & u64::from(u32::MAX))
-        .context("SetRenderState value does not fit u32")?;
+    let value = low_u32(value_raw, "SetRenderState value")?;
 
     // L3 validation: an out-of-range value is the honest D3DERR_INVALIDCALL,
     // never a silent accept. Unmodeled states skip the matrix (their raw
@@ -154,30 +144,27 @@ fn apply_sampler(stage: &mut TextureStageState, slot: u32, value: u32) {
 pub fn handle_set_texture_stage_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::SetTextureStageState")?;
+    let _this_pointer = read_arg(
+        engine,
+        ArgReg::Rcx,
+        "IDirect3DDevice9::SetTextureStageState",
+    )?;
 
-    let stage_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DDevice9::SetTextureStageState")?;
+    let stage_raw = read_arg(
+        engine,
+        ArgReg::Rdx,
+        "IDirect3DDevice9::SetTextureStageState",
+    )?;
 
-    let state_type_raw = engine
-        .read_r8()
-        .context("failed to read R8 for IDirect3DDevice9::SetTextureStageState")?;
+    let state_type_raw = read_arg(engine, ArgReg::R8, "IDirect3DDevice9::SetTextureStageState")?;
 
-    let value_raw = engine
-        .read_r9()
-        .context("failed to read R9 for IDirect3DDevice9::SetTextureStageState")?;
+    let value_raw = read_arg(engine, ArgReg::R9, "IDirect3DDevice9::SetTextureStageState")?;
 
-    let stage = u32::try_from(stage_raw & u64::from(u32::MAX))
-        .context("SetTextureStageState stage does not fit u32")?;
+    let stage = low_u32(stage_raw, "SetTextureStageState stage")?;
 
-    let state_type = u32::try_from(state_type_raw & u64::from(u32::MAX))
-        .context("SetTextureStageState state type does not fit u32")?;
+    let state_type = low_u32(state_type_raw, "SetTextureStageState state type")?;
 
-    let value = u32::try_from(value_raw & u64::from(u32::MAX))
-        .context("SetTextureStageState value does not fit u32")?;
+    let value = low_u32(value_raw, "SetTextureStageState value")?;
 
     // Decode once at the register boundary into the typed per-stage state
     // (stages beyond 7 are out of the 8-stage contract and ignored, matching
@@ -199,18 +186,13 @@ pub fn handle_set_texture_stage_state(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_set_sampler_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this = engine
-        .read_rcx()
-        .context("failed to read RCX for SetSamplerState")?;
+    let _this = read_arg(engine, ArgReg::Rcx, "SetSamplerState")?;
 
-    let sampler = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
-        .context("sampler does not fit u32")?;
+    let sampler = low_u32(engine.read_rdx()?, "sampler")?;
 
-    let state_type = u32::try_from(engine.read_r8()? & u64::from(u32::MAX))
-        .context("state type does not fit u32")?;
+    let state_type = low_u32(engine.read_r8()?, "state type")?;
 
-    let value =
-        u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("value does not fit u32")?;
+    let value = low_u32(engine.read_r9()?, "value")?;
 
     if let Some(stage_state) = state
         .d3d9()
@@ -229,9 +211,7 @@ pub fn handle_set_sampler_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_device_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::Release")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::Release")?;
 
     let valid_object = this_pointer != 0 && this_pointer == state.d3d9().d3d9_device_object_address;
 
@@ -292,9 +272,7 @@ pub fn handle_device_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 pub fn handle_direct3d9_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3D9::Release")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3D9::Release")?;
 
     let valid_object = this_pointer != 0 && this_pointer == state.d3d9().d3d9_object_address;
 
@@ -333,9 +311,7 @@ pub fn handle_direct3d9_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_present(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::Present")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::Present")?;
     // pSourceRect / pDestRect / hDestWindowOverride / pDirtyRegion are unused
     // in slice 1: the whole backbuffer presents into the device window.
 
@@ -355,24 +331,7 @@ pub fn handle_present(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
         state.present().ensure_surface(hwnd, win_w, win_h);
         // Clone the backbuffer so the `d3d9()` borrow ends before `present()`.
         let backbuffer = state.d3d9().d3d9_backbuffer.clone();
-        if let Some(surface) = state.present().surfaces.get_mut(&hwnd) {
-            if bb_w == win_w && bb_h == win_h {
-                let n = surface.pixels.len().min(backbuffer.len());
-                if let (Some(dst), Some(src)) = (surface.pixels.get_mut(..n), backbuffer.get(..n)) {
-                    dst.copy_from_slice(src);
-                }
-            } else {
-                wie_cpu::stretch_nearest(
-                    &mut surface.pixels,
-                    &backbuffer,
-                    bb_w,
-                    bb_h,
-                    win_w,
-                    win_h,
-                );
-            }
-        }
-        state.present().publish(hwnd);
+        state.present().blit_frame(hwnd, &backbuffer, bb_w, bb_h);
     }
     tracing::trace!(target: "wiegui", bb_w, bb_h, hwnd = hwnd.as_u64(), "D3D9 Present");
 
@@ -388,24 +347,15 @@ pub fn handle_present(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
 pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::Clear")?;
-    let count_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DDevice9::Clear")?;
-    let rects_va = engine
-        .read_r8()
-        .context("failed to read R8 for IDirect3DDevice9::Clear")?;
-    let flags_raw = engine
-        .read_r9()
-        .context("failed to read R9 for IDirect3DDevice9::Clear")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::Clear")?;
+    let count_raw = read_arg(engine, ArgReg::Rdx, "IDirect3DDevice9::Clear")?;
+    let rects_va = read_arg(engine, ArgReg::R8, "IDirect3DDevice9::Clear")?;
+    let flags_raw = read_arg(engine, ArgReg::R9, "IDirect3DDevice9::Clear")?;
     let color_raw = read_stack_argument(engine, 0x28, "IDirect3DDevice9::Clear Color")?;
     let z_raw = read_stack_argument(engine, 0x30, "IDirect3DDevice9::Clear Z")?;
     let _stencil = read_stack_argument(engine, 0x38, "IDirect3DDevice9::Clear Stencil")?;
 
-    let flags =
-        u32::try_from(flags_raw & u64::from(u32::MAX)).context("Clear flags do not fit u32")?;
+    let flags = low_u32(flags_raw, "IDirect3DDevice9::Clear flags")?;
     let clear_target = flags & D3DCLEAR_TARGET != 0;
     let clear_depth = flags & D3DCLEAR_ZBUFFER != 0;
     let z_value = f32::from_bits(u32::try_from(z_raw & u64::from(u32::MAX)).unwrap_or(0));
@@ -423,8 +373,7 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
     }
     let rect_count = usize::try_from(count_raw & u64::from(u32::MAX))
         .context("Clear rect count does not fit usize")?;
-    let color =
-        u32::try_from(color_raw & u64::from(u32::MAX)).context("Clear color does not fit u32")?;
+    let color = low_u32(color_raw, "Clear color")?;
     let color_0rgb = color & D3DCOLOR_RGB_MASK;
 
     if clear_target {
@@ -519,9 +468,7 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
 pub fn handle_begin_scene(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::BeginScene")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::BeginScene")?;
 
     let return_value = if state.d3d9().d3d9_scene_active == crate::state::SceneState::Active {
         D3DERR_INVALIDCALL
@@ -540,9 +487,7 @@ pub fn handle_begin_scene(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_end_scene(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::EndScene")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::EndScene")?;
 
     let return_value = if state.d3d9().d3d9_scene_active == crate::state::SceneState::Active {
         state.d3d9().d3d9_scene_active = crate::state::SceneState::Inactive;
@@ -562,18 +507,11 @@ pub fn handle_end_scene(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 pub fn handle_set_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::SetTransform")?;
-    let state_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DDevice9::SetTransform")?;
-    let matrix_va = engine
-        .read_r8()
-        .context("failed to read R8 for IDirect3DDevice9::SetTransform")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::SetTransform")?;
+    let state_raw = read_arg(engine, ArgReg::Rdx, "IDirect3DDevice9::SetTransform")?;
+    let matrix_va = read_arg(engine, ArgReg::R8, "IDirect3DDevice9::SetTransform")?;
 
-    let transform_state = u32::try_from(state_raw & u64::from(u32::MAX))
-        .context("SetTransform state does not fit u32")?;
+    let transform_state = low_u32(state_raw, "SetTransform state")?;
 
     if matrix_va != 0 {
         let mut bytes = [0_u8; 64];
@@ -606,18 +544,11 @@ pub fn handle_set_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_get_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::GetTransform")?;
-    let state_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DDevice9::GetTransform")?;
-    let matrix_va = engine
-        .read_r8()
-        .context("failed to read R8 for IDirect3DDevice9::GetTransform")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::GetTransform")?;
+    let state_raw = read_arg(engine, ArgReg::Rdx, "IDirect3DDevice9::GetTransform")?;
+    let matrix_va = read_arg(engine, ArgReg::R8, "IDirect3DDevice9::GetTransform")?;
 
-    let transform_state = u32::try_from(state_raw & u64::from(u32::MAX))
-        .context("GetTransform state does not fit u32")?;
+    let transform_state = low_u32(state_raw, "GetTransform state")?;
 
     let stored = match transform_state {
         D3DTS_WORLD => Some(state.d3d9().d3d9_world_matrix),
@@ -659,18 +590,11 @@ pub fn handle_get_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_multiply_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::MultiplyTransform")?;
-    let state_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DDevice9::MultiplyTransform")?;
-    let matrix_va = engine
-        .read_r8()
-        .context("failed to read R8 for IDirect3DDevice9::MultiplyTransform")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::MultiplyTransform")?;
+    let state_raw = read_arg(engine, ArgReg::Rdx, "IDirect3DDevice9::MultiplyTransform")?;
+    let matrix_va = read_arg(engine, ArgReg::R8, "IDirect3DDevice9::MultiplyTransform")?;
 
-    let transform_state = u32::try_from(state_raw & u64::from(u32::MAX))
-        .context("MultiplyTransform state does not fit u32")?;
+    let transform_state = low_u32(state_raw, "MultiplyTransform state")?;
 
     let return_value = if matrix_va != 0 {
         let mut bytes = [0_u8; 64];
@@ -725,12 +649,8 @@ pub fn handle_multiply_transform(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_set_scissor_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::SetScissorRect")?;
-    let rect_va = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DDevice9::SetScissorRect")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::SetScissorRect")?;
+    let rect_va = read_arg(engine, ArgReg::Rdx, "IDirect3DDevice9::SetScissorRect")?;
 
     let return_value = if rect_va != 0 {
         let mut bytes = [0_u8; 16];
@@ -764,12 +684,8 @@ pub fn handle_set_scissor_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 pub fn handle_set_viewport(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::SetViewport")?;
-    let viewport_va = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DDevice9::SetViewport")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::SetViewport")?;
+    let viewport_va = read_arg(engine, ArgReg::Rdx, "IDirect3DDevice9::SetViewport")?;
 
     if viewport_va != 0 {
         let mut bytes = [0_u8; 24];
@@ -792,12 +708,8 @@ pub fn handle_set_viewport(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 pub fn handle_get_viewport(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DDevice9::GetViewport")?;
-    let viewport_va = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DDevice9::GetViewport")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::GetViewport")?;
+    let viewport_va = read_arg(engine, ArgReg::Rdx, "IDirect3DDevice9::GetViewport")?;
 
     let return_value = if viewport_va != 0 {
         let (x, y, width, height, min_z, max_z) = state.d3d9().d3d9_viewport;
@@ -822,15 +734,9 @@ pub fn handle_get_viewport(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 /// Handles `IDirect3DDevice9::DrawPrimitiveUP` (vtable slot 83).
 pub fn handle_draw_primitive_up(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let primitive_type = engine
-        .read_rdx()
-        .context("failed to read RDX for DrawPrimitiveUP")?;
-    let primitive_count = engine
-        .read_r8()
-        .context("failed to read R8 for DrawPrimitiveUP")?;
-    let data_va = engine
-        .read_r9()
-        .context("failed to read R9 for DrawPrimitiveUP")?;
+    let primitive_type = read_arg(engine, ArgReg::Rdx, "DrawPrimitiveUP")?;
+    let primitive_count = read_arg(engine, ArgReg::R8, "DrawPrimitiveUP")?;
+    let data_va = read_arg(engine, ArgReg::R9, "DrawPrimitiveUP")?;
     let stride_raw = read_stack_argument(engine, 0x28, "DrawPrimitiveUP VertexStreamZeroStride")?;
 
     let vertex_count = primitive_vertex_count(primitive_type, primitive_count).unwrap_or(0);
@@ -855,15 +761,9 @@ pub fn handle_draw_indexed_primitive_up(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let primitive_type = engine
-        .read_rdx()
-        .context("failed to read RDX for DrawIndexedPrimitiveUP")?;
-    let _min_vertex_index = engine
-        .read_r8()
-        .context("failed to read R8 for DrawIndexedPrimitiveUP")?;
-    let num_vertices_raw = engine
-        .read_r9()
-        .context("failed to read R9 for DrawIndexedPrimitiveUP")?;
+    let primitive_type = read_arg(engine, ArgReg::Rdx, "DrawIndexedPrimitiveUP")?;
+    let _min_vertex_index = read_arg(engine, ArgReg::R8, "DrawIndexedPrimitiveUP")?;
+    let num_vertices_raw = read_arg(engine, ArgReg::R9, "DrawIndexedPrimitiveUP")?;
     let primitive_count =
         read_stack_argument(engine, 0x28, "DrawIndexedPrimitiveUP PrimitiveCount")?;
     let index_va = read_stack_argument(engine, 0x30, "DrawIndexedPrimitiveUP pIndexData")?;
@@ -879,8 +779,7 @@ pub fn handle_draw_indexed_primitive_up(
 
     let num_vertices = usize::try_from(num_vertices_raw & u64::from(u32::MAX))
         .context("DrawIndexedPrimitiveUP vertex count does not fit usize")?;
-    let index_format = u32::try_from(index_format_raw & u64::from(u32::MAX))
-        .context("DrawIndexedPrimitiveUP index format does not fit u32")?;
+    let index_format = low_u32(index_format_raw, "DrawIndexedPrimitiveUP index format")?;
     let index_count = primitive_vertex_count(primitive_type, primitive_count).unwrap_or(0);
     let return_value = handle_draw_up_common(
         engine,
@@ -908,18 +807,10 @@ pub fn handle_draw_indexed_primitive_up(
 pub fn handle_draw_primitive(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for DrawPrimitive")?;
-    let primitive_type = engine
-        .read_rdx()
-        .context("failed to read RDX for DrawPrimitive")?;
-    let start_vertex = engine
-        .read_r8()
-        .context("failed to read R8 for DrawPrimitive")?;
-    let primitive_count = engine
-        .read_r9()
-        .context("failed to read R9 for DrawPrimitive")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "DrawPrimitive")?;
+    let primitive_type = read_arg(engine, ArgReg::Rdx, "DrawPrimitive")?;
+    let start_vertex = read_arg(engine, ArgReg::R8, "DrawPrimitive")?;
+    let primitive_count = read_arg(engine, ArgReg::R9, "DrawPrimitive")?;
 
     let return_value =
         draw_buffer_form_common(state, primitive_type, primitive_count, None, start_vertex)?;
@@ -937,18 +828,10 @@ pub fn handle_draw_primitive(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 pub fn handle_draw_indexed_primitive(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for DrawIndexedPrimitive")?;
-    let primitive_type = engine
-        .read_rdx()
-        .context("failed to read RDX for DrawIndexedPrimitive")?;
-    let base_vertex_index = engine
-        .read_r8()
-        .context("failed to read R8 for DrawIndexedPrimitive")?;
-    let _min_vertex_index = engine
-        .read_r9()
-        .context("failed to read R9 for DrawIndexedPrimitive")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "DrawIndexedPrimitive")?;
+    let primitive_type = read_arg(engine, ArgReg::Rdx, "DrawIndexedPrimitive")?;
+    let base_vertex_index = read_arg(engine, ArgReg::R8, "DrawIndexedPrimitive")?;
+    let _min_vertex_index = read_arg(engine, ArgReg::R9, "DrawIndexedPrimitive")?;
     let _num_vertices = read_stack_argument(engine, 0x28, "DrawIndexedPrimitive NumVertices")?;
     let start_index = read_stack_argument(engine, 0x30, "DrawIndexedPrimitive StartIndex")?;
     let primitive_count = read_stack_argument(engine, 0x38, "DrawIndexedPrimitive PrimitiveCount")?;
@@ -975,18 +858,10 @@ pub fn handle_draw_indexed_primitive(ctx: &mut HandlerContext<'_>) -> Result<Win
 pub fn handle_set_stream_source(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for SetStreamSource")?;
-    let stream_number = engine
-        .read_rdx()
-        .context("failed to read RDX for SetStreamSource")?;
-    let stream_data = engine
-        .read_r8()
-        .context("failed to read R8 for SetStreamSource")?;
-    let offset_in_bytes = engine
-        .read_r9()
-        .context("failed to read R9 for SetStreamSource")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "SetStreamSource")?;
+    let stream_number = read_arg(engine, ArgReg::Rdx, "SetStreamSource")?;
+    let stream_data = read_arg(engine, ArgReg::R8, "SetStreamSource")?;
+    let offset_in_bytes = read_arg(engine, ArgReg::R9, "SetStreamSource")?;
     let stride_raw = read_stack_argument(engine, 0x28, "SetStreamSource Stride")?;
 
     let known_buffer = stream_data == 0
@@ -1018,18 +893,10 @@ pub fn handle_set_stream_source(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_get_stream_source(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetStreamSource")?;
-    let stream_number = engine
-        .read_rdx()
-        .context("failed to read RDX for GetStreamSource")?;
-    let pp_stream_data = engine
-        .read_r8()
-        .context("failed to read R8 for GetStreamSource")?;
-    let p_offset = engine
-        .read_r9()
-        .context("failed to read R9 for GetStreamSource")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetStreamSource")?;
+    let stream_number = read_arg(engine, ArgReg::Rdx, "GetStreamSource")?;
+    let pp_stream_data = read_arg(engine, ArgReg::R8, "GetStreamSource")?;
+    let p_offset = read_arg(engine, ArgReg::R9, "GetStreamSource")?;
     let p_stride = read_stack_argument(engine, 0x28, "GetStreamSource pStride")?;
 
     let (stream_va, offset, stride) = if stream_number == 0 {
@@ -1067,12 +934,8 @@ pub fn handle_get_stream_source(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_set_indices(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for SetIndices")?;
-    let index_data = engine
-        .read_rdx()
-        .context("failed to read RDX for SetIndices")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "SetIndices")?;
+    let index_data = read_arg(engine, ArgReg::Rdx, "SetIndices")?;
 
     let known_buffer = index_data == 0
         || state
@@ -1097,12 +960,8 @@ pub fn handle_set_indices(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_get_indices(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetIndices")?;
-    let pp_index_data = engine
-        .read_rdx()
-        .context("failed to read RDX for GetIndices")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetIndices")?;
+    let pp_index_data = read_arg(engine, ArgReg::Rdx, "GetIndices")?;
 
     if pp_index_data != 0 {
         write_guest_u64(engine, pp_index_data, state.d3d9().d3d9_index_buffer_va)
@@ -1120,64 +979,11 @@ pub fn handle_get_indices(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 /// guest fills the buffer through `Lock`/`Unlock`, binds it with
 /// `SetStreamSource`, and the buffer-form draws read the host copy.
 pub fn handle_create_vertex_buffer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateVertexBuffer")?;
-    let length_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for CreateVertexBuffer")?;
-    let usage_raw = engine
-        .read_r8()
-        .context("failed to read R8 for CreateVertexBuffer")?;
-    let fvf_raw = engine
-        .read_r9()
-        .context("failed to read R9 for CreateVertexBuffer")?;
-    let pool_raw = read_stack_argument(engine, 0x28, "CreateVertexBuffer Pool")?;
-    let pp_buffer = read_stack_argument(engine, 0x30, "CreateVertexBuffer ppBuffer")?;
-    let _shared_handle = read_stack_argument(engine, 0x38, "CreateVertexBuffer pSharedHandle")?;
-
-    let length = u32::try_from(length_raw & u64::from(u32::MAX))
-        .context("CreateVertexBuffer length does not fit u32")?;
-    let usage = u32::try_from(usage_raw & u64::from(u32::MAX))
-        .context("CreateVertexBuffer usage does not fit u32")?;
-    let fvf = u32::try_from(fvf_raw & u64::from(u32::MAX))
-        .context("CreateVertexBuffer FVF does not fit u32")?;
-    let pool = u32::try_from(pool_raw & u64::from(u32::MAX))
-        .context("CreateVertexBuffer pool does not fit u32")?;
-
     // The FVF must describe a vertex layout the rasterizer can decode; an
     // unparseable mask (no XYZ/XYZRHW, or both) is a real Create-time error.
-    let valid_fvf = parse_fvf(fvf).is_some();
-    let return_value = if valid_fvf && pp_buffer != 0 {
-        let object = create_buffer_record(
-            engine,
-            state,
-            D3d9Iface::VertexBuffer9,
-            length,
-            usage,
-            pool,
-            fvf,
-        )?;
-        if object == 0 {
-            write_guest_u64(engine, pp_buffer, 0)
-                .context("failed to clear CreateVertexBuffer output pointer")?;
-            D3DERR_INVALIDCALL
-        } else {
-            write_guest_u64(engine, pp_buffer, object)
-                .context("failed to return IDirect3DVertexBuffer9 pointer")?;
-            D3D_OK
-        }
-    } else {
-        if pp_buffer != 0 {
-            write_guest_u64(engine, pp_buffer, 0)
-                .context("failed to clear CreateVertexBuffer output pointer")?;
-        }
-        D3DERR_INVALIDCALL
-    };
-
-    ctx.finish(return_value)
+    create_buffer_impl(ctx, "CreateVertexBuffer", D3d9Iface::VertexBuffer9, |fvf| {
+        parse_fvf(fvf).is_some()
+    })
 }
 
 /// Handles `IDirect3DDevice9::CreateIndexBuffer` (vtable slot 27).
@@ -1186,57 +992,72 @@ pub fn handle_create_vertex_buffer(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 /// The format must be `D3DFMT_INDEX16` (101) or `D3DFMT_INDEX32` (102); the
 /// index size drives the buffer-form `DrawIndexedPrimitive` fetch.
 pub fn handle_create_index_buffer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    create_buffer_impl(
+        ctx,
+        "CreateIndexBuffer",
+        D3d9Iface::IndexBuffer9,
+        |format| matches!(format, D3DFMT_INDEX16 | D3DFMT_INDEX32),
+    )
+}
+
+/// Shared `CreateVertexBuffer`/`CreateIndexBuffer` body: read the arguments
+/// (`rcx` = this, `rdx` = length, `r8` = usage, `r9` = FVF/format; pool,
+/// output pointer and shared handle on the stack), validate via `validator`,
+/// allocate the buffer object, and write back the interface pointer.
+fn create_buffer_impl(
+    ctx: &mut HandlerContext<'_>,
+    api_name: &str,
+    iface: D3d9Iface,
+    validator: impl Fn(u32) -> bool,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateIndexBuffer")?;
-    let length_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for CreateIndexBuffer")?;
-    let usage_raw = engine
-        .read_r8()
-        .context("failed to read R8 for CreateIndexBuffer")?;
-    let format_raw = engine
-        .read_r9()
-        .context("failed to read R9 for CreateIndexBuffer")?;
-    let pool_raw = read_stack_argument(engine, 0x28, "CreateIndexBuffer Pool")?;
-    let pp_buffer = read_stack_argument(engine, 0x30, "CreateIndexBuffer ppBuffer")?;
-    let _shared_handle = read_stack_argument(engine, 0x38, "CreateIndexBuffer pSharedHandle")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let length_raw = read_arg(engine, ArgReg::Rdx, api_name)?;
+    let usage_raw = read_arg(engine, ArgReg::R8, api_name)?;
+    let format_raw = read_arg(engine, ArgReg::R9, api_name)?;
+    // Per-API stack-slot context names (kept byte-exact for the A/W-style
+    // error strings the two entry points had before sharing this body).
+    let (pool_arg, pp_buffer_arg, shared_handle_arg) = match iface {
+        D3d9Iface::IndexBuffer9 => (
+            "CreateIndexBuffer Pool",
+            "CreateIndexBuffer ppBuffer",
+            "CreateIndexBuffer pSharedHandle",
+        ),
+        _ => (
+            "CreateVertexBuffer Pool",
+            "CreateVertexBuffer ppBuffer",
+            "CreateVertexBuffer pSharedHandle",
+        ),
+    };
+    let pool_raw = read_stack_argument(engine, 0x28, pool_arg)?;
+    let pp_buffer = read_stack_argument(engine, 0x30, pp_buffer_arg)?;
+    let _shared_handle = read_stack_argument(engine, 0x38, shared_handle_arg)?;
 
-    let length = u32::try_from(length_raw & u64::from(u32::MAX))
-        .context("CreateIndexBuffer length does not fit u32")?;
-    let usage = u32::try_from(usage_raw & u64::from(u32::MAX))
-        .context("CreateIndexBuffer usage does not fit u32")?;
-    let format = u32::try_from(format_raw & u64::from(u32::MAX))
-        .context("CreateIndexBuffer format does not fit u32")?;
-    let pool = u32::try_from(pool_raw & u64::from(u32::MAX))
-        .context("CreateIndexBuffer pool does not fit u32")?;
+    let length = low_u32(length_raw, "buffer length")?;
+    let usage = low_u32(usage_raw, "buffer usage")?;
+    let format = low_u32(format_raw, "buffer FVF/format")?;
+    let pool = low_u32(pool_raw, "buffer pool")?;
 
-    let valid_format = matches!(format, D3DFMT_INDEX16 | D3DFMT_INDEX32);
-    let return_value = if valid_format && pp_buffer != 0 {
-        let object = create_buffer_record(
-            engine,
-            state,
-            D3d9Iface::IndexBuffer9,
-            length,
-            usage,
-            pool,
-            format,
-        )?;
+    let iface_pointer = match iface {
+        D3d9Iface::IndexBuffer9 => "IDirect3DIndexBuffer9",
+        _ => "IDirect3DVertexBuffer9",
+    };
+    let return_value = if validator(format) && pp_buffer != 0 {
+        let object = create_buffer_record(engine, state, iface, length, usage, pool, format)?;
         if object == 0 {
             write_guest_u64(engine, pp_buffer, 0)
-                .context("failed to clear CreateIndexBuffer output pointer")?;
+                .with_context(|| format!("failed to clear {api_name} output pointer"))?;
             D3DERR_INVALIDCALL
         } else {
             write_guest_u64(engine, pp_buffer, object)
-                .context("failed to return IDirect3DIndexBuffer9 pointer")?;
+                .with_context(|| format!("failed to return {iface_pointer} pointer"))?;
             D3D_OK
         }
     } else {
         if pp_buffer != 0 {
             write_guest_u64(engine, pp_buffer, 0)
-                .context("failed to clear CreateIndexBuffer output pointer")?;
+                .with_context(|| format!("failed to clear {api_name} output pointer"))?;
         }
         D3DERR_INVALIDCALL
     };
@@ -1255,18 +1076,10 @@ pub fn handle_create_index_buffer(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 pub fn handle_create_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateRenderTarget")?;
-    let width_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for CreateRenderTarget")?;
-    let height_raw = engine
-        .read_r8()
-        .context("failed to read R8 for CreateRenderTarget")?;
-    let format_raw = engine
-        .read_r9()
-        .context("failed to read R9 for CreateRenderTarget")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "CreateRenderTarget")?;
+    let width_raw = read_arg(engine, ArgReg::Rdx, "CreateRenderTarget")?;
+    let height_raw = read_arg(engine, ArgReg::R8, "CreateRenderTarget")?;
+    let format_raw = read_arg(engine, ArgReg::R9, "CreateRenderTarget")?;
     let multi_sample = read_stack_argument(engine, 0x28, "CreateRenderTarget MultiSample")?;
     let _multi_sample_quality =
         read_stack_argument(engine, 0x30, "CreateRenderTarget MultiSampleQuality")?;
@@ -1274,14 +1087,10 @@ pub fn handle_create_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     let pp_surface = read_stack_argument(engine, 0x40, "CreateRenderTarget ppSurface")?;
     let _shared_handle = read_stack_argument(engine, 0x48, "CreateRenderTarget pSharedHandle")?;
 
-    let width = u32::try_from(width_raw & u64::from(u32::MAX))
-        .context("CreateRenderTarget width does not fit u32")?;
-    let height = u32::try_from(height_raw & u64::from(u32::MAX))
-        .context("CreateRenderTarget height does not fit u32")?;
-    let format = u32::try_from(format_raw & u64::from(u32::MAX))
-        .context("CreateRenderTarget format does not fit u32")?;
-    let multi_sample = u32::try_from(multi_sample & u64::from(u32::MAX))
-        .context("CreateRenderTarget MultiSample does not fit u32")?;
+    let width = low_u32(width_raw, "CreateRenderTarget width")?;
+    let height = low_u32(height_raw, "CreateRenderTarget height")?;
+    let format = low_u32(format_raw, "CreateRenderTarget format")?;
+    let multi_sample = low_u32(multi_sample, "CreateRenderTarget MultiSample")?;
 
     // The rasterizer is single-sampled; a multisample request beyond NONE
     // cannot be honored honestly.
@@ -1333,18 +1142,11 @@ pub fn handle_create_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_set_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for SetRenderTarget")?;
-    let index_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for SetRenderTarget")?;
-    let surface = engine
-        .read_r8()
-        .context("failed to read R8 for SetRenderTarget")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "SetRenderTarget")?;
+    let index_raw = read_arg(engine, ArgReg::Rdx, "SetRenderTarget")?;
+    let surface = read_arg(engine, ArgReg::R8, "SetRenderTarget")?;
 
-    let index = u32::try_from(index_raw & u64::from(u32::MAX))
-        .context("SetRenderTarget index does not fit u32")?;
+    let index = low_u32(index_raw, "SetRenderTarget index")?;
     // NULL rebinds the backbuffer; a non-NULL surface must be a known RT.
     let valid =
         index == 0 && (surface == 0 || state.d3d9().d3d9_render_targets.contains_key(&surface));
@@ -1367,18 +1169,11 @@ pub fn handle_set_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_get_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetRenderTarget")?;
-    let index_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for GetRenderTarget")?;
-    let pp_surface = engine
-        .read_r8()
-        .context("failed to read R8 for GetRenderTarget")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetRenderTarget")?;
+    let index_raw = read_arg(engine, ArgReg::Rdx, "GetRenderTarget")?;
+    let pp_surface = read_arg(engine, ArgReg::R8, "GetRenderTarget")?;
 
-    let index = u32::try_from(index_raw & u64::from(u32::MAX))
-        .context("GetRenderTarget index does not fit u32")?;
+    let index = low_u32(index_raw, "GetRenderTarget index")?;
     let return_value = if index == 0 && pp_surface != 0 {
         let bound = state.d3d9().d3d9_render_target;
         write_guest_u64(engine, pp_surface, bound)

@@ -1,12 +1,12 @@
 use super::{
     Context, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, FAKE_DISK_CLUSTERS, FAKE_DISK_GIB,
     FAKE_STDIN_HANDLE, FIXED_SYSTEM_FILETIME, HandlerContext, INVALID_FILE_ATTRIBUTES,
-    INVALID_HANDLE_VALUE, LOGICAL_DRIVE_TCHARS, Result, WinApiHandlerResult, checked_address,
-    finish_create_file_create_only, handle_move_file_w, is_open_file_handle, low_u32,
-    read_ansi_string_from_cpu, read_u64, read_wide_string_from_cpu, resolve_full_windows_path,
-    ret_bool_true, ret_u64, stat_guest_path, temp_name_id_u32, write_fixed_dir_a,
-    write_fixed_dir_w, write_guest_u32, write_guest_u64, write_guest_utf16_units,
-    write_mock_string_a, write_mock_string_w,
+    INVALID_HANDLE_VALUE, LOGICAL_DRIVE_TCHARS, PATH_ARG_MAX, Result, WinApiHandlerResult,
+    checked_address, finish_create_file_create_only, handle_move_file_w, is_open_file_handle,
+    low_u32, read_ansi_string_from_cpu, read_u64, read_wide_string_from_cpu,
+    resolve_full_windows_path, ret_bool_true, ret_u64, stat_guest_path, temp_name_id_u32,
+    write_fixed_dir_a, write_fixed_dir_w, write_guest_u32, write_guest_u64,
+    write_guest_utf16_units, write_mock_string_a, write_mock_string_w,
 };
 use crate::guest_layout::FileAttributeData;
 use crate::guest_memory::with_typed_write;
@@ -141,16 +141,25 @@ pub fn handle_device_io_control(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     state.process.last_error = ERROR_INVALID_FUNCTION;
     ret_u64(engine, 0, "DeviceIoControl")
 }
-/// Handles `KERNEL32.dll!GetCompressedFileSizeA` — return real uncompressed size via VFS.
-pub fn handle_get_compressed_file_size_a(
+/// Cap for the `GetTempFileName` prefix buffer (`lpszPrefixString`, 3 chars
+/// used of a small TCHAR buffer).
+const TEMP_PREFIX_MAX: usize = 16;
+
+/// Shared body of `GetCompressedFileSizeA/W` — return real uncompressed size via VFS.
+fn get_compressed_file_size(
     ctx: &mut HandlerContext<'_>,
+    wide: bool,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let path_va = engine.read_rcx()?;
     let _high_va = engine.read_rdx()?;
-    let path = read_ansi_string_from_cpu(engine, path_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let path = if wide {
+        read_wide_string_from_cpu(engine, path_va, 1024)?
+    } else {
+        read_ansi_string_from_cpu(engine, path_va, 1024)?
+    };
+    let cwd = state.file_io.cwd_utf8();
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
@@ -160,24 +169,17 @@ pub fn handle_get_compressed_file_size_a(
     state.process.last_error = 0;
     ctx.finish(st.size)
 }
-/// Handles `KERNEL32.dll!GetCompressedFileSizeW` — return real uncompressed size via VFS.
+/// Handles `KERNEL32.dll!GetCompressedFileSizeA`.
+pub fn handle_get_compressed_file_size_a(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    get_compressed_file_size(ctx, false)
+}
+/// Handles `KERNEL32.dll!GetCompressedFileSizeW`.
 pub fn handle_get_compressed_file_size_w(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let path_va = engine.read_rcx()?;
-    let _high_va = engine.read_rdx()?;
-    let path = read_wide_string_from_cpu(engine, path_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
-    let full = resolve_full_windows_path(&cwd, &path);
-    let st = stat_guest_path(state, &full);
-    if st.kind == crate::vfs::PathKind::NotFound {
-        state.process.last_error = ERROR_FILE_NOT_FOUND;
-        return ctx.finish(INVALID_FILE_ATTRIBUTES);
-    }
-    state.process.last_error = 0;
-    ctx.finish(st.size)
+    get_compressed_file_size(ctx, true)
 }
 /// Real `winnt.h` `FILE_*` flags the bottle volume claims — the honest set
 /// for the host-bottle directory (macOS): case-preserved + unicode names,
@@ -190,10 +192,16 @@ const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
 const BOTTLE_FS_FLAGS: u32 =
     FILE_CASE_PRESERVED_NAMES | FILE_UNICODE_ON_DISK | FILE_PERSISTENT_ACLS | FILE_NAMED_STREAMS;
 
-/// Handles `KERNEL32.dll!GetVolumeInformationW` — real bottle volume info.
-pub fn handle_get_volume_information_w(
-    ctx: &mut HandlerContext<'_>,
-) -> Result<WinApiHandlerResult> {
+/// Shared body of `GetVolumeInformationA/W` — real bottle volume info.
+///
+/// The trailing outputs are POINTERS stored in the caller's stack arg slots —
+/// read each slot, then write through the pointed-to guest buffer.
+fn get_volume_information(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
+    let api = if wide {
+        "GetVolumeInformationW"
+    } else {
+        "GetVolumeInformationA"
+    };
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _root = engine.read_rcx()?;
@@ -201,16 +209,14 @@ pub fn handle_get_volume_information_w(
     let vol_name_len = engine.read_r8()?;
     let serial_va = engine.read_r9()?;
     let rsp = engine.read_rsp()?;
-    // Trailing outputs are POINTERS stored in the caller's stack arg slots —
-    // read each slot, then write through the pointed-to guest buffer.
     let max_comp_va = read_u64(engine, rsp.wrapping_add(0x28))
-        .context("failed to read lpMaximumComponentLength for GetVolumeInformationW")?;
+        .with_context(|| format!("failed to read lpMaximumComponentLength for {api}"))?;
     let flags_va = read_u64(engine, rsp.wrapping_add(0x30))
-        .context("failed to read lpFileSystemFlags for GetVolumeInformationW")?;
+        .with_context(|| format!("failed to read lpFileSystemFlags for {api}"))?;
     let name_va = read_u64(engine, rsp.wrapping_add(0x38))
-        .context("failed to read lpFileSystemNameBuffer for GetVolumeInformationW")?;
+        .with_context(|| format!("failed to read lpFileSystemNameBuffer for {api}"))?;
     let fs_len_va = read_u64(engine, rsp.wrapping_add(0x40))
-        .context("failed to read nFileSystemNameSize for GetVolumeInformationW")?;
+        .with_context(|| format!("failed to read nFileSystemNameSize for {api}"))?;
 
     // Derive volume label from the bottle root name, or use a default.
     let label = state
@@ -221,7 +227,11 @@ pub fn handle_get_volume_information_w(
         .and_then(|n| n.to_str())
         .unwrap_or("Bottle")
         .to_owned();
-    write_mock_string_w(engine, state, &label, vol_name, vol_name_len)?;
+    if wide {
+        write_mock_string_w(engine, state, &label, vol_name, vol_name_len)?;
+    } else {
+        write_mock_string_a(engine, state, &label, vol_name, vol_name_len)?;
+    }
 
     // Same fake volume serial the BY_HANDLE_FILE_INFORMATION path reports.
     if serial_va != 0 {
@@ -237,10 +247,12 @@ pub fn handle_get_volume_information_w(
     }
     // FileSystemName = "NTFS"; nFileSystemNameSize receives the character
     // count excluding NUL (or the required count when the buffer is NULL).
-    let fs_name_written = if name_va != 0 {
+    let fs_name_written = if name_va == 0 {
+        4
+    } else if wide {
         write_mock_string_w(engine, state, "NTFS", name_va, 16)?
     } else {
-        4
+        write_mock_string_a(engine, state, "NTFS", name_va, 16)?
     };
     if fs_len_va != 0 {
         let _unused = write_guest_u32(
@@ -249,69 +261,21 @@ pub fn handle_get_volume_information_w(
             u32::try_from(fs_name_written).unwrap_or(0),
         );
     }
+
     state.process.last_error = 0;
     ctx.finish(1)
 }
-/// Handles `KERNEL32.dll!GetVolumeInformationA` — real bottle volume info.
+/// Handles `KERNEL32.dll!GetVolumeInformationW`.
+pub fn handle_get_volume_information_w(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    get_volume_information(ctx, true)
+}
+/// Handles `KERNEL32.dll!GetVolumeInformationA`.
 pub fn handle_get_volume_information_a(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _root = engine.read_rcx()?;
-    let vol_name = engine.read_rdx()?;
-    let vol_name_len = engine.read_r8()?;
-    let serial_va = engine.read_r9()?;
-    let rsp = engine.read_rsp()?;
-    // Trailing outputs are POINTERS stored in the caller's stack arg slots —
-    // read each slot, then write through the pointed-to guest buffer.
-    let max_comp_va = read_u64(engine, rsp.wrapping_add(0x28))
-        .context("failed to read lpMaximumComponentLength for GetVolumeInformationA")?;
-    let flags_va = read_u64(engine, rsp.wrapping_add(0x30))
-        .context("failed to read lpFileSystemFlags for GetVolumeInformationA")?;
-    let name_va = read_u64(engine, rsp.wrapping_add(0x38))
-        .context("failed to read lpFileSystemNameBuffer for GetVolumeInformationA")?;
-    let fs_len_va = read_u64(engine, rsp.wrapping_add(0x40))
-        .context("failed to read nFileSystemNameSize for GetVolumeInformationA")?;
-
-    let label = state
-        .file_io
-        .bottle_root
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .unwrap_or("Bottle")
-        .to_owned();
-    write_mock_string_a(engine, state, &label, vol_name, vol_name_len)?;
-
-    // Same fake volume serial the BY_HANDLE_FILE_INFORMATION path reports.
-    if serial_va != 0 {
-        let _unused = write_guest_u32(engine, serial_va, 0x1234_abcd);
-    }
-    if max_comp_va != 0 {
-        let _unused = write_guest_u32(engine, max_comp_va, 255);
-    }
-    let fs_flags: u32 = BOTTLE_FS_FLAGS;
-    if flags_va != 0 {
-        let _unused = write_guest_u32(engine, flags_va, fs_flags);
-    }
-    // FileSystemName = "NTFS"; nFileSystemNameSize receives the byte count
-    // excluding NUL (or the required count when the buffer is NULL).
-    let fs_name_written = if name_va != 0 {
-        write_mock_string_a(engine, state, "NTFS", name_va, 16)?
-    } else {
-        4
-    };
-    if fs_len_va != 0 {
-        let _unused = write_guest_u32(
-            engine,
-            fs_len_va,
-            u32::try_from(fs_name_written).unwrap_or(0),
-        );
-    }
-
-    state.process.last_error = 0;
-    ctx.finish(1)
+    get_volume_information(ctx, false)
 }
 /// Handles `KERNEL32.dll!LockFile` — validate file handle and return TRUE.
 pub fn handle_lock_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -359,7 +323,7 @@ pub fn handle_get_file_attributes_ex_w(
     let _info_level = engine.read_rdx()?;
     let info_va = engine.read_r8()?;
     let path = read_wide_string_from_cpu(engine, path_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let cwd = state.file_io.cwd_utf8();
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
@@ -396,7 +360,7 @@ pub fn handle_get_file_attributes_ex_a(
     let _info_level = engine.read_rdx()?;
     let info_va = engine.read_r8()?;
     let path = read_ansi_string_from_cpu(engine, path_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let cwd = state.file_io.cwd_utf8();
     let full = resolve_full_windows_path(&cwd, &path);
     let st = stat_guest_path(state, &full);
     if st.kind == crate::vfs::PathKind::NotFound {
@@ -463,8 +427,10 @@ pub fn handle_get_temp_path_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     state.process.last_error = 0;
     ctx.finish(return_value)
 }
-/// Handles `KERNEL32.dll!GetTempFileNameW` (unique name under path; creates 0-byte file).
-pub fn handle_get_temp_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+/// Shared body of `GetTempFileNameA/W` (unique name under path; creates a
+/// 0-byte file). A NULL path falls back to the guest temp directory and a
+/// NULL prefix to `"WIE"`, per Microsoft Learn defaults.
+fn get_temp_file_name(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let path_va = engine.read_rcx()?;
@@ -473,13 +439,17 @@ pub fn handle_get_temp_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     let buffer_va = engine.read_r9()?;
     let path = if path_va == 0 {
         crate::vfs::GUEST_TEMP_PATH.to_owned()
+    } else if wide {
+        read_wide_string_from_cpu(engine, path_va, PATH_ARG_MAX)?
     } else {
-        read_wide_string_from_cpu(engine, path_va, 32_768)?
+        read_ansi_string_from_cpu(engine, path_va, PATH_ARG_MAX)?
     };
     let prefix = if prefix_va == 0 {
         "WIE".to_owned()
+    } else if wide {
+        read_wide_string_from_cpu(engine, prefix_va, TEMP_PREFIX_MAX)?
     } else {
-        read_wide_string_from_cpu(engine, prefix_va, 16)?
+        read_ansi_string_from_cpu(engine, prefix_va, TEMP_PREFIX_MAX)?
     };
     let prefix: String = prefix.chars().take(3).collect();
     let id = if unique == 0 {
@@ -497,66 +467,34 @@ pub fn handle_get_temp_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     );
     finish_create_file_create_only(state, &name);
     if buffer_va != 0 {
-        let mut units: Vec<u16> = name.encode_utf16().collect();
-        units.push(0);
-        write_guest_utf16_units(engine, buffer_va, &units)?;
+        if wide {
+            let mut units: Vec<u16> = name.encode_utf16().collect();
+            units.push(0);
+            write_guest_utf16_units(engine, buffer_va, &units)?;
+        } else {
+            let mut out = crate::vfs::encode_acp(&name);
+            out.push(0);
+            engine.mem_write(buffer_va, &out)?;
+        }
     }
     state.process.last_error = 0;
     let return_value = u64::from(id_u32).max(1);
     ctx.finish(return_value)
 }
+/// Handles `KERNEL32.dll!GetTempFileNameW`.
+pub fn handle_get_temp_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    get_temp_file_name(ctx, true)
+}
 /// Handles `KERNEL32.dll!GetTempFileNameA`.
 pub fn handle_get_temp_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let path_va = engine.read_rcx()?;
-    let prefix_va = engine.read_rdx()?;
-    let unique = engine.read_r8()?;
-    let buffer_va = engine.read_r9()?;
-    let path = if path_va == 0 {
-        crate::vfs::GUEST_TEMP_PATH.to_owned()
-    } else {
-        read_ansi_string_from_cpu(engine, path_va, 32_768)?
-    };
-    let prefix = if prefix_va == 0 {
-        "WIE".to_owned()
-    } else {
-        read_ansi_string_from_cpu(engine, prefix_va, 16)?
-    };
-    let prefix: String = prefix.chars().take(3).collect();
-    let id = if unique == 0 {
-        state.window_state().tick_count = state.window_state().tick_count.wrapping_add(1);
-        state.window_state().tick_count
-    } else {
-        unique
-    };
-    let id_u32 = temp_name_id_u32(id);
-    let name = format!(
-        "{}\\{}{:04X}.tmp",
-        path.trim_end_matches('\\'),
-        prefix,
-        id_u32
-    );
-    finish_create_file_create_only(state, &name);
-    if buffer_va != 0 {
-        let mut out = crate::vfs::encode_acp(&name);
-        out.push(0);
-        engine.mem_write(buffer_va, &out)?;
-    }
-    state.process.last_error = 0;
-    let return_value = u64::from(id_u32).max(1);
-    ctx.finish(return_value)
+    get_temp_file_name(ctx, false)
 }
 /// Handles `KERNEL32.dll!GetDriveTypeW`.
 pub fn handle_get_drive_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let path_va = engine.read_rcx()?;
-    let path = if path_va == 0 {
-        String::new()
-    } else {
-        read_wide_string_from_cpu(engine, path_va, 16)?
-    };
+    let path = read_wide_string_from_cpu(engine, path_va, 16)?;
     let return_value = u64::from(crate::vfs::get_drive_type(&state.file_io.volumes, &path));
     ctx.finish(return_value)
 }
@@ -565,11 +503,7 @@ pub fn handle_get_drive_type_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let path_va = engine.read_rcx()?;
-    let path = if path_va == 0 {
-        String::new()
-    } else {
-        read_ansi_string_from_cpu(engine, path_va, 16)?
-    };
+    let path = read_ansi_string_from_cpu(engine, path_va, 16)?;
     let return_value = u64::from(crate::vfs::get_drive_type(&state.file_io.volumes, &path));
     ctx.finish(return_value)
 }
@@ -581,21 +515,17 @@ pub fn handle_get_logical_drives(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 }
 /// Handles `KERNEL32.dll!GetSystemDirectoryW`.
 pub fn handle_get_system_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    write_fixed_dir_w(engine, crate::vfs::GUEST_SYSTEM_DIR)
+    write_fixed_dir_w(ctx, crate::vfs::GUEST_SYSTEM_DIR)
 }
 /// Handles `KERNEL32.dll!GetSystemDirectoryA`.
 pub fn handle_get_system_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    write_fixed_dir_a(engine, crate::vfs::GUEST_SYSTEM_DIR)
+    write_fixed_dir_a(ctx, crate::vfs::GUEST_SYSTEM_DIR)
 }
 /// Handles `KERNEL32.dll!GetWindowsDirectoryW`.
 pub fn handle_get_windows_directory_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    write_fixed_dir_w(engine, crate::vfs::GUEST_WINDOWS_DIR)
+    write_fixed_dir_w(ctx, crate::vfs::GUEST_WINDOWS_DIR)
 }
 /// Handles `KERNEL32.dll!GetWindowsDirectoryA`.
 pub fn handle_get_windows_directory_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    write_fixed_dir_a(engine, crate::vfs::GUEST_WINDOWS_DIR)
+    write_fixed_dir_a(ctx, crate::vfs::GUEST_WINDOWS_DIR)
 }

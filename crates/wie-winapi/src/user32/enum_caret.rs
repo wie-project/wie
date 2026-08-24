@@ -7,6 +7,7 @@
 //! fallback the dense `WinApiId` table does not cover. All handlers here are
 //! the "universal but partial" Tier-2 surface; none are hot-path APIs.
 
+use crate::gdi32::{ArgReg, read_arg};
 use std::sync::Mutex;
 
 use super::{
@@ -129,12 +130,8 @@ fn first_window_with_parent(state: &mut WinApiState, parent_handle: u64) -> u64 
 pub(crate) fn handle_enum_windows(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let callback = engine
-        .read_rcx()
-        .context("failed to read RCX for EnumWindows")?;
-    let long_parameter = engine
-        .read_rdx()
-        .context("failed to read RDX for EnumWindows")?;
+    let callback = read_arg(engine, ArgReg::Rcx, "EnumWindows")?;
+    let long_parameter = read_arg(engine, ArgReg::Rdx, "EnumWindows")?;
 
     if callback == 0 {
         return ctx.finish(0);
@@ -158,15 +155,9 @@ pub(crate) fn handle_enum_child_windows(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let parent_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for EnumChildWindows")?;
-    let callback = engine
-        .read_rdx()
-        .context("failed to read RDX for EnumChildWindows")?;
-    let long_parameter = engine
-        .read_r8()
-        .context("failed to read R8 for EnumChildWindows")?;
+    let parent_handle = read_arg(engine, ArgReg::Rcx, "EnumChildWindows")?;
+    let callback = read_arg(engine, ArgReg::Rdx, "EnumChildWindows")?;
+    let long_parameter = read_arg(engine, ArgReg::R8, "EnumChildWindows")?;
 
     if callback == 0 {
         return ctx.finish(0);
@@ -183,12 +174,8 @@ pub(crate) fn handle_enum_child_windows(
 /// Handles `USER32.dll!FindWindowA`.
 pub(crate) fn handle_find_window_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let class_name_va = engine
-        .read_rcx()
-        .context("failed to read RCX for FindWindowA")?;
-    let window_name_va = engine
-        .read_rdx()
-        .context("failed to read RDX for FindWindowA")?;
+    let class_name_va = read_arg(engine, ArgReg::Rcx, "FindWindowA")?;
+    let window_name_va = read_arg(engine, ArgReg::Rdx, "FindWindowA")?;
     let class_identifier = read_window_class_identifier_a(engine, class_name_va)?;
     let window_name = read_guest_ansi_lossy(engine, window_name_va, 256)
         .context("failed to read FindWindowA window name")?;
@@ -199,12 +186,8 @@ pub(crate) fn handle_find_window_a(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 /// Handles `USER32.dll!FindWindowW`.
 pub(crate) fn handle_find_window_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let class_name_va = engine
-        .read_rcx()
-        .context("failed to read RCX for FindWindowW")?;
-    let window_name_va = engine
-        .read_rdx()
-        .context("failed to read RDX for FindWindowW")?;
+    let class_name_va = read_arg(engine, ArgReg::Rcx, "FindWindowW")?;
+    let window_name_va = read_arg(engine, ArgReg::Rdx, "FindWindowW")?;
     let class_identifier = read_window_class_identifier_w(engine, class_name_va)?;
     let window_name = read_guest_utf16_lossy(engine, window_name_va, 256)
         .context("failed to read FindWindowW window name")?;
@@ -247,18 +230,10 @@ fn window_class_matches(window: &super::WindowRecord, identifier: &WindowClassId
 pub(crate) fn handle_create_caret(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateCaret")?;
-    let _bitmap_handle = engine
-        .read_rdx()
-        .context("failed to read RDX for CreateCaret")?;
-    let width = engine
-        .read_r8()
-        .context("failed to read R8 for CreateCaret")?;
-    let height = engine
-        .read_r9()
-        .context("failed to read R9 for CreateCaret")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "CreateCaret")?;
+    let _bitmap_handle = read_arg(engine, ArgReg::Rdx, "CreateCaret")?;
+    let width = read_arg(engine, ArgReg::R8, "CreateCaret")?;
+    let height = read_arg(engine, ArgReg::R9, "CreateCaret")?;
 
     if !is_known_window(state, window_handle) {
         return ctx.finish(0);
@@ -281,12 +256,8 @@ pub(crate) fn handle_create_caret(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// Win64 ABI: `rcx` = `X`, `rdx` = `Y` (sign-extended `int`s).
 pub(crate) fn handle_set_caret_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let x_raw = engine
-        .read_rcx()
-        .context("failed to read RCX for SetCaretPos")?;
-    let y_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for SetCaretPos")?;
+    let x_raw = read_arg(engine, ArgReg::Rcx, "SetCaretPos")?;
+    let y_raw = read_arg(engine, ArgReg::Rdx, "SetCaretPos")?;
     let x = low_i32(x_raw, "SetCaretPos x")?;
     let y = low_i32(y_raw, "SetCaretPos y")?;
 
@@ -303,9 +274,7 @@ pub(crate) fn handle_set_caret_pos(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 /// never set) as a `POINT` and returns TRUE.
 pub(crate) fn handle_get_caret_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let point_va = engine
-        .read_rcx()
-        .context("failed to read RCX for GetCaretPos")?;
+    let point_va = read_arg(engine, ArgReg::Rcx, "GetCaretPos")?;
 
     let (x, y) = CARET_POSITION
         .lock()
@@ -326,19 +295,13 @@ pub(crate) fn handle_get_caret_pos(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 
 /// Handles `USER32.dll!ShowCaret`.
 pub(crate) fn handle_show_caret(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let _window_handle = ctx
-        .engine
-        .read_rcx()
-        .context("failed to read RCX for ShowCaret")?;
+    let _window_handle = read_arg(ctx.engine, ArgReg::Rcx, "ShowCaret")?;
     ctx.finish(1)
 }
 
 /// Handles `USER32.dll!HideCaret`.
 pub(crate) fn handle_hide_caret(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let _window_handle = ctx
-        .engine
-        .read_rcx()
-        .context("failed to read RCX for HideCaret")?;
+    let _window_handle = read_arg(ctx.engine, ArgReg::Rcx, "HideCaret")?;
     ctx.finish(1)
 }
 
@@ -348,10 +311,7 @@ pub(crate) fn handle_hide_caret(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 /// in RCX anyway, so the stored size keyed by that handle (if any) is
 /// dropped. The position is not cleared (Windows keeps it thread-global).
 pub(crate) fn handle_destroy_caret(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let window_handle = ctx
-        .engine
-        .read_rcx()
-        .context("failed to read RCX for DestroyCaret")?;
+    let window_handle = read_arg(ctx.engine, ArgReg::Rcx, "DestroyCaret")?;
 
     let mut sizes = CARET_SIZES
         .lock()
@@ -366,43 +326,19 @@ pub(crate) fn handle_destroy_caret(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 /// Win64 ABI: `rcx` = `hDC`, `rdx` = `X`, `r8` = `Y`, `r9` = `hIcon`. Icons
 /// are decorative (nothing is rendered) — the call always succeeds.
 pub(crate) fn handle_draw_icon(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let _dc = ctx
-        .engine
-        .read_rcx()
-        .context("failed to read RCX for DrawIcon")?;
-    let _x = ctx
-        .engine
-        .read_rdx()
-        .context("failed to read RDX for DrawIcon")?;
-    let _y = ctx
-        .engine
-        .read_r8()
-        .context("failed to read R8 for DrawIcon")?;
-    let _icon = ctx
-        .engine
-        .read_r9()
-        .context("failed to read R9 for DrawIcon")?;
+    let _dc = read_arg(ctx.engine, ArgReg::Rcx, "DrawIcon")?;
+    let _x = read_arg(ctx.engine, ArgReg::Rdx, "DrawIcon")?;
+    let _y = read_arg(ctx.engine, ArgReg::R8, "DrawIcon")?;
+    let _icon = read_arg(ctx.engine, ArgReg::R9, "DrawIcon")?;
     ctx.finish(1)
 }
 
 /// Handles `USER32.dll!DrawIconEx` — no-op like the plain `DrawIcon` (nine
 /// arguments, none of them consumed).
 pub(crate) fn handle_draw_icon_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let _dc = ctx
-        .engine
-        .read_rcx()
-        .context("failed to read RCX for DrawIconEx")?;
-    let _x = ctx
-        .engine
-        .read_rdx()
-        .context("failed to read RDX for DrawIconEx")?;
-    let _y = ctx
-        .engine
-        .read_r8()
-        .context("failed to read R8 for DrawIconEx")?;
-    let _icon = ctx
-        .engine
-        .read_r9()
-        .context("failed to read R9 for DrawIconEx")?;
+    let _dc = read_arg(ctx.engine, ArgReg::Rcx, "DrawIconEx")?;
+    let _x = read_arg(ctx.engine, ArgReg::Rdx, "DrawIconEx")?;
+    let _y = read_arg(ctx.engine, ArgReg::R8, "DrawIconEx")?;
+    let _icon = read_arg(ctx.engine, ArgReg::R9, "DrawIconEx")?;
     ctx.finish(1)
 }

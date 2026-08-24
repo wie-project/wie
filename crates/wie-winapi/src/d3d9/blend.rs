@@ -5,7 +5,9 @@ use super::{
     D3D_OK, D3DERR_INVALIDCALL, D3DFMT_D16, D3DFMT_D24S8, DepthStencilRecord,
     MAX_TEXTURE_DIMENSION, read_stack_argument,
 };
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_memory::{write_u32 as write_guest_u32, write_u64 as write_guest_u64};
+use crate::kernel32::low_u32;
 use crate::{HandlerContext, WinApiHandlerResult};
 
 // ── blend + depth handlers ──────────────────────────────────────────────
@@ -18,18 +20,11 @@ use crate::{HandlerContext, WinApiHandlerResult};
 pub fn handle_get_render_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetRenderState")?;
-    let state_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for GetRenderState")?;
-    let p_value = engine
-        .read_r8()
-        .context("failed to read R8 for GetRenderState")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetRenderState")?;
+    let state_raw = read_arg(engine, ArgReg::Rdx, "GetRenderState")?;
+    let p_value = read_arg(engine, ArgReg::R8, "GetRenderState")?;
 
-    let state_id = u32::try_from(state_raw & u64::from(u32::MAX))
-        .context("GetRenderState state identifier does not fit u32")?;
+    let state_id = low_u32(state_raw, "GetRenderState state identifier")?;
     if p_value != 0 {
         let d3d = state.d3d9();
         let value = match d3d.d3d9_render_state.value_of(state_id) {
@@ -56,18 +51,10 @@ pub fn handle_create_depth_stencil_surface(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateDepthStencilSurface")?;
-    let width_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for CreateDepthStencilSurface")?;
-    let height_raw = engine
-        .read_r8()
-        .context("failed to read R8 for CreateDepthStencilSurface")?;
-    let format_raw = engine
-        .read_r9()
-        .context("failed to read R9 for CreateDepthStencilSurface")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "CreateDepthStencilSurface")?;
+    let width_raw = read_arg(engine, ArgReg::Rdx, "CreateDepthStencilSurface")?;
+    let height_raw = read_arg(engine, ArgReg::R8, "CreateDepthStencilSurface")?;
+    let format_raw = read_arg(engine, ArgReg::R9, "CreateDepthStencilSurface")?;
     let _multi_sample = read_stack_argument(engine, 0x28, "CreateDepthStencilSurface MultiSample")?;
     let _multi_sample_quality =
         read_stack_argument(engine, 0x30, "CreateDepthStencilSurface MultiSampleQuality")?;
@@ -76,12 +63,9 @@ pub fn handle_create_depth_stencil_surface(
     let _shared_handle =
         read_stack_argument(engine, 0x48, "CreateDepthStencilSurface pSharedHandle")?;
 
-    let width = u32::try_from(width_raw & u64::from(u32::MAX))
-        .context("CreateDepthStencilSurface width does not fit u32")?;
-    let height = u32::try_from(height_raw & u64::from(u32::MAX))
-        .context("CreateDepthStencilSurface height does not fit u32")?;
-    let format = u32::try_from(format_raw & u64::from(u32::MAX))
-        .context("CreateDepthStencilSurface format does not fit u32")?;
+    let width = low_u32(width_raw, "CreateDepthStencilSurface width")?;
+    let height = low_u32(height_raw, "CreateDepthStencilSurface height")?;
+    let format = low_u32(format_raw, "CreateDepthStencilSurface format")?;
 
     let valid = width > 0
         && height > 0
@@ -123,12 +107,8 @@ pub fn handle_set_depth_stencil_surface(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for SetDepthStencilSurface")?;
-    let surface = engine
-        .read_rdx()
-        .context("failed to read RDX for SetDepthStencilSurface")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "SetDepthStencilSurface")?;
+    let surface = read_arg(engine, ArgReg::Rdx, "SetDepthStencilSurface")?;
 
     // NULL unbinds; a non-NULL surface must be a known depth surface.
     let valid = surface == 0 || state.d3d9().d3d9_depth_surfaces.contains_key(&surface);
@@ -148,12 +128,8 @@ pub fn handle_get_depth_stencil_surface(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetDepthStencilSurface")?;
-    let pp_surface = engine
-        .read_rdx()
-        .context("failed to read RDX for GetDepthStencilSurface")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetDepthStencilSurface")?;
+    let pp_surface = read_arg(engine, ArgReg::Rdx, "GetDepthStencilSurface")?;
 
     let return_value = if pp_surface != 0 {
         let bound = state.d3d9().d3d9_depth_stencil;

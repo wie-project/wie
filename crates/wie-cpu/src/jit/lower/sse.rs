@@ -42,6 +42,35 @@ pub(crate) extern "C" fn wie_sse_pshufb_hi(a_lo: u64, a_hi: u64, b_lo: u64, b_hi
     exec::sse_pshufb_hi(a_lo, a_hi, b_lo, b_hi)
 }
 
+/// Read an SSE source operand as a (lo, hi) u64 pair.
+///
+/// XMM register sources read straight from the cached pair; memory sources
+/// compute the effective address and load `nbytes` (4/8/16). Shared by every
+/// two-operand SSE lowering that accepts the xmm/rm form.
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn read_sse_src_pair(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &[Value; 16],
+    rflags: Value,
+    mem: &MemEnv,
+    xmm: &[Value; 32],
+    nbytes: u32,
+    ctx: &str,
+) -> Result<(Value, Value), String> {
+    match instr.op1_kind() {
+        OpKind::Register if instr.op_register(1).is_xmm() => {
+            read_xmm_pair(xmm, instr.op_register(1))
+        }
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
+            load_sse_mem(bcx, mem, gpr, rflags, addr, nbytes, instr.ip())
+        }
+        _ => Err(format!("{ctx} src")),
+    }
+}
+
 /// Load 4/8/16 bytes from guest mem into (lo, hi) u64 pair (hi=0 for <16).
 pub(super) fn load_sse_mem(
     bcx: &mut FunctionBuilder<'_>,
@@ -106,16 +135,7 @@ pub(super) fn lower_sse_mov(
     scalar_merge: bool,
 ) -> Result<(), String> {
     let ip = instr.ip();
-    let (src_lo, src_hi) = match instr.op1_kind() {
-        OpKind::Register if instr.op_register(1).is_xmm() => {
-            read_xmm_pair(xmm, instr.op_register(1))?
-        }
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            load_sse_mem(bcx, mem, gpr, rflags, addr, nbytes, ip)?
-        }
-        _ => return Err("sse mov src".into()),
-    };
+    let (src_lo, src_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, nbytes, "sse mov")?;
 
     match instr.op0_kind() {
         OpKind::Register if instr.op_register(0).is_xmm() => {
@@ -364,14 +384,7 @@ pub(super) fn lower_sse_punpck_lanes(
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, b_hi) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
-        }
-        _ => return Err("punpck lanes src".into()),
-    };
+    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "punpck lanes")?;
     let (lo, hi) = if JitConfig::get().simd_enabled() {
         let a8 = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
         let b8 = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
@@ -492,14 +505,7 @@ pub(super) fn lower_sse_pshufd(
 ) -> Result<(), String> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
-    let (s_lo, s_hi) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
-        }
-        _ => return Err("pshufd src".into()),
-    };
+    let (s_lo, s_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "pshufd")?;
     let imm = instr.immediate(2) & 0xff;
     let (lo, hi) = if JitConfig::get().simd_enabled() {
         let a8 = pair_to_i8x16(bcx, mem.flags, s_lo, s_hi);
@@ -545,14 +551,7 @@ pub(super) fn lower_sse_shufpd(
     let di = xmm_index(dst)?;
     // The first source is the destination register (read before the store).
     let (s1_lo, s1_hi) = read_xmm_pair(xmm, dst)?;
-    let (s2_lo, s2_hi) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
-        }
-        _ => return Err("shufpd src".into()),
-    };
+    let (s2_lo, s2_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "shufpd")?;
     let imm = instr.immediate(2) & 0xff;
     let lo = if imm & 1 == 0 { s1_lo } else { s2_lo };
     let hi = if imm & 2 == 0 { s1_hi } else { s2_hi };
@@ -571,14 +570,7 @@ pub(super) fn lower_sse_pshuflw_hw(
 ) -> Result<(), String> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
-    let (s_lo, s_hi) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
-        }
-        _ => return Err("pshuflw/hw src".into()),
-    };
+    let (s_lo, s_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "pshuflw/hw")?;
     let imm = instr.immediate(2) & 0xff;
     let low = instr.mnemonic() == Mnemonic::Pshuflw;
     let (lo, hi) = if JitConfig::get().simd_enabled() {
@@ -819,14 +811,7 @@ pub(super) fn lower_sse_int_binop(
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, b_hi) = match instr.op1_kind() {
-        OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?,
-        OpKind::Memory => {
-            let addr = effective_addr(bcx, instr, gpr, mem)?;
-            load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
-        }
-        _ => return Err("sse int binop src".into()),
-    };
+    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "sse int binop")?;
     let (lo, hi) = if JitConfig::get().simd_enabled() {
         match op {
             exec::SseIntOp::Paddb => vec_binop(

@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 
-use crate::gdi32::{FontEngine, FontKey, ResolvedFont, fontdb_weight_for, height_px_from_lf};
+use crate::gdi32::{
+    ArgReg, FontEngine, FontKey, ResolvedFont, fontdb_weight_for, height_px_from_lf, read_arg,
+};
 use crate::guest_layout::{BitmapInfoHeader, LogFontA, LogFontW};
 use crate::guest_memory::{
     checked_address, read_u32, read_u64, with_typed_read, write_u64 as write_guest_u64,
@@ -15,17 +17,15 @@ use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 use super::FAKE_GDI_BITMAP_HANDLE_BASE;
 use super::records::{DibSection, allocate_gdi_heap_block};
+use crate::kernel32::low_u32;
 
 /// Handles `GDI32.dll!CreateSolidBrush`.
 pub fn handle_create_solid_brush(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let color_raw = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateSolidBrush")?;
+    let color_raw = read_arg(engine, ArgReg::Rcx, "CreateSolidBrush")?;
 
-    let color = u32::try_from(color_raw & u64::from(u32::MAX))
-        .context("CreateSolidBrush color does not fit u32")?;
+    let color = low_u32(color_raw, "CreateSolidBrush color")?;
 
     let handle = state.gdi_state().alloc_brush(color);
 
@@ -38,18 +38,11 @@ pub fn handle_create_solid_brush(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_create_pen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _style = engine
-        .read_rcx()
-        .context("failed to read RCX for CreatePen")?;
-    let _width = engine
-        .read_rdx()
-        .context("failed to read RDX for CreatePen")?;
-    let color_raw = engine
-        .read_r8()
-        .context("failed to read R8 for CreatePen")?;
+    let _style = read_arg(engine, ArgReg::Rcx, "CreatePen")?;
+    let _width = read_arg(engine, ArgReg::Rdx, "CreatePen")?;
+    let color_raw = read_arg(engine, ArgReg::R8, "CreatePen")?;
 
-    let color = u32::try_from(color_raw & u64::from(u32::MAX))
-        .context("CreatePen color does not fit u32")?;
+    let color = low_u32(color_raw, "CreatePen color")?;
 
     let handle = state.gdi_state().alloc_pen(color);
 
@@ -65,21 +58,13 @@ pub fn handle_create_pen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 pub fn handle_create_dib_section(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateDIBSection")?;
+    let _hdc = read_arg(engine, ArgReg::Rcx, "CreateDIBSection")?;
 
-    let bmi_va = engine
-        .read_rdx()
-        .context("failed to read RDX for CreateDIBSection")?;
+    let bmi_va = read_arg(engine, ArgReg::Rdx, "CreateDIBSection")?;
 
-    let _usage = engine
-        .read_r8()
-        .context("failed to read R8 for CreateDIBSection")?;
+    let _usage = read_arg(engine, ArgReg::R8, "CreateDIBSection")?;
 
-    let bits_out_va = engine
-        .read_r9()
-        .context("failed to read R9 for CreateDIBSection")?;
+    let bits_out_va = read_arg(engine, ArgReg::R9, "CreateDIBSection")?;
 
     let (width_abs, height_abs, bit_count, height_signed) = if bmi_va != 0 {
         // BITMAPINFOHEADER (the fixed 40-byte header of a BITMAPINFO):
@@ -183,17 +168,11 @@ pub fn handle_create_compatible_bitmap(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateCompatibleBitmap")?;
+    let _hdc = read_arg(engine, ArgReg::Rcx, "CreateCompatibleBitmap")?;
 
-    let width = engine
-        .read_rdx()
-        .context("failed to read RDX for CreateCompatibleBitmap")?;
+    let width = read_arg(engine, ArgReg::Rdx, "CreateCompatibleBitmap")?;
 
-    let height = engine
-        .read_r8()
-        .context("failed to read R8 for CreateCompatibleBitmap")?;
+    let height = read_arg(engine, ArgReg::R8, "CreateCompatibleBitmap")?;
 
     let handle = if width == 0 || height == 0 {
         0
@@ -239,9 +218,7 @@ fn handle_create_font_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let height_raw = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let height_raw = read_arg(engine, ArgReg::Rcx, api_name)?;
     let rsp = engine
         .read_rsp()
         .with_context(|| format!("failed to read RSP for {api_name}"))?;
@@ -315,9 +292,7 @@ fn handle_create_font_indirect_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let logfont_va = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let logfont_va = read_arg(engine, ArgReg::Rcx, api_name)?;
 
     if logfont_va == 0 {
         return ctx.finish(0);

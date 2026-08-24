@@ -32,7 +32,9 @@ FILTER="${4:-}"
 
 run_benches() {
     local extra=("$@")
-    cargo bench -p wie-cpu -- "${extra[@]}"
+    # --bench jit_hot_paths: skip the lib unittest "bench" target, whose
+    # libtest harness rejects criterion CLI options.
+    cargo bench -p wie-cpu --bench jit_hot_paths -- "${extra[@]}"
 }
 
 case "$MODE" in

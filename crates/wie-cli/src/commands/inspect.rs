@@ -96,16 +96,20 @@ fn format_import_name(name: &str, ordinal: u16) -> String {
     }
 }
 
-/// Builds and prints a Windows-loader-like image summary.
+/// Prints a Windows-loader-like image summary.
+///
+/// The loader's memory buffer itself is never materialized here — every
+/// printed field is a header-derived identity field (`size_of_image` →
+/// `image_size`, `size_of_headers` → `header_size`).
 pub(crate) fn image(path: &Path) -> Result<()> {
-    let (_image, summary) = wie_pe::build_loaded_image(path)?;
+    let identity = wie_pe::pe_identity_from_file(path)?;
 
-    println!("image_base: {:#018x}", summary.image_base);
-    println!("entry_rva: {:#010x}", summary.entry_rva);
-    println!("entry_point: {:#018x}", summary.entry_point_va);
-    println!("image_size: {:#010x}", summary.image_size);
-    println!("header_size: {:#010x}", summary.header_size);
-    println!("sections: {}", summary.section_count);
+    println!("image_base: {:#018x}", identity.image_base);
+    println!("entry_rva: {:#010x}", identity.entry_rva);
+    println!("entry_point: {:#018x}", identity.entry_va);
+    println!("image_size: {:#010x}", identity.size_of_image);
+    println!("header_size: {:#010x}", identity.size_of_headers);
+    println!("sections: {}", identity.section_count);
 
     Ok(())
 }

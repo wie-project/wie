@@ -13,6 +13,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
+use crate::gdi32::{ArgReg, read_arg};
 use anyhow::{Context, Result};
 
 use crate::guest_layout::{
@@ -459,15 +460,9 @@ pub(crate) fn handle_enum_font_families_ex_w(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let logfont_va = engine
-        .read_rdx()
-        .context("failed to read RDX for EnumFontFamiliesExW")?;
-    let callback = engine
-        .read_r8()
-        .context("failed to read R8 for EnumFontFamiliesExW")?;
-    let lparam = engine
-        .read_r9()
-        .context("failed to read R9 for EnumFontFamiliesExW")?;
+    let logfont_va = read_arg(engine, ArgReg::Rdx, "EnumFontFamiliesExW")?;
+    let callback = read_arg(engine, ArgReg::R8, "EnumFontFamiliesExW")?;
+    let lparam = read_arg(engine, ArgReg::R9, "EnumFontFamiliesExW")?;
     let lf = read_typed_copy::<LogFontW>(engine, logfont_va)
         .context("failed to read LOGFONTW for EnumFontFamiliesExW")?;
     let filter = family_filter(&lf);
@@ -479,15 +474,9 @@ pub(crate) fn handle_enum_font_families_ex_a(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let logfont_va = engine
-        .read_rdx()
-        .context("failed to read RDX for EnumFontFamiliesExA")?;
-    let callback = engine
-        .read_r8()
-        .context("failed to read R8 for EnumFontFamiliesExA")?;
-    let lparam = engine
-        .read_r9()
-        .context("failed to read R9 for EnumFontFamiliesExA")?;
+    let logfont_va = read_arg(engine, ArgReg::Rdx, "EnumFontFamiliesExA")?;
+    let callback = read_arg(engine, ArgReg::R8, "EnumFontFamiliesExA")?;
+    let lparam = read_arg(engine, ArgReg::R9, "EnumFontFamiliesExA")?;
     let lf_a = read_typed_copy::<LogFontA>(engine, logfont_va)
         .context("failed to read LOGFONTA for EnumFontFamiliesExA")?;
     let lf = log_font_w_from_a(&lf_a);
@@ -515,15 +504,9 @@ pub(crate) fn handle_enum_font_families_a(
 /// all families).
 pub(crate) fn handle_enum_fonts_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let face_va = engine
-        .read_rdx()
-        .context("failed to read RDX for EnumFontsW")?;
-    let callback = engine
-        .read_r8()
-        .context("failed to read R8 for EnumFontsW")?;
-    let lparam = engine
-        .read_r9()
-        .context("failed to read R9 for EnumFontsW")?;
+    let face_va = read_arg(engine, ArgReg::Rdx, "EnumFontsW")?;
+    let callback = read_arg(engine, ArgReg::R8, "EnumFontsW")?;
+    let lparam = read_arg(engine, ArgReg::R9, "EnumFontsW")?;
     let filter = if face_va == 0 {
         None
     } else {
@@ -535,15 +518,9 @@ pub(crate) fn handle_enum_fonts_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// Handles `GDI32.dll!EnumFontsA`.
 pub(crate) fn handle_enum_fonts_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let face_va = engine
-        .read_rdx()
-        .context("failed to read RDX for EnumFontsA")?;
-    let callback = engine
-        .read_r8()
-        .context("failed to read R8 for EnumFontsA")?;
-    let lparam = engine
-        .read_r9()
-        .context("failed to read R9 for EnumFontsA")?;
+    let face_va = read_arg(engine, ArgReg::Rdx, "EnumFontsA")?;
+    let callback = read_arg(engine, ArgReg::R8, "EnumFontsA")?;
+    let lparam = read_arg(engine, ArgReg::R9, "EnumFontsA")?;
     let filter = if face_va == 0 {
         None
     } else {
@@ -587,18 +564,10 @@ fn build_glyph_bitmap(glyph: &super::font_system::RasterizedGlyph) -> Vec<u8> {
 fn get_glyph_outline(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for GetGlyphOutline")?;
-    let uchar = engine
-        .read_rdx()
-        .context("failed to read RDX for GetGlyphOutline")?;
-    let fu_format = engine
-        .read_r8()
-        .context("failed to read R8 for GetGlyphOutline")?;
-    let lpgm = engine
-        .read_r9()
-        .context("failed to read R9 for GetGlyphOutline")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "GetGlyphOutline")?;
+    let uchar = read_arg(engine, ArgReg::Rdx, "GetGlyphOutline")?;
+    let fu_format = read_arg(engine, ArgReg::R8, "GetGlyphOutline")?;
+    let lpgm = read_arg(engine, ArgReg::R9, "GetGlyphOutline")?;
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for GetGlyphOutline")?;
@@ -702,9 +671,7 @@ pub(crate) fn handle_add_font_resource_w(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_va = engine
-        .read_rcx()
-        .context("failed to read RCX for AddFontResourceW")?;
+    let path_va = read_arg(engine, ArgReg::Rcx, "AddFontResourceW")?;
     let guest_path = read_guest_utf16_lossy(engine, path_va, 1024)?;
     let ok = add_font_resource(state, &guest_path);
     ctx.finish(u64::from(ok))
@@ -716,9 +683,7 @@ pub(crate) fn handle_add_font_resource_a(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_va = engine
-        .read_rcx()
-        .context("failed to read RCX for AddFontResourceA")?;
+    let path_va = read_arg(engine, ArgReg::Rcx, "AddFontResourceA")?;
     let guest_path = read_guest_ansi_lossy(engine, path_va, 1024)?;
     let ok = add_font_resource(state, &guest_path);
     ctx.finish(u64::from(ok))
@@ -730,9 +695,7 @@ pub(crate) fn handle_remove_font_resource_w(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_va = engine
-        .read_rcx()
-        .context("failed to read RCX for RemoveFontResourceW")?;
+    let path_va = read_arg(engine, ArgReg::Rcx, "RemoveFontResourceW")?;
     let guest_path = read_guest_utf16_lossy(engine, path_va, 1024)?;
     let ok = remove_font_resource(state, &guest_path);
     ctx.finish(u64::from(ok))
@@ -744,9 +707,7 @@ pub(crate) fn handle_remove_font_resource_a(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let path_va = engine
-        .read_rcx()
-        .context("failed to read RCX for RemoveFontResourceA")?;
+    let path_va = read_arg(engine, ArgReg::Rcx, "RemoveFontResourceA")?;
     let guest_path = read_guest_ansi_lossy(engine, path_va, 1024)?;
     let ok = remove_font_resource(state, &guest_path);
     ctx.finish(u64::from(ok))

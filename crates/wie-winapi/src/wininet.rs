@@ -189,27 +189,63 @@ pub fn dispatch_wininet(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let n = name.to_ascii_lowercase();
-    match n.as_str() {
-        "internetopenw" => Ok(Some(handle_internet_open_w(ctx)?)),
-        "internetopena" => Ok(Some(handle_internet_open_a(ctx)?)),
-        "internetclosehandle" => Ok(Some(handle_internet_close_handle(ctx)?)),
-        "internetconnectw" => Ok(Some(handle_internet_connect_w(ctx)?)),
-        "internetconnecta" => Ok(Some(handle_internet_connect_a(ctx)?)),
-        "internetopenurlw" => Ok(Some(handle_internet_open_url_w(ctx)?)),
-        "internetopenurla" => Ok(Some(handle_internet_open_url_a(ctx)?)),
-        "httpopenrequestw" => Ok(Some(handle_http_open_request_w(ctx)?)),
-        "httpopenrequesta" => Ok(Some(handle_http_open_request_a(ctx)?)),
-        "httpsendrequestw" => Ok(Some(handle_http_send_request_w(ctx)?)),
-        "httpsendrequesta" => Ok(Some(handle_http_send_request_a(ctx)?)),
-        "internetreadfile" => Ok(Some(handle_internet_read_file(ctx)?)),
-        "internetsetoptionw" => Ok(Some(handle_internet_set_option_w(ctx)?)),
-        "internetsetoptiona" => Ok(Some(handle_internet_set_option_a(ctx)?)),
-        "internetgetconnectedstate" => Ok(Some(handle_internet_get_connected_state(ctx)?)),
-        "internetqueryoptionw" => Ok(Some(handle_internet_query_option_w(ctx)?)),
-        "internetqueryoptiona" => Ok(Some(handle_internet_query_option_a(ctx)?)),
-        _ => Ok(None),
-    }
+    dispatch_export(ctx, WININET_EXPORTS, name)
+}
+
+/// Census oracle: which `wininet.dll` exports are implemented.
+pub fn is_export(name: &str) -> bool {
+    export_listed(WININET_EXPORTS, name)
+}
+
+/// One implemented export of a string-dispatched DLL: the census name
+/// (lowercase) plus its handler.
+type ExportHandler = fn(&mut HandlerContext<'_>) -> Result<WinApiHandlerResult>;
+
+/// Every implemented `wininet.dll` export — the single source shared by
+/// [`dispatch_wininet`] and the census oracle [`is_export`].
+const WININET_EXPORTS: &[(&str, ExportHandler)] = &[
+    ("internetopenw", handle_internet_open_w),
+    ("internetopena", handle_internet_open_a),
+    ("internetclosehandle", handle_internet_close_handle),
+    ("internetconnectw", handle_internet_connect_w),
+    ("internetconnecta", handle_internet_connect_a),
+    ("internetopenurlw", handle_internet_open_url_w),
+    ("internetopenurla", handle_internet_open_url_a),
+    ("httpopenrequestw", handle_http_open_request_w),
+    ("httpopenrequesta", handle_http_open_request_a),
+    ("httpsendrequestw", handle_http_send_request_w),
+    ("httpsendrequesta", handle_http_send_request_a),
+    ("internetreadfile", handle_internet_read_file),
+    ("internetsetoptionw", handle_internet_set_option_w),
+    ("internetsetoptiona", handle_internet_set_option_a),
+    (
+        "internetgetconnectedstate",
+        handle_internet_get_connected_state,
+    ),
+    ("internetqueryoptionw", handle_internet_query_option_w),
+    ("internetqueryoptiona", handle_internet_query_option_a),
+];
+
+/// Route `name` through an export table; `None` when it is not implemented.
+fn dispatch_export(
+    ctx: &mut HandlerContext<'_>,
+    exports: &[(&str, ExportHandler)],
+    name: &str,
+) -> Result<Option<WinApiHandlerResult>> {
+    let wanted = name.to_ascii_lowercase();
+    let Some((_, handler)) = exports
+        .iter()
+        .find(|(export, _)| *export == wanted.as_str())
+    else {
+        return Ok(None);
+    };
+    handler(ctx).map(Some)
+}
+
+/// Whether a lowercased `name` appears in an export table.
+fn export_listed(exports: &[(&str, ExportHandler)], name: &str) -> bool {
+    let wanted = name.to_ascii_lowercase();
+    exports.iter().any(|(export, _)| *export == wanted.as_str())
 }
 
 /// Parse `http://host[:port]/path` — the only scheme the lane supports.
@@ -508,32 +544,52 @@ fn finish_perform_failure(
     finish_false(engine, state, code)
 }
 
-/// Read a wide header string from guest memory as raw bytes (cp1252, the ACP
-/// — the wire format for the ANSI header variants).
-fn read_wide_headers(engine: &mut dyn wie_cpu::CpuEngine, va: u64) -> Result<Vec<u8>> {
-    if va == 0 {
-        return Ok(Vec::new());
-    }
-    let text = read_wide_string_from_cpu(engine, va, MAX_URL_LEN)?;
-    Ok(crate::guest_string::encode_cp1252(&text))
+/// Which character encoding a WinInet A/W pair uses for its string
+/// parameters.
+#[derive(Debug, Clone, Copy)]
+enum StringEncoding {
+    /// UTF-16LE (`…W` exports).
+    Wide,
+    /// The ANSI code page (`…A` exports).
+    Ansi,
 }
 
-/// Read an ANSI header string from guest memory as raw bytes.
-fn read_ansi_headers(engine: &mut dyn wie_cpu::CpuEngine, va: u64) -> Result<Vec<u8>> {
-    if va == 0 {
-        return Ok(Vec::new());
+impl StringEncoding {
+    /// Read a NUL-terminated guest string of this encoding, capped at `max`
+    /// units.
+    fn read_string(
+        self,
+        engine: &mut dyn wie_cpu::CpuEngine,
+        va: u64,
+        max: usize,
+    ) -> Result<String> {
+        match self {
+            Self::Wide => read_wide_string_from_cpu(engine, va, max),
+            Self::Ansi => read_ansi_string_from_cpu(engine, va, max),
+        }
     }
-    let text = read_ansi_string_from_cpu(engine, va, MAX_URL_LEN)?;
-    Ok(crate::guest_string::encode_cp1252(&text))
+
+    /// Read a header string of this encoding from guest memory as raw wire
+    /// bytes (CP1252, the ACP — the format headers are sent in).
+    fn read_header_bytes(self, engine: &mut dyn wie_cpu::CpuEngine, va: u64) -> Result<Vec<u8>> {
+        if va == 0 {
+            return Ok(Vec::new());
+        }
+        let text = self.read_string(engine, va, MAX_URL_LEN)?;
+        Ok(crate::guest_string::encode_cp1252(&text))
+    }
 }
 
 /// `HINTERNET InternetOpenW(LPCWSTR lpszAgent, DWORD dwAccessType,
 ///                          LPCWSTR lpszProxyName, LPCWSTR lpszProxyBypass,
-///                          DWORD dwFlags)`
+///                          DWORD dwFlags)` shared body.
 ///
 /// Creates a session handle. The access type / proxy arguments are accepted
 /// and ignored — this lane always connects directly.
-fn handle_internet_open_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+fn handle_internet_open(
+    ctx: &mut HandlerContext<'_>,
+    enc: StringEncoding,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let agent_va = engine.read_rcx()?;
@@ -544,7 +600,7 @@ fn handle_internet_open_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     let agent = if agent_va == 0 {
         String::new()
     } else {
-        read_wide_string_from_cpu(engine, agent_va, 256)?
+        enc.read_string(engine, agent_va, 256)?
     };
     let handle = {
         let wininet = state.wininet();
@@ -555,27 +611,14 @@ fn handle_internet_open_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     finish(engine, handle)
 }
 
+/// `HINTERNET InternetOpenW(...)` — the wide variant.
+fn handle_internet_open_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_internet_open(ctx, StringEncoding::Wide)
+}
+
 /// `HINTERNET InternetOpenA(LPCSTR lpszAgent, ...)` — ANSI variant.
 fn handle_internet_open_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let agent_va = engine.read_rcx()?;
-    let _access_type = engine.read_rdx()?;
-    let _proxy = engine.read_r8()?;
-    let _proxy_bypass = engine.read_r9()?;
-    let _flags = read_stack_u64(engine, 0x28)?;
-    let agent = if agent_va == 0 {
-        String::new()
-    } else {
-        read_ansi_string_from_cpu(engine, agent_va, 256)?
-    };
-    let handle = {
-        let wininet = state.wininet();
-        let handle = wininet.alloc_handle();
-        wininet.sessions.insert(handle, WininetSession { agent });
-        handle
-    };
-    finish(engine, handle)
+    handle_internet_open(ctx, StringEncoding::Ansi)
 }
 
 /// `BOOL InternetCloseHandle(HINTERNET hInternet)` — frees any session /
@@ -593,19 +636,20 @@ fn handle_internet_close_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     finish(engine, u64::from(removed))
 }
 
-/// `HINTERNET InternetConnectW(HINTERNET hInternet, LPCWSTR lpszServerName,
-///                             INTERNET_PORT nServerPort, LPCWSTR lpszUserName,
-///                             LPCWSTR lpszPassword, DWORD dwService,
-///                             DWORD dwFlags, DWORD_PTR dwContext)`
-fn handle_internet_connect_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+/// `HINTERNET InternetConnect*` shared body.
+fn handle_internet_connect(
+    ctx: &mut HandlerContext<'_>,
+    enc: StringEncoding,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let session_handle = engine.read_rcx()?;
     let server_va = engine.read_rdx()?;
-    let port_raw = low_u32(engine.read_r8()?, "InternetConnectW port")?;
+    let port_raw = low_u32(engine.read_r8()?, &format!("{api} port"))?;
     let _user_va = engine.read_r9()?;
     let _password_va = read_stack_u64(engine, 0x28)?;
-    let service = low_u32(read_stack_u64(engine, 0x30)?, "InternetConnectW service")?;
+    let service = low_u32(read_stack_u64(engine, 0x30)?, &format!("{api} service"))?;
     let _flags = read_stack_u64(engine, 0x38)?;
     let _context = read_stack_u64(engine, 0x40)?;
     let agent = {
@@ -622,7 +666,7 @@ fn handle_internet_connect_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         }
         return finish_false(engine, state, ERROR_INVALID_PARAMETER);
     }
-    let server = read_wide_string_from_cpu(engine, server_va, 1024)?;
+    let server = enc.read_string(engine, server_va, 1024)?;
     // A zero port means "the service default" — HTTP default is 80.
     let port = if port_raw == 0 {
         DEFAULT_HTTP_PORT
@@ -645,18 +689,34 @@ fn handle_internet_connect_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     finish(engine, handle)
 }
 
+/// `HINTERNET InternetConnectW(HINTERNET hInternet, LPCWSTR lpszServerName,
+///                             INTERNET_PORT nServerPort, LPCWSTR lpszUserName,
+///                             LPCWSTR lpszPassword, DWORD dwService,
+///                             DWORD dwFlags, DWORD_PTR dwContext)`
+fn handle_internet_connect_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_internet_connect(ctx, StringEncoding::Wide, "InternetConnectW")
+}
+
 /// `HINTERNET InternetConnectA(...)` — ANSI variant.
 fn handle_internet_connect_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_internet_connect(ctx, StringEncoding::Ansi, "InternetConnectA")
+}
+
+/// `HINTERNET InternetOpenUrl*` shared body: create a request handle and
+/// perform the implicit `GET` immediately.
+fn handle_internet_open_url(
+    ctx: &mut HandlerContext<'_>,
+    enc: StringEncoding,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let session_handle = engine.read_rcx()?;
-    let server_va = engine.read_rdx()?;
-    let port_raw = low_u32(engine.read_r8()?, "InternetConnectA port")?;
-    let _user_va = engine.read_r9()?;
-    let _password_va = read_stack_u64(engine, 0x28)?;
-    let service = low_u32(read_stack_u64(engine, 0x30)?, "InternetConnectA service")?;
-    let _flags = read_stack_u64(engine, 0x38)?;
-    let _context = read_stack_u64(engine, 0x40)?;
+    let url_va = engine.read_rdx()?;
+    let headers_va = engine.read_r8()?;
+    let _headers_len = engine.read_r9()?;
+    let _flags = read_stack_u64(engine, 0x28)?;
+    let _context = read_stack_u64(engine, 0x30)?;
     let agent = {
         let wininet = state.wininet();
         match wininet.sessions.get(&session_handle) {
@@ -664,151 +724,60 @@ fn handle_internet_connect_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             None => return finish_false(engine, state, ERROR_INVALID_HANDLE),
         }
     };
-    if service != INTERNET_SERVICE_HTTP && service != 0 {
-        if service == INTERNET_SERVICE_FTP {
-            return finish_false(engine, state, ERROR_INTERNET_CANNOT_CONNECT);
+    let url = enc.read_string(engine, url_va, MAX_URL_LEN)?;
+    let parsed = match parse_http_url(&url) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::debug!(%url, "{api} URL parse failed: {err:#}");
+            let code = if url.starts_with("https://") || url.starts_with("ftp://") {
+                ERROR_INTERNET_UNRECOGNIZED_SCHEME
+            } else {
+                ERROR_INTERNET_INVALID_URL
+            };
+            return finish_false(engine, state, code);
         }
-        return finish_false(engine, state, ERROR_INVALID_PARAMETER);
-    }
-    let server = read_ansi_string_from_cpu(engine, server_va, 1024)?;
-    let port = if port_raw == 0 {
-        DEFAULT_HTTP_PORT
-    } else {
-        u16::try_from(port_raw & 0xffff).unwrap_or(0)
     };
+    let headers = enc.read_header_bytes(engine, headers_va)?;
     let handle = {
         let wininet = state.wininet();
         let handle = wininet.alloc_handle();
-        wininet.connections.insert(
-            handle,
-            WininetConnection {
-                host: server,
-                port,
-                agent,
-            },
-        );
+        let mut request =
+            WininetRequest::unperformed("GET".to_owned(), parsed.path, parsed.host, parsed.port);
+        request.headers = headers;
+        apply_user_agent(&mut request.headers, &agent);
+        wininet.requests.insert(handle, request);
         handle
     };
-    finish(engine, handle)
+    let outcome = {
+        let wininet = state.wininet();
+        match wininet.requests.get_mut(&handle) {
+            Some(request) => perform_and_store(request, &[]),
+            None => anyhow::bail!("wininet: request handle vanished"),
+        }
+    };
+    match outcome {
+        Ok(()) => finish(engine, handle),
+        Err(err) => finish_perform_failure(engine, state, &err),
+    }
 }
 
 /// `HINTERNET InternetOpenUrlW(HINTERNET hInternet, LPCWSTR lpszUrl,
 ///                             LPCWSTR lpszHeaders, DWORD dwHeadersLength,
 ///                             DWORD dwFlags, DWORD_PTR dwContext)`
-///
-/// Creates a request handle and performs the implicit `GET` immediately.
 fn handle_internet_open_url_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let session_handle = engine.read_rcx()?;
-    let url_va = engine.read_rdx()?;
-    let headers_va = engine.read_r8()?;
-    let _headers_len = engine.read_r9()?;
-    let _flags = read_stack_u64(engine, 0x28)?;
-    let _context = read_stack_u64(engine, 0x30)?;
-    let agent = {
-        let wininet = state.wininet();
-        match wininet.sessions.get(&session_handle) {
-            Some(session) => session.agent.clone(),
-            None => return finish_false(engine, state, ERROR_INVALID_HANDLE),
-        }
-    };
-    let url = read_wide_string_from_cpu(engine, url_va, MAX_URL_LEN)?;
-    let parsed = match parse_http_url(&url) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            tracing::debug!(%url, "InternetOpenUrlW URL parse failed: {err:#}");
-            let code = if url.starts_with("https://") || url.starts_with("ftp://") {
-                ERROR_INTERNET_UNRECOGNIZED_SCHEME
-            } else {
-                ERROR_INTERNET_INVALID_URL
-            };
-            return finish_false(engine, state, code);
-        }
-    };
-    let headers = read_wide_headers(engine, headers_va)?;
-    let handle = {
-        let wininet = state.wininet();
-        let handle = wininet.alloc_handle();
-        let mut request =
-            WininetRequest::unperformed("GET".to_owned(), parsed.path, parsed.host, parsed.port);
-        request.headers = headers;
-        apply_user_agent(&mut request.headers, &agent);
-        wininet.requests.insert(handle, request);
-        handle
-    };
-    let outcome = {
-        let wininet = state.wininet();
-        match wininet.requests.get_mut(&handle) {
-            Some(request) => perform_and_store(request, &[]),
-            None => anyhow::bail!("wininet: request handle vanished"),
-        }
-    };
-    match outcome {
-        Ok(()) => finish(engine, handle),
-        Err(err) => finish_perform_failure(engine, state, &err),
-    }
+    handle_internet_open_url(ctx, StringEncoding::Wide, "InternetOpenUrlW")
 }
 
 /// `HINTERNET InternetOpenUrlA(...)` — ANSI variant.
 fn handle_internet_open_url_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let session_handle = engine.read_rcx()?;
-    let url_va = engine.read_rdx()?;
-    let headers_va = engine.read_r8()?;
-    let _headers_len = engine.read_r9()?;
-    let _flags = read_stack_u64(engine, 0x28)?;
-    let _context = read_stack_u64(engine, 0x30)?;
-    let agent = {
-        let wininet = state.wininet();
-        match wininet.sessions.get(&session_handle) {
-            Some(session) => session.agent.clone(),
-            None => return finish_false(engine, state, ERROR_INVALID_HANDLE),
-        }
-    };
-    let url = read_ansi_string_from_cpu(engine, url_va, MAX_URL_LEN)?;
-    let parsed = match parse_http_url(&url) {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            tracing::debug!(%url, "InternetOpenUrlA URL parse failed: {err:#}");
-            let code = if url.starts_with("https://") || url.starts_with("ftp://") {
-                ERROR_INTERNET_UNRECOGNIZED_SCHEME
-            } else {
-                ERROR_INTERNET_INVALID_URL
-            };
-            return finish_false(engine, state, code);
-        }
-    };
-    let headers = read_ansi_headers(engine, headers_va)?;
-    let handle = {
-        let wininet = state.wininet();
-        let handle = wininet.alloc_handle();
-        let mut request =
-            WininetRequest::unperformed("GET".to_owned(), parsed.path, parsed.host, parsed.port);
-        request.headers = headers;
-        apply_user_agent(&mut request.headers, &agent);
-        wininet.requests.insert(handle, request);
-        handle
-    };
-    let outcome = {
-        let wininet = state.wininet();
-        match wininet.requests.get_mut(&handle) {
-            Some(request) => perform_and_store(request, &[]),
-            None => anyhow::bail!("wininet: request handle vanished"),
-        }
-    };
-    match outcome {
-        Ok(()) => finish(engine, handle),
-        Err(err) => finish_perform_failure(engine, state, &err),
-    }
+    handle_internet_open_url(ctx, StringEncoding::Ansi, "InternetOpenUrlA")
 }
 
-/// `HINTERNET HttpOpenRequestW(HINTERNET hConnect, LPCWSTR lpszVerb,
-///                             LPCWSTR lpszObjectName, LPCWSTR lpszVersion,
-///                             LPCWSTR lpszReferrer, LPCWSTR *lplpszAcceptTypes,
-///                             DWORD dwFlags, DWORD_PTR dwContext)`
-fn handle_http_open_request_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+/// `HINTERNET HttpOpenRequest*` shared body.
+fn handle_http_open_request(
+    ctx: &mut HandlerContext<'_>,
+    enc: StringEncoding,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let conn_handle = engine.read_rcx()?;
@@ -830,13 +799,13 @@ fn handle_http_open_request_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let verb = if verb_va == 0 {
         "GET".to_owned()
     } else {
-        read_wide_string_from_cpu(engine, verb_va, 64)?
+        enc.read_string(engine, verb_va, 64)?
     };
-    let path = read_wide_string_from_cpu(engine, object_va, MAX_URL_LEN)?;
+    let path = enc.read_string(engine, object_va, MAX_URL_LEN)?;
     let version = if version_va == 0 {
         "HTTP/1.1".to_owned()
     } else {
-        read_wide_string_from_cpu(engine, version_va, 32)?
+        enc.read_string(engine, version_va, 32)?
     };
     let handle = {
         let wininet = state.wininet();
@@ -850,119 +819,70 @@ fn handle_http_open_request_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     finish(engine, handle)
 }
 
+/// `HINTERNET HttpOpenRequestW(HINTERNET hConnect, LPCWSTR lpszVerb,
+///                             LPCWSTR lpszObjectName, LPCWSTR lpszVersion,
+///                             LPCWSTR lpszReferrer, LPCWSTR *lplpszAcceptTypes,
+///                             DWORD dwFlags, DWORD_PTR dwContext)`
+fn handle_http_open_request_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_http_open_request(ctx, StringEncoding::Wide)
+}
+
 /// `HINTERNET HttpOpenRequestA(...)` — ANSI variant.
 fn handle_http_open_request_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_http_open_request(ctx, StringEncoding::Ansi)
+}
+
+/// `BOOL HttpSendRequest*` shared body.
+///
+/// Performs the HTTP exchange over a fresh `TcpStream`: the send-time headers
+/// are merged into the request and `lpOptional` becomes the request body.
+fn handle_http_send_request(
+    ctx: &mut HandlerContext<'_>,
+    enc: StringEncoding,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let conn_handle = engine.read_rcx()?;
-    let verb_va = engine.read_rdx()?;
-    let object_va = engine.read_r8()?;
-    let version_va = engine.read_r9()?;
-    let _referrer_va = read_stack_u64(engine, 0x28)?;
-    let _accept_types_va = read_stack_u64(engine, 0x30)?;
-    let _flags = read_stack_u64(engine, 0x38)?;
-    let _context = read_stack_u64(engine, 0x40)?;
-    let (host, port, agent) = {
+    let req_handle = engine.read_rcx()?;
+    let headers_va = engine.read_rdx()?;
+    let _headers_len = engine.read_r8()?;
+    let optional_va = engine.read_r9()?;
+    let optional_len = low_u32(
+        read_stack_u64(engine, 0x28)?,
+        &format!("{api} optional length"),
+    )?;
+    let send_headers = enc.read_header_bytes(engine, headers_va)?;
+    let body_len = usize::try_from(optional_len).context("optional length does not fit usize")?;
+    let mut body = vec![0_u8; body_len];
+    if optional_va != 0 && !body.is_empty() {
+        engine.mem_read(optional_va, &mut body)?;
+    }
+    let outcome = {
         let wininet = state.wininet();
-        match wininet.connections.get(&conn_handle) {
-            Some(conn) => (conn.host.clone(), conn.port, conn.agent.clone()),
-            None => return finish_false(engine, state, ERROR_INVALID_HANDLE),
+        match wininet.requests.get_mut(&req_handle) {
+            Some(request) => {
+                request.headers.extend_from_slice(&send_headers);
+                perform_and_store(request, &body)
+            }
+            None => anyhow::bail!("wininet: request handle not found"),
         }
     };
-    let verb = if verb_va == 0 {
-        "GET".to_owned()
-    } else {
-        read_ansi_string_from_cpu(engine, verb_va, 64)?
-    };
-    let path = read_ansi_string_from_cpu(engine, object_va, MAX_URL_LEN)?;
-    let version = if version_va == 0 {
-        "HTTP/1.1".to_owned()
-    } else {
-        read_ansi_string_from_cpu(engine, version_va, 32)?
-    };
-    let handle = {
-        let wininet = state.wininet();
-        let handle = wininet.alloc_handle();
-        let mut request = WininetRequest::unperformed(verb, path, host, port);
-        request.version = version;
-        apply_user_agent(&mut request.headers, &agent);
-        wininet.requests.insert(handle, request);
-        handle
-    };
-    finish(engine, handle)
+    match outcome {
+        Ok(()) => finish(engine, 1),
+        Err(err) => finish_perform_failure(engine, state, &err),
+    }
 }
 
 /// `BOOL HttpSendRequestW(HINTERNET hRequest, LPCWSTR lpszHeaders,
 ///                        DWORD dwHeadersLength, LPVOID lpOptional,
 ///                        DWORD dwOptionalLength)`
-///
-/// Performs the HTTP exchange over a fresh `TcpStream`: the send-time headers
-/// are merged into the request and `lpOptional` becomes the request body.
 fn handle_http_send_request_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let req_handle = engine.read_rcx()?;
-    let headers_va = engine.read_rdx()?;
-    let _headers_len = engine.read_r8()?;
-    let optional_va = engine.read_r9()?;
-    let optional_len = low_u32(
-        read_stack_u64(engine, 0x28)?,
-        "HttpSendRequestW optional length",
-    )?;
-    let send_headers = read_wide_headers(engine, headers_va)?;
-    let body_len = usize::try_from(optional_len).context("optional length does not fit usize")?;
-    let mut body = vec![0_u8; body_len];
-    if optional_va != 0 && !body.is_empty() {
-        engine.mem_read(optional_va, &mut body)?;
-    }
-    let outcome = {
-        let wininet = state.wininet();
-        match wininet.requests.get_mut(&req_handle) {
-            Some(request) => {
-                request.headers.extend_from_slice(&send_headers);
-                perform_and_store(request, &body)
-            }
-            None => anyhow::bail!("wininet: request handle not found"),
-        }
-    };
-    match outcome {
-        Ok(()) => finish(engine, 1),
-        Err(err) => finish_perform_failure(engine, state, &err),
-    }
+    handle_http_send_request(ctx, StringEncoding::Wide, "HttpSendRequestW")
 }
 
 /// `BOOL HttpSendRequestA(...)` — ANSI variant.
 fn handle_http_send_request_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let req_handle = engine.read_rcx()?;
-    let headers_va = engine.read_rdx()?;
-    let _headers_len = engine.read_r8()?;
-    let optional_va = engine.read_r9()?;
-    let optional_len = low_u32(
-        read_stack_u64(engine, 0x28)?,
-        "HttpSendRequestA optional length",
-    )?;
-    let send_headers = read_ansi_headers(engine, headers_va)?;
-    let body_len = usize::try_from(optional_len).context("optional length does not fit usize")?;
-    let mut body = vec![0_u8; body_len];
-    if optional_va != 0 && !body.is_empty() {
-        engine.mem_read(optional_va, &mut body)?;
-    }
-    let outcome = {
-        let wininet = state.wininet();
-        match wininet.requests.get_mut(&req_handle) {
-            Some(request) => {
-                request.headers.extend_from_slice(&send_headers);
-                perform_and_store(request, &body)
-            }
-            None => anyhow::bail!("wininet: request handle not found"),
-        }
-    };
-    match outcome {
-        Ok(()) => finish(engine, 1),
-        Err(err) => finish_perform_failure(engine, state, &err),
-    }
+    handle_http_send_request(ctx, StringEncoding::Ansi, "HttpSendRequestA")
 }
 
 /// `BOOL InternetReadFile(HINTERNET hFile, LPVOID lpBuffer,
@@ -1045,7 +965,8 @@ fn is_ignored_option(option: u32) -> bool {
 ///                          LPVOID lpBuffer, DWORD dwBufferLength)`
 ///
 /// Accepts-and-ignores the common tuning options; unknown options fail with
-/// `ERROR_INVALID_PARAMETER` instead of faking success.
+/// `ERROR_INVALID_PARAMETER` instead of faking success. The option values are
+/// encoding-independent, so the ANSI variant delegates here.
 fn handle_internet_set_option_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -1062,17 +983,7 @@ fn handle_internet_set_option_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 
 /// `BOOL InternetSetOptionA(...)` — ANSI variant (same option values).
 fn handle_internet_set_option_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _h = engine.read_rcx()?;
-    let option = low_u32(engine.read_rdx()?, "InternetSetOptionA option")?;
-    let _buffer_va = engine.read_r8()?;
-    let _buffer_len = engine.read_r9()?;
-    if is_ignored_option(option) {
-        finish(engine, 1)
-    } else {
-        finish_false(engine, state, ERROR_INVALID_PARAMETER)
-    }
+    handle_internet_set_option_w(ctx)
 }
 
 /// `BOOL InternetGetConnectedState(LPDWORD lpdwFlags, DWORD dwReserved)`
@@ -1107,29 +1018,4 @@ fn handle_internet_query_option_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// `BOOL InternetQueryOptionA(...)` — ANSI variant.
 fn handle_internet_query_option_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     handle_internet_query_option_w(ctx)
-}
-
-/// Census oracle: which `wininet.dll` exports are implemented.
-pub fn is_export(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    matches!(
-        n.as_str(),
-        "internetopenw"
-            | "internetopena"
-            | "internetclosehandle"
-            | "internetconnectw"
-            | "internetconnecta"
-            | "internetopenurlw"
-            | "internetopenurla"
-            | "httpopenrequestw"
-            | "httpopenrequesta"
-            | "httpsendrequestw"
-            | "httpsendrequesta"
-            | "internetreadfile"
-            | "internetsetoptionw"
-            | "internetsetoptiona"
-            | "internetgetconnectedstate"
-            | "internetqueryoptionw"
-            | "internetqueryoptiona"
-    )
 }

@@ -253,7 +253,7 @@ fn read_version_block_from_guest(
 /// The table mirrors the LANGID set of the repo's locale work (`user32::lang`);
 /// unknown primary languages report `Unknown language (0xNNNN)` — the honest
 /// Windows format, never a fabricated name.
-fn ver_language_name(langid: u32) -> String {
+fn ver_language_name_for_langid(langid: u32) -> String {
     // LANGID layout (winnt.h): primary language in the low 10 bits,
     // sublanguage in the high 6 bits.
     let primary = langid & 0x3FF;
@@ -434,39 +434,117 @@ fn validate_ver_get_flags(flags: u32, state: &mut WinApiState) -> bool {
 
 // ── Handlers (Win64 register ABI) ────────────────────────────────────────
 
-/// Handles `VERSION.dll!GetFileVersionInfoSizeW`.
-pub fn handle_get_file_version_info_size_w(
+/// Which character encoding an A/W API pair uses for its string parameters.
+#[derive(Debug, Clone, Copy)]
+enum StringEncoding {
+    /// UTF-16LE (`…W` variants).
+    Wide,
+    /// The ANSI code page — CP1252 decode/encode (`…A` variants).
+    Ansi,
+}
+
+impl StringEncoding {
+    /// Read a NUL-terminated guest string of this encoding, capped at `max`
+    /// units.
+    fn read_string(
+        self,
+        engine: &mut dyn wie_cpu::CpuEngine,
+        va: u64,
+        max: usize,
+    ) -> Result<String> {
+        match self {
+            Self::Wide => read_wide_string_from_cpu(engine, va, max),
+            Self::Ansi => read_ansi_string_from_cpu(engine, va, max),
+        }
+    }
+
+    /// Encoded length in guest units (UTF-16 code units or CP1252 bytes).
+    fn encoded_len(self, text: &str) -> usize {
+        match self {
+            Self::Wide => text.encode_utf16().count(),
+            Self::Ansi => crate::guest_string::encode_cp1252(text).len(),
+        }
+    }
+
+    /// Write `text` as a NUL-terminated string of this encoding.
+    fn write_c_string(
+        self,
+        engine: &mut dyn wie_cpu::CpuEngine,
+        va: u64,
+        cap: usize,
+        text: &str,
+    ) -> Result<usize> {
+        match self {
+            Self::Wide => crate::guest_string::write_utf16_c_string(engine, va, cap, text),
+            Self::Ansi => crate::guest_string::write_ansi_c_string(engine, va, cap, text),
+        }
+    }
+}
+
+/// Resolve a guest-relative `path` against the current directory.
+fn resolve_guest_path(state: &WinApiState, path: &str) -> String {
+    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    kernel32::resolve_full_windows_path(&cwd, path)
+}
+
+/// Shared `GetFileVersionInfoSize*` body (`api` names the variant for errors).
+fn get_file_version_info_size(
     ctx: &mut HandlerContext<'_>,
+    enc: StringEncoding,
+    api: &str,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let file_va = engine
         .read_rcx()
-        .context("failed to read RCX for GetFileVersionInfoSizeW")?;
+        .with_context(|| format!("failed to read RCX for {api}"))?;
     let handle_va = engine
         .read_rdx()
-        .context("failed to read RDX for GetFileVersionInfoSizeW")?;
-    let path = read_wide_string_from_cpu(engine, file_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
-    let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
+        .with_context(|| format!("failed to read RDX for {api}"))?;
+    let path = enc.read_string(engine, file_va, 1024)?;
+    let full_path = resolve_guest_path(state, &path);
     finish_version_size(engine, state, &full_path, handle_va)
+}
+
+/// Handles `VERSION.dll!GetFileVersionInfoSizeW`.
+pub fn handle_get_file_version_info_size_w(
+    ctx: &mut HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
+    get_file_version_info_size(ctx, StringEncoding::Wide, "GetFileVersionInfoSizeW")
 }
 
 /// Handles `VERSION.dll!GetFileVersionInfoSizeA`.
 pub fn handle_get_file_version_info_size_a(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    get_file_version_info_size(ctx, StringEncoding::Ansi, "GetFileVersionInfoSizeA")
+}
+
+/// Shared `GetFileVersionInfoSizeEx*` body.
+fn get_file_version_info_size_ex(
+    ctx: &mut HandlerContext<'_>,
+    enc: StringEncoding,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    let flags = kernel32::low_u32(
+        engine
+            .read_rcx()
+            .with_context(|| format!("failed to read RCX for {api}"))?,
+        &format!("{api} dwFlags"),
+    )?;
+    if !validate_ver_get_flags(flags, state) {
+        return return_zero(engine, api);
+    }
     let file_va = engine
-        .read_rcx()
-        .context("failed to read RCX for GetFileVersionInfoSizeA")?;
-    let handle_va = engine
         .read_rdx()
-        .context("failed to read RDX for GetFileVersionInfoSizeA")?;
-    let path = read_ansi_string_from_cpu(engine, file_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
-    let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
+        .with_context(|| format!("failed to read RDX for {api}"))?;
+    let handle_va = engine
+        .read_r8()
+        .with_context(|| format!("failed to read R8 for {api}"))?;
+    let path = enc.read_string(engine, file_va, 1024)?;
+    let full_path = resolve_guest_path(state, &path);
     finish_version_size(engine, state, &full_path, handle_va)
 }
 
@@ -474,97 +552,80 @@ pub fn handle_get_file_version_info_size_a(
 pub fn handle_get_file_version_info_size_ex_w(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let flags = kernel32::low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for GetFileVersionInfoSizeExW")?,
-        "GetFileVersionInfoSizeExW dwFlags",
-    )?;
-    if !validate_ver_get_flags(flags, state) {
-        return return_zero(engine, "GetFileVersionInfoSizeExW");
-    }
-    let file_va = engine
-        .read_rdx()
-        .context("failed to read RDX for GetFileVersionInfoSizeExW")?;
-    let handle_va = engine
-        .read_r8()
-        .context("failed to read R8 for GetFileVersionInfoSizeExW")?;
-    let path = read_wide_string_from_cpu(engine, file_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
-    let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
-    finish_version_size(engine, state, &full_path, handle_va)
+    get_file_version_info_size_ex(ctx, StringEncoding::Wide, "GetFileVersionInfoSizeExW")
 }
 
 /// Handles `VERSION.dll!GetFileVersionInfoSizeExA`.
 pub fn handle_get_file_version_info_size_ex_a(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    get_file_version_info_size_ex(ctx, StringEncoding::Ansi, "GetFileVersionInfoSizeExA")
+}
+
+/// Shared `GetFileVersionInfo*` body.
+fn get_file_version_info(
+    ctx: &mut HandlerContext<'_>,
+    enc: StringEncoding,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let file_va = engine
+        .read_rcx()
+        .with_context(|| format!("failed to read RCX for {api}"))?;
+    let _handle = engine
+        .read_rdx()
+        .with_context(|| format!("failed to read RDX for {api}"))?;
+    let data_len = engine
+        .read_r8()
+        .with_context(|| format!("failed to read R8 for {api}"))?;
+    let data_va = engine
+        .read_r9()
+        .with_context(|| format!("failed to read R9 for {api}"))?;
+    let path = enc.read_string(engine, file_va, 1024)?;
+    let full_path = resolve_guest_path(state, &path);
+    finish_version_info(engine, state, &full_path, data_len, data_va)
+}
+
+/// Handles `VERSION.dll!GetFileVersionInfoW`.
+pub fn handle_get_file_version_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    get_file_version_info(ctx, StringEncoding::Wide, "GetFileVersionInfoW")
+}
+
+/// Handles `VERSION.dll!GetFileVersionInfoA`.
+pub fn handle_get_file_version_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    get_file_version_info(ctx, StringEncoding::Ansi, "GetFileVersionInfoA")
+}
+
+/// Shared `GetFileVersionInfoEx*` body.
+fn get_file_version_info_ex(
+    ctx: &mut HandlerContext<'_>,
+    enc: StringEncoding,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let flags = kernel32::low_u32(
         engine
             .read_rcx()
-            .context("failed to read RCX for GetFileVersionInfoSizeExA")?,
-        "GetFileVersionInfoSizeExA dwFlags",
+            .with_context(|| format!("failed to read RCX for {api}"))?,
+        &format!("{api} dwFlags"),
     )?;
     if !validate_ver_get_flags(flags, state) {
-        return return_zero(engine, "GetFileVersionInfoSizeExA");
+        return return_zero(engine, api);
     }
     let file_va = engine
         .read_rdx()
-        .context("failed to read RDX for GetFileVersionInfoSizeExA")?;
-    let handle_va = engine
-        .read_r8()
-        .context("failed to read R8 for GetFileVersionInfoSizeExA")?;
-    let path = read_ansi_string_from_cpu(engine, file_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
-    let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
-    finish_version_size(engine, state, &full_path, handle_va)
-}
-
-/// Handles `VERSION.dll!GetFileVersionInfoW`.
-pub fn handle_get_file_version_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let file_va = engine
-        .read_rcx()
-        .context("failed to read RCX for GetFileVersionInfoW")?;
+        .with_context(|| format!("failed to read RDX for {api}"))?;
     let _handle = engine
-        .read_rdx()
-        .context("failed to read RDX for GetFileVersionInfoW")?;
-    let data_len = engine
         .read_r8()
-        .context("failed to read R8 for GetFileVersionInfoW")?;
-    let data_va = engine
-        .read_r9()
-        .context("failed to read R9 for GetFileVersionInfoW")?;
-    let path = read_wide_string_from_cpu(engine, file_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
-    let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
-    finish_version_info(engine, state, &full_path, data_len, data_va)
-}
-
-/// Handles `VERSION.dll!GetFileVersionInfoA`.
-pub fn handle_get_file_version_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let file_va = engine
-        .read_rcx()
-        .context("failed to read RCX for GetFileVersionInfoA")?;
-    let _handle = engine
-        .read_rdx()
-        .context("failed to read RDX for GetFileVersionInfoA")?;
+        .with_context(|| format!("failed to read R8 for {api}"))?;
     let data_len = engine
-        .read_r8()
-        .context("failed to read R8 for GetFileVersionInfoA")?;
-    let data_va = engine
         .read_r9()
-        .context("failed to read R9 for GetFileVersionInfoA")?;
-    let path = read_ansi_string_from_cpu(engine, file_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
-    let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
+        .with_context(|| format!("failed to read R9 for {api}"))?;
+    let data_va = read_stack_u64(engine, 0x28)?; // 5th arg
+    let path = enc.read_string(engine, file_va, 1024)?;
+    let full_path = resolve_guest_path(state, &path);
     finish_version_info(engine, state, &full_path, data_len, data_va)
 }
 
@@ -572,101 +633,49 @@ pub fn handle_get_file_version_info_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_get_file_version_info_ex_w(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let flags = kernel32::low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for GetFileVersionInfoExW")?,
-        "GetFileVersionInfoExW dwFlags",
-    )?;
-    if !validate_ver_get_flags(flags, state) {
-        return return_zero(engine, "GetFileVersionInfoExW");
-    }
-    let file_va = engine
-        .read_rdx()
-        .context("failed to read RDX for GetFileVersionInfoExW")?;
-    let _handle = engine
-        .read_r8()
-        .context("failed to read R8 for GetFileVersionInfoExW")?;
-    let data_len = engine
-        .read_r9()
-        .context("failed to read R9 for GetFileVersionInfoExW")?;
-    let data_va = read_stack_u64(engine, 0x28)?; // 5th arg
-    let path = read_wide_string_from_cpu(engine, file_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
-    let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
-    finish_version_info(engine, state, &full_path, data_len, data_va)
+    get_file_version_info_ex(ctx, StringEncoding::Wide, "GetFileVersionInfoExW")
 }
 
 /// Handles `VERSION.dll!GetFileVersionInfoExA`.
 pub fn handle_get_file_version_info_ex_a(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
+    get_file_version_info_ex(ctx, StringEncoding::Ansi, "GetFileVersionInfoExA")
+}
+
+/// Shared `VerQueryValue*` body.
+fn ver_query_value(
+    ctx: &mut HandlerContext<'_>,
+    enc: StringEncoding,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let flags = kernel32::low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for GetFileVersionInfoExA")?,
-        "GetFileVersionInfoExA dwFlags",
-    )?;
-    if !validate_ver_get_flags(flags, state) {
-        return return_zero(engine, "GetFileVersionInfoExA");
-    }
-    let file_va = engine
+    let block_va = engine
+        .read_rcx()
+        .with_context(|| format!("failed to read RCX for {api}"))?;
+    let path_va = engine
         .read_rdx()
-        .context("failed to read RDX for GetFileVersionInfoExA")?;
-    let _handle = engine
+        .with_context(|| format!("failed to read RDX for {api}"))?;
+    let buffer_out = engine
         .read_r8()
-        .context("failed to read R8 for GetFileVersionInfoExA")?;
-    let data_len = engine
+        .with_context(|| format!("failed to read R8 for {api}"))?;
+    let len_out = engine
         .read_r9()
-        .context("failed to read R9 for GetFileVersionInfoExA")?;
-    let data_va = read_stack_u64(engine, 0x28)?; // 5th arg
-    let path = read_ansi_string_from_cpu(engine, file_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
-    let full_path = kernel32::resolve_full_windows_path(&cwd, &path);
-    finish_version_info(engine, state, &full_path, data_len, data_va)
+        .with_context(|| format!("failed to read R9 for {api}"))?;
+    let path = enc.read_string(engine, path_va, 1024)?;
+    finish_ver_query_value(engine, block_va, &path, buffer_out, len_out)
 }
 
 /// Handles `VERSION.dll!VerQueryValueW`.
 pub fn handle_ver_query_value_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let block_va = engine
-        .read_rcx()
-        .context("failed to read RCX for VerQueryValueW")?;
-    let path_va = engine
-        .read_rdx()
-        .context("failed to read RDX for VerQueryValueW")?;
-    let buffer_out = engine
-        .read_r8()
-        .context("failed to read R8 for VerQueryValueW")?;
-    let len_out = engine
-        .read_r9()
-        .context("failed to read R9 for VerQueryValueW")?;
-    let path = read_wide_string_from_cpu(engine, path_va, 1024)?;
-    finish_ver_query_value(engine, block_va, &path, buffer_out, len_out)
+    ver_query_value(ctx, StringEncoding::Wide, "VerQueryValueW")
 }
 
 /// Handles `VERSION.dll!VerQueryValueA`.
+///
+/// The A-path is decoded via the shared CP1252 path (UTF-8 literals first).
 pub fn handle_ver_query_value_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let block_va = engine
-        .read_rcx()
-        .context("failed to read RCX for VerQueryValueA")?;
-    let path_va = engine
-        .read_rdx()
-        .context("failed to read RDX for VerQueryValueA")?;
-    let buffer_out = engine
-        .read_r8()
-        .context("failed to read R8 for VerQueryValueA")?;
-    let len_out = engine
-        .read_r9()
-        .context("failed to read R9 for VerQueryValueA")?;
-    // The A-path is decoded via the shared CP1252 path (UTF-8 literals first).
-    let path = read_ansi_string_from_cpu(engine, path_va, 1024)?;
-    finish_ver_query_value(engine, block_va, &path, buffer_out, len_out)
+    ver_query_value(ctx, StringEncoding::Ansi, "VerQueryValueA")
 }
 
 /// Handles `VERSION.dll!GetFileVersionInfoByHandleW`.
@@ -726,68 +735,63 @@ pub fn handle_get_file_version_info_by_handle_a(
     handle_get_file_version_info_by_handle_w(ctx)
 }
 
-/// Handles `VERSION.dll!VerLanguageNameW`.
-pub fn handle_ver_language_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+/// Shared `VerLanguageName*` body.
+fn ver_language_name(
+    ctx: &mut HandlerContext<'_>,
+    enc: StringEncoding,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let lang = kernel32::low_u32(
         engine
             .read_rcx()
-            .context("failed to read RCX for VerLanguageNameW")?,
-        "VerLanguageNameW wLang",
+            .with_context(|| format!("failed to read RCX for {api}"))?,
+        &format!("{api} wLang"),
     )?;
     let buf = engine
         .read_rdx()
-        .context("failed to read RDX for VerLanguageNameW")?;
+        .with_context(|| format!("failed to read RDX for {api}"))?;
     let cch = engine
         .read_r8()
-        .context("failed to read R8 for VerLanguageNameW")?;
-    let name = ver_language_name(lang);
-    let cch_usize = usize::try_from(cch).context("VerLanguageNameW cch does not fit usize")?;
-    let _written = crate::guest_string::write_utf16_c_string(engine, buf, cch_usize, &name)?;
-    // The full length in characters excluding NUL — the "required size"
-    // contract even when a small buffer truncated the write.
-    let units = u64::try_from(name.encode_utf16().count()).unwrap_or(0);
-    ctx.finish(units)
+        .with_context(|| format!("failed to read R8 for {api}"))?;
+    let name = ver_language_name_for_langid(lang);
+    let cch_usize =
+        usize::try_from(cch).with_context(|| format!("{api} cch does not fit usize"))?;
+    let _written = enc.write_c_string(engine, buf, cch_usize, &name)?;
+    // The full encoded length excluding NUL — the "required size" contract
+    // even when a small buffer truncated the write.
+    ctx.finish(u64::try_from(enc.encoded_len(&name)).unwrap_or(0))
+}
+
+/// Handles `VERSION.dll!VerLanguageNameW`.
+pub fn handle_ver_language_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    ver_language_name(ctx, StringEncoding::Wide, "VerLanguageNameW")
 }
 
 /// Handles `VERSION.dll!VerLanguageNameA`.
 pub fn handle_ver_language_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let lang = kernel32::low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for VerLanguageNameA")?,
-        "VerLanguageNameA wLang",
-    )?;
-    let buf = engine
-        .read_rdx()
-        .context("failed to read RDX for VerLanguageNameA")?;
-    let cch = engine
-        .read_r8()
-        .context("failed to read R8 for VerLanguageNameA")?;
-    let name = ver_language_name(lang);
-    let cch_usize = usize::try_from(cch).context("VerLanguageNameA cch does not fit usize")?;
-    let _written = crate::guest_string::write_ansi_c_string(engine, buf, cch_usize, &name)?;
-    // CP1252 is one byte per char, so the byte count is the char count.
-    let bytes = u64::try_from(crate::guest_string::encode_cp1252(&name).len()).unwrap_or(0);
-    ctx.finish(bytes)
+    ver_language_name(ctx, StringEncoding::Ansi, "VerLanguageNameA")
 }
 
-/// Handles `VERSION.dll!VerFindFileW`.
-pub fn handle_ver_find_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+/// Shared `VerFindFile*` body.
+fn ver_find_file(
+    ctx: &mut HandlerContext<'_>,
+    enc: StringEncoding,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _flags = engine
         .read_rcx()
-        .context("failed to read RCX for VerFindFileW")?;
+        .with_context(|| format!("failed to read RCX for {api}"))?;
     let file_va = engine
         .read_rdx()
-        .context("failed to read RDX for VerFindFileW")?;
+        .with_context(|| format!("failed to read RDX for {api}"))?;
     let cur_dir_va = read_stack_u64(engine, 0x28)?;
     let cur_dir_len_va = read_stack_u64(engine, 0x30)?;
     let dest_dir_va = read_stack_u64(engine, 0x38)?;
     let dest_dir_len_va = read_stack_u64(engine, 0x40)?;
-    let file = read_wide_string_from_cpu(engine, file_va, 1024)?;
+    let file = enc.read_string(engine, file_va, 1024)?;
     let (mut flags, located) = find_file_dirs(state, &file);
     // Report the located directory; the dest dir is a Windows-versioning
     // concept WIE does not model, so it stays empty (documented above).
@@ -796,25 +800,14 @@ pub fn handle_ver_find_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     ctx.finish(u64::from(flags))
 }
 
+/// Handles `VERSION.dll!VerFindFileW`.
+pub fn handle_ver_find_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    ver_find_file(ctx, StringEncoding::Wide, "VerFindFileW")
+}
+
 /// Handles `VERSION.dll!VerFindFileA`.
 pub fn handle_ver_find_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _flags = engine
-        .read_rcx()
-        .context("failed to read RCX for VerFindFileA")?;
-    let file_va = engine
-        .read_rdx()
-        .context("failed to read RDX for VerFindFileA")?;
-    let cur_dir_va = read_stack_u64(engine, 0x28)?;
-    let cur_dir_len_va = read_stack_u64(engine, 0x30)?;
-    let dest_dir_va = read_stack_u64(engine, 0x38)?;
-    let dest_dir_len_va = read_stack_u64(engine, 0x40)?;
-    let file = read_ansi_string_from_cpu(engine, file_va, 1024)?;
-    let (mut flags, located) = find_file_dirs(state, &file);
-    flags |= write_dir_out(engine, cur_dir_va, cur_dir_len_va, &located)?;
-    flags |= write_dir_out(engine, dest_dir_va, dest_dir_len_va, "")?;
-    ctx.finish(u64::from(flags))
+    ver_find_file(ctx, StringEncoding::Ansi, "VerFindFileA")
 }
 
 /// `VerInstallFile` core: really copy the source into the destination dir.
@@ -841,29 +834,34 @@ fn install_file(
     }
 }
 
-/// Handles `VERSION.dll!VerInstallFileW`.
-pub fn handle_ver_install_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+/// Shared `VerInstallFile*` body: really copy the source into the destination
+/// dir, then report the temp file (the destination itself).
+fn ver_install_file(
+    ctx: &mut HandlerContext<'_>,
+    enc: StringEncoding,
+    api: &str,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _flags = engine
         .read_rcx()
-        .context("failed to read RCX for VerInstallFileW")?;
+        .with_context(|| format!("failed to read RCX for {api}"))?;
     let src_file_va = engine
         .read_rdx()
-        .context("failed to read RDX for VerInstallFileW")?;
+        .with_context(|| format!("failed to read RDX for {api}"))?;
     let dest_file_va = engine
         .read_r8()
-        .context("failed to read R8 for VerInstallFileW")?;
+        .with_context(|| format!("failed to read R8 for {api}"))?;
     let src_dir_va = engine
         .read_r9()
-        .context("failed to read R9 for VerInstallFileW")?;
+        .with_context(|| format!("failed to read R9 for {api}"))?;
     let dest_dir_va = read_stack_u64(engine, 0x28)?;
     let tmp_file_va = read_stack_u64(engine, 0x38)?;
     let tmp_file_len_va = read_stack_u64(engine, 0x40)?;
-    let src_file = read_wide_string_from_cpu(engine, src_file_va, 1024)?;
-    let dest_file = read_wide_string_from_cpu(engine, dest_file_va, 1024)?;
-    let src_dir = read_wide_string_from_cpu(engine, src_dir_va, 1024)?;
-    let dest_dir = read_wide_string_from_cpu(engine, dest_dir_va, 1024)?;
+    let src_file = enc.read_string(engine, src_file_va, 1024)?;
+    let dest_file = enc.read_string(engine, dest_file_va, 1024)?;
+    let src_dir = enc.read_string(engine, src_dir_va, 1024)?;
+    let dest_dir = enc.read_string(engine, dest_dir_va, 1024)?;
     let mut flags = install_file(state, &src_dir, &src_file, &dest_dir, &dest_file)?;
     // The temp file is the destination file itself (WIE copies in place —
     // there is no two-phase temp-then-rename dance to report).
@@ -871,13 +869,13 @@ pub fn handle_ver_install_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         0
     } else {
         usize::try_from(u64::from(kernel32::read_u32(engine, tmp_file_len_va)?))
-            .context("VerInstallFileW temp length does not fit usize")?
+            .with_context(|| format!("{api} temp length does not fit usize"))?
     };
-    let needed = dest_file.encode_utf16().count();
+    let needed = enc.encoded_len(&dest_file);
     let written = if tmp_file_va == 0 {
         0
     } else {
-        crate::guest_string::write_utf16_c_string(engine, tmp_file_va, cap, &dest_file)?
+        enc.write_c_string(engine, tmp_file_va, cap, &dest_file)?
     };
     if tmp_file_len_va != 0 {
         kernel32::write_guest_u32(
@@ -892,53 +890,14 @@ pub fn handle_ver_install_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     ctx.finish(u64::from(flags))
 }
 
+/// Handles `VERSION.dll!VerInstallFileW`.
+pub fn handle_ver_install_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    ver_install_file(ctx, StringEncoding::Wide, "VerInstallFileW")
+}
+
 /// Handles `VERSION.dll!VerInstallFileA`.
 pub fn handle_ver_install_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _flags = engine
-        .read_rcx()
-        .context("failed to read RCX for VerInstallFileA")?;
-    let src_file_va = engine
-        .read_rdx()
-        .context("failed to read RDX for VerInstallFileA")?;
-    let dest_file_va = engine
-        .read_r8()
-        .context("failed to read R8 for VerInstallFileA")?;
-    let src_dir_va = engine
-        .read_r9()
-        .context("failed to read R9 for VerInstallFileA")?;
-    let dest_dir_va = read_stack_u64(engine, 0x28)?;
-    let tmp_file_va = read_stack_u64(engine, 0x38)?;
-    let tmp_file_len_va = read_stack_u64(engine, 0x40)?;
-    let src_file = read_ansi_string_from_cpu(engine, src_file_va, 1024)?;
-    let dest_file = read_ansi_string_from_cpu(engine, dest_file_va, 1024)?;
-    let src_dir = read_ansi_string_from_cpu(engine, src_dir_va, 1024)?;
-    let dest_dir = read_ansi_string_from_cpu(engine, dest_dir_va, 1024)?;
-    let mut flags = install_file(state, &src_dir, &src_file, &dest_dir, &dest_file)?;
-    let cap = if tmp_file_len_va == 0 {
-        0
-    } else {
-        usize::try_from(u64::from(kernel32::read_u32(engine, tmp_file_len_va)?))
-            .context("VerInstallFileA temp length does not fit usize")?
-    };
-    let needed = crate::guest_string::encode_cp1252(&dest_file).len();
-    let written = if tmp_file_va == 0 {
-        0
-    } else {
-        crate::guest_string::write_ansi_c_string(engine, tmp_file_va, cap, &dest_file)?
-    };
-    if tmp_file_len_va != 0 {
-        kernel32::write_guest_u32(
-            engine,
-            tmp_file_len_va,
-            u32::try_from(needed).unwrap_or(u32::MAX),
-        )?;
-    }
-    if written < needed {
-        flags |= VIF_BUFFTOOSMALL;
-    }
-    ctx.finish(u64::from(flags))
+    ver_install_file(ctx, StringEncoding::Ansi, "VerInstallFileA")
 }
 
 /// Return 0 with the current last-error already set.
@@ -960,19 +919,31 @@ mod tests {
 
     #[test]
     fn language_names_cover_the_common_langids() {
-        assert_eq!(ver_language_name(0x0409), "English (United States)");
-        assert_eq!(ver_language_name(0x0809), "English (United Kingdom)");
-        assert_eq!(ver_language_name(0x0407), "German (Germany)");
-        assert_eq!(ver_language_name(0x040C), "French (France)");
-        assert_eq!(ver_language_name(0x0419), "Russian (Russia)");
-        assert_eq!(ver_language_name(0x0411), "Japanese (Japan)");
+        assert_eq!(
+            ver_language_name_for_langid(0x0409),
+            "English (United States)"
+        );
+        assert_eq!(
+            ver_language_name_for_langid(0x0809),
+            "English (United Kingdom)"
+        );
+        assert_eq!(ver_language_name_for_langid(0x0407), "German (Germany)");
+        assert_eq!(ver_language_name_for_langid(0x040C), "French (France)");
+        assert_eq!(ver_language_name_for_langid(0x0419), "Russian (Russia)");
+        assert_eq!(ver_language_name_for_langid(0x0411), "Japanese (Japan)");
         // Neutral sublanguage 0 reports the bare primary name.
-        assert_eq!(ver_language_name(0x0009), "English");
-        assert_eq!(ver_language_name(0x0007), "German");
+        assert_eq!(ver_language_name_for_langid(0x0009), "English");
+        assert_eq!(ver_language_name_for_langid(0x0007), "German");
         // Chinese is script-reported; an unknown primary is honestly flagged.
-        assert_eq!(ver_language_name(0x0804), "Chinese (Simplified)");
-        assert_eq!(ver_language_name(0x0404), "Chinese (Traditional)");
-        assert_eq!(ver_language_name(0x0FFF), "Unknown language (0x0FFF)");
+        assert_eq!(ver_language_name_for_langid(0x0804), "Chinese (Simplified)");
+        assert_eq!(
+            ver_language_name_for_langid(0x0404),
+            "Chinese (Traditional)"
+        );
+        assert_eq!(
+            ver_language_name_for_langid(0x0FFF),
+            "Unknown language (0x0FFF)"
+        );
     }
 
     /// The A-path decode feeds the query walk: CP1252 byte 0xE9 (é) must

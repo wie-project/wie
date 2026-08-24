@@ -450,32 +450,11 @@ fn handle_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
         let _ = state.heap_state.heap.free_coherent(engine, ptr);
         return finish(engine, 0);
     }
-    if let Some(same) = state.heap_state.heap.try_realloc_in_place(ptr, new_size) {
-        return finish(engine, same);
-    }
-    let old_size = state
+    // Move-or-stay realloc shared with HeapReAlloc; the CRT path never zero-fills.
+    let (new_addr, _old_size) = state
         .heap_state
         .heap
-        .size_of(ptr)
-        .or_else(|| {
-            let mut hb = [0_u8; 8];
-            engine
-                .mem_read(ptr.wrapping_sub(8), &mut hb)
-                .ok()
-                .map(|()| u64::from_le_bytes(hb))
-        })
-        .unwrap_or(0);
-    let new_addr = state.heap_state.heap.alloc_coherent(engine, new_size);
-    if new_addr == 0 {
-        return finish(engine, 0);
-    }
-    let copy_len = usize::try_from(old_size.min(new_size)).unwrap_or(0);
-    if copy_len > 0 {
-        let mut bytes = vec![0_u8; copy_len];
-        engine.mem_read(ptr, &mut bytes)?;
-        engine.mem_write(new_addr, &bytes)?;
-    }
-    let _ = state.heap_state.heap.free_coherent(engine, ptr);
+        .realloc_coherent(engine, ptr, new_size)?;
     finish(engine, new_addr)
 }
 /// Read a NUL-terminated string from guest memory into a host buffer.

@@ -4,8 +4,10 @@ use super::{
     write_guest_utf16_c_string, write_typed_copy,
 };
 use crate::HandlerContext;
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::MenuItemInfo;
 use crate::handles::{Hmenu, Hwnd};
+use crate::kernel32::low_u32;
 use wie_pe::resources::{MenuItemTemplate, MenuTemplate};
 
 /// One fake USER32 menu: its handle and the ordered item list. A `Popup`
@@ -66,25 +68,15 @@ const MFT_STRING: u32 = 0x0000;
 pub fn handle_enable_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let menu_handle = Hmenu::from(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for EnableMenuItem")?,
-    );
+    let menu_handle = Hmenu::from(read_arg(engine, ArgReg::Rcx, "EnableMenuItem")?);
 
-    let item_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for EnableMenuItem")?;
+    let item_raw = read_arg(engine, ArgReg::Rdx, "EnableMenuItem")?;
 
-    let flags_raw = engine
-        .read_r8()
-        .context("failed to read R8 for EnableMenuItem")?;
+    let flags_raw = read_arg(engine, ArgReg::R8, "EnableMenuItem")?;
 
-    let item = u32::try_from(item_raw & u64::from(u32::MAX))
-        .context("EnableMenuItem item does not fit u32")?;
+    let item = low_u32(item_raw, "EnableMenuItem item")?;
 
-    let flags = u32::try_from(flags_raw & u64::from(u32::MAX))
-        .context("EnableMenuItem flags do not fit u32")?;
+    let flags = low_u32(flags_raw, "EnableMenuItem flags")?;
 
     let new_enabled = flags & (MF_GRAYED | MF_DISABLED) == 0;
     let (previous_flags, mutated) = mutate_item(
@@ -115,25 +107,15 @@ pub fn handle_enable_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 pub fn handle_check_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let menu_handle = Hmenu::from(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for CheckMenuItem")?,
-    );
+    let menu_handle = Hmenu::from(read_arg(engine, ArgReg::Rcx, "CheckMenuItem")?);
 
-    let item_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for CheckMenuItem")?;
+    let item_raw = read_arg(engine, ArgReg::Rdx, "CheckMenuItem")?;
 
-    let flags_raw = engine
-        .read_r8()
-        .context("failed to read R8 for CheckMenuItem")?;
+    let flags_raw = read_arg(engine, ArgReg::R8, "CheckMenuItem")?;
 
-    let item = u32::try_from(item_raw & u64::from(u32::MAX))
-        .context("CheckMenuItem item does not fit u32")?;
+    let item = low_u32(item_raw, "CheckMenuItem item")?;
 
-    let flags = u32::try_from(flags_raw & u64::from(u32::MAX))
-        .context("CheckMenuItem flags do not fit u32")?;
+    let flags = low_u32(flags_raw, "CheckMenuItem flags")?;
 
     let new_checked = flags & MF_CHECKED != 0;
     let (previous_flags, mutated) = mutate_item(
@@ -233,12 +215,8 @@ fn handle_load_menu_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let instance_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let menu_name_raw = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let instance_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let menu_name_raw = read_arg(engine, ArgReg::Rdx, api_name)?;
 
     let menu_id = if menu_name_raw >> 16 == 0 {
         u16::try_from(menu_name_raw & u64::from(u16::MAX)).unwrap_or(0)
@@ -418,23 +396,13 @@ fn handle_append_menu_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let menu_handle = Hmenu::from(
-        engine
-            .read_rcx()
-            .with_context(|| format!("failed to read RCX for {api_name}"))?,
-    );
+    let menu_handle = Hmenu::from(read_arg(engine, ArgReg::Rcx, api_name)?);
 
-    let flags_raw = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let flags_raw = read_arg(engine, ArgReg::Rdx, api_name)?;
 
-    let item_id_raw = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let item_id_raw = read_arg(engine, ArgReg::R8, api_name)?;
 
-    let item_text_va = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let item_text_va = read_arg(engine, ArgReg::R9, api_name)?;
 
     let flags = u32::try_from(flags_raw & u64::from(u32::MAX))
         .with_context(|| format!("{api_name} flags do not fit u32"))?;
@@ -499,14 +467,8 @@ fn handle_append_menu_impl(
 pub fn handle_set_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hwnd = Hwnd::from(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for SetMenu")?,
-    );
-    let menu_handle = engine
-        .read_rdx()
-        .context("failed to read RDX for SetMenu")?;
+    let hwnd = Hwnd::from(read_arg(engine, ArgReg::Rcx, "SetMenu")?);
+    let menu_handle = read_arg(engine, ArgReg::Rdx, "SetMenu")?;
     let ws = state.window_state();
     if let Some(window) = ws.windows.iter_mut().find(|w| w.handle == hwnd) {
         window.menu_handle = menu_handle;
@@ -518,11 +480,7 @@ pub fn handle_set_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
 pub fn handle_destroy_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let menu_handle = Hmenu::from(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for DestroyMenu")?,
-    );
+    let menu_handle = Hmenu::from(read_arg(engine, ArgReg::Rcx, "DestroyMenu")?);
     let ws = state.window_state();
     // YAGNI: DestroyMenu does not tear down resource_menus entries — a
     // resource menu is a (module, id)-keyed cache shared by repeated
@@ -576,23 +534,13 @@ fn handle_get_menu_item_info_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let menu_handle = Hmenu::from(
-        engine
-            .read_rcx()
-            .with_context(|| format!("failed to read RCX for {api_name}"))?,
-    );
+    let menu_handle = Hmenu::from(read_arg(engine, ArgReg::Rcx, api_name)?);
 
-    let item_value = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let item_value = read_arg(engine, ArgReg::Rdx, api_name)?;
 
-    let by_position_raw = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let by_position_raw = read_arg(engine, ArgReg::R8, api_name)?;
 
-    let info_va = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let info_va = read_arg(engine, ArgReg::R9, api_name)?;
 
     let by_position = by_position_raw != 0;
     let success = info_va != 0
@@ -835,22 +783,13 @@ fn fill_menu_item_info(
 pub fn handle_get_menu_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let menu_handle = Hmenu::from(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for GetMenuState")?,
-    );
+    let menu_handle = Hmenu::from(read_arg(engine, ArgReg::Rcx, "GetMenuState")?);
 
-    let item_value = engine
-        .read_rdx()
-        .context("failed to read RDX for GetMenuState")?;
+    let item_value = read_arg(engine, ArgReg::Rdx, "GetMenuState")?;
 
-    let flags_raw = engine
-        .read_r8()
-        .context("failed to read R8 for GetMenuState")?;
+    let flags_raw = read_arg(engine, ArgReg::R8, "GetMenuState")?;
 
-    let flags = u32::try_from(flags_raw & u64::from(u32::MAX))
-        .context("GetMenuState flags do not fit u32")?;
+    let flags = low_u32(flags_raw, "GetMenuState flags")?;
 
     let by_position = flags & MF_BYPOSITION != 0;
 

@@ -3,20 +3,19 @@
 
 use super::class::{find_window, find_window_mut};
 use crate::OuterReturn;
+use crate::gdi32::{ArgReg, read_arg};
 use crate::state::WindowFlags;
 use crate::user32::{
-    Context, FAKE_WINDOW_HANDLE, GWLP_WNDPROC_RAW, GuestCallbackRequest, HandlerContext, Result,
-    WM_DESTROY, WM_KILLFOCUS, WM_PAINT, WM_SETFOCUS, WinApiControlSignal, WinApiHandlerResult,
-    WinApiState, dispatch_control_proc, get_window_long_ptr_value, is_known_window,
+    FAKE_WINDOW_HANDLE, GWLP_WNDPROC_RAW, GuestCallbackRequest, HandlerContext, Result, WM_DESTROY,
+    WM_KILLFOCUS, WM_PAINT, WM_SETFOCUS, WinApiControlSignal, WinApiHandlerResult, WinApiState,
+    dispatch_control_proc, get_window_long_ptr_value, is_known_window,
 };
 
 /// Handles `USER32.dll!IsWindow`.
 pub fn handle_is_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for IsWindow")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "IsWindow")?;
 
     // Any runtime-known window is a valid window — including child controls,
     // not just the legacy fake top-level handle.
@@ -28,9 +27,7 @@ pub fn handle_is_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 pub fn handle_is_window_visible(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for IsWindowVisible")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "IsWindowVisible")?;
 
     let return_value = u64::from(if window_handle == FAKE_WINDOW_HANDLE {
         state.window_state().window_visible
@@ -44,9 +41,7 @@ pub fn handle_is_window_visible(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_is_window_enabled(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for IsWindowEnabled")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "IsWindowEnabled")?;
 
     let return_value = u64::from(if window_handle == FAKE_WINDOW_HANDLE {
         state.window_state().window_enabled
@@ -61,9 +56,7 @@ pub fn handle_is_window_enabled(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_get_parent(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetParent")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "GetParent")?;
 
     let return_value =
         find_window(state, window_handle).map_or(0, |window| window.parent_handle.as_u64());
@@ -88,13 +81,9 @@ pub fn handle_get_foreground_window(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_show_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for ShowWindow")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "ShowWindow")?;
 
-    let show_command = engine
-        .read_rdx()
-        .context("failed to read RDX for ShowWindow")?;
+    let show_command = read_arg(engine, ArgReg::Rdx, "ShowWindow")?;
 
     let previously_visible = state.window_state().window_visible;
     tracing::debug!(
@@ -159,13 +148,9 @@ pub fn handle_show_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_enable_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for EnableWindow")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "EnableWindow")?;
 
-    let enable_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for EnableWindow")?;
+    let enable_raw = read_arg(engine, ArgReg::Rdx, "EnableWindow")?;
 
     let previously_disabled = !state.window_state().window_enabled;
 
@@ -182,9 +167,7 @@ pub fn handle_enable_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_set_foreground_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for SetForegroundWindow")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "SetForegroundWindow")?;
 
     let success = window_handle == FAKE_WINDOW_HANDLE;
 
@@ -201,9 +184,7 @@ pub fn handle_set_foreground_window(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_set_active_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for SetActiveWindow")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "SetActiveWindow")?;
 
     let previous_window = state.window_state().active_window_handle;
 
@@ -217,9 +198,7 @@ pub fn handle_set_active_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_set_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for SetFocus")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "SetFocus")?;
 
     let previous_window = state.window_state().focus_window_handle;
     let accepted = window_handle == 0 || is_known_window(state, window_handle);
@@ -377,9 +356,7 @@ pub fn handle_get_focus(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 pub fn handle_update_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for UpdateWindow")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "UpdateWindow")?;
 
     let (window_proc, unicode) = {
         let windows = &state.window_state().windows;
@@ -429,13 +406,9 @@ pub fn handle_update_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_invalidate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for InvalidateRect")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "InvalidateRect")?;
 
-    let erase_background = engine
-        .read_r8()
-        .context("failed to read R8 for InvalidateRect")?;
+    let erase_background = read_arg(engine, ArgReg::R8, "InvalidateRect")?;
 
     let success = window_handle == 0 || is_known_window(state, window_handle);
 
@@ -461,21 +434,13 @@ pub fn handle_invalidate_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 pub fn handle_redraw_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for RedrawWindow")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "RedrawWindow")?;
 
-    let _update_rect_va = engine
-        .read_rdx()
-        .context("failed to read RDX for RedrawWindow")?;
+    let _update_rect_va = read_arg(engine, ArgReg::Rdx, "RedrawWindow")?;
 
-    let _update_region = engine
-        .read_r8()
-        .context("failed to read R8 for RedrawWindow")?;
+    let _update_region = read_arg(engine, ArgReg::R8, "RedrawWindow")?;
 
-    let _flags = engine
-        .read_r9()
-        .context("failed to read R9 for RedrawWindow")?;
+    let _flags = read_arg(engine, ArgReg::R9, "RedrawWindow")?;
 
     let success = window_handle == 0 || is_known_window(state, window_handle);
 
@@ -496,9 +461,7 @@ pub fn handle_redraw_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 pub fn handle_destroy_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for DestroyWindow")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "DestroyWindow")?;
 
     // Extract window info before any mutation.
     let window_info =

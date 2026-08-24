@@ -1,11 +1,11 @@
 //! Plants guest stub bodies into the fake-API mapping and builds the stop-bit mask.
 
-use crate::asm_utils::clear_bit;
 use anyhow::{Context, Result};
 
 use super::classify::classify_guest_stub;
 use super::config::GuestStubConfig;
 use super::kind::GuestStubKind;
+use crate::guest_rewire::{clear_stop_bits, plant_jmp_abs64};
 
 /// Writes guest stubs into the fake-API mapping and builds a stop-bit mask.
 ///
@@ -71,21 +71,12 @@ pub(crate) fn plant_guest_stubs(
             engine
                 .mem_write(helper_cursor, &body)
                 .context("failed to write out-of-line guest stub body")?;
-            let mut jmp = [0_u8; 12];
-            jmp[0] = 0x48;
-            jmp[1] = 0xb8;
-            jmp[2..10].copy_from_slice(&helper_cursor.to_le_bytes());
-            jmp[10] = 0xff;
-            jmp[11] = 0xe0;
             if offset.checked_add(12).is_none_or(|end| end > fake_api_size) {
                 continue;
             }
-            engine
-                .mem_write(va, &jmp)
+            plant_jmp_abs64(engine, va, helper_cursor)
                 .context("failed to write guest stub entry jmp")?;
-            for byte_off in offset..offset.saturating_add(12) {
-                clear_bit(&mut stop_bitmap, byte_off);
-            }
+            clear_stop_bits(&mut stop_bitmap, fake_api_base, fake_api_size, va, 12);
             helper_cursor = helper_cursor.saturating_add(body_len.saturating_add(15) & !15);
         } else {
             let len = body.len();
@@ -98,9 +89,7 @@ pub(crate) fn plant_guest_stubs(
             engine
                 .mem_write(va, &body)
                 .context("failed to write guest API stub bytes")?;
-            for byte_off in offset..offset.saturating_add(len) {
-                clear_bit(&mut stop_bitmap, byte_off);
-            }
+            clear_stop_bits(&mut stop_bitmap, fake_api_base, fake_api_size, va, len);
         }
         planted = planted.saturating_add(1);
     }

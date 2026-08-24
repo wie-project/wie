@@ -123,16 +123,6 @@ impl GuestHandle {
         wie_winapi::present::frame_timing_enabled()
     }
 
-    /// The current present generation (bumped by every publish). Used by
-    /// the host to skip redundant presents of an unchanged frame.
-    #[must_use]
-    pub fn present_generation(&self) -> u64 {
-        let Some(state) = self.lock_state() else {
-            return 0;
-        };
-        state.try_present().map_or(0, |p| p.generation)
-    }
-
     /// Record one host present (softbuffer copy + upload) wall time (ns).
     /// The internal gate makes this a no-op (no lock) when timing is disabled.
     pub fn record_present_time(&self, ns: u128) {
@@ -244,14 +234,6 @@ impl GuestHandle {
         ))
     }
 
-    /// The window currently holding the mouse capture, if any.
-    #[must_use]
-    pub fn capture_window(&self) -> Option<u64> {
-        let state = self.lock_state()?;
-        let capture = state.try_window_state()?.capture_window_handle;
-        (capture != wie_winapi::handles::Hwnd::NULL).then_some(capture.as_u64())
-    }
-
     /// The guest's top-level window-SET revision — bumped by every top-level
     /// create/destroy (see [`wie_winapi::present::PresentState::windows_rev`]).
     ///
@@ -279,27 +261,10 @@ impl GuestHandle {
         state.try_present().map_or(0, |p| p.z_rev)
     }
 
-    /// Snapshot of the guest's top-level z-order, back-to-front: index 0 is
-    /// the backmost window, the last element the topmost.
-    ///
-    /// The host presenter mirrors this ordering into its NSWindows (AppKit
-    /// `orderFront` per window, in this order). `SetWindowPos` HWND_TOP /
-    /// HWND_BOTTOM reorder it; creation stacks each new top-level on top.
-    #[must_use]
-    pub fn top_level_z_order(&self) -> Vec<u64> {
-        let Some(state) = self.lock_state() else {
-            return Vec::new();
-        };
-        state.try_present().map_or_else(Vec::new, |p| {
-            p.z_order.iter().map(|hwnd| hwnd.as_u64()).collect()
-        })
-    }
-
     /// Atomic snapshot of the guest top-level z-order: the revision AND the
     /// ordered list read under ONE lock.
     ///
-    /// [`Self::z_rev`] and [`Self::top_level_z_order`] are two separate locked
-    /// reads — a guest z-change landing between them would hand the caller a
+    /// Separate locked reads (revision, then list) would hand the caller a
     /// fresh revision with a stale list (or the reverse). The Frame handler
     /// uses this combined accessor so the reorder always applies the list the
     /// revision it compared actually describes.
@@ -1437,8 +1402,8 @@ mod tests {
 
     /// `z_snapshot` reads the revision AND the ordered list under ONE lock:
     /// the Frame handler's reorder always applies the list the revision it
-    /// compared actually describes. Two separate locked reads (`z_rev` +
-    /// `top_level_z_order`) could observe the list mid-mutation.
+    /// compared actually describes. Separate locked reads could observe the
+    /// list mid-mutation.
     #[test]
     fn z_snapshot_reads_rev_and_order_under_one_lock() {
         let process = wie_pe::ProcessIdentity {
@@ -1467,11 +1432,6 @@ mod tests {
 
         let (rev, order) = handle.z_snapshot();
         assert_eq!(rev, handle.z_rev(), "snapshot rev == the z_rev accessor");
-        assert_eq!(
-            order,
-            handle.top_level_z_order(),
-            "snapshot order == the top_level_z_order accessor"
-        );
         assert_eq!(order, vec![0x200, 0x300, 0x100], "back-to-front order");
 
         // A guest z-change bumps the revision; the NEXT snapshot reflects the

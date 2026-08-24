@@ -2,6 +2,7 @@
 
 use super::{resolve_dialog_owner, state_comm_dlg_none};
 use crate::comdlg32::find::create_find_control;
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::{ChooseFontW, LogFontW};
 use crate::guest_memory::{
     checked_address, read_i32, read_u32, read_u64, with_typed_read, with_typed_write,
@@ -73,9 +74,7 @@ const FONT_DLG_CY: i32 = 260;
 pub fn handle_choose_font_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let cf_va = engine
-        .read_rcx()
-        .context("failed to read RCX for ChooseFontW")?;
+    let cf_va = read_arg(engine, ArgReg::Rcx, "ChooseFontW")?;
 
     if cf_va == 0 {
         state_comm_dlg_none(state);

@@ -2,6 +2,7 @@
 //! `GetFileTitle`.
 
 use super::{CDERR_NONE, ES_AUTOHSCROLL, WS_BORDER, resolve_dialog_owner};
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::OpenFileName;
 use crate::guest_memory::{with_typed_read, with_typed_write};
 use crate::guest_string::{
@@ -101,15 +102,9 @@ fn handle_get_file_title_impl(
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let file_va = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let title_va = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let cch_raw = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let file_va = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let title_va = read_arg(engine, ArgReg::Rdx, api_name)?;
+    let cch_raw = read_arg(engine, ArgReg::R8, api_name)?;
     // cchTitle is a WORD (u16); clamp oversized guest values defensively.
     let cch_title = usize::from(u16::try_from(cch_raw).unwrap_or(u16::MAX));
 
@@ -210,9 +205,7 @@ fn handle_get_file_name(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let ofn_va = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let ofn_va = read_arg(engine, ArgReg::Rcx, api_name)?;
 
     if ofn_va == 0 {
         state.window_state().comm_dlg_extended_error = CDERR_NONE;

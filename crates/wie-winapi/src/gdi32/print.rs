@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::DocInfoW;
 use crate::guest_memory::{checked_address, read_i32, with_typed_read};
 use crate::guest_string::{
@@ -44,9 +45,7 @@ use super::state::{
 pub fn handle_create_dc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let driver_va = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateDCW")?;
+    let driver_va = read_arg(engine, ArgReg::Rcx, "CreateDCW")?;
 
     if driver_va != 0 {
         let driver = read_guest_utf16_lossy(engine, driver_va, 64).unwrap_or_default();
@@ -66,9 +65,7 @@ pub fn handle_create_dc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_create_dc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let driver_va = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateDCA")?;
+    let driver_va = read_arg(engine, ArgReg::Rcx, "CreateDCA")?;
 
     if driver_va != 0 {
         let driver = read_guest_ansi_lossy(engine, driver_va, 64).unwrap_or_default();
@@ -88,12 +85,8 @@ pub fn handle_create_dc_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_start_doc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for StartDocW")?;
-    let docinfo_va = engine
-        .read_rdx()
-        .context("failed to read RDX for StartDocW")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "StartDocW")?;
+    let docinfo_va = read_arg(engine, ArgReg::Rdx, "StartDocW")?;
 
     let mut success = false;
     if docinfo_va != 0 {
@@ -129,9 +122,7 @@ pub fn handle_start_doc_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_start_page(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for StartPage")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "StartPage")?;
 
     let mut success = false;
     if let Some(job) = state.gdi_state().find_print_job_mut(Hdc::from(hdc))
@@ -156,9 +147,7 @@ pub fn handle_start_page(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 pub fn handle_end_page(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for EndPage")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "EndPage")?;
 
     let mut success = false;
     if let Some(job) = state.gdi_state().find_print_job_mut(Hdc::from(hdc))
@@ -190,7 +179,7 @@ pub fn handle_end_doc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
 
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine.read_rcx().context("failed to read RCX for EndDoc")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "EndDoc")?;
 
     // Re-entry: the native print operation ran (the pump arm ran the
     // print-job bridge without the shared lock and recorded its result).
@@ -257,9 +246,7 @@ pub fn handle_end_doc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
 pub fn handle_abort_doc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for AbortDoc")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "AbortDoc")?;
 
     let mut was_active = false;
     if let Some(job) = state.gdi_state().find_print_job_mut(Hdc::from(hdc))
@@ -281,12 +268,8 @@ pub fn handle_abort_doc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 pub fn handle_set_map_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for SetMapMode")?;
-    let mode_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for SetMapMode")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "SetMapMode")?;
+    let mode_raw = read_arg(engine, ArgReg::Rdx, "SetMapMode")?;
 
     let mode = low_i32(mode_raw, "SetMapMode mode")?;
     let mode = u32::try_from(mode).context("SetMapMode mode does not fit u32")?;
@@ -310,25 +293,14 @@ pub fn handle_set_map_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 pub fn handle_rectangle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for Rectangle")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "Rectangle")?;
     let left = low_i32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for Rectangle")?,
+        read_arg(engine, ArgReg::Rdx, "Rectangle")?,
         "Rectangle left",
     )?;
-    let top = low_i32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for Rectangle")?,
-        "Rectangle top",
-    )?;
+    let top = low_i32(read_arg(engine, ArgReg::R8, "Rectangle")?, "Rectangle top")?;
     let right = low_i32(
-        engine
-            .read_r9()
-            .context("failed to read R9 for Rectangle")?,
+        read_arg(engine, ArgReg::R9, "Rectangle")?,
         "Rectangle right",
     )?;
     let rsp = engine

@@ -3,14 +3,13 @@
 //! `render::glsl` object store.
 
 use super::*;
+use crate::gdi32::{ArgReg, read_arg};
 
 /// `GLuint glCreateShader(GLenum type)`.
 pub(super) fn handle_gl_create_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let kind = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glCreateShader")?,
+        read_arg(engine, ArgReg::Rcx, "glCreateShader")?,
         "glCreateShader kind",
     )?;
     let id = with_current_gl(|c| render::glsl::gl_create_shader(c, kind)).unwrap_or(0);
@@ -21,23 +20,15 @@ pub(super) fn handle_gl_create_shader(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub(super) fn handle_gl_shader_source(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let shader = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glShaderSource")?,
+        read_arg(engine, ArgReg::Rcx, "glShaderSource")?,
         "glShaderSource shader",
     )?;
     let count = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glShaderSource")?,
+        read_arg(engine, ArgReg::Rdx, "glShaderSource")?,
         "glShaderSource count",
     )?;
-    let strings_va = engine
-        .read_r8()
-        .context("failed to read R8 for glShaderSource")?;
-    let lengths_va = engine
-        .read_r9()
-        .context("failed to read R9 for glShaderSource")?;
+    let strings_va = read_arg(engine, ArgReg::R8, "glShaderSource")?;
+    let lengths_va = read_arg(engine, ArgReg::R9, "glShaderSource")?;
     let mut source = String::new();
     for i in 0..count {
         let slot = u64::from(i).saturating_mul(8);
@@ -74,9 +65,7 @@ pub(super) fn handle_gl_compile_shader(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let shader = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glCompileShader")?,
+        read_arg(engine, ArgReg::Rcx, "glCompileShader")?,
         "glCompileShader shader",
     )?;
     with_current_gl(|c| render::glsl::gl_compile_shader(c, shader));
@@ -87,20 +76,14 @@ pub(super) fn handle_gl_compile_shader(
 pub(super) fn handle_gl_get_shader_iv(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let shader = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glGetShaderiv")?,
+        read_arg(engine, ArgReg::Rcx, "glGetShaderiv")?,
         "glGetShaderiv shader",
     )?;
     let pname = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glGetShaderiv")?,
+        read_arg(engine, ArgReg::Rdx, "glGetShaderiv")?,
         "glGetShaderiv pname",
     )?;
-    let params_va = engine
-        .read_r8()
-        .context("failed to read R8 for glGetShaderiv")?;
+    let params_va = read_arg(engine, ArgReg::R8, "glGetShaderiv")?;
     if params_va != 0 {
         let value = with_current_gl(|c| match pname {
             render::glsl::GL_COMPILE_STATUS => render::glsl::gl_shader_compile_status(c, shader),
@@ -126,23 +109,15 @@ pub(super) fn handle_gl_get_shader_info_log(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let shader = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glGetShaderInfoLog")?,
+        read_arg(engine, ArgReg::Rcx, "glGetShaderInfoLog")?,
         "glGetShaderInfoLog shader",
     )?;
     let max_len = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glGetShaderInfoLog")?,
+        read_arg(engine, ArgReg::Rdx, "glGetShaderInfoLog")?,
         "glGetShaderInfoLog max",
     )?;
-    let length_va = engine
-        .read_r8()
-        .context("failed to read R8 for glGetShaderInfoLog")?;
-    let log_va = engine
-        .read_r9()
-        .context("failed to read R9 for glGetShaderInfoLog")?;
+    let length_va = read_arg(engine, ArgReg::R8, "glGetShaderInfoLog")?;
+    let log_va = read_arg(engine, ArgReg::R9, "glGetShaderInfoLog")?;
     let log = with_current_gl(|c| render::glsl::gl_shader_info_log(c, shader)).unwrap_or_default();
     write_info_log(engine, log_va, max_len, length_va, &log)?;
     ctx.finish(0)
@@ -152,9 +127,7 @@ pub(super) fn handle_gl_get_shader_info_log(
 pub(super) fn handle_gl_delete_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let shader = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glDeleteShader")?,
+        read_arg(engine, ArgReg::Rcx, "glDeleteShader")?,
         "glDeleteShader shader",
     )?;
     with_current_gl(|c| render::glsl::gl_delete_shader(c, shader));
@@ -165,9 +138,7 @@ pub(super) fn handle_gl_delete_shader(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub(super) fn handle_gl_is_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let shader = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glIsShader")?,
+        read_arg(engine, ArgReg::Rcx, "glIsShader")?,
         "glIsShader shader",
     )?;
     let present = with_current_gl(|c| render::glsl::gl_is_shader(c, shader)).unwrap_or(false);
@@ -186,15 +157,11 @@ pub(super) fn handle_gl_create_program(
 pub(super) fn handle_gl_attach_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let program = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glAttachShader")?,
+        read_arg(engine, ArgReg::Rcx, "glAttachShader")?,
         "glAttachShader program",
     )?;
     let shader = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glAttachShader")?,
+        read_arg(engine, ArgReg::Rdx, "glAttachShader")?,
         "glAttachShader shader",
     )?;
     with_current_gl(|c| render::glsl::gl_attach_shader(c, program, shader));
@@ -205,15 +172,11 @@ pub(super) fn handle_gl_attach_shader(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub(super) fn handle_gl_detach_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let program = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glDetachShader")?,
+        read_arg(engine, ArgReg::Rcx, "glDetachShader")?,
         "glDetachShader program",
     )?;
     let shader = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glDetachShader")?,
+        read_arg(engine, ArgReg::Rdx, "glDetachShader")?,
         "glDetachShader shader",
     )?;
     with_current_gl(|c| render::glsl::gl_detach_shader(c, program, shader));
@@ -224,9 +187,7 @@ pub(super) fn handle_gl_detach_shader(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub(super) fn handle_gl_link_program(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let program = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glLinkProgram")?,
+        read_arg(engine, ArgReg::Rcx, "glLinkProgram")?,
         "glLinkProgram program",
     )?;
     with_current_gl(|c| render::glsl::gl_link_program(c, program));
@@ -237,9 +198,7 @@ pub(super) fn handle_gl_link_program(ctx: &mut HandlerContext<'_>) -> Result<Win
 pub(super) fn handle_gl_use_program(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let program = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glUseProgram")?,
+        read_arg(engine, ArgReg::Rcx, "glUseProgram")?,
         "glUseProgram program",
     )?;
     with_current_gl(|c| render::glsl::gl_use_program(c, program));
@@ -252,20 +211,14 @@ pub(super) fn handle_gl_get_program_iv(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let program = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glGetProgramiv")?,
+        read_arg(engine, ArgReg::Rcx, "glGetProgramiv")?,
         "glGetProgramiv program",
     )?;
     let pname = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glGetProgramiv")?,
+        read_arg(engine, ArgReg::Rdx, "glGetProgramiv")?,
         "glGetProgramiv pname",
     )?;
-    let params_va = engine
-        .read_r8()
-        .context("failed to read R8 for glGetProgramiv")?;
+    let params_va = read_arg(engine, ArgReg::R8, "glGetProgramiv")?;
     if params_va != 0 {
         let value = with_current_gl(|c| match pname {
             render::glsl::GL_LINK_STATUS | render::glsl::GL_VALIDATE_STATUS => {
@@ -298,23 +251,15 @@ pub(super) fn handle_gl_get_program_info_log(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let program = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glGetProgramInfoLog")?,
+        read_arg(engine, ArgReg::Rcx, "glGetProgramInfoLog")?,
         "glGetProgramInfoLog program",
     )?;
     let max_len = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glGetProgramInfoLog")?,
+        read_arg(engine, ArgReg::Rdx, "glGetProgramInfoLog")?,
         "glGetProgramInfoLog max",
     )?;
-    let length_va = engine
-        .read_r8()
-        .context("failed to read R8 for glGetProgramInfoLog")?;
-    let log_va = engine
-        .read_r9()
-        .context("failed to read R9 for glGetProgramInfoLog")?;
+    let length_va = read_arg(engine, ArgReg::R8, "glGetProgramInfoLog")?;
+    let log_va = read_arg(engine, ArgReg::R9, "glGetProgramInfoLog")?;
     let log =
         with_current_gl(|c| render::glsl::gl_program_info_log(c, program)).unwrap_or_default();
     write_info_log(engine, log_va, max_len, length_va, &log)?;
@@ -327,9 +272,7 @@ pub(super) fn handle_gl_delete_program(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let program = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glDeleteProgram")?,
+        read_arg(engine, ArgReg::Rcx, "glDeleteProgram")?,
         "glDeleteProgram program",
     )?;
     with_current_gl(|c| render::glsl::gl_delete_program(c, program));
@@ -340,9 +283,7 @@ pub(super) fn handle_gl_delete_program(
 pub(super) fn handle_gl_is_program(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let program = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glIsProgram")?,
+        read_arg(engine, ArgReg::Rcx, "glIsProgram")?,
         "glIsProgram program",
     )?;
     let present = with_current_gl(|c| render::glsl::gl_is_program(c, program)).unwrap_or(false);
@@ -355,9 +296,7 @@ pub(super) fn handle_gl_validate_program(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let program = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glValidateProgram")?,
+        read_arg(engine, ArgReg::Rcx, "glValidateProgram")?,
         "glValidateProgram program",
     )?;
     with_current_gl(|c| render::glsl::gl_validate_program(c, program));
@@ -370,14 +309,10 @@ pub(super) fn handle_gl_get_uniform_location(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let program = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glGetUniformLocation")?,
+        read_arg(engine, ArgReg::Rcx, "glGetUniformLocation")?,
         "glGetUniformLocation program",
     )?;
-    let name_va = engine
-        .read_rdx()
-        .context("failed to read RDX for glGetUniformLocation")?;
+    let name_va = read_arg(engine, ArgReg::Rdx, "glGetUniformLocation")?;
     let name = crate::guest_string::read_ansi_lossy(engine, name_va, 256).unwrap_or_default();
     let location =
         with_current_gl(|c| render::glsl::gl_get_uniform_location(c, program, &name)).unwrap_or(-1);
@@ -388,11 +323,7 @@ pub(super) fn handle_gl_get_uniform_location(
 /// `void glUniform1f(GLint location, GLfloat v0)`.
 pub(super) fn handle_gl_uniform1f(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let location = low_i32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glUniform1f")?,
-    );
+    let location = low_i32(read_arg(engine, ArgReg::Rcx, "glUniform1f")?);
     let v = read_xmm_f32(engine, 1).context("failed to read XMM1 for glUniform1f")?;
     with_current_gl(|c| render::glsl::gl_uniform_set(c, location, render::glsl::GlslVal::F32(v)));
     ctx.finish(0)
@@ -401,11 +332,7 @@ pub(super) fn handle_gl_uniform1f(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// `void glUniform2f(GLint location, GLfloat v0, GLfloat v1)`.
 pub(super) fn handle_gl_uniform2f(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let location = low_i32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glUniform2f")?,
-    );
+    let location = low_i32(read_arg(engine, ArgReg::Rcx, "glUniform2f")?);
     let a = read_xmm_f32(engine, 1).context("failed to read XMM1 for glUniform2f")?;
     let b = read_xmm_f32(engine, 2).context("failed to read XMM2 for glUniform2f")?;
     with_current_gl(|c| {
@@ -417,11 +344,7 @@ pub(super) fn handle_gl_uniform2f(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// `void glUniform3f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2)`.
 pub(super) fn handle_gl_uniform3f(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let location = low_i32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glUniform3f")?,
-    );
+    let location = low_i32(read_arg(engine, ArgReg::Rcx, "glUniform3f")?);
     let a = read_xmm_f32(engine, 1).context("failed to read XMM1 for glUniform3f")?;
     let b = read_xmm_f32(engine, 2).context("failed to read XMM2 for glUniform3f")?;
     let c = read_xmm_f32(engine, 3).context("failed to read XMM3 for glUniform3f")?;
@@ -434,11 +357,7 @@ pub(super) fn handle_gl_uniform3f(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// `void glUniform4f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3)`.
 pub(super) fn handle_gl_uniform4f(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let location = low_i32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glUniform4f")?,
-    );
+    let location = low_i32(read_arg(engine, ArgReg::Rcx, "glUniform4f")?);
     let a = read_xmm_f32(engine, 1).context("failed to read XMM1 for glUniform4f")?;
     let b = read_xmm_f32(engine, 2).context("failed to read XMM2 for glUniform4f")?;
     let c = read_xmm_f32(engine, 3).context("failed to read XMM3 for glUniform4f")?;
@@ -454,16 +373,8 @@ pub(super) fn handle_gl_uniform4f(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// `void glUniform1i(GLint location, GLint v0)` — the sampler → unit path.
 pub(super) fn handle_gl_uniform1i(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let location = low_i32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glUniform1i")?,
-    );
-    let v = low_i32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glUniform1i")?,
-    );
+    let location = low_i32(read_arg(engine, ArgReg::Rcx, "glUniform1i")?);
+    let v = low_i32(read_arg(engine, ArgReg::Rdx, "glUniform1i")?);
     with_current_gl(|c| {
         render::glsl::gl_uniform_set(
             c,
@@ -479,24 +390,13 @@ pub(super) fn handle_gl_uniform_matrix4fv(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let location = low_i32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glUniformMatrix4fv")?,
-    );
+    let location = low_i32(read_arg(engine, ArgReg::Rcx, "glUniformMatrix4fv")?);
     let count = low_u32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for glUniformMatrix4fv")?,
+        read_arg(engine, ArgReg::Rdx, "glUniformMatrix4fv")?,
         "count",
     )?;
-    let transpose = engine
-        .read_r8()
-        .context("failed to read R8 for glUniformMatrix4fv")?
-        != 0;
-    let value_va = engine
-        .read_r9()
-        .context("failed to read R9 for glUniformMatrix4fv")?;
+    let transpose = read_arg(engine, ArgReg::R8, "glUniformMatrix4fv")? != 0;
+    let value_va = read_arg(engine, ArgReg::R9, "glUniformMatrix4fv")?;
     let mut bytes = [0_u8; 64];
     if value_va != 0 && engine.mem_read(value_va, &mut bytes).is_ok() {
         let mut m = [0.0_f32; 16];
@@ -533,9 +433,7 @@ pub(super) fn handle_gl_active_texture(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let texture = low_u32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for glActiveTexture")?,
+        read_arg(engine, ArgReg::Rcx, "glActiveTexture")?,
         "glActiveTexture unit",
     )?;
     with_current_gl(|c| {

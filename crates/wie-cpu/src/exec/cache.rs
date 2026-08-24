@@ -128,8 +128,3 @@ pub(crate) fn iced_decode_cache_flush() {
         }
     });
 }
-
-#[allow(dead_code)] // retained for external callers that only want a length
-fn peek_insn_len(mem: &GuestMemory, rip: u64) -> Option<u32> {
-    decode_at(mem, rip).map(|(_, len)| len)
-}

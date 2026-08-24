@@ -90,30 +90,8 @@ fn absolute_guest_arg_path(arg: &str) -> Option<(char, String)> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
-
-    /// Unique temp dir under the system temp dir; removed on drop.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("wie-gui-args-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).expect("create temp dir");
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_support::TempDir;
+    use std::path::Path;
 
     /// Create a bottle with `drive_c/data/level.bin` and return its root.
     fn seeded_bottle(tag: &str) -> TempDir {

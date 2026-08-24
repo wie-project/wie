@@ -451,166 +451,52 @@ pub(super) fn lower_insn(
         Mnemonic::Andnps | Mnemonic::Andnpd | Mnemonic::Pandn => {
             lower_sse_bitwise(bcx, instr, gpr, *rflags, mem, xmm, SseBit::Andn)
         }
-        Mnemonic::Addss => lower_sse_scalar_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Add,
-            FloatWidth::F32,
-        ),
-        Mnemonic::Subss => lower_sse_scalar_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Sub,
-            FloatWidth::F32,
-        ),
-        Mnemonic::Mulss => lower_sse_scalar_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Mul,
-            FloatWidth::F32,
-        ),
-        Mnemonic::Divss => lower_sse_scalar_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Div,
-            FloatWidth::F32,
-        ),
-        Mnemonic::Addsd => lower_sse_scalar_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Add,
-            FloatWidth::F64,
-        ),
-        Mnemonic::Subsd => lower_sse_scalar_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Sub,
-            FloatWidth::F64,
-        ),
-        Mnemonic::Mulsd => lower_sse_scalar_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Mul,
-            FloatWidth::F64,
-        ),
-        Mnemonic::Divsd => lower_sse_scalar_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Div,
-            FloatWidth::F64,
-        ),
-        Mnemonic::Addps => lower_sse_packed_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Add,
-            FloatWidth::F32,
-        ),
-        Mnemonic::Subps => lower_sse_packed_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Sub,
-            FloatWidth::F32,
-        ),
-        Mnemonic::Mulps => lower_sse_packed_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Mul,
-            FloatWidth::F32,
-        ),
-        Mnemonic::Divps => lower_sse_packed_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Div,
-            FloatWidth::F32,
-        ),
-        Mnemonic::Addpd => lower_sse_packed_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Add,
-            FloatWidth::F64,
-        ),
-        Mnemonic::Subpd => lower_sse_packed_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Sub,
-            FloatWidth::F64,
-        ),
-        Mnemonic::Mulpd => lower_sse_packed_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Mul,
-            FloatWidth::F64,
-        ),
-        Mnemonic::Divpd => lower_sse_packed_fp(
-            bcx,
-            instr,
-            gpr,
-            *rflags,
-            mem,
-            xmm,
-            FloatBinOp::Div,
-            FloatWidth::F64,
-        ),
+        // Scalar/packed FP arithmetic: map mnemonic → (op, width) once, then
+        // dispatch on the scalar/packed suffix to the shared lowerings.
+        m @ (Mnemonic::Addss
+        | Mnemonic::Addps
+        | Mnemonic::Subss
+        | Mnemonic::Subps
+        | Mnemonic::Mulss
+        | Mnemonic::Mulps
+        | Mnemonic::Divss
+        | Mnemonic::Divps
+        | Mnemonic::Addsd
+        | Mnemonic::Addpd
+        | Mnemonic::Subsd
+        | Mnemonic::Subpd
+        | Mnemonic::Mulsd
+        | Mnemonic::Mulpd
+        | Mnemonic::Divsd
+        | Mnemonic::Divpd) => {
+            let (bin_op, width) = match m {
+                Mnemonic::Addss | Mnemonic::Addps => (FloatBinOp::Add, FloatWidth::F32),
+                Mnemonic::Subss | Mnemonic::Subps => (FloatBinOp::Sub, FloatWidth::F32),
+                Mnemonic::Mulss | Mnemonic::Mulps => (FloatBinOp::Mul, FloatWidth::F32),
+                Mnemonic::Divss | Mnemonic::Divps => (FloatBinOp::Div, FloatWidth::F32),
+                Mnemonic::Addsd | Mnemonic::Addpd => (FloatBinOp::Add, FloatWidth::F64),
+                Mnemonic::Subsd | Mnemonic::Subpd => (FloatBinOp::Sub, FloatWidth::F64),
+                Mnemonic::Mulsd | Mnemonic::Mulpd => (FloatBinOp::Mul, FloatWidth::F64),
+                Mnemonic::Divsd | Mnemonic::Divpd => (FloatBinOp::Div, FloatWidth::F64),
+                _ => return Err("fp binop mnemonic".into()),
+            };
+            let scalar = !matches!(
+                m,
+                Mnemonic::Addps
+                    | Mnemonic::Subps
+                    | Mnemonic::Mulps
+                    | Mnemonic::Divps
+                    | Mnemonic::Addpd
+                    | Mnemonic::Subpd
+                    | Mnemonic::Mulpd
+                    | Mnemonic::Divpd
+            );
+            if scalar {
+                lower_sse_scalar_fp(bcx, instr, gpr, *rflags, mem, xmm, bin_op, width)
+            } else {
+                lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, bin_op, width)
+            }
+        }
         Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq => lower_sse_punpck(bcx, instr, xmm, mem),
         Mnemonic::Punpcklbw
         | Mnemonic::Punpcklwd

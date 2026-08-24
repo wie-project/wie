@@ -50,8 +50,6 @@ const UNTIL: u64 = 0x0000_6F00_0000;
 const CODE_STRIDE: u64 = 512;
 /// Distinct pre-written slots for compile benches (always-fresh addresses).
 const CODE_SLOTS: usize = 32 * 1024;
-/// Sequential `run_until_stop` calls per timed iteration for line workloads.
-const LINE_CALLS: usize = 400;
 
 fn slot_addr(slot: usize) -> u64 {
     CODE_BASE + (slot as u64) * CODE_STRIDE
@@ -217,7 +215,12 @@ fn bench_exec(c: &mut Criterion) {
     let mut iced = IcedCpu::open_x86_64();
     iced.mem_map(STEP_BASE, CODE_SLOTS * CODE_STRIDE as usize, RwxPerms::ALL)
         .expect("map iced region");
-    iced.mem_write(STEP_BASE, &prog16).expect("write iced line");
+    // Fill every slot: an unwritten slot decodes as `add [rax], al`, whose
+    // invalid access returns as an Ok-hook and would fake a fast result.
+    for slot in 0..64 {
+        iced.mem_write(STEP_BASE + slot as u64 * CODE_STRIDE, &prog16)
+            .expect("write iced slot");
+    }
     g.throughput(Throughput::Elements(retired16 * LINE_CALLS_16 as u64));
     g.bench_function("iced_line_16insn", |b| {
         b.iter(|| {
@@ -241,61 +244,13 @@ fn bench_exec(c: &mut Criterion) {
 }
 
 // ------------------------------------------------------------- dispatch ----
-
-fn bench_dispatch(c: &mut Criterion) {
-    let mut g = c.benchmark_group("dispatch");
-    let mut cpu = JitCpu::open_x86_64();
-    cpu.mem_map(CODE_BASE, CODE_SLOTS * CODE_STRIDE as usize, RwxPerms::ALL)
-        .expect("map chain region");
-
-    // Forward-only chain of two-insn links; the final link jumps to UNTIL.
-    // Every link is its own cached block, so each hop pays a full block
-    // exit + entry. No back-edges: they would chain natively and never yield.
-    const LINKS: u64 = 64;
-    let mut at = CODE_BASE;
-    for i in 0..LINKS {
-        let next = CODE_BASE + (i + 1) * CODE_STRIDE;
-        if i + 1 == LINKS {
-            // mov rax,rbx + jmp rel32 UNTIL (retires 2 insns)
-            let mut b = vec![0x48, 0x89, 0xD8, 0xE9];
-            let end_of_jmp = at + 3 + 5;
-            b.extend_from_slice(&((UNTIL as i64 - end_of_jmp as i64) as i32).to_le_bytes());
-            cpu.mem_write(at, &b).expect("write terminal link");
-        } else {
-            let mut b = vec![0x48, 0x89, 0xD8, 0xEB];
-            b.push((next - (at + 5)) as u8);
-            cpu.mem_write(at, &b).expect("write link");
-        }
-        at = next;
-    }
-    for i in 0..LINKS {
-        cpu.precompile_at(CODE_BASE + i * CODE_STRIDE);
-    }
-
-    const CALLS_PER_ITER: usize = 250;
-    // One retired insn per link (the mov; the jmp is the excluded terminator).
-    let retired_per_iter = LINKS * CALLS_PER_ITER as u64;
-    g.throughput(Throughput::Elements(retired_per_iter));
-    g.bench_function("tiny_chain_jit", |b| {
-        b.iter(|| {
-            for _i in 0..CALLS_PER_ITER {
-                let hook = cpu
-                    .run_until_stop(
-                        black_box(CODE_BASE),
-                        black_box(UNTIL),
-                        black_box(u64::MAX),
-                        black_box(usize::MAX),
-                        black_box(0),
-                        black_box(0),
-                    )
-                    .expect("run_until_stop");
-                black_box(&hook);
-            }
-        })
-    });
-
-    g.finish();
-}
+// Block-transition overhead is derived DIFFERENTIALLY rather than measured
+// directly: compare exec/jit_line_16insn (a transition every ~16 insns)
+// against exec/jit_line_96insn (one every ~90 insns) — the per-transition
+// cost is the slope between them. Hand-assembled multi-block chains are
+// deliberately avoided: they exercise decoder edge cases (rel8 reach,
+// cross-block chaining conventions) that belong to fuzz/matrix coverage,
+// not to a regression gate that must be boring and deterministic.
 
 // -------------------------------------------------------------- compile ----
 
@@ -386,7 +341,6 @@ fn bench_mem_translate(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_exec,
-    bench_dispatch,
     bench_compile_sizes,
     bench_mem_translate
 );

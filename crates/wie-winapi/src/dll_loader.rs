@@ -920,7 +920,7 @@ pub fn resolve_static_guest_import(
         return Ok(None);
     };
 
-    let guest_cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let guest_cwd = state.file_io.cwd_utf8();
     let guest_path = crate::kernel32::resolve_windows_dll_path(
         library,
         &state.process.main_module_path,

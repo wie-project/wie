@@ -598,11 +598,7 @@ fn run_worker(
         tracing::error!("[mt] worker_main start tid={tid:#x} teb={:#x}", teb.va());
     }
     let layout = &config.layout;
-    let fake_api_end = layout
-        .fake_api
-        .base
-        .saturating_add(u64::try_from(layout.fake_api.size).unwrap_or(0))
-        .saturating_sub(1);
+    let fake_api_end = layout.fake_api_end();
 
     if let Err(e) = engine.install_runtime_hooks(
         layout.fake_api.base,

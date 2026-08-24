@@ -291,7 +291,53 @@ impl TryFrom<u64> for SseCvtOp {
             16 => Self::Cvtpd2ps,
             17 => Self::Cvtsd2ss,
             18 => Self::Cvtss2sd,
+            19 => Self::Cvttpd2dq,
             _ => return Err(()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SseCvtOp;
+
+    const ALL_OPS: [SseCvtOp; 20] = [
+        SseCvtOp::Cvtsi2ss32,
+        SseCvtOp::Cvtsi2ss64,
+        SseCvtOp::Cvtsi2sd32,
+        SseCvtOp::Cvtsi2sd64,
+        SseCvtOp::Cvttss2si32,
+        SseCvtOp::Cvtss2si32,
+        SseCvtOp::Cvttss2si64,
+        SseCvtOp::Cvtss2si64,
+        SseCvtOp::Cvttsd2si32,
+        SseCvtOp::Cvtsd2si32,
+        SseCvtOp::Cvttsd2si64,
+        SseCvtOp::Cvtsd2si64,
+        SseCvtOp::Cvtps2dq,
+        SseCvtOp::Cvtdq2ps,
+        SseCvtOp::Cvttps2dq,
+        SseCvtOp::Cvtpd2dq,
+        SseCvtOp::Cvtpd2ps,
+        SseCvtOp::Cvtsd2ss,
+        SseCvtOp::Cvtss2sd,
+        SseCvtOp::Cvttpd2dq,
+    ];
+
+    /// The JIT encodes the op into an `extern "C"` u64 and the host helper
+    /// decodes it. Encode/decode must be exact inverses or a compiled block
+    /// silently performs the wrong convert.
+    #[test]
+    fn sse_cvt_op_abi_roundtrips() {
+        for op in ALL_OPS {
+            assert_eq!(SseCvtOp::try_from(op.to_abi()), Ok(op), "op={op:?}");
+        }
+    }
+
+    #[test]
+    fn sse_cvt_op_rejects_out_of_range() {
+        for raw in [20_u64, 21, u64::MAX] {
+            assert_eq!(SseCvtOp::try_from(raw), Err(()), "raw={raw}");
+        }
     }
 }

@@ -66,19 +66,6 @@ impl super::GuestMemory {
         self.backend.read(address, bytes)
     }
 
-    /// Soft-translate a **contiguous** guest range to a host pointer for bulk copy.
-    ///
-    /// Used by REP MOVS/STOS after SPC. Never returns guest VAs.
-    ///
-    /// Returns `None` when:
-    /// - `len == 0` or the range wraps,
-    /// - SPC denies the access for the whole span,
-    /// - multi-page range is not entirely inside one mmap arena,
-    /// - single-page host resolve fails (uncommitted / NOACCESS).
-    ///
-    /// On success, the returned pointer is valid for `len` bytes for the lifetime
-    /// of this `GuestMemory` borrow (and until the covering arena is released).
-    #[must_use]
     /// Copy `len` bytes guest→guest without bouncing through a host buffer.
     ///
     /// Uses `memmove` semantics, so overlapping ranges are well defined — which
@@ -120,6 +107,19 @@ impl super::GuestMemory {
         true
     }
 
+    /// Soft-translate a **contiguous** guest range to a host pointer for bulk copy.
+    ///
+    /// Used by REP MOVS/STOS after SPC. Never returns guest VAs.
+    ///
+    /// Returns `None` when:
+    /// - `len == 0` or the range wraps,
+    /// - SPC denies the access for the whole span,
+    /// - multi-page range is not entirely inside one mmap arena,
+    /// - single-page host resolve fails (uncommitted / NOACCESS).
+    ///
+    /// On success, the returned pointer is valid for `len` bytes for the lifetime
+    /// of this `GuestMemory` borrow (and until the covering arena is released).
+    #[must_use]
     pub(crate) fn host_span(&self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
         if len == 0 {
             return None;

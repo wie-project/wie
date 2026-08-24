@@ -8,7 +8,6 @@
 //! `PendingSpawn` path as `CreateThread`, so a pthread is a real 1:1 host thread
 //! with its own CPU engine.
 
-#![expect(dead_code)]
 #![allow(unreachable_pub)]
 //!
 //! # Guest ABI
@@ -79,8 +78,6 @@ pub const ESRCH: i32 = 3;
 pub const EINTR: i32 = 4;
 /// `EAGAIN` — resource temporarily unavailable / `sem_trywait` would block.
 pub const EAGAIN: i32 = 11;
-/// `ENOMEM` — out of memory / thread limit reached.
-pub const ENOMEM: i32 = 12;
 /// `EOVERFLOW` — value too large for the target type.
 pub const EOVERFLOW: i32 = 75;
 /// `EBUSY` — object is in use.
@@ -346,14 +343,6 @@ fn write_u32(engine: &mut dyn CpuEngine, va: u64, value: u32) {
 /// Store a 32-bit signed word at `va`.
 fn write_i32(engine: &mut dyn CpuEngine, va: u64, value: i32) {
     write_u32(engine, va, value.cast_unsigned());
-}
-
-/// Read a stack argument (5th onward) at `RSP + offset`.
-fn stack_arg(engine: &mut dyn CpuEngine, offset: u64) -> u64 {
-    let Ok(rsp) = engine.read_rsp() else {
-        return 0;
-    };
-    read_u64(engine, rsp.saturating_add(offset))
 }
 
 /// Read a NUL-terminated ASCII string of at most 512 bytes.

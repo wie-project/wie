@@ -1,13 +1,13 @@
 //! Guest-memory access: host-callable `wie_jit_*` helpers (registered as JIT
 //! symbols) and the IR-emitting load/store/pin helpers used by block emission.
 
-use super::emit::{HoistedPin, MemEnv, exit_args};
+use super::emit::{HoistedPin, MemEnv, check_fault_after_ucrt};
 use super::flags::iconst_u64;
 use super::gpr::sticky_tlb_probe;
 use super::tlb::{set_fault, tlb_page_ptr};
 use super::{
-    CHAIN_SLOTS, EDGE_IC_SLOTS, JitCtx, OFF_FAULT, OFF_MEM_GEN, OFF_PINS, PIN_STRIDE, TLB_PROT_R,
-    TLB_PROT_W, chain_hash,
+    CHAIN_SLOTS, EDGE_IC_SLOTS, JitCtx, OFF_MEM_GEN, OFF_PINS, PIN_STRIDE, TLB_PROT_R, TLB_PROT_W,
+    chain_hash,
 };
 
 use crate::exec::{self, StringOpKind};
@@ -407,41 +407,23 @@ pub(super) fn call_load(
 
     if let Some(ref pin) = mem.stack_pin {
         let (ok, host) = hoisted_pin_probe(bcx, pin, addr, size, false);
-        let hit = bcx.create_block();
-        let miss = bcx.create_block();
-        bcx.ins().brif(ok, hit, &[], miss, &[]);
-        bcx.switch_to_block(hit);
-        bcx.seal_block(hit);
-        let v = load_guest_bytes(bcx, mem.guest_flags, host, size);
-        bcx.ins().jump(merge, &[BlockArg::Value(v)]);
-        bcx.switch_to_block(miss);
-        bcx.seal_block(miss);
+        emit_probe_stage(bcx, ok, host, merge, |bcx, host| {
+            Some(load_guest_bytes(bcx, mem.guest_flags, host, size))
+        });
     }
 
     {
         let (ok, host) = sticky_tlb_probe(bcx, mem, addr, size, false);
-        let hit = bcx.create_block();
-        let miss = bcx.create_block();
-        bcx.ins().brif(ok, hit, &[], miss, &[]);
-        bcx.switch_to_block(hit);
-        bcx.seal_block(hit);
-        let v = load_guest_bytes(bcx, mem.guest_flags, host, size);
-        bcx.ins().jump(merge, &[BlockArg::Value(v)]);
-        bcx.switch_to_block(miss);
-        bcx.seal_block(miss);
+        emit_probe_stage(bcx, ok, host, merge, |bcx, host| {
+            Some(load_guest_bytes(bcx, mem.guest_flags, host, size))
+        });
     }
 
     for pin in &mem.data_pins {
         let (ok, host) = hoisted_pin_probe(bcx, pin, addr, size, false);
-        let hit = bcx.create_block();
-        let miss = bcx.create_block();
-        bcx.ins().brif(ok, hit, &[], miss, &[]);
-        bcx.switch_to_block(hit);
-        bcx.seal_block(hit);
-        let v = load_guest_bytes(bcx, mem.guest_flags, host, size);
-        bcx.ins().jump(merge, &[BlockArg::Value(v)]);
-        bcx.switch_to_block(miss);
-        bcx.seal_block(miss);
+        emit_probe_stage(bcx, ok, host, merge, |bcx, host| {
+            Some(load_guest_bytes(bcx, mem.guest_flags, host, size))
+        });
     }
 
     let slow_val = emit_load_helper(bcx, mem, gpr, rflags, addr, size, insn_ip, load_ref);
@@ -450,6 +432,34 @@ pub(super) fn call_load(
     bcx.switch_to_block(merge);
     bcx.seal_block(merge);
     Ok(bcx.block_params(merge)[0])
+}
+
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+/// Emit one CFG-ordered probe stage of the load/store miss chain.
+///
+/// Branches on `ok` to a fresh `hit` block (which runs `hit_effect` and jumps
+/// to `merge`, threading its optional value as a merge arg) and a fresh `miss`
+/// block; leaves the builder positioned at the sealed `miss` block so the next
+/// stage (or the slow-path helper) continues there. Monomorphized closures
+/// keep this compile-path-only — emitted IR is identical per call site.
+fn emit_probe_stage(
+    bcx: &mut FunctionBuilder<'_>,
+    ok: Value,
+    host: Value,
+    merge: Block,
+    hit_effect: impl FnOnce(&mut FunctionBuilder<'_>, Value) -> Option<Value>,
+) {
+    let hit = bcx.create_block();
+    let miss = bcx.create_block();
+    bcx.ins().brif(ok, hit, &[], miss, &[]);
+    bcx.switch_to_block(hit);
+    bcx.seal_block(hit);
+    match hit_effect(bcx, host) {
+        Some(v) => bcx.ins().jump(merge, &[BlockArg::Value(v)]),
+        None => bcx.ins().jump(merge, &[]),
+    };
+    bcx.switch_to_block(miss);
+    bcx.seal_block(miss);
 }
 
 // The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
@@ -468,14 +478,7 @@ pub(super) fn emit_load_helper(
     let ip_v = iconst_u64(bcx, insn_ip);
     let call = bcx.ins().call(load_ref, &[mem.ctx_ptr, addr, size_v, ip_v]);
     let slow_val = bcx.inst_results(call)[0];
-    let fault_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_FAULT));
-    let fault = bcx.ins().load(types::I64, mem.flags, fault_ptr, 0);
-    let is_fault = bcx.ins().icmp_imm(IntCC::NotEqual, fault, 0);
-    let cont = bcx.create_block();
-    let args = exit_args(gpr, rflags);
-    bcx.ins().brif(is_fault, mem.exit, &args, cont, &[]);
-    bcx.switch_to_block(cont);
-    bcx.seal_block(cont);
+    check_fault_after_ucrt(bcx, mem, gpr, rflags);
     slow_val
 }
 
@@ -509,41 +512,26 @@ pub(super) fn call_store(
 
     if let Some(ref pin) = mem.stack_pin {
         let (ok, host) = hoisted_pin_probe(bcx, pin, addr, size, true);
-        let hit = bcx.create_block();
-        let miss = bcx.create_block();
-        bcx.ins().brif(ok, hit, &[], miss, &[]);
-        bcx.switch_to_block(hit);
-        bcx.seal_block(hit);
-        store_guest_bytes(bcx, mem.guest_flags, host, size, value);
-        bcx.ins().jump(merge, &[]);
-        bcx.switch_to_block(miss);
-        bcx.seal_block(miss);
+        emit_probe_stage(bcx, ok, host, merge, |bcx, host| {
+            store_guest_bytes(bcx, mem.guest_flags, host, size, value);
+            None
+        });
     }
 
     {
         let (ok, host) = sticky_tlb_probe(bcx, mem, addr, size, true);
-        let hit = bcx.create_block();
-        let miss = bcx.create_block();
-        bcx.ins().brif(ok, hit, &[], miss, &[]);
-        bcx.switch_to_block(hit);
-        bcx.seal_block(hit);
-        store_guest_bytes(bcx, mem.guest_flags, host, size, value);
-        bcx.ins().jump(merge, &[]);
-        bcx.switch_to_block(miss);
-        bcx.seal_block(miss);
+        emit_probe_stage(bcx, ok, host, merge, |bcx, host| {
+            store_guest_bytes(bcx, mem.guest_flags, host, size, value);
+            None
+        });
     }
 
     for pin in &mem.data_pins {
         let (ok, host) = hoisted_pin_probe(bcx, pin, addr, size, true);
-        let hit = bcx.create_block();
-        let miss = bcx.create_block();
-        bcx.ins().brif(ok, hit, &[], miss, &[]);
-        bcx.switch_to_block(hit);
-        bcx.seal_block(hit);
-        store_guest_bytes(bcx, mem.guest_flags, host, size, value);
-        bcx.ins().jump(merge, &[]);
-        bcx.switch_to_block(miss);
-        bcx.seal_block(miss);
+        emit_probe_stage(bcx, ok, host, merge, |bcx, host| {
+            store_guest_bytes(bcx, mem.guest_flags, host, size, value);
+            None
+        });
     }
 
     emit_store_helper(bcx, mem, gpr, rflags, addr, size, value, insn_ip, store_ref);
@@ -571,12 +559,5 @@ pub(super) fn emit_store_helper(
     let ip_v = iconst_u64(bcx, insn_ip);
     bcx.ins()
         .call(store_ref, &[mem.ctx_ptr, addr, size_v, value, ip_v]);
-    let fault_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_FAULT));
-    let fault = bcx.ins().load(types::I64, mem.flags, fault_ptr, 0);
-    let is_fault = bcx.ins().icmp_imm(IntCC::NotEqual, fault, 0);
-    let cont = bcx.create_block();
-    let args = exit_args(gpr, rflags);
-    bcx.ins().brif(is_fault, mem.exit, &args, cont, &[]);
-    bcx.switch_to_block(cont);
-    bcx.seal_block(cont);
+    check_fault_after_ucrt(bcx, mem, gpr, rflags);
 }

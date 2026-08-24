@@ -5,6 +5,7 @@
 //! parent module's `render` submodule.
 
 use super::*;
+use crate::gdi32::{ArgReg, read_arg};
 
 /// The stub's single pixel-format index (`wglChoosePixelFormat` / describe).
 const STUB_PIXEL_FORMAT: u32 = 1;
@@ -25,9 +26,7 @@ pub(super) fn handle_wgl_create_context(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for wglCreateContext")?;
+    let _hdc = read_arg(engine, ArgReg::Rcx, "wglCreateContext")?;
     // Fail closed (0) when the table is poisoned — a context cannot exist.
     let handle = lock_gl_state().map_or(0, |mut gl| {
         let handle = gl.next_handle;
@@ -43,9 +42,7 @@ pub(super) fn handle_wgl_delete_context(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let hglrc = engine
-        .read_rcx()
-        .context("failed to read RCX for wglDeleteContext")?;
+    let hglrc = read_arg(engine, ArgReg::Rcx, "wglDeleteContext")?;
     if let Some(mut gl) = lock_gl_state() {
         gl.contexts.remove(&hglrc);
         // Deleting the current context releases it (real WGL semantics).
@@ -62,12 +59,8 @@ pub(super) fn handle_wgl_delete_context(
 pub(super) fn handle_wgl_make_current(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for wglMakeCurrent")?;
-    let hglrc = engine
-        .read_rdx()
-        .context("failed to read RDX for wglMakeCurrent")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "wglMakeCurrent")?;
+    let hglrc = read_arg(engine, ArgReg::Rdx, "wglMakeCurrent")?;
     if let Some(mut gl) = lock_gl_state() {
         gl.current = (hglrc != 0).then_some((hdc, hglrc));
         if hglrc != 0
@@ -80,10 +73,6 @@ pub(super) fn handle_wgl_make_current(ctx: &mut HandlerContext<'_>) -> Result<Wi
     ctx.finish(1)
 }
 
-/// `PROC wglGetProcAddress(LPCSTR name)` — NULL for every extension.
-///
-/// Extension entry points are never published; Qt-class apps fall back to
-/// their non-extension paths when the pointer is NULL.
 /// `PROC wglGetProcAddress(LPCSTR name)` — a callable fake VA for every
 /// `opengl32.dll` export (the dispatch table is the source of truth; every
 /// name is preplanted in [`crate::dynamic_apis::PREPLANTED_SOFT_APIS`] at a
@@ -95,9 +84,7 @@ pub(super) fn handle_wgl_get_proc_address(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let name_va = engine
-        .read_rcx()
-        .context("failed to read RCX for wglGetProcAddress")?;
+    let name_va = read_arg(engine, ArgReg::Rcx, "wglGetProcAddress")?;
     if name_va != 0 {
         let name = crate::guest_string::read_ansi_lossy(engine, name_va, 256).unwrap_or_default();
         let lower = name.to_ascii_lowercase();
@@ -125,12 +112,8 @@ pub(crate) fn handle_wgl_choose_pixel_format(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for wglChoosePixelFormat")?;
-    let _ppfd = engine
-        .read_rdx()
-        .context("failed to read RDX for wglChoosePixelFormat")?;
+    let _hdc = read_arg(engine, ArgReg::Rcx, "wglChoosePixelFormat")?;
+    let _ppfd = read_arg(engine, ArgReg::Rdx, "wglChoosePixelFormat")?;
     ctx.finish(u64::from(STUB_PIXEL_FORMAT))
 }
 
@@ -140,13 +123,9 @@ pub(crate) fn handle_wgl_set_pixel_format(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for wglSetPixelFormat")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "wglSetPixelFormat")?;
     let format = low_u32(engine.read_rdx()?, "wglSetPixelFormat format")?;
-    let _ppfd = engine
-        .read_r8()
-        .context("failed to read R8 for wglSetPixelFormat")?;
+    let _ppfd = read_arg(engine, ArgReg::R8, "wglSetPixelFormat")?;
     if let Some(mut gl) = lock_gl_state() {
         gl.pixel_formats.insert(hdc, format);
     }
@@ -160,18 +139,10 @@ pub(crate) fn handle_wgl_describe_pixel_format(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for wglDescribePixelFormat")?;
-    let _format = engine
-        .read_rdx()
-        .context("failed to read RDX for wglDescribePixelFormat")?;
-    let n_bytes = engine
-        .read_r8()
-        .context("failed to read R8 for wglDescribePixelFormat")?;
-    let ppfd_va = engine
-        .read_r9()
-        .context("failed to read R9 for wglDescribePixelFormat")?;
+    let _hdc = read_arg(engine, ArgReg::Rcx, "wglDescribePixelFormat")?;
+    let _format = read_arg(engine, ArgReg::Rdx, "wglDescribePixelFormat")?;
+    let n_bytes = read_arg(engine, ArgReg::R8, "wglDescribePixelFormat")?;
+    let ppfd_va = read_arg(engine, ArgReg::R9, "wglDescribePixelFormat")?;
     if ppfd_va != 0 && n_bytes >= PIXELFORMATDESCRIPTOR_SIZE {
         write_pixel_format_descriptor(engine, ppfd_va)?;
     }
@@ -184,9 +155,7 @@ pub(crate) fn handle_wgl_get_pixel_format(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for wglGetPixelFormat")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "wglGetPixelFormat")?;
     let format = lock_gl_state()
         .and_then(|gl| gl.pixel_formats.get(&hdc).copied())
         .unwrap_or(0);
@@ -203,9 +172,7 @@ pub(crate) fn handle_wgl_get_pixel_format(
 pub(crate) fn handle_wgl_swap_buffers(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for wglSwapBuffers")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "wglSwapBuffers")?;
     let resolved = crate::gdi32::resolve_dest_info(state, hdc);
     let (hwnd, width, height) = match resolved {
         Some(dest) => (dest.hwnd, dest.width, dest.height),
@@ -224,19 +191,11 @@ pub(crate) fn handle_wgl_swap_buffers(ctx: &mut HandlerContext<'_>) -> Result<Wi
     state.present().ensure_surface(hwnd, width, height);
     // Snapshot the context's backbuffer (0RGB) — the frame the user sees.
     let frame = with_current_gl(|gl_ctx| render::gl_frame_0rgb(gl_ctx, width, height));
-    if let Some((fw, fh, pixels)) = frame
-        && let Some(surface) = state.present().surfaces.get_mut(&hwnd)
-    {
-        if fw == width && fh == height {
-            let n = surface.pixels.len().min(pixels.len());
-            if let (Some(dst), Some(src)) = (surface.pixels.get_mut(..n), pixels.get(..n)) {
-                dst.copy_from_slice(src);
-            }
-        } else {
-            wie_cpu::stretch_nearest(&mut surface.pixels, &pixels, fw, fh, width, height);
-        }
+    if let Some((fw, fh, pixels)) = frame {
+        state.present().blit_frame(hwnd, &pixels, fw, fh);
+    } else {
+        state.present().publish(hwnd);
     }
-    state.present().publish(hwnd);
     tracing::trace!(target: "wiegui", hdc, width, height, "wglSwapBuffers published a rendered frame");
     ctx.finish(1)
 }
@@ -245,12 +204,8 @@ pub(crate) fn handle_wgl_swap_buffers(ctx: &mut HandlerContext<'_>) -> Result<Wi
 /// sharing across contexts is documented-missing).
 pub(super) fn handle_wgl_share_lists(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _hglrc1 = engine
-        .read_rcx()
-        .context("failed to read RCX for wglShareLists")?;
-    let _hglrc2 = engine
-        .read_rdx()
-        .context("failed to read RDX for wglShareLists")?;
+    let _hglrc1 = read_arg(engine, ArgReg::Rcx, "wglShareLists")?;
+    let _hglrc2 = read_arg(engine, ArgReg::Rdx, "wglShareLists")?;
     ctx.finish(1)
 }
 

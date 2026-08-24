@@ -5,6 +5,7 @@
 //! `WS_TABSTOP` children and Enter / Esc → `WM_COMMAND(IDOK/IDCANCEL)` to
 //! the dialog proc.
 
+use crate::gdi32::{ArgReg, read_arg};
 use anyhow::{Context, Result};
 
 use crate::OuterReturn;
@@ -45,12 +46,8 @@ fn handle_is_dialog_message_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let dialog_hwnd = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let message_address = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let dialog_hwnd = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let message_address = read_arg(engine, ArgReg::Rdx, api_name)?;
 
     let (dialog_proc, dialog_unicode) = find_window(state, dialog_hwnd)
         .filter(|w| w.dialog_proc != 0)

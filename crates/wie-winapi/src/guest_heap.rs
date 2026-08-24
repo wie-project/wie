@@ -302,6 +302,59 @@ impl GuestHeap {
         None
     }
 
+    /// Block size for `ptr`: host live-table first, else the guest-side header
+    /// (the `u64` length each allocator stores immediately before the payload).
+    ///
+    /// Shared fallback for `HeapReAlloc`, CRT `realloc`, and `HeapSize` — all
+    /// must size blocks the in-guest JIT helpers allocated (host table miss).
+    pub(crate) fn size_from_header(
+        &self,
+        engine: &mut dyn wie_cpu::CpuEngine,
+        ptr: u64,
+    ) -> Option<u64> {
+        if let Some(size) = self.live.get(&ptr) {
+            return Some(*size);
+        }
+        // Below the header there is no room for a length field at all.
+        if ptr < HEAP_BLOCK_HEADER_SIZE {
+            return None;
+        }
+        Self::read_u64(engine, ptr.wrapping_sub(HEAP_BLOCK_HEADER_SIZE))
+    }
+
+    /// Realloc shared by `HeapReAlloc` and CRT `realloc`: try in-place first;
+    /// on the move path allocate a fresh block, copy `min(old, new)` bytes
+    /// (`memmove` semantics via bulk guest copy), and free the original.
+    ///
+    /// Returns `(address, old_size)`. `address == 0` means the new allocation
+    /// failed — per Microsoft Learn the original block stays live. Zero-fill
+    /// of a grown tail is the caller's policy (`HEAP_ZERO_MEMORY`), not ours.
+    pub(crate) fn realloc_coherent(
+        &mut self,
+        engine: &mut dyn wie_cpu::CpuEngine,
+        ptr: u64,
+        new_size: u64,
+    ) -> anyhow::Result<(u64, u64)> {
+        if let Some(same) = self.try_realloc_in_place(ptr, new_size) {
+            let old_size = self.size_of(ptr).unwrap_or(new_size);
+            return Ok((same, old_size));
+        }
+        let old_size = self.size_from_header(engine, ptr).unwrap_or(0);
+        let new_addr = self.alloc_coherent(engine, new_size);
+        if new_addr == 0 {
+            return Ok((0, old_size));
+        }
+        let copy_len = usize::try_from(old_size.min(new_size)).unwrap_or(0);
+        if copy_len > 0 && !engine.mem_copy(new_addr, ptr, copy_len) {
+            // Bounce buffer when the engine cannot bulk-copy.
+            let mut bytes = vec![0_u8; copy_len];
+            engine.mem_read(ptr, &mut bytes)?;
+            engine.mem_write(new_addr, &bytes)?;
+        }
+        let _ = self.free_coherent(engine, ptr);
+        Ok((new_addr, old_size))
+    }
+
     fn bump_alloc(&mut self, rounded: u64) -> u64 {
         // Layout matches guest helper: size header, then aligned payload.
         // payload = align16(bump + header); header at payload-header; bump' = payload + rounded.

@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_memory::{checked_address, read_u16};
 use crate::{HandlerContext, WinApiHandlerResult};
 
@@ -22,9 +23,7 @@ const FAKE_PALETTE_HANDLE: u64 = 0x0000_0000_6800_6001;
 /// The emulated screen is 32-bpp, so no palette entries are stored.
 pub fn handle_create_palette(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let log_palette_va = engine
-        .read_rcx()
-        .context("failed to read RCX for CreatePalette")?;
+    let log_palette_va = read_arg(engine, ArgReg::Rcx, "CreatePalette")?;
 
     if log_palette_va == 0 {
         return ctx.finish(0);
@@ -59,12 +58,8 @@ pub fn handle_get_system_palette_entries(
     let engine = &mut *ctx.engine;
     let _hdc = engine.read_rcx()?;
     let _i_start = engine.read_rdx()?;
-    let c_entries = engine
-        .read_r8()
-        .context("failed to read R8 for GetSystemPaletteEntries")?;
-    let entries_va = engine
-        .read_r9()
-        .context("failed to read R9 for GetSystemPaletteEntries")?;
+    let c_entries = read_arg(engine, ArgReg::R8, "GetSystemPaletteEntries")?;
+    let entries_va = read_arg(engine, ArgReg::R9, "GetSystemPaletteEntries")?;
 
     let count = u32::try_from(c_entries & u64::from(u32::MAX)).unwrap_or(0);
     let bytes = u64::from(count).saturating_mul(4);

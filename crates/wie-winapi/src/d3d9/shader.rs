@@ -7,6 +7,8 @@ use crate::guest_memory::{read_u32, write_u64 as write_guest_u64};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 use super::texture::fill_com_vtable;
+use crate::gdi32::{ArgReg, read_arg};
+use crate::kernel32::low_u32;
 
 // ── shader objects ─────────────────────────────────────────────────────
 //
@@ -122,17 +124,36 @@ fn allocate_shader_object(
 /// malformed bytecode or shaders whose opcodes the interpreter cannot
 /// execute (`D3DERR_INVALIDCALL` — the full instruction set is not yet implemented).
 pub fn handle_create_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    create_shader_impl(ctx, ShaderKind::Pixel, D3d9Iface::PixelShader9)
+}
+
+/// Handles `IDirect3DDevice9::CreateVertexShader` (vtable slot 91).
+///
+/// Accepts vs_2_0 bytecode whose opcodes the vertex-stage interpreter
+/// executes; the advanced ops (`m4x4`/`dst`/`lit`/`pow`/… and all flow
+/// control) parse but are rejected with `D3DERR_INVALIDCALL` until L5.
+pub fn handle_create_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    create_shader_impl(ctx, ShaderKind::Vertex, D3d9Iface::VertexShader9)
+}
+
+/// Shared `CreatePixelShader`/`CreateVertexShader` body: `rcx` = this,
+/// `rdx` = bytecode, `r8` = output pointer. The parsed shader is stored and
+/// its `def*` constants seed the device constant banks for the shader's
+/// stage (see [`seed_constant_banks`]).
+fn create_shader_impl(
+    ctx: &mut HandlerContext<'_>,
+    kind: ShaderKind,
+    iface: D3d9Iface,
+) -> Result<WinApiHandlerResult> {
+    let api_name = match kind {
+        ShaderKind::Pixel => "CreatePixelShader",
+        ShaderKind::Vertex => "CreateVertexShader",
+    };
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for CreatePixelShader")?;
-    let bytecode_va = engine
-        .read_rdx()
-        .context("failed to read RDX for CreatePixelShader")?;
-    let pp_shader = engine
-        .read_r8()
-        .context("failed to read R8 for CreatePixelShader")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let bytecode_va = read_arg(engine, ArgReg::Rdx, api_name)?;
+    let pp_shader = read_arg(engine, ArgReg::R8, api_name)?;
 
     let return_value = if bytecode_va != 0 && pp_shader != 0 {
         let bytecode = read_shader_bytecode(engine, bytecode_va);
@@ -141,10 +162,8 @@ pub fn handle_create_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApi
             .ok()
             .and_then(|tokens| parse_shader(tokens).ok());
         match (bytecode, parsed) {
-            (Ok(bytecode), Some(parsed))
-                if parsed.kind == ShaderKind::Pixel && parsed.is_fully_executable() =>
-            {
-                let object = allocate_shader_object(engine, state, D3d9Iface::PixelShader9)?;
+            (Ok(bytecode), Some(parsed)) if parsed.kind == kind && parsed.is_fully_executable() => {
+                let object = allocate_shader_object(engine, state, iface)?;
                 if object == 0 {
                     D3DERR_INVALIDCALL
                 } else {
@@ -152,29 +171,21 @@ pub fn handle_create_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApi
                         object,
                         ShaderRecord {
                             handle: object,
-                            kind: ShaderKind::Pixel,
+                            kind,
                             bytecode,
                             parsed,
                         },
                     );
-                    // `def` writes the device constant registers (real D3D9
-                    // semantics); later SetPixelShaderConstantF calls override.
-                    let d3d = state.d3d9();
-                    let def_constants = d3d
-                        .d3d9_shaders
-                        .get(&object)
-                        .map(|record| record.parsed.constants.clone())
-                        .unwrap_or_default();
-                    for (register, value) in &def_constants {
-                        if let Some(slot) = d3d
-                            .d3d9_ps_constants
-                            .get_mut(usize::try_from(*register).unwrap_or(usize::MAX))
-                        {
-                            *slot = *value;
-                        }
-                    }
-                    write_guest_u64(engine, pp_shader, object)
-                        .context("failed to return IDirect3DPixelShader9 pointer")?;
+                    seed_constant_banks(state, object, kind);
+                    write_guest_u64(engine, pp_shader, object).with_context(|| {
+                        format!(
+                            "failed to return IDirect3D{}Shader9 pointer",
+                            match kind {
+                                ShaderKind::Pixel => "Pixel",
+                                ShaderKind::Vertex => "Vertex",
+                            }
+                        )
+                    })?;
                     D3D_OK
                 }
             }
@@ -187,99 +198,69 @@ pub fn handle_create_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     ctx.finish(return_value)
 }
 
-/// Handles `IDirect3DDevice9::CreateVertexShader` (vtable slot 91).
-///
-/// Accepts vs_2_0 bytecode whose opcodes the vertex-stage interpreter
-/// executes; the advanced ops (`m4x4`/`dst`/`lit`/`pow`/… and all flow
-/// control) parse but are rejected with `D3DERR_INVALIDCALL` until L5.
-pub fn handle_create_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateVertexShader")?;
-    let bytecode_va = engine
-        .read_rdx()
-        .context("failed to read RDX for CreateVertexShader")?;
-    let pp_shader = engine
-        .read_r8()
-        .context("failed to read R8 for CreateVertexShader")?;
-
-    let return_value = if bytecode_va != 0 && pp_shader != 0 {
-        let bytecode = read_shader_bytecode(engine, bytecode_va);
-        let parsed = bytecode
-            .as_deref()
-            .ok()
-            .and_then(|tokens| parse_shader(tokens).ok());
-        match (bytecode, parsed) {
-            (Ok(bytecode), Some(parsed))
-                if parsed.kind == ShaderKind::Vertex && parsed.is_fully_executable() =>
-            {
-                let object = allocate_shader_object(engine, state, D3d9Iface::VertexShader9)?;
-                if object == 0 {
-                    D3DERR_INVALIDCALL
-                } else {
-                    state.d3d9().d3d9_shaders.insert(
-                        object,
-                        ShaderRecord {
-                            handle: object,
-                            kind: ShaderKind::Vertex,
-                            bytecode,
-                            parsed,
-                        },
-                    );
-                    // `def`/`defb`/`defi` write the device constant registers
-                    // at Create time (real D3D9 semantics — the same as the
-                    // pixel-shader `def` path); later Set*ShaderConstant
-                    // calls override.
-                    let d3d = state.d3d9();
-                    let record = d3d
-                        .d3d9_shaders
-                        .get(&object)
-                        .map(|r| {
-                            (
-                                r.parsed.constants.clone(),
-                                r.parsed.bool_constants.clone(),
-                                r.parsed.int_constants.clone(),
-                            )
-                        })
-                        .unwrap_or_default();
-                    for (register, value) in &record.0 {
-                        if let Some(slot) = d3d
-                            .d3d9_vs_constants
-                            .get_mut(usize::try_from(*register).unwrap_or(usize::MAX))
-                        {
-                            *slot = *value;
-                        }
-                    }
-                    for (register, value) in &record.1 {
-                        if let Some(slot) = d3d
-                            .d3d9_vs_bool_constants
-                            .get_mut(usize::try_from(*register).unwrap_or(usize::MAX))
-                        {
-                            *slot = *value;
-                        }
-                    }
-                    for (register, value) in &record.2 {
-                        if let Some(slot) = d3d
-                            .d3d9_vs_int_constants
-                            .get_mut(usize::try_from(*register).unwrap_or(usize::MAX))
-                        {
-                            slot[0] = *value;
-                        }
-                    }
-                    write_guest_u64(engine, pp_shader, object)
-                        .context("failed to return IDirect3DVertexShader9 pointer")?;
-                    D3D_OK
+/// Seed the device constant banks from a just-created shader's `def*`
+/// pseudo-opcodes (real D3D9 semantics; later `Set*ShaderConstant` calls
+/// override). Bank selection follows the shader stage exactly as before the
+/// two Create paths were shared: pixel shaders seed `d3d9_ps_constants`,
+/// vertex shaders seed the float/bool/int `d3d9_vs_*` banks in that order.
+fn seed_constant_banks(state: &mut WinApiState, object: u64, kind: ShaderKind) {
+    let d3d = state.d3d9();
+    match kind {
+        ShaderKind::Pixel => {
+            // `def` writes the device constant registers (real D3D9
+            // semantics); later SetPixelShaderConstantF calls override.
+            let def_constants = d3d
+                .d3d9_shaders
+                .get(&object)
+                .map(|record| record.parsed.constants.clone())
+                .unwrap_or_default();
+            for (register, value) in &def_constants {
+                if let Some(slot) = d3d
+                    .d3d9_ps_constants
+                    .get_mut(usize::try_from(*register).unwrap_or(usize::MAX))
+                {
+                    *slot = *value;
                 }
             }
-            _ => D3DERR_INVALIDCALL,
         }
-    } else {
-        D3DERR_INVALIDCALL
-    };
-
-    ctx.finish(return_value)
+        ShaderKind::Vertex => {
+            let record = d3d
+                .d3d9_shaders
+                .get(&object)
+                .map(|r| {
+                    (
+                        r.parsed.constants.clone(),
+                        r.parsed.bool_constants.clone(),
+                        r.parsed.int_constants.clone(),
+                    )
+                })
+                .unwrap_or_default();
+            for (register, value) in &record.0 {
+                if let Some(slot) = d3d
+                    .d3d9_vs_constants
+                    .get_mut(usize::try_from(*register).unwrap_or(usize::MAX))
+                {
+                    *slot = *value;
+                }
+            }
+            for (register, value) in &record.1 {
+                if let Some(slot) = d3d
+                    .d3d9_vs_bool_constants
+                    .get_mut(usize::try_from(*register).unwrap_or(usize::MAX))
+                {
+                    *slot = *value;
+                }
+            }
+            for (register, value) in &record.2 {
+                if let Some(slot) = d3d
+                    .d3d9_vs_int_constants
+                    .get_mut(usize::try_from(*register).unwrap_or(usize::MAX))
+                {
+                    slot[0] = *value;
+                }
+            }
+        }
+    }
 }
 
 /// Common Set*Shader body: validate the pointer (NULL clears) and bind it.
@@ -304,12 +285,8 @@ fn set_shader_binding(state: &mut WinApiState, shader: u64, kind: ShaderKind) {
 pub fn handle_set_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for SetPixelShader")?;
-    let shader = engine
-        .read_rdx()
-        .context("failed to read RDX for SetPixelShader")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "SetPixelShader")?;
+    let shader = read_arg(engine, ArgReg::Rdx, "SetPixelShader")?;
 
     set_shader_binding(state, shader, ShaderKind::Pixel);
 
@@ -321,12 +298,8 @@ pub fn handle_set_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 pub fn handle_get_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetPixelShader")?;
-    let pp_shader = engine
-        .read_rdx()
-        .context("failed to read RDX for GetPixelShader")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetPixelShader")?;
+    let pp_shader = read_arg(engine, ArgReg::Rdx, "GetPixelShader")?;
 
     let return_value = if pp_shader != 0 {
         write_guest_u64(engine, pp_shader, state.d3d9().d3d9_pixel_shader)
@@ -342,12 +315,8 @@ pub fn handle_get_pixel_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 pub fn handle_set_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for SetVertexShader")?;
-    let vertex_shader = engine
-        .read_rdx()
-        .context("failed to read RDX for SetVertexShader")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "SetVertexShader")?;
+    let vertex_shader = read_arg(engine, ArgReg::Rdx, "SetVertexShader")?;
 
     set_shader_binding(state, vertex_shader, ShaderKind::Vertex);
 
@@ -359,12 +328,8 @@ pub fn handle_set_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_get_vertex_shader(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetVertexShader")?;
-    let pp_shader = engine
-        .read_rdx()
-        .context("failed to read RDX for GetVertexShader")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetVertexShader")?;
+    let pp_shader = read_arg(engine, ArgReg::Rdx, "GetVertexShader")?;
 
     let return_value = if pp_shader != 0 {
         write_guest_u64(engine, pp_shader, state.d3d9().d3d9_current_vertex_shader)
@@ -452,16 +417,10 @@ pub fn handle_set_pixel_shader_constant_f(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for SetPixelShaderConstantF")?;
-    let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
-        .context("start register does not fit u32")?;
-    let data_va = engine
-        .read_r8()
-        .context("failed to read R8 for SetPixelShaderConstantF")?;
-    let count =
-        u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("count does not fit u32")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "SetPixelShaderConstantF")?;
+    let start_register = low_u32(engine.read_rdx()?, "start register")?;
+    let data_va = read_arg(engine, ArgReg::R8, "SetPixelShaderConstantF")?;
+    let count = low_u32(engine.read_r9()?, "count")?;
 
     let d3d = state.d3d9();
     set_shader_constant_f(
@@ -481,16 +440,10 @@ pub fn handle_get_pixel_shader_constant_f(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetPixelShaderConstantF")?;
-    let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
-        .context("start register does not fit u32")?;
-    let data_va = engine
-        .read_r8()
-        .context("failed to read R8 for GetPixelShaderConstantF")?;
-    let count =
-        u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("count does not fit u32")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetPixelShaderConstantF")?;
+    let start_register = low_u32(engine.read_rdx()?, "start register")?;
+    let data_va = read_arg(engine, ArgReg::R8, "GetPixelShaderConstantF")?;
+    let count = low_u32(engine.read_r9()?, "count")?;
 
     let d3d = state.d3d9();
     get_shader_constant_f(
@@ -513,16 +466,10 @@ pub fn handle_set_vertex_shader_constant_f(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for SetVertexShaderConstantF")?;
-    let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
-        .context("start register does not fit u32")?;
-    let data_va = engine
-        .read_r8()
-        .context("failed to read R8 for SetVertexShaderConstantF")?;
-    let count =
-        u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("count does not fit u32")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "SetVertexShaderConstantF")?;
+    let start_register = low_u32(engine.read_rdx()?, "start register")?;
+    let data_va = read_arg(engine, ArgReg::R8, "SetVertexShaderConstantF")?;
+    let count = low_u32(engine.read_r9()?, "count")?;
 
     let d3d = state.d3d9();
     set_shader_constant_f(
@@ -542,16 +489,10 @@ pub fn handle_get_vertex_shader_constant_f(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetVertexShaderConstantF")?;
-    let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
-        .context("start register does not fit u32")?;
-    let data_va = engine
-        .read_r8()
-        .context("failed to read R8 for GetVertexShaderConstantF")?;
-    let count =
-        u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("count does not fit u32")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetVertexShaderConstantF")?;
+    let start_register = low_u32(engine.read_rdx()?, "start register")?;
+    let data_va = read_arg(engine, ArgReg::R8, "GetVertexShaderConstantF")?;
+    let count = low_u32(engine.read_r9()?, "count")?;
 
     let d3d = state.d3d9();
     get_shader_constant_f(
@@ -694,16 +635,10 @@ pub fn handle_set_vertex_shader_constant_i(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for SetVertexShaderConstantI")?;
-    let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
-        .context("start register does not fit u32")?;
-    let data_va = engine
-        .read_r8()
-        .context("failed to read R8 for SetVertexShaderConstantI")?;
-    let count =
-        u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("count does not fit u32")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "SetVertexShaderConstantI")?;
+    let start_register = low_u32(engine.read_rdx()?, "start register")?;
+    let data_va = read_arg(engine, ArgReg::R8, "SetVertexShaderConstantI")?;
+    let count = low_u32(engine.read_r9()?, "count")?;
 
     let d3d = state.d3d9();
     set_shader_constant_i(
@@ -723,16 +658,10 @@ pub fn handle_get_vertex_shader_constant_i(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetVertexShaderConstantI")?;
-    let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
-        .context("start register does not fit u32")?;
-    let data_va = engine
-        .read_r8()
-        .context("failed to read R8 for GetVertexShaderConstantI")?;
-    let count =
-        u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("count does not fit u32")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetVertexShaderConstantI")?;
+    let start_register = low_u32(engine.read_rdx()?, "start register")?;
+    let data_va = read_arg(engine, ArgReg::R8, "GetVertexShaderConstantI")?;
+    let count = low_u32(engine.read_r9()?, "count")?;
 
     let d3d = state.d3d9();
     get_shader_constant_i(
@@ -755,16 +684,10 @@ pub fn handle_set_vertex_shader_constant_b(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for SetVertexShaderConstantB")?;
-    let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
-        .context("start register does not fit u32")?;
-    let data_va = engine
-        .read_r8()
-        .context("failed to read R8 for SetVertexShaderConstantB")?;
-    let count =
-        u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("count does not fit u32")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "SetVertexShaderConstantB")?;
+    let start_register = low_u32(engine.read_rdx()?, "start register")?;
+    let data_va = read_arg(engine, ArgReg::R8, "SetVertexShaderConstantB")?;
+    let count = low_u32(engine.read_r9()?, "count")?;
 
     let d3d = state.d3d9();
     set_shader_constant_b(
@@ -784,16 +707,10 @@ pub fn handle_get_vertex_shader_constant_b(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetVertexShaderConstantB")?;
-    let start_register = u32::try_from(engine.read_rdx()? & u64::from(u32::MAX))
-        .context("start register does not fit u32")?;
-    let data_va = engine
-        .read_r8()
-        .context("failed to read R8 for GetVertexShaderConstantB")?;
-    let count =
-        u32::try_from(engine.read_r9()? & u64::from(u32::MAX)).context("count does not fit u32")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetVertexShaderConstantB")?;
+    let start_register = low_u32(engine.read_rdx()?, "start register")?;
+    let data_va = read_arg(engine, ArgReg::R8, "GetVertexShaderConstantB")?;
+    let count = low_u32(engine.read_r9()?, "count")?;
 
     let d3d = state.d3d9();
     get_shader_constant_b(
@@ -811,9 +728,7 @@ pub fn handle_get_vertex_shader_constant_b(
 pub fn handle_pixel_shader_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DPixelShader9::Release")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DPixelShader9::Release")?;
 
     let return_value = if state.d3d9().d3d9_shaders.remove(&this_pointer).is_some() {
         if state.d3d9().d3d9_pixel_shader == this_pointer {
@@ -833,9 +748,7 @@ pub fn handle_pixel_shader_release(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_vertex_shader_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DVertexShader9::Release")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DVertexShader9::Release")?;
 
     let return_value = if state.d3d9().d3d9_shaders.remove(&this_pointer).is_some() {
         if state.d3d9().d3d9_current_vertex_shader == this_pointer {

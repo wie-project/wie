@@ -16,6 +16,7 @@
 //! GPU overlap uploads with reads, a race the host-side copy-back cannot
 //! have.
 
+use crate::gdi32::{ArgReg, read_arg};
 use anyhow::{Context, Result};
 
 use super::{
@@ -29,6 +30,7 @@ use crate::guest_memory::write_u64 as write_guest_u64;
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 use super::texture::fill_com_vtable;
+use crate::kernel32::low_u32;
 
 /// `E_NOINTERFACE` — QueryInterface for an IID this object does not expose.
 const E_NOINTERFACE: u64 = 0x8000_4002;
@@ -146,12 +148,8 @@ fn buffer_query_interface_common(
     state: &mut WinApiState,
     this_pointer: u64,
 ) -> Result<u64> {
-    let iid_va = engine
-        .read_rdx()
-        .context("failed to read RDX for QueryInterface")?;
-    let ppv_object = engine
-        .read_r8()
-        .context("failed to read R8 for QueryInterface")?;
+    let iid_va = read_arg(engine, ArgReg::Rdx, "QueryInterface")?;
+    let ppv_object = read_arg(engine, ArgReg::R8, "QueryInterface")?;
 
     let known_buffer = state.d3d9().d3d9_buffers.contains_key(&this_pointer);
     if !known_buffer {
@@ -253,20 +251,12 @@ struct LockArgs {
 }
 
 fn read_lock_args(engine: &mut dyn wie_cpu::CpuEngine, method_name: &str) -> Result<LockArgs> {
-    let offset_raw = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {method_name}"))?;
-    let size_raw = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {method_name}"))?;
-    let ppb_data = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {method_name}"))?;
+    let offset_raw = read_arg(engine, ArgReg::Rdx, method_name)?;
+    let size_raw = read_arg(engine, ArgReg::R8, method_name)?;
+    let ppb_data = read_arg(engine, ArgReg::R9, method_name)?;
     Ok(LockArgs {
-        offset: u32::try_from(offset_raw & u64::from(u32::MAX))
-            .context("Lock offset does not fit u32")?,
-        size: u32::try_from(size_raw & u64::from(u32::MAX))
-            .context("Lock size does not fit u32")?,
+        offset: low_u32(offset_raw, "Lock offset")?,
+        size: low_u32(size_raw, "Lock size")?,
         ppb_data,
     })
 }
@@ -350,9 +340,11 @@ pub fn handle_vertex_buffer_query_interface(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DVertexBuffer9::QueryInterface")?;
+    let this_pointer = read_arg(
+        engine,
+        ArgReg::Rcx,
+        "IDirect3DVertexBuffer9::QueryInterface",
+    )?;
     let return_value = buffer_query_interface_common(engine, state, this_pointer)?;
     ctx.finish(return_value)
 }
@@ -361,9 +353,7 @@ pub fn handle_vertex_buffer_query_interface(
 pub fn handle_vertex_buffer_add_ref(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DVertexBuffer9::AddRef")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DVertexBuffer9::AddRef")?;
     let return_value = buffer_add_ref_common(state, this_pointer);
     ctx.finish(return_value)
 }
@@ -372,9 +362,7 @@ pub fn handle_vertex_buffer_add_ref(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_vertex_buffer_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DVertexBuffer9::Release")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DVertexBuffer9::Release")?;
     let return_value = buffer_release_common(engine, state, this_pointer)?;
     ctx.finish(return_value)
 }
@@ -383,9 +371,7 @@ pub fn handle_vertex_buffer_release(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_vertex_buffer_lock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DVertexBuffer9::Lock")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DVertexBuffer9::Lock")?;
     let return_value = buffer_lock_common(engine, state, this_pointer)?;
     ctx.finish(return_value)
 }
@@ -394,9 +380,7 @@ pub fn handle_vertex_buffer_lock(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_vertex_buffer_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DVertexBuffer9::Unlock")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DVertexBuffer9::Unlock")?;
     let return_value = buffer_unlock_common(engine, state, this_pointer)?;
     ctx.finish(return_value)
 }
@@ -409,12 +393,8 @@ pub fn handle_vertex_buffer_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_vertex_buffer_get_desc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DVertexBuffer9::GetDesc")?;
-    let desc_va = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DVertexBuffer9::GetDesc")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DVertexBuffer9::GetDesc")?;
+    let desc_va = read_arg(engine, ArgReg::Rdx, "IDirect3DVertexBuffer9::GetDesc")?;
 
     let return_value = if desc_va != 0 {
         match state.d3d9().d3d9_buffers.get(&this_pointer) {
@@ -454,9 +434,7 @@ pub fn handle_index_buffer_query_interface(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DIndexBuffer9::QueryInterface")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DIndexBuffer9::QueryInterface")?;
     let return_value = buffer_query_interface_common(engine, state, this_pointer)?;
     ctx.finish(return_value)
 }
@@ -465,9 +443,7 @@ pub fn handle_index_buffer_query_interface(
 pub fn handle_index_buffer_add_ref(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DIndexBuffer9::AddRef")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DIndexBuffer9::AddRef")?;
     let return_value = buffer_add_ref_common(state, this_pointer);
     ctx.finish(return_value)
 }
@@ -476,9 +452,7 @@ pub fn handle_index_buffer_add_ref(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_index_buffer_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DIndexBuffer9::Release")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DIndexBuffer9::Release")?;
     let return_value = buffer_release_common(engine, state, this_pointer)?;
     ctx.finish(return_value)
 }
@@ -487,9 +461,7 @@ pub fn handle_index_buffer_release(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_index_buffer_lock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DIndexBuffer9::Lock")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DIndexBuffer9::Lock")?;
     let return_value = buffer_lock_common(engine, state, this_pointer)?;
     ctx.finish(return_value)
 }
@@ -498,9 +470,7 @@ pub fn handle_index_buffer_lock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_index_buffer_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DIndexBuffer9::Unlock")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DIndexBuffer9::Unlock")?;
     let return_value = buffer_unlock_common(engine, state, this_pointer)?;
     ctx.finish(return_value)
 }
@@ -513,12 +483,8 @@ pub fn handle_index_buffer_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 pub fn handle_index_buffer_get_desc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DIndexBuffer9::GetDesc")?;
-    let desc_va = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DIndexBuffer9::GetDesc")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DIndexBuffer9::GetDesc")?;
+    let desc_va = read_arg(engine, ArgReg::Rdx, "IDirect3DIndexBuffer9::GetDesc")?;
 
     let return_value = if desc_va != 0 {
         match state.d3d9().d3d9_buffers.get(&this_pointer) {

@@ -1,15 +1,16 @@
 use super::{
-    Context, FAKE_DEVICE_CONTEXT_HANDLE, HandlerContext, Result, WinApiHandlerResult,
-    checked_address, write_guest_i32, write_guest_u32, write_guest_u64,
+    FAKE_DEVICE_CONTEXT_HANDLE, HandlerContext, Result, WinApiHandlerResult, checked_address,
+    write_guest_i32, write_guest_u32, write_guest_u64,
 };
 use crate::gdi32::DcKind;
+use crate::gdi32::{ArgReg, read_arg};
 use crate::state::WindowFlags;
 
 /// Handles `USER32.dll!GetDC`.
 pub fn handle_get_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine.read_rcx().context("failed to read RCX for GetDC")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "GetDC")?;
 
     let dc_handle = if super::is_known_window(state, window_handle) {
         state
@@ -31,13 +32,9 @@ pub fn handle_get_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult
 pub fn handle_get_dc_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetDCEx")?;
-    let _clip_region = engine
-        .read_rdx()
-        .context("failed to read RDX for GetDCEx")?;
-    let _flags = engine.read_r8().context("failed to read R8 for GetDCEx")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "GetDCEx")?;
+    let _clip_region = read_arg(engine, ArgReg::Rdx, "GetDCEx")?;
+    let _flags = read_arg(engine, ArgReg::R8, "GetDCEx")?;
 
     let dc_handle = if super::is_known_window(state, window_handle) {
         state
@@ -53,13 +50,9 @@ pub fn handle_get_dc_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 pub fn handle_release_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for ReleaseDC")?;
+    let _window_handle = read_arg(engine, ArgReg::Rcx, "ReleaseDC")?;
 
-    let dc_handle = engine
-        .read_rdx()
-        .context("failed to read RDX for ReleaseDC")?;
+    let dc_handle = read_arg(engine, ArgReg::Rdx, "ReleaseDC")?;
 
     state
         .gdi_state()
@@ -71,13 +64,9 @@ pub fn handle_release_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 pub fn handle_begin_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for BeginPaint")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "BeginPaint")?;
 
-    let paint_va = engine
-        .read_rdx()
-        .context("failed to read RDX for BeginPaint")?;
+    let paint_va = read_arg(engine, ArgReg::Rdx, "BeginPaint")?;
 
     let known = super::is_known_window(state, window_handle);
     let return_value = if known && paint_va != 0 {
@@ -133,13 +122,9 @@ pub fn handle_begin_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_end_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for EndPaint")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "EndPaint")?;
 
-    let _paint_va = engine
-        .read_rdx()
-        .context("failed to read RDX for EndPaint")?;
+    let _paint_va = read_arg(engine, ArgReg::Rdx, "EndPaint")?;
 
     let success = super::is_known_window(state, window_handle);
     if let Some(window) = super::find_window_mut(state, window_handle) {
@@ -155,9 +140,7 @@ pub fn handle_end_paint(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 /// Handles `USER32.dll!ScrollDC` (no-op success stub; no real pixel scroll).
 pub fn handle_scroll_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for ScrollDC")?;
+    let _hdc = read_arg(engine, ArgReg::Rcx, "ScrollDC")?;
 
     ctx.finish(1)
 }

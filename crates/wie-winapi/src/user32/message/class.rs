@@ -1,21 +1,39 @@
 //! Class-registry handlers: RegisterClass/UnregisterClass, ValidateRect,
 //! SetWindowLong, GetWindowDC (split from `message.rs`).
 
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::WndClass;
 use crate::user32::{
-    Context, FAKE_DEVICE_CONTEXT_HANDLE, HandlerContext, Result, WinApiHandlerResult,
-    WindowClassRecord, read_guest_ansi_lossy, read_guest_utf16_lossy, register_window_class,
-    with_typed_read,
+    FAKE_DEVICE_CONTEXT_HANDLE, HandlerContext, Result, WinApiHandlerResult, WindowClassRecord,
+    read_guest_ansi_lossy, read_guest_utf16_lossy, register_window_class, with_typed_read,
 };
+use anyhow::Context as _;
 
 /// Handles `USER32.dll!RegisterClassA`.
 pub fn handle_register_class_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    register_class_impl(ctx, false)
+}
+
+/// Handles `USER32.dll!RegisterClassW`.
+pub fn handle_register_class_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    register_class_impl(ctx, true)
+}
+
+/// Shared `RegisterClassA/W` implementation.
+///
+/// Win64 ABI: `rcx` = `lpwcx` (guest `WNDCLASS`). The struct layout is shared
+/// by both variants; only the pointed-to strings differ in encoding.
+fn register_class_impl(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    let api_name = if wide {
+        "RegisterClassW"
+    } else {
+        "RegisterClassA"
+    };
+    let struct_tag = if wide { "WNDCLASSW" } else { "WNDCLASSA" };
 
-    let class_va = engine
-        .read_rcx()
-        .context("failed to read RCX for RegisterClassA")?;
+    let class_va = read_arg(engine, ArgReg::Rcx, api_name)?;
 
     if class_va == 0 {
         return ctx.finish(0);
@@ -46,10 +64,13 @@ pub fn handle_register_class_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             wc.class_name_ptr,
         ))
     })
-    .context("failed to read WNDCLASSA for RegisterClassA")?;
+    .with_context(|| format!("failed to read {struct_tag} for {api_name}"))?;
 
     let class_name = if class_name_va == 0 {
         String::new()
+    } else if wide {
+        read_guest_utf16_lossy(engine, class_name_va, 256)
+            .context("failed to read WNDCLASSW.lpszClassName for RegisterClassW")?
     } else {
         read_guest_ansi_lossy(engine, class_name_va, 256)
             .context("failed to read WNDCLASS.lpszClassName for RegisterClassA")?
@@ -68,76 +89,10 @@ pub fn handle_register_class_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             background_brush,
             small_icon_handle: 0,
             menu_name,
-            unicode: false,
+            unicode: wide,
         },
     )
-    .context("failed to register window class for RegisterClassA")?;
-
-    ctx.finish(atom)
-}
-
-/// Handles `USER32.dll!RegisterClassW`.
-pub fn handle_register_class_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-
-    let class_va = engine
-        .read_rcx()
-        .context("failed to read RCX for RegisterClassW")?;
-
-    if class_va == 0 {
-        return ctx.finish(0);
-    }
-
-    // WNDCLASSW shares the WNDCLASSA layout (see the A variant above); only
-    // the pointed-to strings are UTF-16.
-    let (
-        style,
-        window_proc,
-        instance_handle,
-        icon,
-        cursor,
-        background_brush,
-        menu_name,
-        class_name_va,
-    ) = with_typed_read::<WndClass, _, _>(engine, class_va, |wc| {
-        Ok((
-            wc.style,
-            wc.window_proc,
-            wc.instance_handle,
-            wc.icon_handle,
-            wc.cursor_handle,
-            wc.background_brush,
-            wc.menu_name,
-            wc.class_name_ptr,
-        ))
-    })
-    .context("failed to read WNDCLASSW for RegisterClassW")?;
-
-    let class_name = if class_name_va == 0 {
-        String::new()
-    } else {
-        read_guest_utf16_lossy(engine, class_name_va, 256)
-            .context("failed to read WNDCLASSW.lpszClassName for RegisterClassW")?
-    };
-
-    let atom = register_window_class(
-        state,
-        WindowClassRecord {
-            atom: 0,
-            class_name,
-            window_proc,
-            style,
-            instance_handle,
-            icon_handle: icon,
-            cursor_handle: cursor,
-            background_brush,
-            small_icon_handle: 0,
-            menu_name,
-            unicode: true,
-        },
-    )
-    .context("failed to register window class for RegisterClassW")?;
+    .with_context(|| format!("failed to register window class for {api_name}"))?;
 
     ctx.finish(atom)
 }

@@ -18,6 +18,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 
 use crate::gdi32::blit::{IRect, intersect_rect, subtract_rect};
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::Rect;
 use crate::guest_memory::{checked_address, read_i32, with_typed_write};
 use crate::user32::low_i32;
@@ -166,27 +167,19 @@ fn insert_region(table: &mut RegionTable, region: RegionData) -> u64 {
 pub fn handle_create_rect_rgn(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let left = low_i32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for CreateRectRgn")?,
+        read_arg(engine, ArgReg::Rcx, "CreateRectRgn")?,
         "CreateRectRgn left",
     )?;
     let top = low_i32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for CreateRectRgn")?,
+        read_arg(engine, ArgReg::Rdx, "CreateRectRgn")?,
         "CreateRectRgn top",
     )?;
     let right = low_i32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for CreateRectRgn")?,
+        read_arg(engine, ArgReg::R8, "CreateRectRgn")?,
         "CreateRectRgn right",
     )?;
     let bottom = low_i32(
-        engine
-            .read_r9()
-            .context("failed to read R9 for CreateRectRgn")?,
+        read_arg(engine, ArgReg::R9, "CreateRectRgn")?,
         "CreateRectRgn bottom",
     )?;
 
@@ -205,27 +198,19 @@ pub fn handle_create_rect_rgn(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 pub fn handle_create_elliptic_rgn(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let left = low_i32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for CreateEllipticRgn")?,
+        read_arg(engine, ArgReg::Rcx, "CreateEllipticRgn")?,
         "CreateEllipticRgn left",
     )?;
     let top = low_i32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for CreateEllipticRgn")?,
+        read_arg(engine, ArgReg::Rdx, "CreateEllipticRgn")?,
         "CreateEllipticRgn top",
     )?;
     let right = low_i32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for CreateEllipticRgn")?,
+        read_arg(engine, ArgReg::R8, "CreateEllipticRgn")?,
         "CreateEllipticRgn right",
     )?;
     let bottom = low_i32(
-        engine
-            .read_r9()
-            .context("failed to read R9 for CreateEllipticRgn")?,
+        read_arg(engine, ArgReg::R9, "CreateEllipticRgn")?,
         "CreateEllipticRgn bottom",
     )?;
 
@@ -244,18 +229,12 @@ pub fn handle_create_elliptic_rgn(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// the true polygon).
 pub fn handle_create_polygon_rgn(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let ppt = engine
-        .read_rcx()
-        .context("failed to read RCX for CreatePolygonRgn")?;
+    let ppt = read_arg(engine, ArgReg::Rcx, "CreatePolygonRgn")?;
     let c_points = low_i32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for CreatePolygonRgn")?,
+        read_arg(engine, ArgReg::Rdx, "CreatePolygonRgn")?,
         "CreatePolygonRgn cPoints",
     )?;
-    let _fill_mode = engine
-        .read_r8()
-        .context("failed to read R8 for CreatePolygonRgn")?;
+    let _fill_mode = read_arg(engine, ArgReg::R8, "CreatePolygonRgn")?;
 
     if ppt == 0 || c_points <= 0 {
         return ctx.finish(0);
@@ -300,18 +279,10 @@ pub fn handle_create_polygon_rgn(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 /// mode or an unknown destination.
 pub fn handle_combine_rgn(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let hrgn_dst = engine
-        .read_rcx()
-        .context("failed to read RCX for CombineRgn")?;
-    let hrgn_src1 = engine
-        .read_rdx()
-        .context("failed to read RDX for CombineRgn")?;
-    let hrgn_src2 = engine
-        .read_r8()
-        .context("failed to read R8 for CombineRgn")?;
-    let fn_mode_raw = engine
-        .read_r9()
-        .context("failed to read R9 for CombineRgn")?;
+    let hrgn_dst = read_arg(engine, ArgReg::Rcx, "CombineRgn")?;
+    let hrgn_src1 = read_arg(engine, ArgReg::Rdx, "CombineRgn")?;
+    let hrgn_src2 = read_arg(engine, ArgReg::R8, "CombineRgn")?;
+    let fn_mode_raw = read_arg(engine, ArgReg::R9, "CombineRgn")?;
     let fn_mode = u32::try_from(fn_mode_raw & u64::from(u32::MAX)).unwrap_or(0);
 
     let mut table = lock_regions();
@@ -370,25 +341,17 @@ pub fn handle_combine_rgn(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 /// unknown region.
 pub fn handle_set_rect_rgn(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let hrgn = engine
-        .read_rcx()
-        .context("failed to read RCX for SetRectRgn")?;
+    let hrgn = read_arg(engine, ArgReg::Rcx, "SetRectRgn")?;
     let left = low_i32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for SetRectRgn")?,
+        read_arg(engine, ArgReg::Rdx, "SetRectRgn")?,
         "SetRectRgn left",
     )?;
     let top = low_i32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for SetRectRgn")?,
+        read_arg(engine, ArgReg::R8, "SetRectRgn")?,
         "SetRectRgn top",
     )?;
     let right = low_i32(
-        engine
-            .read_r9()
-            .context("failed to read R9 for SetRectRgn")?,
+        read_arg(engine, ArgReg::R9, "SetRectRgn")?,
         "SetRectRgn right",
     )?;
     let rsp = engine
@@ -415,12 +378,8 @@ pub fn handle_set_rect_rgn(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 /// complexity class here; KISS collapses it to 1 as the milestone specifies.)
 pub fn handle_get_rgn_box(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let hrgn = engine
-        .read_rcx()
-        .context("failed to read RCX for GetRgnBox")?;
-    let lprc = engine
-        .read_rdx()
-        .context("failed to read RDX for GetRgnBox")?;
+    let hrgn = read_arg(engine, ArgReg::Rcx, "GetRgnBox")?;
+    let lprc = read_arg(engine, ArgReg::Rdx, "GetRgnBox")?;
     if lprc == 0 {
         return ctx.finish(ERROR);
     }

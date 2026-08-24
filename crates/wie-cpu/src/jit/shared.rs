@@ -389,9 +389,6 @@ impl JitShared {
                         func: micro.func(),
                         func_id: None,
                         insn_count: micro.insn_count(),
-                        uses_sse: false,
-                        xmm_live_mask: 0,
-                        xmm_may_def_mask: 0,
                         guest_start: rip,
                         guest_end,
                     });

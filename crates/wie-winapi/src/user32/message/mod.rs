@@ -14,6 +14,8 @@ use super::{
     find_window_mut, is_known_window, read_u32, with_typed_read, write_message_structure,
 };
 use crate::OuterReturn;
+use crate::gdi32::{ArgReg, read_arg};
+use crate::kernel32::low_u32;
 use crate::state::WindowFlags;
 
 mod class;
@@ -31,21 +33,13 @@ use synth::{message_matches_filter, retarget_keyboard_messages, synthesize_idle_
 pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let message_address = engine
-        .read_rcx()
-        .context("failed to read RCX for PeekMessageA")?;
+    let message_address = read_arg(engine, ArgReg::Rcx, "PeekMessageA")?;
 
-    let window_filter = engine
-        .read_rdx()
-        .context("failed to read RDX for PeekMessageA")?;
+    let window_filter = read_arg(engine, ArgReg::Rdx, "PeekMessageA")?;
 
-    let minimum_message_raw = engine
-        .read_r8()
-        .context("failed to read R8 for PeekMessageA")?;
+    let minimum_message_raw = read_arg(engine, ArgReg::R8, "PeekMessageA")?;
 
-    let maximum_message_raw = engine
-        .read_r9()
-        .context("failed to read R9 for PeekMessageA")?;
+    let maximum_message_raw = read_arg(engine, ArgReg::R9, "PeekMessageA")?;
 
     let w_remove_msg = engine
         .read_rsp()
@@ -53,11 +47,9 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .and_then(|rsp| read_u32(engine, rsp.wrapping_add(0x28)).ok())
         .unwrap_or(0);
 
-    let minimum_message = u32::try_from(minimum_message_raw & u64::from(u32::MAX))
-        .context("PeekMessageA minimum message does not fit u32")?;
+    let minimum_message = low_u32(minimum_message_raw, "PeekMessageA minimum message")?;
 
-    let maximum_message = u32::try_from(maximum_message_raw & u64::from(u32::MAX))
-        .context("PeekMessageA maximum message does not fit u32")?;
+    let maximum_message = low_u32(maximum_message_raw, "PeekMessageA maximum message")?;
 
     // Keyboard messages go to the focus window; rewrite before the filter scan
     // so the filter and the returned MSG both carry the effective target.
@@ -149,12 +141,8 @@ pub fn handle_call_msg_filter(
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _msg_va = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let _code = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let _msg_va = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let _code = read_arg(engine, ArgReg::Rdx, api_name)?;
 
     ctx.finish(0)
 }
@@ -162,24 +150,15 @@ pub fn handle_call_msg_filter(
 pub fn handle_post_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for PostMessageA")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "PostMessageA")?;
 
-    let message_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for PostMessageA")?;
+    let message_raw = read_arg(engine, ArgReg::Rdx, "PostMessageA")?;
 
-    let word_parameter = engine
-        .read_r8()
-        .context("failed to read R8 for PostMessageA")?;
+    let word_parameter = read_arg(engine, ArgReg::R8, "PostMessageA")?;
 
-    let long_parameter = engine
-        .read_r9()
-        .context("failed to read R9 for PostMessageA")?;
+    let long_parameter = read_arg(engine, ArgReg::R9, "PostMessageA")?;
 
-    let message = u32::try_from(message_raw & u64::from(u32::MAX))
-        .context("PostMessageA message does not fit u32")?;
+    let message = low_u32(message_raw, "PostMessageA message")?;
 
     // HWND_BROADCAST (0xFFFF) and thread messages (NULL=0) are not yet
     // supported, so the gate is intentionally narrower than real Windows.
@@ -214,21 +193,13 @@ pub(crate) fn handle_send_message(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
 
-    let message_raw = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let message_raw = read_arg(engine, ArgReg::Rdx, api_name)?;
 
-    let word_parameter = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let word_parameter = read_arg(engine, ArgReg::R8, api_name)?;
 
-    let long_parameter = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let long_parameter = read_arg(engine, ArgReg::R9, api_name)?;
 
     let message = u32::try_from(message_raw & u64::from(u32::MAX))
         .with_context(|| format!("{api_name} message does not fit u32"))?;
@@ -335,21 +306,13 @@ pub(crate) fn handle_send_message(
 /// Handles `USER32.dll!CallNextHookEx`.
 pub fn handle_call_next_hook_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _hook_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for CallNextHookEx")?;
+    let _hook_handle = read_arg(engine, ArgReg::Rcx, "CallNextHookEx")?;
 
-    let _code = engine
-        .read_rdx()
-        .context("failed to read RDX for CallNextHookEx")?;
+    let _code = read_arg(engine, ArgReg::Rdx, "CallNextHookEx")?;
 
-    let _word_parameter = engine
-        .read_r8()
-        .context("failed to read R8 for CallNextHookEx")?;
+    let _word_parameter = read_arg(engine, ArgReg::R8, "CallNextHookEx")?;
 
-    let _long_parameter = engine
-        .read_r9()
-        .context("failed to read R9 for CallNextHookEx")?;
+    let _long_parameter = read_arg(engine, ArgReg::R9, "CallNextHookEx")?;
 
     // There is currently no host-side hook chain after the guest hook.
     let return_value = 0;
@@ -412,27 +375,17 @@ fn empty_queue_result(
 pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let message_address = engine
-        .read_rcx()
-        .context("failed to read RCX for GetMessageA")?;
+    let message_address = read_arg(engine, ArgReg::Rcx, "GetMessageA")?;
 
-    let window_filter = engine
-        .read_rdx()
-        .context("failed to read RDX for GetMessageA")?;
+    let window_filter = read_arg(engine, ArgReg::Rdx, "GetMessageA")?;
 
-    let minimum_message_raw = engine
-        .read_r8()
-        .context("failed to read R8 for GetMessageA")?;
+    let minimum_message_raw = read_arg(engine, ArgReg::R8, "GetMessageA")?;
 
-    let maximum_message_raw = engine
-        .read_r9()
-        .context("failed to read R9 for GetMessageA")?;
+    let maximum_message_raw = read_arg(engine, ArgReg::R9, "GetMessageA")?;
 
-    let minimum_message = u32::try_from(minimum_message_raw & u64::from(u32::MAX))
-        .context("GetMessageA minimum message does not fit u32")?;
+    let minimum_message = low_u32(minimum_message_raw, "GetMessageA minimum message")?;
 
-    let maximum_message = u32::try_from(maximum_message_raw & u64::from(u32::MAX))
-        .context("GetMessageA maximum message does not fit u32")?;
+    let maximum_message = low_u32(maximum_message_raw, "GetMessageA maximum message")?;
 
     // Keyboard messages go to the focus window; rewrite before the filter scan
     // so the filter and the returned MSG both carry the effective target.
@@ -505,9 +458,7 @@ pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 /// Handles `USER32.dll!TranslateMessage`.
 pub fn handle_translate_message(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let message_address = engine
-        .read_rcx()
-        .context("failed to read RCX for TranslateMessage")?;
+    let message_address = read_arg(engine, ArgReg::Rcx, "TranslateMessage")?;
 
     let translated = if message_address == 0 {
         false
@@ -540,20 +491,11 @@ pub(crate) fn handle_default_window_procedure(
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
 
-    let hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for DefWindowProc")?;
-    let message_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for DefWindowProc")?;
-    let msg = u32::try_from(message_raw & u64::from(u32::MAX))
-        .context("DefWindowProc message does not fit u32")?;
-    let wparam = engine
-        .read_r8()
-        .context("failed to read R8 for DefWindowProc")?;
-    let lparam = engine
-        .read_r9()
-        .context("failed to read R9 for DefWindowProc")?;
+    let hwnd = read_arg(engine, ArgReg::Rcx, "DefWindowProc")?;
+    let message_raw = read_arg(engine, ArgReg::Rdx, "DefWindowProc")?;
+    let msg = low_u32(message_raw, "DefWindowProc message")?;
+    let wparam = read_arg(engine, ArgReg::R8, "DefWindowProc")?;
+    let lparam = read_arg(engine, ArgReg::R9, "DefWindowProc")?;
 
     tracing::trace!(
         target: "wiegui",
@@ -710,9 +652,7 @@ pub fn handle_def_mdi_child_proc_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let message_address = engine
-        .read_rcx()
-        .context("failed to read RCX for DispatchMessageA")?;
+    let message_address = read_arg(engine, ArgReg::Rcx, "DispatchMessageA")?;
 
     if message_address == 0 {
         return ctx.finish(0);
@@ -847,9 +787,7 @@ pub fn handle_dispatch_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_post_quit_message(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let exit_code = engine
-        .read_rcx()
-        .context("failed to read RCX for PostQuitMessage")?;
+    let exit_code = read_arg(engine, ArgReg::Rcx, "PostQuitMessage")?;
 
     tracing::info!(
         target: "wiegui",

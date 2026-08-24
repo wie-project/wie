@@ -2,7 +2,7 @@
 //! panel bridges.
 
 use super::state_comm_dlg_none;
-use crate::gdi32::{paper_tenths_mm_to_mm, paper_tenths_mm_to_px};
+use crate::gdi32::{ArgReg, paper_tenths_mm_to_mm, paper_tenths_mm_to_px, read_arg};
 use crate::guest_layout::{DevModeW, PageSetupDlgW, PrintDlgW};
 use crate::guest_memory::{with_typed_read, with_typed_write};
 use crate::state::{
@@ -300,9 +300,7 @@ fn write_print_dev_names(
 pub fn handle_print_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let pd_va = engine
-        .read_rcx()
-        .context("failed to read RCX for PrintDlgW")?;
+    let pd_va = read_arg(engine, ArgReg::Rcx, "PrintDlgW")?;
 
     if pd_va == 0 {
         state_comm_dlg_none(state);
@@ -637,9 +635,7 @@ const PSD_INTHOUSANDTHSOFINCHES: u32 = 0x0000_0004;
 pub fn handle_page_setup_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let psd_va = engine
-        .read_rcx()
-        .context("failed to read RCX for PageSetupDlgW")?;
+    let psd_va = read_arg(engine, ArgReg::Rcx, "PageSetupDlgW")?;
 
     if psd_va == 0 {
         state_comm_dlg_none(state);

@@ -1,3 +1,4 @@
+use crate::gdi32::{ArgReg, read_arg};
 use anyhow::{Context, Result};
 
 use super::{
@@ -16,6 +17,7 @@ use crate::fake_va::{D3d9Iface, encode_com};
 use crate::guest_memory::{
     checked_address, write_u32 as write_guest_u32, write_u64 as write_guest_u64,
 };
+use crate::kernel32::low_u32;
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 /// `D3DRTYPE_SURFACE` — the `D3DRESOURCETYPE` a surface reports in GetDesc.
@@ -199,32 +201,20 @@ pub(crate) fn allocate_surface_object(
 pub fn handle_create_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateTexture")?;
-    let width_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for CreateTexture")?;
-    let height_raw = engine
-        .read_r8()
-        .context("failed to read R8 for CreateTexture")?;
-    let levels_raw = engine
-        .read_r9()
-        .context("failed to read R9 for CreateTexture")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "CreateTexture")?;
+    let width_raw = read_arg(engine, ArgReg::Rdx, "CreateTexture")?;
+    let height_raw = read_arg(engine, ArgReg::R8, "CreateTexture")?;
+    let levels_raw = read_arg(engine, ArgReg::R9, "CreateTexture")?;
     let _usage = read_stack_argument(engine, 0x28, "CreateTexture Usage")?;
     let format_raw = read_stack_argument(engine, 0x30, "CreateTexture Format")?;
     let _pool = read_stack_argument(engine, 0x38, "CreateTexture Pool")?;
     let pp_texture = read_stack_argument(engine, 0x40, "CreateTexture ppTexture")?;
     let _shared_handle = read_stack_argument(engine, 0x48, "CreateTexture pSharedHandle")?;
 
-    let width = u32::try_from(width_raw & u64::from(u32::MAX))
-        .context("CreateTexture width does not fit u32")?;
-    let height = u32::try_from(height_raw & u64::from(u32::MAX))
-        .context("CreateTexture height does not fit u32")?;
-    let levels_raw_value = u32::try_from(levels_raw & u64::from(u32::MAX))
-        .context("CreateTexture levels does not fit u32")?;
-    let format = u32::try_from(format_raw & u64::from(u32::MAX))
-        .context("CreateTexture format does not fit u32")?;
+    let width = low_u32(width_raw, "CreateTexture width")?;
+    let height = low_u32(height_raw, "CreateTexture height")?;
+    let levels_raw_value = low_u32(levels_raw, "CreateTexture levels")?;
+    let format = low_u32(format_raw, "CreateTexture format")?;
 
     let valid = width > 0
         && height > 0
@@ -299,18 +289,11 @@ pub fn handle_texture_get_surface_level(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetSurfaceLevel")?;
-    let level_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for GetSurfaceLevel")?;
-    let pp_surface = engine
-        .read_r8()
-        .context("failed to read R8 for GetSurfaceLevel")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "GetSurfaceLevel")?;
+    let level_raw = read_arg(engine, ArgReg::Rdx, "GetSurfaceLevel")?;
+    let pp_surface = read_arg(engine, ArgReg::R8, "GetSurfaceLevel")?;
 
-    let level = u32::try_from(level_raw & u64::from(u32::MAX))
-        .context("GetSurfaceLevel level does not fit u32")?;
+    let level = low_u32(level_raw, "GetSurfaceLevel level")?;
     let valid_texture = state.d3d9().d3d9_textures.contains_key(&this_pointer);
     let return_value = if valid_texture && pp_surface != 0 {
         // Out-of-range level (or a degenerate record) → the honest invalid
@@ -655,12 +638,8 @@ fn unlock_rect_render_target(
 pub fn handle_surface_get_desc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DSurface9::GetDesc")?;
-    let desc_va = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DSurface9::GetDesc")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DSurface9::GetDesc")?;
+    let desc_va = read_arg(engine, ArgReg::Rdx, "IDirect3DSurface9::GetDesc")?;
 
     let d3d = state.d3d9();
     let desc = d3d
@@ -700,15 +679,9 @@ pub fn handle_surface_get_desc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 pub fn handle_surface_lock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DSurface9::LockRect")?;
-    let p_locked_rect = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DSurface9::LockRect")?;
-    let p_rect = engine
-        .read_r8()
-        .context("failed to read R8 for IDirect3DSurface9::LockRect")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DSurface9::LockRect")?;
+    let p_locked_rect = read_arg(engine, ArgReg::Rdx, "IDirect3DSurface9::LockRect")?;
+    let p_rect = read_arg(engine, ArgReg::R8, "IDirect3DSurface9::LockRect")?;
     let _flags = read_stack_argument(engine, 0x28, "LockRect Flags")?;
 
     let texture_va = state
@@ -740,22 +713,13 @@ pub fn handle_surface_lock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_texture_lock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DTexture9::LockRect")?;
-    let level_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for IDirect3DTexture9::LockRect")?;
-    let p_locked_rect = engine
-        .read_r8()
-        .context("failed to read R8 for IDirect3DTexture9::LockRect")?;
-    let p_rect = engine
-        .read_r9()
-        .context("failed to read R9 for IDirect3DTexture9::LockRect")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DTexture9::LockRect")?;
+    let level_raw = read_arg(engine, ArgReg::Rdx, "IDirect3DTexture9::LockRect")?;
+    let p_locked_rect = read_arg(engine, ArgReg::R8, "IDirect3DTexture9::LockRect")?;
+    let p_rect = read_arg(engine, ArgReg::R9, "IDirect3DTexture9::LockRect")?;
     let _flags = read_stack_argument(engine, 0x28, "IDirect3DTexture9::LockRect Flags")?;
 
-    let level = u32::try_from(level_raw & u64::from(u32::MAX))
-        .context("IDirect3DTexture9::LockRect level does not fit u32")?;
+    let level = low_u32(level_raw, "IDirect3DTexture9::LockRect level")?;
     let return_value = lock_rect_common(engine, state, this_pointer, level, p_locked_rect, p_rect)?;
 
     ctx.finish(return_value)
@@ -852,9 +816,7 @@ fn unlock_rect_common(
 pub fn handle_surface_unlock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DSurface9::UnlockRect")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DSurface9::UnlockRect")?;
 
     let texture_va = state
         .d3d9()
@@ -877,9 +839,7 @@ pub fn handle_surface_unlock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 pub fn handle_texture_unlock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DTexture9::UnlockRect")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DTexture9::UnlockRect")?;
 
     let return_value = unlock_rect_common(engine, state, this_pointer);
 
@@ -890,18 +850,11 @@ pub fn handle_texture_unlock_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 pub fn handle_set_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for SetTexture")?;
-    let stage_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for SetTexture")?;
-    let texture_va = engine
-        .read_r8()
-        .context("failed to read R8 for SetTexture")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "SetTexture")?;
+    let stage_raw = read_arg(engine, ArgReg::Rdx, "SetTexture")?;
+    let texture_va = read_arg(engine, ArgReg::R8, "SetTexture")?;
 
-    let stage = u32::try_from(stage_raw & u64::from(u32::MAX))
-        .context("SetTexture stage does not fit u32")?;
+    let stage = low_u32(stage_raw, "SetTexture stage")?;
     if let Some(slot) = state
         .d3d9()
         .d3d9_texture_bindings
@@ -917,18 +870,11 @@ pub fn handle_set_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_get_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetTexture")?;
-    let stage_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for GetTexture")?;
-    let pp_texture = engine
-        .read_r8()
-        .context("failed to read R8 for GetTexture")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetTexture")?;
+    let stage_raw = read_arg(engine, ArgReg::Rdx, "GetTexture")?;
+    let pp_texture = read_arg(engine, ArgReg::R8, "GetTexture")?;
 
-    let stage = u32::try_from(stage_raw & u64::from(u32::MAX))
-        .context("GetTexture stage does not fit u32")?;
+    let stage = low_u32(stage_raw, "GetTexture stage")?;
     let binding = state
         .d3d9()
         .d3d9_texture_bindings
@@ -947,23 +893,13 @@ pub fn handle_get_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_get_texture_stage_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetTextureStageState")?;
-    let stage_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for GetTextureStageState")?;
-    let state_type_raw = engine
-        .read_r8()
-        .context("failed to read R8 for GetTextureStageState")?;
-    let p_value = engine
-        .read_r9()
-        .context("failed to read R9 for GetTextureStageState")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetTextureStageState")?;
+    let stage_raw = read_arg(engine, ArgReg::Rdx, "GetTextureStageState")?;
+    let state_type_raw = read_arg(engine, ArgReg::R8, "GetTextureStageState")?;
+    let p_value = read_arg(engine, ArgReg::R9, "GetTextureStageState")?;
 
-    let stage = u32::try_from(stage_raw & u64::from(u32::MAX))
-        .context("GetTextureStageState stage does not fit u32")?;
-    let state_type = u32::try_from(state_type_raw & u64::from(u32::MAX))
-        .context("GetTextureStageState state type does not fit u32")?;
+    let stage = low_u32(stage_raw, "GetTextureStageState stage")?;
+    let state_type = low_u32(state_type_raw, "GetTextureStageState state type")?;
     if p_value != 0 {
         // Modeled slots read their D3D9 default when unset; unmodeled slots
         // read the stored verbatim value (or 0).
@@ -999,23 +935,13 @@ pub fn handle_get_texture_stage_state(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_get_sampler_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetSamplerState")?;
-    let sampler_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for GetSamplerState")?;
-    let state_type_raw = engine
-        .read_r8()
-        .context("failed to read R8 for GetSamplerState")?;
-    let p_value = engine
-        .read_r9()
-        .context("failed to read R9 for GetSamplerState")?;
+    let _this_pointer = read_arg(engine, ArgReg::Rcx, "GetSamplerState")?;
+    let sampler_raw = read_arg(engine, ArgReg::Rdx, "GetSamplerState")?;
+    let state_type_raw = read_arg(engine, ArgReg::R8, "GetSamplerState")?;
+    let p_value = read_arg(engine, ArgReg::R9, "GetSamplerState")?;
 
-    let sampler = u32::try_from(sampler_raw & u64::from(u32::MAX))
-        .context("GetSamplerState sampler does not fit u32")?;
-    let state_type = u32::try_from(state_type_raw & u64::from(u32::MAX))
-        .context("GetSamplerState state type does not fit u32")?;
+    let sampler = low_u32(sampler_raw, "GetSamplerState sampler")?;
+    let state_type = low_u32(state_type_raw, "GetSamplerState state type")?;
     if p_value != 0 {
         let value = match state
             .d3d9()
@@ -1050,9 +976,7 @@ pub fn handle_get_sampler_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_texture_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DTexture9::Release")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DTexture9::Release")?;
 
     let (surface_vas, locked_va) = state
         .d3d9()
@@ -1100,9 +1024,7 @@ pub fn handle_texture_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 pub fn handle_surface_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for IDirect3DSurface9::Release")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DSurface9::Release")?;
 
     let return_value =
         if let Some(texture_va) = state.d3d9().d3d9_surface_textures.remove(&this_pointer) {
@@ -1160,9 +1082,7 @@ pub fn handle_surface_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 pub fn handle_texture_get_level_count(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let this_pointer = engine
-        .read_rcx()
-        .context("failed to read RCX for GetLevelCount")?;
+    let this_pointer = read_arg(engine, ArgReg::Rcx, "GetLevelCount")?;
 
     let levels = state
         .d3d9()

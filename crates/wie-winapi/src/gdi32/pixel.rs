@@ -1,25 +1,5 @@
 // Pixel format conversion helpers and blit clipping.
 
-/// 32-bit BGRA (native endian) → 0RGB (present format).
-///
-/// A DIB pixel loaded as `u32` from 4 bytes `[B, G, R, A]` (little-endian)
-/// produces `0xAARRGGBB`.  The present path wants `0RGB` — alpha masked off, no
-/// channel swizzle.
-#[inline]
-#[must_use]
-#[expect(dead_code)]
-pub(super) fn bgra_to_0rgb(pixel: u32) -> u32 {
-    pixel & 0x00FF_FFFF
-}
-
-/// 24-bit BGR packed → 0RGB.
-#[inline]
-#[must_use]
-#[expect(dead_code)]
-pub(super) fn bgr24_to_0rgb(r: u8, g: u8, b: u8) -> u32 {
-    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
-}
-
 /// Clip a blit rect to source/destination dimensions.
 ///
 /// Returns `None` if the rect is completely out of bounds.  Otherwise returns
@@ -27,7 +7,7 @@ pub(super) fn bgr24_to_0rgb(r: u8, g: u8, b: u8) -> u32 {
 // Wide signature: pure geometry helper — 4 dims + 2 rects + size is the natural input.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
-pub(super) fn clip_blit_rect(
+pub(crate) fn clip_blit_rect(
     dest_w: i32,
     dest_h: i32,
     src_w: i32,

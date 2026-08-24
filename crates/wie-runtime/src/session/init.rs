@@ -378,15 +378,6 @@ impl super::RuntimeSession {
         Self::new_with_options(path, idle_policy, DEFAULT_LAYOUT, SessionOptions::default())
     }
 
-    /// Creates a session with an explicit guest memory layout.
-    pub fn new_with_layout(
-        path: &std::path::Path,
-        idle_policy: wie_winapi::MessageQueueIdlePolicy,
-        layout: RuntimeMemoryLayout,
-    ) -> Result<Self> {
-        Self::new_with_options(path, idle_policy, layout, SessionOptions::default())
-    }
-
     /// Creates a session with guest argv / stdin bootstrap options.
     pub fn new_with_options(
         path: &std::path::Path,

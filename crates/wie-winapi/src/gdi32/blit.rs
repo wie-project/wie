@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::Rect;
 use crate::guest_memory::{checked_address, read_i32, read_u64, with_typed_read};
 use crate::user32::WS_CLIPCHILDREN;
@@ -296,24 +297,55 @@ fn dest_rects(
     rects
 }
 
+/// A resolved 32-bpp DIB surface behind an HDC.
+///
+/// Shared by the GDI32 blit paths and MSIMG32: the DC record must have a
+/// bitmap selected and that bitmap must be a 32-bpp `CreateDIBSection`
+/// record; `None` otherwise. Width/height are always positive (saturated at
+/// `i32::MAX`: the old `as` wrapped i32::MIN's magnitude negative).
+pub(crate) struct ResolvedDib {
+    /// Guest VA of the pixel buffer.
+    pub bits_va: u64,
+    /// Row stride in bytes.
+    pub stride: i32,
+    /// Pixel width (always positive).
+    pub width: i32,
+    /// Pixel height (always positive).
+    pub height: i32,
+    /// `true` = top-down (buffer row 0 is the top); `false` = bottom-up.
+    pub top_down: bool,
+}
+
+/// Resolve an HDC to its selected 32-bpp DIB (shared blit/MSIMG32 resolver).
+pub(crate) fn resolve_32bpp_dib(
+    state: &mut crate::WinApiState,
+    dc_handle: u64,
+) -> Option<ResolvedDib> {
+    let dib = {
+        let gdi = state.gdi_state();
+        let dc = gdi.find_dc(crate::handles::Hdc::from(dc_handle))?;
+        gdi.find_dib(dc.selected_bitmap?)?.clone()
+    };
+    if dib.bit_count != 32 {
+        return None;
+    }
+    // Saturate at i32::MAX: the old `as` wrapped i32::MIN's magnitude negative.
+    Some(ResolvedDib {
+        bits_va: dib.bits_va,
+        stride: dib.stride,
+        width: i32::try_from(dib.width.unsigned_abs()).unwrap_or(i32::MAX),
+        height: i32::try_from(dib.height.unsigned_abs()).unwrap_or(i32::MAX),
+        top_down: dib.height < 0,
+    })
+}
+
 /// Resolve a source DC to (bits_va, stride, src_w, src_h, top_down).
 fn resolve_src_info(
     state: &mut crate::WinApiState,
     dc_handle: u64,
 ) -> Option<(u64, i32, i32, i32, bool)> {
-    let dc = state
-        .gdi_state()
-        .find_dc(crate::handles::Hdc::from(dc_handle))?
-        .clone();
-    let dib_handle = dc.selected_bitmap?;
-    let dib = state.gdi_state().find_dib(dib_handle)?.clone();
-    if dib.bit_count != 32 {
-        return None;
-    }
-    // Saturate at i32::MAX: the old `as` wrapped i32::MIN's magnitude negative.
-    let w = i32::try_from(dib.width.unsigned_abs()).unwrap_or(i32::MAX);
-    let h = i32::try_from(dib.height.unsigned_abs()).unwrap_or(i32::MAX);
-    Some((dib.bits_va, dib.stride, w, h, dib.height < 0))
+    let dib = resolve_32bpp_dib(state, dc_handle)?;
+    Some((dib.bits_va, dib.stride, dib.width, dib.height, dib.top_down))
 }
 
 // Reusable scratch buffer for the one-shot `mem_read` of a blit span.
@@ -507,19 +539,10 @@ pub(crate) fn fill_rect_surface(
 pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc_dst = engine.read_rcx().context("failed to read RCX for BitBlt")?;
-    let x = low_i32(
-        engine.read_rdx().context("failed to read RDX for BitBlt")?,
-        "BitBlt x",
-    )?;
-    let y = low_i32(
-        engine.read_r8().context("failed to read R8 for BitBlt")?,
-        "BitBlt y",
-    )?;
-    let cx = low_i32(
-        engine.read_r9().context("failed to read R9 for BitBlt")?,
-        "BitBlt cx",
-    )?;
+    let hdc_dst = read_arg(engine, ArgReg::Rcx, "BitBlt")?;
+    let x = low_i32(read_arg(engine, ArgReg::Rdx, "BitBlt")?, "BitBlt x")?;
+    let y = low_i32(read_arg(engine, ArgReg::R8, "BitBlt")?, "BitBlt y")?;
+    let cx = low_i32(read_arg(engine, ArgReg::R9, "BitBlt")?, "BitBlt cx")?;
     let rsp = engine.read_rsp().context("failed to read RSP for BitBlt")?;
     let cy = read_i32(engine, checked_address(rsp, 0x28, "BitBlt cy"))
         .context("failed to read BitBlt cy")?;
@@ -697,18 +720,10 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
 /// Handles `GDI32.dll!StretchBlt` (stub).
 pub fn handle_stretch_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _hdc_dst = engine
-        .read_rcx()
-        .context("failed to read RCX for StretchBlt")?;
-    let _x = engine
-        .read_rdx()
-        .context("failed to read RDX for StretchBlt")?;
-    let _y = engine
-        .read_r8()
-        .context("failed to read R8 for StretchBlt")?;
-    let _cx = engine
-        .read_r9()
-        .context("failed to read R9 for StretchBlt")?;
+    let _hdc_dst = read_arg(engine, ArgReg::Rcx, "StretchBlt")?;
+    let _x = read_arg(engine, ArgReg::Rdx, "StretchBlt")?;
+    let _y = read_arg(engine, ArgReg::R8, "StretchBlt")?;
+    let _cx = read_arg(engine, ArgReg::R9, "StretchBlt")?;
     ctx.finish(1)
 }
 
@@ -717,19 +732,10 @@ pub fn handle_stretch_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_pat_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine.read_rcx().context("failed to read RCX for PatBlt")?;
-    let x = low_i32(
-        engine.read_rdx().context("failed to read RDX for PatBlt")?,
-        "PatBlt x",
-    )?;
-    let y = low_i32(
-        engine.read_r8().context("failed to read R8 for PatBlt")?,
-        "PatBlt y",
-    )?;
-    let cx = low_i32(
-        engine.read_r9().context("failed to read R9 for PatBlt")?,
-        "PatBlt cx",
-    )?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "PatBlt")?;
+    let x = low_i32(read_arg(engine, ArgReg::Rdx, "PatBlt")?, "PatBlt x")?;
+    let y = low_i32(read_arg(engine, ArgReg::R8, "PatBlt")?, "PatBlt y")?;
+    let cx = low_i32(read_arg(engine, ArgReg::R9, "PatBlt")?, "PatBlt cx")?;
     let rsp = engine.read_rsp().context("failed to read RSP for PatBlt")?;
     let cy = read_i32(engine, checked_address(rsp, 0x28, "PatBlt cy"))
         .context("failed to read PatBlt cy")?;
@@ -771,13 +777,9 @@ pub fn handle_pat_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
 pub fn handle_fill_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for FillRect")?;
-    let rect_va = engine
-        .read_rdx()
-        .context("failed to read RDX for FillRect")?;
-    let brush = engine.read_r8().context("failed to read R8 for FillRect")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "FillRect")?;
+    let rect_va = read_arg(engine, ArgReg::Rdx, "FillRect")?;
+    let brush = read_arg(engine, ArgReg::R8, "FillRect")?;
 
     let mut filled = false;
     if rect_va != 0 {

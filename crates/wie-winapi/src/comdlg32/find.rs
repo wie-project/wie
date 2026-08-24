@@ -1,6 +1,7 @@
 //! `FindTextW` / `ReplaceTextW` modeless find/replace dialogs.
 
 use super::{ES_AUTOHSCROLL, WS_BORDER, resolve_dialog_owner};
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::FindReplace;
 use crate::guest_memory::{with_typed_read, with_typed_write};
 use crate::guest_string::{read_utf16_lossy, write_utf16_c_string};
@@ -114,9 +115,7 @@ fn handle_find_replace_text(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let fr_va = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let fr_va = read_arg(engine, ArgReg::Rcx, api_name)?;
 
     if fr_va == 0 {
         // FindTextW(NULL) fails like GetOpenFileName(NULL): no dialog.

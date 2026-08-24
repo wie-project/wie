@@ -237,6 +237,19 @@ pub(crate) fn read_utf16_lossy(
     read_utf16(engine, address, max_units, Utf16Decode::Lossy)
 }
 
+/// Encode UTF-16 units as their little-endian guest byte layout.
+///
+/// The single home of the per-unit `to_le_bytes` expansion shared by the
+/// UTF-16 writers and the bulk string-output handlers.
+pub(crate) fn utf16_units_to_le(units: &[u16]) -> Vec<u8> {
+    // Capacity hint only: extend grows if the multiply saturates.
+    let mut bytes = Vec::with_capacity(units.len().saturating_mul(std::mem::size_of::<u16>()));
+    for unit in units {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
 pub(crate) fn write_utf16_units(
     engine: &mut dyn wie_cpu::CpuEngine,
     address: u64,
@@ -247,11 +260,8 @@ pub(crate) fn write_utf16_units(
         .checked_mul(std::mem::size_of::<u16>())
         .context("UTF-16 byte length overflow")?;
 
-    let mut bytes = Vec::with_capacity(byte_length);
-
-    for unit in units {
-        bytes.extend_from_slice(&unit.to_le_bytes());
-    }
+    let bytes = utf16_units_to_le(units);
+    debug_assert_eq!(bytes.len(), byte_length);
 
     crate::guest_memory::write_bytes(engine, address, &bytes)
         .context("failed to write UTF-16 units to guest memory")

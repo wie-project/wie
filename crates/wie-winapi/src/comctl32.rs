@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 
 use crate::gdi32::window_font_resolution_or_default;
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_memory::{
     checked_address, read_i32, read_u64 as read_guest_u64, write_u32 as write_guest_u32,
     write_u64 as write_guest_u64,
@@ -100,9 +101,7 @@ const STATUSCLASSNAME: &str = "msctls_statusbar32";
 /// Handles dynamic `COMCTL32.dll!DllGetVersion`.
 pub fn handle_dll_get_version(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let version_info_va = engine
-        .read_rcx()
-        .context("failed to read RCX for DllGetVersion")?;
+    let version_info_va = read_arg(engine, ArgReg::Rcx, "DllGetVersion")?;
 
     if version_info_va != 0 {
         // DLLVERSIONINFO:
@@ -147,9 +146,7 @@ pub fn handle_init_common_controls(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 /// Handles dynamic `COMCTL32.dll!InitCommonControlsEx`.
 pub fn handle_init_common_controls_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let init_common_controls_ex_va = engine
-        .read_rcx()
-        .context("failed to read RCX for InitCommonControlsEx")?;
+    let init_common_controls_ex_va = read_arg(engine, ArgReg::Rcx, "InitCommonControlsEx")?;
 
     let return_value = u64::from(init_common_controls_ex_va != 0);
 
@@ -161,26 +158,18 @@ pub fn handle_image_list_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let icon_width = low_i32(
-        engine
-            .read_rcx()
-            .context("failed to read RCX for ImageList_Create")?,
+        read_arg(engine, ArgReg::Rcx, "ImageList_Create")?,
         "ImageList_Create icon width",
     )?;
 
     let icon_height = low_i32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for ImageList_Create")?,
+        read_arg(engine, ArgReg::Rdx, "ImageList_Create")?,
         "ImageList_Create icon height",
     )?;
 
-    let _flags = engine
-        .read_r8()
-        .context("failed to read R8 for ImageList_Create")?;
+    let _flags = read_arg(engine, ArgReg::R8, "ImageList_Create")?;
 
-    let _initial_count = engine
-        .read_r9()
-        .context("failed to read R9 for ImageList_Create")?;
+    let _initial_count = read_arg(engine, ArgReg::R9, "ImageList_Create")?;
 
     if let Some((_, count)) = state
         .window_state()
@@ -207,17 +196,11 @@ pub fn handle_image_list_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_image_list_add_masked(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let image_list_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for ImageList_AddMasked")?;
+    let image_list_handle = read_arg(engine, ArgReg::Rcx, "ImageList_AddMasked")?;
 
-    let bitmap_handle = engine
-        .read_rdx()
-        .context("failed to read RDX for ImageList_AddMasked")?;
+    let bitmap_handle = read_arg(engine, ArgReg::Rdx, "ImageList_AddMasked")?;
 
-    let _mask_color = engine
-        .read_r8()
-        .context("failed to read R8 for ImageList_AddMasked")?;
+    let _mask_color = read_arg(engine, ArgReg::R8, "ImageList_AddMasked")?;
 
     let return_value = if image_list_handle == FAKE_IMAGE_LIST_HANDLE && bitmap_handle != 0 {
         let count = state
@@ -254,13 +237,9 @@ pub fn handle_image_list_add_masked(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub fn handle_image_list_set_bk_color(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let image_list_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for ImageList_SetBkColor")?;
+    let image_list_handle = read_arg(engine, ArgReg::Rcx, "ImageList_SetBkColor")?;
 
-    let background_color_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for ImageList_SetBkColor")?;
+    let background_color_raw = read_arg(engine, ArgReg::Rdx, "ImageList_SetBkColor")?;
 
     let background_color = u32::try_from(background_color_raw)
         .context("ImageList_SetBkColor color does not fit u32")?;
@@ -300,9 +279,7 @@ pub fn handle_image_list_set_bk_color(ctx: &mut HandlerContext<'_>) -> Result<Wi
 pub fn handle_image_list_destroy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let image_list_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for ImageList_Destroy")?;
+    let image_list_handle = read_arg(engine, ArgReg::Rcx, "ImageList_Destroy")?;
 
     let existed = state
         .window_state()
@@ -348,15 +325,9 @@ pub fn handle_image_list_destroy(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_image_list_add(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let image_list_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for ImageList_Add")?;
-    let bitmap_handle = engine
-        .read_rdx()
-        .context("failed to read RDX for ImageList_Add")?;
-    let _mask_handle = engine
-        .read_r8()
-        .context("failed to read R8 for ImageList_Add")?;
+    let image_list_handle = read_arg(engine, ArgReg::Rcx, "ImageList_Add")?;
+    let bitmap_handle = read_arg(engine, ArgReg::Rdx, "ImageList_Add")?;
+    let _mask_handle = read_arg(engine, ArgReg::R8, "ImageList_Add")?;
 
     let registered = state
         .window_state()
@@ -398,9 +369,7 @@ pub fn handle_image_list_get_image_count(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let image_list_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for ImageList_GetImageCount")?;
+    let image_list_handle = read_arg(engine, ArgReg::Rcx, "ImageList_GetImageCount")?;
 
     let count = state
         .window_state()
@@ -421,15 +390,9 @@ pub fn handle_image_list_get_icon_size(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let image_list_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for ImageList_GetIconSize")?;
-    let cx_va = engine
-        .read_rdx()
-        .context("failed to read RDX for ImageList_GetIconSize")?;
-    let cy_va = engine
-        .read_r8()
-        .context("failed to read R8 for ImageList_GetIconSize")?;
+    let image_list_handle = read_arg(engine, ArgReg::Rcx, "ImageList_GetIconSize")?;
+    let cx_va = read_arg(engine, ArgReg::Rdx, "ImageList_GetIconSize")?;
+    let cy_va = read_arg(engine, ArgReg::R8, "ImageList_GetIconSize")?;
 
     let (width, height) = lock_image_lists()
         .and_then(|lists| lists.get(&image_list_handle).cloned())
@@ -455,19 +418,13 @@ pub fn handle_image_list_set_icon_size(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let image_list_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for ImageList_SetIconSize")?;
+    let image_list_handle = read_arg(engine, ArgReg::Rcx, "ImageList_SetIconSize")?;
     let cx = low_i32(
-        engine
-            .read_rdx()
-            .context("failed to read RDX for ImageList_SetIconSize")?,
+        read_arg(engine, ArgReg::Rdx, "ImageList_SetIconSize")?,
         "ImageList_SetIconSize cx",
     )?;
     let cy = low_i32(
-        engine
-            .read_r8()
-            .context("failed to read R8 for ImageList_SetIconSize")?,
+        read_arg(engine, ArgReg::R8, "ImageList_SetIconSize")?,
         "ImageList_SetIconSize cy",
     )?;
 
@@ -498,18 +455,10 @@ pub fn handle_image_list_set_icon_size(
 /// this milestone.
 pub fn handle_image_list_draw(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let image_list_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for ImageList_Draw")?;
-    let _image_index = engine
-        .read_rdx()
-        .context("failed to read RDX for ImageList_Draw")?;
-    let _target_dc = engine
-        .read_r8()
-        .context("failed to read R8 for ImageList_Draw")?;
-    let _x = engine
-        .read_r9()
-        .context("failed to read R9 for ImageList_Draw")?;
+    let image_list_handle = read_arg(engine, ArgReg::Rcx, "ImageList_Draw")?;
+    let _image_index = read_arg(engine, ArgReg::Rdx, "ImageList_Draw")?;
+    let _target_dc = read_arg(engine, ArgReg::R8, "ImageList_Draw")?;
+    let _x = read_arg(engine, ArgReg::R9, "ImageList_Draw")?;
 
     tracing::debug!(
         target: "wie_winapi",
@@ -531,15 +480,9 @@ pub fn handle_image_list_get_image_info(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let image_list_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for ImageList_GetImageInfo")?;
-    let image_index_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for ImageList_GetImageInfo")?;
-    let image_info_va = engine
-        .read_r8()
-        .context("failed to read R8 for ImageList_GetImageInfo")?;
+    let image_list_handle = read_arg(engine, ArgReg::Rcx, "ImageList_GetImageInfo")?;
+    let image_index_raw = read_arg(engine, ArgReg::Rdx, "ImageList_GetImageInfo")?;
+    let image_info_va = read_arg(engine, ArgReg::R8, "ImageList_GetImageInfo")?;
 
     if image_info_va == 0 {
         return ctx.finish(0);
@@ -626,18 +569,10 @@ fn handle_create_status_window_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let style_raw = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let text_va = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let parent_handle = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
-    let window_id = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let style_raw = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let text_va = read_arg(engine, ArgReg::Rdx, api_name)?;
+    let parent_handle = read_arg(engine, ArgReg::R8, api_name)?;
+    let window_id = read_arg(engine, ArgReg::R9, api_name)?;
 
     let style =
         u32::try_from(style_raw).with_context(|| format!("{api_name}: style does not fit u32"))?;
@@ -966,18 +901,10 @@ fn status_bar_default_height(state: &mut WinApiState, hwnd: u64) -> Result<i32> 
 pub fn handle_create_toolbar_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let parent_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateToolbarEx")?;
-    let style_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for CreateToolbarEx")?;
-    let window_id = engine
-        .read_r8()
-        .context("failed to read R8 for CreateToolbarEx")?;
-    let _bitmap_count = engine
-        .read_r9()
-        .context("failed to read R9 for CreateToolbarEx")?;
+    let parent_handle = read_arg(engine, ArgReg::Rcx, "CreateToolbarEx")?;
+    let style_raw = read_arg(engine, ArgReg::Rdx, "CreateToolbarEx")?;
+    let window_id = read_arg(engine, ArgReg::R8, "CreateToolbarEx")?;
+    let _bitmap_count = read_arg(engine, ArgReg::R9, "CreateToolbarEx")?;
 
     let rsp = engine
         .read_rsp()

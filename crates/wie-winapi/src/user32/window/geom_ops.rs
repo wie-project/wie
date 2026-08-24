@@ -3,6 +3,7 @@
 //! `window.rs`).
 
 use super::class::find_window_mut;
+use crate::gdi32::{ArgReg, read_arg};
 use crate::user32::{
     Context, FAKE_WINDOW_HANDLE, HandlerContext, Result, WinApiHandlerResult, low_i32, read_u32,
     read_u64,
@@ -12,21 +13,13 @@ use crate::user32::{
 pub fn handle_move_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for MoveWindow")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "MoveWindow")?;
 
-    let x_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for MoveWindow")?;
+    let x_raw = read_arg(engine, ArgReg::Rdx, "MoveWindow")?;
 
-    let y_raw = engine
-        .read_r8()
-        .context("failed to read R8 for MoveWindow")?;
+    let y_raw = read_arg(engine, ArgReg::R8, "MoveWindow")?;
 
-    let width_raw = engine
-        .read_r9()
-        .context("failed to read R9 for MoveWindow")?;
+    let width_raw = read_arg(engine, ArgReg::R9, "MoveWindow")?;
 
     let rsp = engine
         .read_rsp()
@@ -108,18 +101,10 @@ pub fn handle_move_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_set_window_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for SetWindowPos")?;
-    let insert_after = engine
-        .read_rdx()
-        .context("failed to read RDX for SetWindowPos")?;
-    let _x = engine
-        .read_r8()
-        .context("failed to read R8 for SetWindowPos")?;
-    let _y = engine
-        .read_r9()
-        .context("failed to read R9 for SetWindowPos")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "SetWindowPos")?;
+    let insert_after = read_arg(engine, ArgReg::Rdx, "SetWindowPos")?;
+    let _x = read_arg(engine, ArgReg::R8, "SetWindowPos")?;
+    let _y = read_arg(engine, ArgReg::R9, "SetWindowPos")?;
 
     // Remaining Win64 arguments are cx, cy and flags on the stack.
     let rsp = engine

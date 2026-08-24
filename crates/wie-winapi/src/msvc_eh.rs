@@ -17,10 +17,7 @@ const HT_CATCH_ALL_TYPE: u32 = 0;
 
 /// `HandlerType.adjectives` bits (public MSVC EH docs).
 pub const HT_IS_CONST: u32 = 0x01;
-pub const HT_IS_VOLATILE: u32 = 0x02;
-pub const HT_IS_UNALIGNED: u32 = 0x04;
 pub const HT_IS_REFERENCE: u32 = 0x08;
-pub const HT_IS_RESUMABLE: u32 = 0x10;
 pub const HT_IS_STD_DOT_DOT: u32 = 0x40;
 
 /// x64 `HandlerType` size: adjectives, type RVA, dispCatchObj, handler RVA, dispFrame.
@@ -270,6 +267,26 @@ fn handler_matches(ht: &HandlerType, thrown_types: Option<&[u32]>) -> bool {
     }
 }
 
+/// Build the successful-match record from a matched `HandlerType`.
+fn msvc_catch_from(
+    image_base: u64,
+    ht: HandlerType,
+    state: i32,
+    try_low: i32,
+    func_info: FuncInfoHeader,
+) -> MsvcCatch {
+    MsvcCatch {
+        landing_pad: image_base.saturating_add(u64::from(ht.handler_rva)),
+        disp_catch_obj: ht.disp_catch_obj,
+        adjectives: ht.adjectives,
+        type_rva: ht.type_rva,
+        disp_frame: ht.disp_frame,
+        state,
+        try_low,
+        func_info,
+    }
+}
+
 /// Search `FuncInfo` for a catch covering `control_pc`.
 ///
 /// Matching policy:
@@ -318,28 +335,10 @@ pub fn find_msvc_catch(
                 ht.type_rva == HT_CATCH_ALL_TYPE || (ht.adjectives & HT_IS_STD_DOT_DOT) != 0;
             if !is_catch_all {
                 if handler_matches(&ht, thrown_types.as_deref()) {
-                    return Some(MsvcCatch {
-                        landing_pad: image_base.saturating_add(u64::from(ht.handler_rva)),
-                        disp_catch_obj: ht.disp_catch_obj,
-                        adjectives: ht.adjectives,
-                        type_rva: ht.type_rva,
-                        disp_frame: ht.disp_frame,
-                        state,
-                        try_low: tb.try_low,
-                        func_info: info,
-                    });
+                    return Some(msvc_catch_from(image_base, ht, state, tb.try_low, info));
                 }
             } else if catch_all.is_none() {
-                catch_all = Some(MsvcCatch {
-                    landing_pad: image_base.saturating_add(u64::from(ht.handler_rva)),
-                    disp_catch_obj: ht.disp_catch_obj,
-                    adjectives: ht.adjectives,
-                    type_rva: ht.type_rva,
-                    disp_frame: ht.disp_frame,
-                    state,
-                    try_low: tb.try_low,
-                    func_info: info,
-                });
+                catch_all = Some(msvc_catch_from(image_base, ht, state, tb.try_low, info));
             }
         }
     }
@@ -362,16 +361,7 @@ fn find_catch_all_any_try(
             let is_catch_all =
                 ht.type_rva == HT_CATCH_ALL_TYPE || (ht.adjectives & HT_IS_STD_DOT_DOT) != 0;
             if is_catch_all && ht.handler_rva != 0 {
-                return Some(MsvcCatch {
-                    landing_pad: image_base.saturating_add(u64::from(ht.handler_rva)),
-                    disp_catch_obj: ht.disp_catch_obj,
-                    adjectives: ht.adjectives,
-                    type_rva: ht.type_rva,
-                    disp_frame: ht.disp_frame,
-                    state,
-                    try_low: tb.try_low,
-                    func_info: *info,
-                });
+                return Some(msvc_catch_from(image_base, ht, state, tb.try_low, *info));
             }
         }
     }

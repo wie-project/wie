@@ -60,7 +60,7 @@ pub fn handle_get_file_attributes_a(ctx: &mut HandlerContext<'_>) -> Result<WinA
         .context("failed to read RCX for GetFileAttributesA")?;
 
     let path = read_ansi_string_from_cpu(engine, path_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let cwd = state.file_io.cwd_utf8();
     let full_path = resolve_full_windows_path(&cwd, &path);
     let return_value = file_attributes_for_path(state, &full_path);
     if return_value == INVALID_FILE_ATTRIBUTES {
@@ -80,7 +80,7 @@ pub fn handle_get_file_attributes_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
         .context("failed to read RCX for GetFileAttributesW")?;
 
     let path = read_wide_string_from_cpu(engine, path_va, 1024)?;
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let cwd = state.file_io.cwd_utf8();
     let full_path = resolve_full_windows_path(&cwd, &path);
     let return_value = file_attributes_for_path(state, &full_path);
     if return_value == INVALID_FILE_ATTRIBUTES {
@@ -172,88 +172,60 @@ pub fn handle_find_close(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 
     ctx.finish(1)
 }
-/// Handles `KERNEL32.dll!CreateFileW`.
-pub fn handle_create_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let file_name_va = engine
+/// Cap for a guest path-argument read (bytes for the A path, UTF-16 units for
+/// the W path) — the Win32 max long-path window.
+pub(crate) const PATH_ARG_MAX: usize = 32_768;
+
+/// Shared body of `CreateFileA` / `CreateFileW`.
+fn create_file(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
+    let api = if wide { "CreateFileW" } else { "CreateFileA" };
+    let file_name_va = ctx
+        .engine
         .read_rcx()
-        .context("failed to read RCX for CreateFileW")?;
-
-    let desired_access = engine
+        .context("failed to read RCX for CreateFile")?;
+    let desired_access = ctx
+        .engine
         .read_rdx()
-        .context("failed to read RDX for CreateFileW")?;
-
-    let _share_mode = engine
+        .context("failed to read RDX for CreateFile")?;
+    let _share_mode = ctx
+        .engine
         .read_r8()
-        .context("failed to read R8 for CreateFileW")?;
-
-    let _security_attributes = engine
+        .context("failed to read R8 for CreateFile")?;
+    let _security_attributes = ctx
+        .engine
         .read_r9()
-        .context("failed to read R9 for CreateFileW")?;
+        .context("failed to read R9 for CreateFile")?;
 
-    let file_name = if file_name_va == 0 {
-        String::new()
+    let file_name = if wide {
+        read_wide_string_from_cpu(ctx.engine, file_name_va, PATH_ARG_MAX)
+            .context("failed to read CreateFile file name")?
     } else {
-        read_wide_string_from_cpu(engine, file_name_va, 32_768)
-            .context("failed to read CreateFileW file name")?
+        read_ansi_string_from_cpu(ctx.engine, file_name_va, PATH_ARG_MAX)
+            .context("failed to read CreateFile file name")?
     };
 
     // 5th arg (CreationDisposition) lives at [RSP+0x28] at Win64 API entry.
     let creation_disposition =
-        read_create_file_stack_u32(engine, 0x28).map_or(OPEN_EXISTING, u64::from);
+        read_create_file_stack_u32(ctx.engine, 0x28).map_or(OPEN_EXISTING, u64::from);
 
     let return_value = finish_create_file(
-        engine,
-        state,
+        ctx.engine,
+        &mut *ctx.state,
         &file_name,
         desired_access,
         creation_disposition,
-        "CreateFileW",
+        api,
     );
 
     ctx.finish(return_value)
 }
+/// Handles `KERNEL32.dll!CreateFileW`.
+pub fn handle_create_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    create_file(ctx, true)
+}
 /// Handles `KERNEL32.dll!CreateFileA`.
 pub fn handle_create_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let file_name_va = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateFileA")?;
-
-    let desired_access = engine
-        .read_rdx()
-        .context("failed to read RDX for CreateFileA")?;
-
-    let _share_mode = engine
-        .read_r8()
-        .context("failed to read R8 for CreateFileA")?;
-
-    let _security_attributes = engine
-        .read_r9()
-        .context("failed to read R9 for CreateFileA")?;
-
-    let file_name = if file_name_va == 0 {
-        String::new()
-    } else {
-        read_ansi_string_from_cpu(engine, file_name_va, 32_768)
-            .context("failed to read CreateFileA file name")?
-    };
-
-    let creation_disposition =
-        read_create_file_stack_u32(engine, 0x28).map_or(OPEN_EXISTING, u64::from);
-
-    let return_value = finish_create_file(
-        engine,
-        state,
-        &file_name,
-        desired_access,
-        creation_disposition,
-        "CreateFileA",
-    );
-
-    ctx.finish(return_value)
+    create_file(ctx, false)
 }
 /// Handles `KERNEL32.dll!CloseHandle`.
 pub fn handle_close_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -709,7 +681,7 @@ pub(crate) fn finish_find_first(
         return Ok(INVALID_HANDLE_VALUE);
     }
 
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    let cwd = state.file_io.cwd_utf8();
     let full_pattern = resolve_full_windows_path(&cwd, pattern);
     let entries_vec = collect_find_entries(state, &full_pattern);
     if entries_vec.is_empty() {
@@ -897,10 +869,8 @@ fn open_directory_for_watch(state: &mut WinApiState, file_name: &str) -> Option<
     if file_name.is_empty() {
         return None;
     }
-    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
-        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
-    }
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    state.file_io.sync_volumes();
+    let cwd = state.file_io.cwd_utf8();
     let full_path = resolve_full_windows_path(&cwd, file_name);
     let host_path = crate::kernel32::file_io::watch::resolve_watch_host_path(state, &full_path)?;
 
@@ -951,11 +921,9 @@ pub(crate) fn temp_name_id_u32(id: u64) -> u32 {
 }
 
 pub(crate) fn finish_create_file_create_only(state: &mut WinApiState, guest_path: &str) {
-    let cwd = String::from_utf16_lossy(&state.file_io.current_directory_wide);
+    state.file_io.sync_volumes();
+    let cwd = state.file_io.cwd_utf8();
     let full = resolve_full_windows_path(&cwd, guest_path);
-    if state.file_io.volumes.bottle_root != state.file_io.bottle_root {
-        state.file_io.volumes.bottle_root = state.file_io.bottle_root.clone();
-    }
     if let Some(map) = crate::vfs::guest_path_to_host(&state.file_io.volumes, &full) {
         drop(crate::vfs::create_host_file(&map.host));
     } else {
@@ -963,10 +931,14 @@ pub(crate) fn finish_create_file_create_only(state: &mut WinApiState, guest_path
     }
 }
 
+/// Write a fixed directory path into the caller's guest buffer with real
+/// Windows buffer semantics (`Get{System,Windows}Directory` family): too-small
+/// or NULL buffers return the required length including the NUL.
 pub(crate) fn write_fixed_dir_w(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
     dir: &str,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let buffer_len = engine.read_rcx()?;
     let buffer_va = engine.read_rdx()?;
     let units: Vec<u16> = dir.encode_utf16().collect();
@@ -979,17 +951,14 @@ pub(crate) fn write_fixed_dir_w(
         write_guest_utf16_units(engine, buffer_va, &t)?;
         u64::try_from(t.len().saturating_sub(1)).unwrap_or(0)
     };
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 
 pub(crate) fn write_fixed_dir_a(
-    engine: &mut dyn wie_cpu::CpuEngine,
+    ctx: &mut HandlerContext<'_>,
     dir: &str,
 ) -> Result<WinApiHandlerResult> {
+    let engine = &mut *ctx.engine;
     let buffer_len = engine.read_rcx()?;
     let buffer_va = engine.read_rdx()?;
     let bytes = crate::vfs::encode_acp(dir);
@@ -1002,11 +971,7 @@ pub(crate) fn write_fixed_dir_a(
         engine.mem_write(buffer_va, &out)?;
         u64::try_from(out.len().saturating_sub(1)).unwrap_or(0)
     };
-    let return_address = engine.return_from_win64_api(return_value)?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value,
-    })
+    ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!FindFirstFileExW` — `FindFirstFileW` semantics with
 /// the extended argument list (info level / search op / filter / flags are

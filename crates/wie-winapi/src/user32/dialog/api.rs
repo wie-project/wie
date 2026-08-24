@@ -2,6 +2,7 @@
 //! `SetDlgItemTextA/W`, `GetDlgItemInt`, `SetDlgItemInt` and
 //! `SendDlgItemMessageW`.
 
+use crate::gdi32::{ArgReg, read_arg};
 use anyhow::{Context, Result};
 
 use crate::user32::{
@@ -24,12 +25,8 @@ fn handle_get_dlg_item_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let dialog_hwnd = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let id_raw = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let dialog_hwnd = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let id_raw = read_arg(engine, ArgReg::Rdx, api_name)?;
     let id = u16::try_from(id_raw & u64::from(u32::MAX)).unwrap_or(0);
 
     let child = get_dlg_item(state, dialog_hwnd, id);
@@ -66,18 +63,10 @@ fn handle_get_dlg_item_text_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let dialog_hwnd = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let id_raw = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let buffer_va = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
-    let max_characters = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let dialog_hwnd = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let id_raw = read_arg(engine, ArgReg::Rdx, api_name)?;
+    let buffer_va = read_arg(engine, ArgReg::R8, api_name)?;
+    let max_characters = read_arg(engine, ArgReg::R9, api_name)?;
     let id = u16::try_from(id_raw & u64::from(u32::MAX)).unwrap_or(0);
 
     let child = get_dlg_item(state, dialog_hwnd, id);
@@ -118,15 +107,9 @@ fn handle_set_dlg_item_text_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let dialog_hwnd = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
-    let id_raw = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
-    let text_va = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let dialog_hwnd = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let id_raw = read_arg(engine, ArgReg::Rdx, api_name)?;
+    let text_va = read_arg(engine, ArgReg::R8, api_name)?;
     let id = u16::try_from(id_raw & u64::from(u32::MAX)).unwrap_or(0);
 
     let child = get_dlg_item(state, dialog_hwnd, id);
@@ -151,18 +134,10 @@ fn handle_set_dlg_item_text_impl(
 pub fn handle_set_dlg_item_int(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let dialog_hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for SetDlgItemInt")?;
-    let id_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for SetDlgItemInt")?;
-    let value_raw = engine
-        .read_r8()
-        .context("failed to read R8 for SetDlgItemInt")?;
-    let signed_raw = engine
-        .read_r9()
-        .context("failed to read R9 for SetDlgItemInt")?;
+    let dialog_hwnd = read_arg(engine, ArgReg::Rcx, "SetDlgItemInt")?;
+    let id_raw = read_arg(engine, ArgReg::Rdx, "SetDlgItemInt")?;
+    let value_raw = read_arg(engine, ArgReg::R8, "SetDlgItemInt")?;
+    let signed_raw = read_arg(engine, ArgReg::R9, "SetDlgItemInt")?;
     let id = u16::try_from(id_raw & u64::from(u32::MAX)).unwrap_or(0);
 
     let child = get_dlg_item(state, dialog_hwnd, id);
@@ -208,18 +183,10 @@ pub fn handle_set_dlg_item_int(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 pub fn handle_get_dlg_item_int(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let dialog_hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for GetDlgItemInt")?;
-    let id_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for GetDlgItemInt")?;
-    let translated_va = engine
-        .read_r8()
-        .context("failed to read R8 for GetDlgItemInt")?;
-    let signed_raw = engine
-        .read_r9()
-        .context("failed to read R9 for GetDlgItemInt")?;
+    let dialog_hwnd = read_arg(engine, ArgReg::Rcx, "GetDlgItemInt")?;
+    let id_raw = read_arg(engine, ArgReg::Rdx, "GetDlgItemInt")?;
+    let translated_va = read_arg(engine, ArgReg::R8, "GetDlgItemInt")?;
+    let signed_raw = read_arg(engine, ArgReg::R9, "GetDlgItemInt")?;
     let id = u16::try_from(id_raw & u64::from(u32::MAX)).unwrap_or(0);
 
     let child = get_dlg_item(state, dialog_hwnd, id);
@@ -296,18 +263,10 @@ fn parse_dlg_item_int(text: &str, signed: bool) -> (u32, bool) {
 pub fn handle_send_dlg_item_message_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let dialog_hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for SendDlgItemMessageW")?;
-    let id_raw = engine
-        .read_rdx()
-        .context("failed to read RDX for SendDlgItemMessageW")?;
-    let message_raw = engine
-        .read_r8()
-        .context("failed to read R8 for SendDlgItemMessageW")?;
-    let word_parameter = engine
-        .read_r9()
-        .context("failed to read R9 for SendDlgItemMessageW")?;
+    let dialog_hwnd = read_arg(engine, ArgReg::Rcx, "SendDlgItemMessageW")?;
+    let id_raw = read_arg(engine, ArgReg::Rdx, "SendDlgItemMessageW")?;
+    let message_raw = read_arg(engine, ArgReg::R8, "SendDlgItemMessageW")?;
+    let word_parameter = read_arg(engine, ArgReg::R9, "SendDlgItemMessageW")?;
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for SendDlgItemMessageW")?;

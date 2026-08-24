@@ -6,10 +6,10 @@ use wie_cpu::CpuEngine;
 
 use super::objects::PtThread;
 use super::{
-    BARRIER_SERIAL_THREAD, CANCEL_ASYNCHRONOUS, CANCEL_ENABLE, CANCELED, CREATE_DETACHED, EAGAIN,
-    EDEADLK, EINVAL, ENOTSUP, EPERM, ESRCH, INHERIT_SCHED, PtPending, SCOPE_SYSTEM, call_guest,
-    finish_guest_call, park_on, read_cstr, read_u32, read_u64, ret_int, ret_u64, slice_until,
-    trunc_i32, write_i32, write_u32, write_u64,
+    CANCEL_ASYNCHRONOUS, CANCEL_ENABLE, CANCELED, CREATE_DETACHED, EAGAIN, EDEADLK, EINVAL,
+    ENOTSUP, ESRCH, INHERIT_SCHED, PtPending, SCOPE_SYSTEM, call_guest, finish_guest_call, park_on,
+    read_cstr, read_u32, read_u64, ret_int, ret_u64, slice_until, trunc_i32, write_i32, write_u32,
+    write_u64,
 };
 use crate::{WinApiHandlerResult, WinApiState};
 
@@ -649,6 +649,9 @@ fn exit(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApiHan
 /// # Errors
 /// Propagates guest memory / register access failures, and returns the
 /// `ExitThread` control signal once the thread is ready to die.
+// Wired up when the runtime routes pthread-trampoline returns here; until
+/// then keep the entry point visible.
+#[expect(dead_code)]
 pub fn handle_thread_return(
     engine: &mut dyn CpuEngine,
     state: &mut WinApiState,
@@ -967,12 +970,4 @@ fn getname(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinApi
         &[0_u8],
     ));
     ret_int(engine, 0)
-}
-
-/// Silence the unused-import warning for constants used only in docs.
-const _: (i32, i32, u64) = (BARRIER_SERIAL_THREAD, EPERM, stack_arg_unused());
-
-/// Placeholder so the shared `stack_arg` helper stays reachable from this file.
-const fn stack_arg_unused() -> u64 {
-    0
 }

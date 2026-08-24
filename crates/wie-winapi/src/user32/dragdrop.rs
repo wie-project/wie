@@ -7,6 +7,7 @@
 //! `DragFinish`. The list is single-slot: a new drop replaces the previous
 //! one, and `DragFinish` clears it (Windows frees the HDROP global memory).
 
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_memory::write_i32;
 use crate::guest_string::{write_ansi_c_string, write_utf16_c_string};
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
@@ -70,36 +71,28 @@ impl DragDropState {
 pub fn handle_drag_query_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let h_drop = engine
-        .read_rcx()
-        .context("failed to read RCX for DragQueryFileW")?;
-    let i_file = engine
-        .read_rdx()
-        .context("failed to read RDX for DragQueryFileW")?;
-    let lpsz_file = engine
-        .read_r8()
-        .context("failed to read R8 for DragQueryFileW")?;
-    let cch = engine
-        .read_r9()
-        .context("failed to read R9 for DragQueryFileW")?;
+    let h_drop = read_arg(engine, ArgReg::Rcx, "DragQueryFileW")?;
+    let i_file = read_arg(engine, ArgReg::Rdx, "DragQueryFileW")?;
+    let lpsz_file = read_arg(engine, ArgReg::R8, "DragQueryFileW")?;
+    let cch = read_arg(engine, ArgReg::R9, "DragQueryFileW")?;
 
     match drag_query_core(state, h_drop, i_file) {
         Some(DragQueryResolution::Count) => {
             let count = state.drag_drop().files().len();
             tracing::info!(count, "DragQueryFileW: count query");
-            finish(engine, u64::try_from(count).unwrap_or(u64::MAX))
+            ctx.finish(u64::try_from(count).unwrap_or(u64::MAX))
         }
         Some(DragQueryResolution::Path(path)) => {
             tracing::info!(index = i_file, path, "DragQueryFileW: path query");
             if lpsz_file == 0 || cch == 0 {
                 // Buffer-size query: required chars incl. the terminating NUL.
                 let required = path.encode_utf16().count().saturating_add(1);
-                return finish(engine, u64::try_from(required).unwrap_or(u64::MAX));
+                return ctx.finish(u64::try_from(required).unwrap_or(u64::MAX));
             }
             let max_chars = usize::try_from(cch).unwrap_or(0);
             let copied = write_utf16_c_string(engine, lpsz_file, max_chars, path)
                 .context("failed to write DragQueryFileW path")?;
-            finish(engine, u64::try_from(copied).unwrap_or(u64::MAX))
+            ctx.finish(u64::try_from(copied).unwrap_or(u64::MAX))
         }
         None => {
             tracing::info!(
@@ -107,7 +100,7 @@ pub fn handle_drag_query_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
                 index = i_file,
                 "DragQueryFileW: miss (foreign handle or empty list)"
             );
-            finish(engine, 0)
+            ctx.finish(0)
         }
     }
 }
@@ -119,36 +112,28 @@ pub fn handle_drag_query_file_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_drag_query_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let h_drop = engine
-        .read_rcx()
-        .context("failed to read RCX for DragQueryFileA")?;
-    let i_file = engine
-        .read_rdx()
-        .context("failed to read RDX for DragQueryFileA")?;
-    let lpsz_file = engine
-        .read_r8()
-        .context("failed to read R8 for DragQueryFileA")?;
-    let cch = engine
-        .read_r9()
-        .context("failed to read R9 for DragQueryFileA")?;
+    let h_drop = read_arg(engine, ArgReg::Rcx, "DragQueryFileA")?;
+    let i_file = read_arg(engine, ArgReg::Rdx, "DragQueryFileA")?;
+    let lpsz_file = read_arg(engine, ArgReg::R8, "DragQueryFileA")?;
+    let cch = read_arg(engine, ArgReg::R9, "DragQueryFileA")?;
 
     match drag_query_core(state, h_drop, i_file) {
         Some(DragQueryResolution::Count) => {
             let count = state.drag_drop().files().len();
             tracing::info!(count, "DragQueryFileA: count query");
-            finish(engine, u64::try_from(count).unwrap_or(u64::MAX))
+            ctx.finish(u64::try_from(count).unwrap_or(u64::MAX))
         }
         Some(DragQueryResolution::Path(path)) => {
             tracing::info!(index = i_file, path, "DragQueryFileA: path query");
             if lpsz_file == 0 || cch == 0 {
                 // Buffer-size query: required bytes incl. the terminating NUL.
                 let required = path.len().saturating_add(1);
-                return finish(engine, u64::try_from(required).unwrap_or(u64::MAX));
+                return ctx.finish(u64::try_from(required).unwrap_or(u64::MAX));
             }
             let max_bytes = usize::try_from(cch).unwrap_or(0);
             let copied = write_ansi_c_string(engine, lpsz_file, max_bytes, path)
                 .context("failed to write DragQueryFileA path")?;
-            finish(engine, u64::try_from(copied).unwrap_or(u64::MAX))
+            ctx.finish(u64::try_from(copied).unwrap_or(u64::MAX))
         }
         None => {
             tracing::info!(
@@ -156,7 +141,7 @@ pub fn handle_drag_query_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
                 index = i_file,
                 "DragQueryFileA: miss (foreign handle or empty list)"
             );
-            finish(engine, 0)
+            ctx.finish(0)
         }
     }
 }
@@ -169,21 +154,17 @@ pub fn handle_drag_query_file_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 pub fn handle_drag_query_point(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let h_drop = engine
-        .read_rcx()
-        .context("failed to read RCX for DragQueryPoint")?;
-    let ppt = engine
-        .read_rdx()
-        .context("failed to read RDX for DragQueryPoint")?;
+    let h_drop = read_arg(engine, ArgReg::Rcx, "DragQueryPoint")?;
+    let ppt = read_arg(engine, ArgReg::Rdx, "DragQueryPoint")?;
     if h_drop != FAKE_HDROP {
-        return finish(engine, 0); // FALSE — not our drop list
+        return ctx.finish(0); // FALSE — not our drop list
     }
     let (x, y) = state.drag_drop().point();
     if ppt != 0 {
         write_i32(engine, ppt, x).context("failed to write DragQueryPoint x")?;
         write_i32(engine, ppt.wrapping_add(4), y).context("failed to write DragQueryPoint y")?;
     }
-    finish(engine, 1) // TRUE — dropped inside the client area
+    ctx.finish(1) // TRUE — dropped inside the client area
 }
 
 /// `void DragFinish(HDROP hDrop)`
@@ -193,14 +174,12 @@ pub fn handle_drag_query_point(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 pub fn handle_drag_finish(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let h_drop = engine
-        .read_rcx()
-        .context("failed to read RCX for DragFinish")?;
+    let h_drop = read_arg(engine, ArgReg::Rcx, "DragFinish")?;
     if h_drop == FAKE_HDROP {
         tracing::info!("DragFinish: drop consumed");
         state.drag_drop().clear();
     }
-    finish(engine, 1)
+    ctx.finish(1)
 }
 
 /// Shared `DragQueryFile` core: validate the handle and resolve `iFile`.
@@ -232,16 +211,6 @@ enum DragQueryResolution<'a> {
     Count,
     /// A valid index — the path to copy into the caller's buffer.
     Path(&'a str),
-}
-
-fn finish(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerResult> {
-    let return_address = engine
-        .return_from_win64_api(value)
-        .context("drag-drop return")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: value,
-    })
 }
 
 #[cfg(test)]

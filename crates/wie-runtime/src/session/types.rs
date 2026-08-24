@@ -14,14 +14,6 @@ pub(crate) struct GuestVa(pub(crate) u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct GuestStackPtr(pub(crate) u64);
 
-/// A guest window handle (the raw `HWND` value as seen by the guest).
-///
-/// Only consumer today is [`super::RuntimeSession::post_window_message`],
-/// an unused internal seam — `dead_code` until a caller lands.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct GuestHwnd(pub(crate) u64);
-
 /// A guest thread ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct GuestTid(pub(crate) u32);

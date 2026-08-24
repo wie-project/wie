@@ -36,6 +36,7 @@ use anyhow::{Context, Result};
 
 use crate::HandlerContext;
 use crate::WinApiHandlerResult;
+use crate::gdi32::{ArgReg, read_arg};
 
 /// `S_OK`
 const S_OK: u64 = 0;
@@ -59,9 +60,7 @@ const TYMED_HGLOBAL: u32 = 1;
 /// `HRESULT OleInitialize(LPVOID pvReserved)` — records the per-process flag.
 pub(super) fn handle_ole_initialize(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _reserved = engine
-        .read_rcx()
-        .context("failed to read RCX for OleInitialize")?;
+    let _reserved = read_arg(engine, ArgReg::Rcx, "OleInitialize")?;
     ctx.state.ole32().ole_initialized = true;
     ctx.finish(S_OK)
 }
@@ -81,9 +80,7 @@ pub(super) fn handle_ole_set_clipboard(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let data_object = engine
-        .read_rcx()
-        .context("failed to read RCX for OleSetClipboard")?;
+    let data_object = read_arg(engine, ArgReg::Rcx, "OleSetClipboard")?;
     let state = &mut *ctx.state;
     if data_object == 0 {
         state.ole32().clipboard_data_object = 0;
@@ -101,9 +98,7 @@ pub(super) fn handle_ole_get_clipboard(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let pp_data_obj = engine
-        .read_rcx()
-        .context("failed to read RCX for OleGetClipboard")?;
+    let pp_data_obj = read_arg(engine, ArgReg::Rcx, "OleGetClipboard")?;
     if pp_data_obj == 0 {
         return ctx.finish(E_POINTER);
     }
@@ -146,12 +141,8 @@ pub(super) fn handle_register_drag_drop(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for RegisterDragDrop")?;
-    let drop_target = engine
-        .read_rdx()
-        .context("failed to read RDX for RegisterDragDrop")?;
+    let hwnd = read_arg(engine, ArgReg::Rcx, "RegisterDragDrop")?;
+    let drop_target = read_arg(engine, ArgReg::Rdx, "RegisterDragDrop")?;
     if hwnd != 0 && drop_target != 0 {
         ctx.state.ole32().drop_targets.insert(hwnd, drop_target);
     }
@@ -161,9 +152,7 @@ pub(super) fn handle_register_drag_drop(
 /// `HRESULT RevokeDragDrop(HWND hwnd)`
 pub(super) fn handle_revoke_drag_drop(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let hwnd = engine
-        .read_rcx()
-        .context("failed to read RCX for RevokeDragDrop")?;
+    let hwnd = read_arg(engine, ArgReg::Rcx, "RevokeDragDrop")?;
     ctx.state.ole32().drop_targets.remove(&hwnd);
     ctx.finish(S_OK)
 }
@@ -176,18 +165,10 @@ pub(super) fn handle_revoke_drag_drop(ctx: &mut HandlerContext<'_>) -> Result<Wi
 /// drag gracefully.
 pub(super) fn handle_do_drag_drop(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _data_object = engine
-        .read_rcx()
-        .context("failed to read RCX for DoDragDrop")?;
-    let _drop_source = engine
-        .read_rdx()
-        .context("failed to read RDX for DoDragDrop")?;
-    let _ok_effects = engine
-        .read_r8()
-        .context("failed to read R8 for DoDragDrop")?;
-    let pdw_effect = engine
-        .read_r9()
-        .context("failed to read R9 for DoDragDrop")?;
+    let _data_object = read_arg(engine, ArgReg::Rcx, "DoDragDrop")?;
+    let _drop_source = read_arg(engine, ArgReg::Rdx, "DoDragDrop")?;
+    let _ok_effects = read_arg(engine, ArgReg::R8, "DoDragDrop")?;
+    let pdw_effect = read_arg(engine, ArgReg::R9, "DoDragDrop")?;
     if pdw_effect != 0 {
         engine.mem_write(pdw_effect, &DROPEFFECT_NONE.to_le_bytes())?;
     }
@@ -200,15 +181,9 @@ pub(super) fn handle_do_drag_drop(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// is host-synthesized; there is only one interface).
 pub(super) fn handle_query_interface(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let this = engine
-        .read_rcx()
-        .context("failed to read RCX for IDataObject::QueryInterface")?;
-    let _riid = engine
-        .read_rdx()
-        .context("failed to read RDX for IDataObject::QueryInterface")?;
-    let ppv = engine
-        .read_r8()
-        .context("failed to read R8 for IDataObject::QueryInterface")?;
+    let this = read_arg(engine, ArgReg::Rcx, "IDataObject::QueryInterface")?;
+    let _riid = read_arg(engine, ArgReg::Rdx, "IDataObject::QueryInterface")?;
+    let ppv = read_arg(engine, ArgReg::R8, "IDataObject::QueryInterface")?;
     if ppv != 0 {
         engine.mem_write(ppv, &this.to_le_bytes())?;
     }
@@ -218,18 +193,14 @@ pub(super) fn handle_query_interface(ctx: &mut HandlerContext<'_>) -> Result<Win
 /// `AddRef` — the synthesized object is not reference-counted.
 pub(super) fn handle_add_ref(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _this = engine
-        .read_rcx()
-        .context("failed to read RCX for IDataObject::AddRef")?;
+    let _this = read_arg(engine, ArgReg::Rcx, "IDataObject::AddRef")?;
     ctx.finish(1)
 }
 
 /// `Release` — the synthesized object is not reference-counted.
 pub(super) fn handle_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _this = engine
-        .read_rcx()
-        .context("failed to read RCX for IDataObject::Release")?;
+    let _this = read_arg(engine, ArgReg::Rcx, "IDataObject::Release")?;
     ctx.finish(1)
 }
 
@@ -240,15 +211,9 @@ pub(super) fn handle_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 /// `DV_E_FORMATETC`.
 pub(super) fn handle_get_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _this = engine
-        .read_rcx()
-        .context("failed to read RCX for IDataObject::GetData")?;
-    let pformatetc = engine
-        .read_rdx()
-        .context("failed to read RDX for IDataObject::GetData")?;
-    let pmedium = engine
-        .read_r8()
-        .context("failed to read R8 for IDataObject::GetData")?;
+    let _this = read_arg(engine, ArgReg::Rcx, "IDataObject::GetData")?;
+    let pformatetc = read_arg(engine, ArgReg::Rdx, "IDataObject::GetData")?;
+    let pmedium = read_arg(engine, ArgReg::R8, "IDataObject::GetData")?;
     if pmedium == 0 {
         return ctx.finish(E_POINTER);
     }
@@ -282,18 +247,10 @@ pub(super) fn handle_get_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 /// (fRelease is ignored — the bytes are copied, so the caller keeps its block).
 pub(super) fn handle_set_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _this = engine
-        .read_rcx()
-        .context("failed to read RCX for IDataObject::SetData")?;
-    let pformatetc = engine
-        .read_rdx()
-        .context("failed to read RDX for IDataObject::SetData")?;
-    let pmedium = engine
-        .read_r8()
-        .context("failed to read R8 for IDataObject::SetData")?;
-    let _f_release = engine
-        .read_r9()
-        .context("failed to read R9 for IDataObject::SetData")?;
+    let _this = read_arg(engine, ArgReg::Rcx, "IDataObject::SetData")?;
+    let pformatetc = read_arg(engine, ArgReg::Rdx, "IDataObject::SetData")?;
+    let pmedium = read_arg(engine, ArgReg::R8, "IDataObject::SetData")?;
+    let _f_release = read_arg(engine, ArgReg::R9, "IDataObject::SetData")?;
     if pformatetc == 0 || pmedium == 0 {
         return ctx.finish(E_POINTER);
     }
@@ -317,9 +274,7 @@ pub(super) fn handle_enum_format_etc(ctx: &mut HandlerContext<'_>) -> Result<Win
 /// GetCanonicalFormatEtc, DAdvise, DUnadvise, EnumDAdvise).
 pub(super) fn handle_e_notimpl(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _this = engine
-        .read_rcx()
-        .context("failed to read RCX for IDataObject method")?;
+    let _this = read_arg(engine, ArgReg::Rcx, "IDataObject method")?;
     ctx.finish(E_NOTIMPL)
 }
 

@@ -36,12 +36,6 @@ impl LayoutRegion {
     pub const fn contains(&self, va: u64) -> bool {
         va >= self.base && va < self.end()
     }
-
-    /// Whether this region shares any byte with `other`.
-    #[must_use]
-    pub const fn overlaps(&self, other: &Self) -> bool {
-        self.base < other.end() && other.base < self.end()
-    }
 }
 
 /// `usize` → `u64` in const fns (`u64::try_from` is not const-callable yet).
@@ -291,6 +285,16 @@ impl RuntimeMemoryLayout {
         self.fast_api_stub.base
     }
 
+    /// Inclusive last VA of the fake-API hook window (`base + size − 1`).
+    ///
+    /// Single source for the primary quantum loop and worker-thread hook
+    /// installation so both compute the host-stop range identically. The
+    /// compile-time layout gate pins region sizes far below `u64` overflow.
+    #[must_use]
+    pub const fn fake_api_end(self) -> u64 {
+        self.fake_api.base + layout_size(self.fake_api.size) - 1
+    }
+
     /// The fixed guest regions, including the derived shadow heap.
     ///
     /// This is the set session init registers into the CPU region table and
@@ -477,6 +481,13 @@ const _: () = assert!(
 /// Default layout constants re-exported for existing call sites.
 pub const DEFAULT_LAYOUT: RuntimeMemoryLayout = RuntimeMemoryLayout::default();
 
+/// SDL2 guests: disable the DirectInput joystick driver (WIE has no
+/// DirectInput COM implementation; without the hint SDL2's dinput driver init
+/// fails → `SDL_InitSubSystem` fails → the already-initialized video
+/// subsystem is torn down). Single source so the default WinAPI environment
+/// and the default env-strings block cannot drift apart.
+const SDL_DIRECTINPUT_ENV_PAIR: (&str, &str) = ("SDL_DIRECTINPUT_ENABLED", "0");
+
 /// Fake API address region base.
 pub const FAKE_API_BASE: u64 = DEFAULT_LAYOUT.fake_api.base;
 /// Fake API address region size.
@@ -487,30 +498,6 @@ pub const PROCESS_HEAP_HANDLE: u64 = DEFAULT_LAYOUT.process_heap_handle;
 pub const PROCESS_HEAP_BASE: u64 = DEFAULT_LAYOUT.process_heap.base;
 /// Fake process heap size.
 pub const PROCESS_HEAP_SIZE: usize = DEFAULT_LAYOUT.process_heap.size;
-/// Offset used by observed Lunar Magic/CRT heap metadata accesses.
-pub const PROCESS_HEAP_SHADOW_DELTA: u64 = DEFAULT_LAYOUT.process_heap_shadow_delta;
-/// Shadow heap base.
-pub const PROCESS_HEAP_SHADOW_BASE: u64 = DEFAULT_LAYOUT.process_heap_shadow_base();
-/// Fake low TEB/TIB page base.
-pub const FAKE_TEB_LOW_BASE: u64 = DEFAULT_LAYOUT.teb_low.base;
-/// Fake low TEB/TIB page size.
-pub const FAKE_TEB_LOW_SIZE: usize = DEFAULT_LAYOUT.teb_low.size;
-/// Fake resource data base.
-pub const FAKE_RESOURCE_DATA_BASE: u64 = DEFAULT_LAYOUT.resource_data.base;
-/// Fake resource data size.
-pub const FAKE_RESOURCE_DATA_SIZE: usize = DEFAULT_LAYOUT.resource_data.size;
-/// Maximum guest instructions between fake API hooks.
-pub const ENTRY_TRACE_INSTRUCTION_BUDGET: usize = DEFAULT_LAYOUT.instruction_budget;
-/// Maximum consecutive no-hook slices.
-pub const ENTRY_TRACE_NO_HOOK_SLICE_LIMIT: usize = DEFAULT_LAYOUT.no_hook_slice_limit;
-/// Guest-code region for trivial WinAPI fast-path stubs.
-pub const FAST_API_STUB_BASE: u64 = DEFAULT_LAYOUT.fast_api_stub.base;
-/// Size of the guest-code fast-path stub region.
-pub const FAST_API_STUB_SIZE: usize = DEFAULT_LAYOUT.fast_api_stub.size;
-/// Shared `ret` stub for void synchronization APIs.
-pub const FAST_VOID_RETURN_STUB_VA: u64 = DEFAULT_LAYOUT.fast_void_return_stub_va();
-/// Return trampoline for guest WndProc invocations.
-pub const CALLBACK_RETURN_TRAMPOLINE_VA: u64 = DEFAULT_LAYOUT.callback_return_trampoline_va;
 
 pub(crate) fn default_winapi_state(
     layout: &RuntimeMemoryLayout,
@@ -528,6 +515,8 @@ pub(crate) fn default_winapi_state(
     let executable_file_size = u64::try_from(executable_file_bytes.len())
         .context("executable file size does not fit u64")?;
 
+    let (directinput_var, directinput_value) = SDL_DIRECTINPUT_ENV_PAIR;
+
     Ok(wie_winapi::WinApiState {
         heap_state: wie_winapi::HeapState {
             heap: wie_winapi::GuestHeap::new(layout.process_heap.base, heap_end),
@@ -544,11 +533,9 @@ pub(crate) fn default_winapi_state(
             main_module_host_dir: None,
             error_mode: 0,
             suspended_threads: ahash::HashMap::new(),
-            // SDL2 guests: disable the DirectInput joystick driver — WIE has
-            // no DirectInput COM implementation, and SDL2's fallback (DInput
-            // driver init failing → SDL_InitSubSystem failing → video torn
-            // down) would break the display for games that use SDL_Init.
-            environment: vec![("SDL_DIRECTINPUT_ENABLED".to_string(), "0".to_string())],
+            // SDL2 guests: disable the DirectInput joystick driver (see
+            // `SDL_DIRECTINPUT_ENV_PAIR`).
+            environment: vec![(directinput_var.to_string(), directinput_value.to_string())],
             // The main module's RT_DIALOG/RT_MENU/RT_STRING/RT_ACCELERATOR
             // resources are parsed in session init (the section map is not
             // available here).
@@ -678,16 +665,16 @@ pub(crate) fn write_utf16_string(
 }
 
 pub(crate) fn build_default_environment_strings_w() -> Result<Vec<u8>> {
-    let values = [
+    let (directinput_var, directinput_value) = SDL_DIRECTINPUT_ENV_PAIR;
+    // The SDL DirectInput pair is appended from the shared const so both env
+    // writers stay in sync.
+    let directinput_entry = format!("{directinput_var}={directinput_value}");
+    let mut values: Vec<&str> = vec![
         "PATH=C:\\Windows\\System32",
         "TEMP=C:\\Users\\WIE\\AppData\\Local\\Temp",
         "TMP=C:\\Users\\WIE\\AppData\\Local\\Temp",
-        // SDL2 guests: disable the DirectInput joystick driver (no WIE
-        // DirectInput COM). Without the hint, the dinput driver's
-        // CoCreateInstance fails → SDL_InitSubSystem fails → the already-
-        // initialized video subsystem gets torn down.
-        "SDL_DIRECTINPUT_ENABLED=0",
     ];
+    values.push(&directinput_entry);
 
     let mut bytes = Vec::new();
 

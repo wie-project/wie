@@ -116,6 +116,24 @@ pub struct FileIoState {
     pub cached_streams: HashMap<u64, std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
 }
 
+impl FileIoState {
+    /// The stored guest current directory as a host string (lossy UTF-16
+    /// decode of [`Self::current_directory_wide`]).
+    pub(crate) fn cwd_utf8(&self) -> String {
+        String::from_utf16_lossy(&self.current_directory_wide)
+    }
+
+    /// Re-sync the VFS volume config with the legacy single-volume field.
+    ///
+    /// `bottle_root` predates the multi-volume [`VolumeConfig`]; both are still
+    /// written, so every VFS consumer refreshes the shared view first.
+    pub(crate) fn sync_volumes(&mut self) {
+        if self.volumes.bottle_root != self.bottle_root {
+            self.volumes.bottle_root = self.bottle_root.clone();
+        }
+    }
+}
+
 /// Guest IAT resolver callback: (module name, import name, IAT slot) → fake VA.
 type ResolveFn = Box<dyn FnMut(&str, &str, u64) -> anyhow::Result<u64> + Send>;
 

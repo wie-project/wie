@@ -1,16 +1,15 @@
 //! `ChooseColorA` handler (simulated accept with black).
 
 use super::CDERR_NONE;
+use crate::gdi32::{ArgReg, read_arg};
 use crate::{HandlerContext, WinApiHandlerResult};
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 /// Handles `comdlg32.dll!ChooseColorA` (simulates accept with black color).
 pub fn handle_choose_color_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let choose_color_va = engine
-        .read_rcx()
-        .context("failed to read RCX for ChooseColorA")?;
+    let choose_color_va = read_arg(engine, ArgReg::Rcx, "ChooseColorA")?;
 
     state.window_state().comm_dlg_extended_error = CDERR_NONE;
 

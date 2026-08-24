@@ -115,16 +115,6 @@ impl ThreadInbox {
             Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
         )
     }
-
-    /// Block until a token arrives (no timeout). For genuinely INFINITE waits
-    /// whose every wake source sends tokens.
-    pub fn wait_forever(&self) -> Wake {
-        let rx = self.inner.rx.lock().unwrap_or_else(|p| p.into_inner());
-        match rx.recv() {
-            Ok(wake) => wake,
-            Err(std::sync::mpsc::RecvError) => Wake::Shutdown,
-        }
-    }
 }
 
 /// Guest TID → inbox registry.

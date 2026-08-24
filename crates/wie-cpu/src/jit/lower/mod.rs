@@ -466,18 +466,6 @@ pub(super) struct CompiledBlock {
     /// `None` for hand-written trampolines (late-bound chain only).
     pub func_id: Option<FuncId>,
     pub insn_count: u32,
-    /// Block touches XMM/SSE state — host must sync the XMM bank.
-    /// Pure GPR blocks skip XMM copy on entry/exit (CPU + cache win).
-    /// Retained for selective masking; the dispatcher currently syncs the
-    /// full XMM bank on entry/exit.
-    #[allow(dead_code)]
-    pub uses_sse: bool,
-    /// Bit `i` set if XMMi is referenced (selective entry load).
-    #[allow(dead_code)]
-    pub xmm_live_mask: u16,
-    /// Bit `i` set if XMMi may be written (selective exit writeback).
-    #[allow(dead_code)]
-    pub xmm_may_def_mask: u16,
     /// Guest code range covered by this block `[guest_start, guest_end)`.
     /// Used for range-selective cache invalidation on `mem_write`.
     pub guest_start: u64,
@@ -548,7 +536,7 @@ mod tlb;
 
 use analysis::{
     analyze_def_xmm, analyze_live_gprs, analyze_live_xmm, block_has_fp, block_has_mem,
-    block_has_string, block_needs_flags, load_xmm_pair, xmm_mask_from,
+    block_has_string, block_needs_flags, load_xmm_pair,
 };
 use emit::{
     MemEnv, SuperStack, emit_block_wide_stack_guard, emit_body_and_term, term_chain_targets,
@@ -592,8 +580,6 @@ pub(super) fn compile_block(
     let live = analyze_live_gprs(insns);
     let live_xmm = analyze_live_xmm(insns);
     let def_xmm = analyze_def_xmm(insns);
-    let xmm_live_mask = xmm_mask_from(&live_xmm);
-    let xmm_may_def_mask = xmm_mask_from(&def_xmm);
     let needs_flags = block_needs_flags(insns, term);
     let has_fast_call = call_fast.is_some();
     let has_mem = block_has_mem(insns)
@@ -1214,9 +1200,6 @@ pub(super) fn compile_block(
         func,
         func_id: Some(func_id),
         insn_count: u32::try_from(insns.len()).unwrap_or(0),
-        uses_sse: has_sse || has_fp,
-        xmm_live_mask,
-        xmm_may_def_mask,
         guest_start: start_rip,
         guest_end,
     })

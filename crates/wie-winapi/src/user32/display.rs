@@ -4,6 +4,7 @@ use super::{
     checked_address, write_guest_fixed_ansi, write_guest_fixed_utf16, write_guest_i32,
     write_guest_u32,
 };
+use crate::gdi32::{ArgReg, read_arg};
 
 pub(crate) fn write_fake_monitor_info(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -152,9 +153,7 @@ pub(crate) fn fake_system_metric(metric_index: u64) -> u64 {
 /// Handles `USER32.dll!GetSystemMetrics`.
 pub fn handle_get_system_metrics(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let metric_index = engine
-        .read_rcx()
-        .context("failed to read RCX for GetSystemMetrics")?;
+    let metric_index = read_arg(engine, ArgReg::Rcx, "GetSystemMetrics")?;
 
     let return_value = fake_system_metric(metric_index);
 
@@ -163,26 +162,18 @@ pub fn handle_get_system_metrics(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 /// Handles dynamic `USER32.dll!MonitorFromWindow`.
 pub fn handle_monitor_from_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for MonitorFromWindow")?;
+    let _window_handle = read_arg(engine, ArgReg::Rcx, "MonitorFromWindow")?;
 
-    let _flags = engine
-        .read_rdx()
-        .context("failed to read RDX for MonitorFromWindow")?;
+    let _flags = read_arg(engine, ArgReg::Rdx, "MonitorFromWindow")?;
 
     ctx.finish(FAKE_MONITOR_HANDLE)
 }
 /// Handles dynamic `USER32.dll!GetMonitorInfoA`.
 pub fn handle_get_monitor_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let monitor_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetMonitorInfoA")?;
+    let monitor_handle = read_arg(engine, ArgReg::Rcx, "GetMonitorInfoA")?;
 
-    let monitor_info_va = engine
-        .read_rdx()
-        .context("failed to read RDX for GetMonitorInfoA")?;
+    let monitor_info_va = read_arg(engine, ArgReg::Rdx, "GetMonitorInfoA")?;
 
     let success = monitor_handle == FAKE_MONITOR_HANDLE && monitor_info_va != 0;
 
@@ -197,13 +188,9 @@ pub fn handle_get_monitor_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 /// Handles dynamic `USER32.dll!GetMonitorInfoW`.
 pub fn handle_get_monitor_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let monitor_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetMonitorInfoW")?;
+    let monitor_handle = read_arg(engine, ArgReg::Rcx, "GetMonitorInfoW")?;
 
-    let monitor_info_va = engine
-        .read_rdx()
-        .context("failed to read RDX for GetMonitorInfoW")?;
+    let monitor_info_va = read_arg(engine, ArgReg::Rdx, "GetMonitorInfoW")?;
 
     let success = monitor_handle == FAKE_MONITOR_HANDLE && monitor_info_va != 0;
 
@@ -218,26 +205,18 @@ pub fn handle_get_monitor_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 /// Handles dynamic `USER32.dll!MonitorFromRect`.
 pub fn handle_monitor_from_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _rect_va = engine
-        .read_rcx()
-        .context("failed to read RCX for MonitorFromRect")?;
+    let _rect_va = read_arg(engine, ArgReg::Rcx, "MonitorFromRect")?;
 
-    let _flags = engine
-        .read_rdx()
-        .context("failed to read RDX for MonitorFromRect")?;
+    let _flags = read_arg(engine, ArgReg::Rdx, "MonitorFromRect")?;
 
     ctx.finish(FAKE_MONITOR_HANDLE)
 }
 /// Handles dynamic `USER32.dll!MonitorFromPoint`.
 pub fn handle_monitor_from_point(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _point_low = engine
-        .read_rcx()
-        .context("failed to read RCX for MonitorFromPoint")?;
+    let _point_low = read_arg(engine, ArgReg::Rcx, "MonitorFromPoint")?;
 
-    let _flags = engine
-        .read_rdx()
-        .context("failed to read RDX for MonitorFromPoint")?;
+    let _flags = read_arg(engine, ArgReg::Rdx, "MonitorFromPoint")?;
 
     ctx.finish(FAKE_MONITOR_HANDLE)
 }
@@ -256,21 +235,13 @@ pub fn handle_monitor_from_point(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 /// initialized".
 pub fn handle_enum_display_monitors(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _device_context = engine
-        .read_rcx()
-        .context("failed to read RCX for EnumDisplayMonitors")?;
+    let _device_context = read_arg(engine, ArgReg::Rcx, "EnumDisplayMonitors")?;
 
-    let _clip_rect_va = engine
-        .read_rdx()
-        .context("failed to read RDX for EnumDisplayMonitors")?;
+    let _clip_rect_va = read_arg(engine, ArgReg::Rdx, "EnumDisplayMonitors")?;
 
-    let callback_va = engine
-        .read_r8()
-        .context("failed to read R8 for EnumDisplayMonitors")?;
+    let callback_va = read_arg(engine, ArgReg::R8, "EnumDisplayMonitors")?;
 
-    let callback_data = engine
-        .read_r9()
-        .context("failed to read R9 for EnumDisplayMonitors")?;
+    let callback_data = read_arg(engine, ArgReg::R9, "EnumDisplayMonitors")?;
 
     if callback_va == 0 {
         // A NULL callback is invalid per Win32, but fail soft and report
@@ -317,21 +288,13 @@ pub fn handle_enum_display_monitors(ctx: &mut HandlerContext<'_>) -> Result<WinA
 /// Handles dynamic `USER32.dll!EnumDisplayDevicesA`.
 pub fn handle_enum_display_devices_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _device_name_va = engine
-        .read_rcx()
-        .context("failed to read RCX for EnumDisplayDevicesA")?;
+    let _device_name_va = read_arg(engine, ArgReg::Rcx, "EnumDisplayDevicesA")?;
 
-    let device_index = engine
-        .read_rdx()
-        .context("failed to read RDX for EnumDisplayDevicesA")?;
+    let device_index = read_arg(engine, ArgReg::Rdx, "EnumDisplayDevicesA")?;
 
-    let display_device_va = engine
-        .read_r8()
-        .context("failed to read R8 for EnumDisplayDevicesA")?;
+    let display_device_va = read_arg(engine, ArgReg::R8, "EnumDisplayDevicesA")?;
 
-    let _flags = engine
-        .read_r9()
-        .context("failed to read R9 for EnumDisplayDevicesA")?;
+    let _flags = read_arg(engine, ArgReg::R9, "EnumDisplayDevicesA")?;
 
     let success = device_index == 0 && display_device_va != 0;
 
@@ -387,21 +350,13 @@ pub fn handle_enum_display_devices_a(ctx: &mut HandlerContext<'_>) -> Result<Win
 /// Handles dynamic `USER32.dll!EnumDisplayDevicesW`.
 pub fn handle_enum_display_devices_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _device_name_va = engine
-        .read_rcx()
-        .context("failed to read RCX for EnumDisplayDevicesW")?;
+    let _device_name_va = read_arg(engine, ArgReg::Rcx, "EnumDisplayDevicesW")?;
 
-    let device_index = engine
-        .read_rdx()
-        .context("failed to read RDX for EnumDisplayDevicesW")?;
+    let device_index = read_arg(engine, ArgReg::Rdx, "EnumDisplayDevicesW")?;
 
-    let display_device_va = engine
-        .read_r8()
-        .context("failed to read R8 for EnumDisplayDevicesW")?;
+    let display_device_va = read_arg(engine, ArgReg::R8, "EnumDisplayDevicesW")?;
 
-    let _flags = engine
-        .read_r9()
-        .context("failed to read R9 for EnumDisplayDevicesW")?;
+    let _flags = read_arg(engine, ArgReg::R9, "EnumDisplayDevicesW")?;
 
     let success = device_index == 0 && display_device_va != 0;
 
@@ -470,13 +425,9 @@ pub fn handle_get_system_metrics_for_dpi(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let metric_index = engine
-        .read_rcx()
-        .context("failed to read RCX for GetSystemMetricsForDpi")?;
+    let metric_index = read_arg(engine, ArgReg::Rcx, "GetSystemMetricsForDpi")?;
 
-    let dpi = engine
-        .read_rdx()
-        .context("failed to read RDX for GetSystemMetricsForDpi")?;
+    let dpi = read_arg(engine, ArgReg::Rdx, "GetSystemMetricsForDpi")?;
 
     let base_value = fake_system_metric(metric_index);
     let return_value = scale_system_metric_for_dpi(base_value, dpi)?;

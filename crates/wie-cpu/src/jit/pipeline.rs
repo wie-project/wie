@@ -150,17 +150,6 @@ impl JitCpu {
         self.invalidate_chain_and_shadow();
     }
 
-    // `fast_api_kind` was the on-demand helper used by the old peek loop;
-    // `block_kind_ends_in_fast_ucrt` inlines the same lookup on the miss path.
-    // Kept accessible for future callers (e.g. non-Pure fast-API detection).
-    #[allow(dead_code)]
-    #[inline]
-    fn fast_api_kind(&self, va: u64) -> Option<FastApiKind> {
-        self.fast_api
-            .iter()
-            .find_map(|&(k, kind)| (k == va).then_some(kind))
-    }
-
     pub(super) fn insert_ready(&mut self, rip: u64, compiled: CompiledBlock) {
         self.shared.insert_ready(rip, compiled);
     }

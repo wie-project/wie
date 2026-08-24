@@ -8,6 +8,7 @@
 //! notepad imports the import census flagged as unhandled; none are hot-path.
 
 use super::{Context, HandlerContext, Result, WinApiHandlerResult, read_guest_utf16_lossy};
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_memory::read_u64;
 
 /// Cap for a `CharUpperW` in-place string read and a `wsprintfW` format read.
@@ -50,9 +51,7 @@ pub(crate) fn dispatch_charfmt(
 /// BMP text exactly).
 pub(crate) fn handle_char_upper_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let value = engine
-        .read_rcx()
-        .context("failed to read RCX for CharUpperW")?;
+    let value = read_arg(engine, ArgReg::Rcx, "CharUpperW")?;
     if value < 0x1_0000 {
         let unit = u16::try_from(value).unwrap_or(0);
         // ASCII-only uppercase: 'a'..='z' → 'A'..='Z', identity otherwise
@@ -85,15 +84,9 @@ pub(crate) fn handle_char_upper_w(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 /// matters for DBCS lead-byte handling, which is out of scope.
 pub(crate) fn handle_char_prev_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let start = engine
-        .read_rcx()
-        .context("failed to read RCX for CharPrevExA")?;
-    let current = engine
-        .read_rdx()
-        .context("failed to read RDX for CharPrevExA")?;
-    let _flags = engine
-        .read_r8()
-        .context("failed to read R8 for CharPrevExA")?;
+    let start = read_arg(engine, ArgReg::Rcx, "CharPrevExA")?;
+    let current = read_arg(engine, ArgReg::Rdx, "CharPrevExA")?;
+    let _flags = read_arg(engine, ArgReg::R8, "CharPrevExA")?;
 
     let previous = if current > start { current - 1 } else { start };
     ctx.finish(previous)
@@ -106,10 +99,7 @@ pub(crate) fn handle_char_prev_ex_a(ctx: &mut HandlerContext<'_>) -> Result<WinA
 pub(crate) fn handle_set_process_default_layout(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    let _layout = ctx
-        .engine
-        .read_rcx()
-        .context("failed to read RCX for SetProcessDefaultLayout")?;
+    let _layout = read_arg(ctx.engine, ArgReg::Rcx, "SetProcessDefaultLayout")?;
     ctx.finish(1)
 }
 
@@ -118,22 +108,10 @@ pub(crate) fn handle_set_process_default_layout(
 /// The help viewer is not emulated; the call is accepted so the guest keeps
 /// running (Windows help is a UX nicety, never load-bearing).
 pub(crate) fn handle_win_help_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let _hwnd = ctx
-        .engine
-        .read_rcx()
-        .context("failed to read RCX for WinHelpW")?;
-    let _help_file = ctx
-        .engine
-        .read_rdx()
-        .context("failed to read RDX for WinHelpW")?;
-    let _command = ctx
-        .engine
-        .read_r8()
-        .context("failed to read R8 for WinHelpW")?;
-    let _data = ctx
-        .engine
-        .read_r9()
-        .context("failed to read R9 for WinHelpW")?;
+    let _hwnd = read_arg(ctx.engine, ArgReg::Rcx, "WinHelpW")?;
+    let _help_file = read_arg(ctx.engine, ArgReg::Rdx, "WinHelpW")?;
+    let _command = read_arg(ctx.engine, ArgReg::R8, "WinHelpW")?;
+    let _data = read_arg(ctx.engine, ArgReg::R9, "WinHelpW")?;
     ctx.finish(1)
 }
 
@@ -152,21 +130,13 @@ pub(crate) fn handle_win_help_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 /// Returns the number of characters written, excluding the terminating NUL.
 pub(crate) fn handle_wsprintf_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let out_va = engine
-        .read_rcx()
-        .context("failed to read RCX for wsprintfW")?;
-    let fmt_va = engine
-        .read_rdx()
-        .context("failed to read RDX for wsprintfW")?;
+    let out_va = read_arg(engine, ArgReg::Rcx, "wsprintfW")?;
+    let fmt_va = read_arg(engine, ArgReg::Rdx, "wsprintfW")?;
     if out_va == 0 || fmt_va == 0 {
         return ctx.finish(0);
     }
-    let first_vararg = engine
-        .read_r8()
-        .context("failed to read R8 for wsprintfW")?;
-    let second_vararg = engine
-        .read_r9()
-        .context("failed to read R9 for wsprintfW")?;
+    let first_vararg = read_arg(engine, ArgReg::R8, "wsprintfW")?;
+    let second_vararg = read_arg(engine, ArgReg::R9, "wsprintfW")?;
     let rsp = engine
         .read_rsp()
         .context("failed to read RSP for wsprintfW")?;

@@ -630,30 +630,8 @@ pub(crate) fn run_console_interactive(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
     use std::path::PathBuf;
-
-    /// Unique temp dir under the system temp dir; removed on drop.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("wie-bottle-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).expect("create temp dir");
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     /// A real file the staging can copy.
     fn fake_exe(dir: &Path, name: &str) -> PathBuf {

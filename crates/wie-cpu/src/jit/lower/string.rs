@@ -2,9 +2,9 @@
 //! and `lower_string`.
 
 use super::super::config::JitConfig;
-use super::emit::{MemEnv, exit_args};
+use super::OFF_RFLAGS;
+use super::emit::{MemEnv, check_fault_after_ucrt};
 use super::flags::iconst_u64;
-use super::{OFF_FAULT, OFF_RFLAGS};
 
 use super::super::block::string_op_size;
 
@@ -200,14 +200,7 @@ pub(super) fn try_lower_inline_rep(
         slow_gpr[i] = bcx.ins().load(types::I64, mem.flags, p, 0);
     }
     let slow_flags = bcx.ins().load(types::I64, mem.flags, rflags_ptr, 0);
-    let fault_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_FAULT));
-    let fault = bcx.ins().load(types::I64, mem.flags, fault_ptr, 0);
-    let is_fault = bcx.ins().icmp_imm(IntCC::NotEqual, fault, 0);
-    let cont = bcx.create_block();
-    let args = exit_args(&slow_gpr, slow_flags);
-    bcx.ins().brif(is_fault, mem.exit, &args, cont, &[]);
-    bcx.switch_to_block(cont);
-    bcx.seal_block(cont);
+    check_fault_after_ucrt(bcx, mem, &slow_gpr, slow_flags);
     let stay_nz = bcx.ins().icmp_imm(IntCC::NotEqual, stay, 0);
     let cur_ip = iconst_u64(bcx, instr.ip());
     let next_ip = iconst_u64(bcx, instr.next_ip());
@@ -474,14 +467,7 @@ pub(super) fn lower_string(
     *rflags = bcx.ins().load(types::I64, mem.flags, rflags_ptr, 0);
 
     // Fault check (exit_args now hold post-helper state).
-    let fault_ptr = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_FAULT));
-    let fault = bcx.ins().load(types::I64, mem.flags, fault_ptr, 0);
-    let is_fault = bcx.ins().icmp_imm(IntCC::NotEqual, fault, 0);
-    let cont = bcx.create_block();
-    let args = exit_args(gpr, *rflags);
-    bcx.ins().brif(is_fault, mem.exit, &args, cont, &[]);
-    bcx.switch_to_block(cont);
-    bcx.seal_block(cont);
+    check_fault_after_ucrt(bcx, mem, gpr, *rflags);
 
     let next = iconst_u64(bcx, instr.next_ip());
     let cur = iconst_u64(bcx, instr.ip());

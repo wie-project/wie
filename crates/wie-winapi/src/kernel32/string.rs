@@ -11,6 +11,18 @@ use crate::user32::low_i32;
 /// bogus pointer therefore cannot make the guest stall forever.
 const MAX_LSTR_SCAN: u64 = 1_000_000;
 
+/// Read one UTF-16 unit at `va + byte_off` (cold-path scalar read).
+///
+/// The single home of the two-byte `mem_read` + LE decode the `lstr*W`
+/// scanners and `CompareStringW` previously repeated.
+fn read_utf16_unit_at(engine: &mut dyn wie_cpu::CpuEngine, va: u64, byte_off: u64) -> Result<u16> {
+    let mut buf = [0_u8; 2];
+    engine
+        .mem_read(checked_address(va, byte_off, "UTF-16 unit"), &mut buf)
+        .context("failed to read guest UTF-16 unit")?;
+    Ok(u16::from_le_bytes(buf))
+}
+
 /// Handles `KERNEL32.dll!lstrlenW`.
 pub fn handle_lstrlen_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -22,9 +34,7 @@ pub fn handle_lstrlen_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     } else {
         let mut len = 0_u64;
         loop {
-            let mut buf = [0_u8; 2];
-            engine.mem_read(s.wrapping_add(len.saturating_mul(2)), &mut buf)?;
-            if u16::from_le_bytes(buf) == 0 {
+            if read_utf16_unit_at(engine, s, len.saturating_mul(2))? == 0 {
                 break;
             }
             len = len.saturating_add(1);
@@ -48,10 +58,9 @@ pub fn handle_lstrcpy_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     if dest != 0 && src != 0 {
         let mut offset = 0_u64;
         loop {
-            let mut buf = [0_u8; 2];
-            engine.mem_read(src.wrapping_add(offset), &mut buf)?;
-            engine.mem_write(dest.wrapping_add(offset), &buf)?;
-            if u16::from_le_bytes(buf) == 0 {
+            let unit = read_utf16_unit_at(engine, src, offset)?;
+            write_guest_u16(engine, dest.wrapping_add(offset), unit)?;
+            if unit == 0 {
                 break;
             }
             offset = offset.saturating_add(2);
@@ -75,9 +84,7 @@ pub fn handle_lstrcat_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         // Find end of dest.
         let mut dest_end = 0_u64;
         loop {
-            let mut buf = [0_u8; 2];
-            engine.mem_read(dest.wrapping_add(dest_end), &mut buf)?;
-            if u16::from_le_bytes(buf) == 0 {
+            if read_utf16_unit_at(engine, dest, dest_end)? == 0 {
                 break;
             }
             dest_end = dest_end.saturating_add(2);
@@ -87,10 +94,13 @@ pub fn handle_lstrcat_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         }
         let mut offset = 0_u64;
         loop {
-            let mut buf = [0_u8; 2];
-            engine.mem_read(src.wrapping_add(offset), &mut buf)?;
-            engine.mem_write(dest.wrapping_add(dest_end).wrapping_add(offset), &buf)?;
-            if u16::from_le_bytes(buf) == 0 {
+            let unit = read_utf16_unit_at(engine, src, offset)?;
+            write_guest_u16(
+                engine,
+                dest.wrapping_add(dest_end).wrapping_add(offset),
+                unit,
+            )?;
+            if unit == 0 {
                 break;
             }
             offset = offset.saturating_add(2);
@@ -471,15 +481,7 @@ pub fn handle_multi_byte_to_wide_char(ctx: &mut HandlerContext<'_>) -> Result<Wi
             state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
             0
         } else {
-            // Bulk LE write without per-unit extend_from_slice.
-            let mut output_bytes = vec![0_u8; units.len().saturating_mul(2)];
-            for (i, unit) in units.iter().enumerate() {
-                let o = i.saturating_mul(2);
-                let end = o.saturating_add(2);
-                if let Some(dst) = output_bytes.get_mut(o..end) {
-                    dst.copy_from_slice(&unit.to_le_bytes());
-                }
-            }
+            let output_bytes = crate::guest_string::utf16_units_to_le(&units);
             engine
                 .mem_write(output_va, &output_bytes)
                 .context("failed to write MultiByteToWideChar output")?;
@@ -531,16 +533,7 @@ pub fn handle_lc_map_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         if dest_len_usize < source_units.len() {
             0
         } else {
-            let output_byte_len = source_units
-                .len()
-                .checked_mul(2)
-                .context("LCMapStringW output byte length overflow")?;
-
-            let mut output_bytes = Vec::with_capacity(output_byte_len);
-
-            for unit in &source_units {
-                output_bytes.extend_from_slice(&unit.to_le_bytes());
-            }
+            let output_bytes = crate::guest_string::utf16_units_to_le(&source_units);
 
             engine
                 .mem_write(dest_va, &output_bytes)
@@ -600,14 +593,8 @@ pub fn handle_compare_string_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         let count = usize::try_from(len).unwrap_or(0);
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
-            let mut b = [0_u8; 2];
-            engine
-                .mem_read(
-                    va.wrapping_add(u64::try_from(i).unwrap_or(0).wrapping_mul(2)),
-                    &mut b,
-                )
-                .context("failed to read CompareStringW unit")?;
-            out.push(u16::from_le_bytes(b));
+            let byte_off = u64::try_from(i).unwrap_or(0).wrapping_mul(2);
+            out.push(read_utf16_unit_at(engine, va, byte_off)?);
         }
         Ok(out)
     };

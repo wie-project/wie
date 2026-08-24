@@ -101,16 +101,6 @@ pub fn dispatch_oleaut32(
     }
 }
 
-fn finish(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandlerResult> {
-    let return_address = engine
-        .return_from_win64_api(value)
-        .context("OLEAUT32 return")?;
-    Ok(WinApiHandlerResult {
-        return_address,
-        return_value: value,
-    })
-}
-
 /// BSTR layout: 4-byte length prefix (byte count), then UTF-16 data + 2-byte NUL.
 fn alloc_bstr(
     engine: &mut dyn wie_cpu::CpuEngine,
@@ -144,7 +134,7 @@ fn handle_sys_alloc_string(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let state = &mut *ctx.state;
     let src = engine.read_rcx()?;
     if src == 0 {
-        return finish(engine, 0);
+        return ctx.finish(0);
     }
     let mut units = Vec::new();
     let mut i = 0_u64;
@@ -162,7 +152,7 @@ fn handle_sys_alloc_string(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         }
     }
     let bstr = alloc_bstr(engine, state, &units)?;
-    finish(engine, bstr)
+    ctx.finish(bstr)
 }
 
 /// `BSTR SysAllocStringLen(const OLECHAR*, UINT)`.
@@ -182,7 +172,7 @@ fn handle_sys_alloc_string_len(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         }
     }
     let bstr = alloc_bstr(engine, state, &units)?;
-    finish(engine, bstr)
+    ctx.finish(bstr)
 }
 
 /// `void SysFreeString(BSTR)`.
@@ -197,7 +187,7 @@ fn handle_sys_free_string(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
             .heap
             .free_coherent(engine, bstr.wrapping_sub(4));
     }
-    finish(engine, 0)
+    ctx.finish(0)
 }
 
 /// `UINT SysStringLen(BSTR)`.
@@ -205,12 +195,12 @@ fn handle_sys_string_len(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
     let engine = &mut *ctx.engine;
     let bstr = engine.read_rcx()?;
     if bstr == 0 {
-        return finish(engine, 0);
+        return ctx.finish(0);
     }
     let mut len_bytes = [0_u8; 4];
     engine.mem_read(bstr.wrapping_sub(4), &mut len_bytes)?;
     let byte_len = u32::from_le_bytes(len_bytes);
-    finish(engine, u64::from(byte_len.wrapping_shr(1)))
+    ctx.finish(u64::from(byte_len.wrapping_shr(1)))
 }
 
 /// `UINT SysStringByteLen(BSTR)`.
@@ -218,11 +208,11 @@ fn handle_sys_string_byte_len(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let engine = &mut *ctx.engine;
     let bstr = engine.read_rcx()?;
     if bstr == 0 {
-        return finish(engine, 0);
+        return ctx.finish(0);
     }
     let mut len_bytes = [0_u8; 4];
     engine.mem_read(bstr.wrapping_sub(4), &mut len_bytes)?;
-    finish(engine, u64::from(u32::from_le_bytes(len_bytes)))
+    ctx.finish(u64::from(u32::from_le_bytes(len_bytes)))
 }
 
 /// `void VariantInit(VARIANTARG*)` — set VT_EMPTY.
@@ -232,7 +222,7 @@ fn handle_variant_init(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
     if pvar != 0 {
         engine.mem_write(pvar, &[0_u8; 24])?;
     }
-    finish(engine, 0)
+    ctx.finish(0)
 }
 
 /// x64 `VARIANT` / `PROPVARIANT` payload size (vt + reserved + union).
@@ -357,7 +347,7 @@ fn handle_variant_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     let state = &mut *ctx.state;
     let pvar = engine.read_rcx()?;
     variant_clear_at(engine, state, pvar)?;
-    finish(engine, 0) // S_OK
+    ctx.finish(0) // S_OK
 }
 
 /// `HRESULT VariantCopy(VARIANTARG* dest, const VARIANTARG* src)`.
@@ -371,10 +361,10 @@ fn handle_variant_copy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
     let src = engine.read_rdx()?;
     if dest == 0 || src == 0 {
         // Real OLEAUT32 returns `E_INVALIDARG` for null pointers.
-        return finish(engine, E_INVALIDARG);
+        return ctx.finish(E_INVALIDARG);
     }
     if dest == src {
-        return finish(engine, 0);
+        return ctx.finish(0);
     }
 
     let src_vt = read_vt(engine, src)?;
@@ -387,7 +377,7 @@ fn handle_variant_copy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
         let new_bstr = dup_bstr(engine, state, src_bstr)?;
         if src_bstr != 0 && new_bstr == 0 {
             // Out of memory.
-            return finish(engine, E_OUTOFMEMORY);
+            return ctx.finish(E_OUTOFMEMORY);
         }
         // vt = VT_BSTR, reserved zeros, bstrVal = new_bstr
         engine.mem_write(dest, &VT_BSTR.to_le_bytes())?;
@@ -395,7 +385,7 @@ fn handle_variant_copy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
         engine.mem_write(dest.wrapping_add(VARIANT_DATA_OFF), &new_bstr.to_le_bytes())?;
         // Zero high padding of the 24-byte VARIANT if any remainder exists.
         // Data field is 8 bytes at +8; total 16 used + 8 pad already covered by clear.
-        return finish(engine, 0);
+        return ctx.finish(0);
     }
 
     // Simple / non-owning types: bitwise copy of the 24-byte x64 VARIANT.
@@ -403,7 +393,7 @@ fn handle_variant_copy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
     let mut buf = [0_u8; VARIANT_SIZE];
     engine.mem_read(src, &mut buf)?;
     engine.mem_write(dest, &buf)?;
-    finish(engine, 0)
+    ctx.finish(0)
 }
 
 // ── Variant arithmetic ─────────────────────────────────────────────────────
@@ -417,7 +407,7 @@ fn handle_var_math(ctx: &mut HandlerContext<'_>, op: &str) -> Result<WinApiHandl
     let plhs = engine.read_rdx()?;
     let prhs = engine.read_r8()?;
     if presult == 0 || plhs == 0 || prhs == 0 {
-        return finish(engine, E_INVALIDARG);
+        return ctx.finish(E_INVALIDARG);
     }
     let (lvt, lhs_val) = read_variant_num(engine, plhs)?;
     let (rvt, rhs_val) = read_variant_num(engine, prhs)?;
@@ -432,21 +422,21 @@ fn handle_var_math(ctx: &mut HandlerContext<'_>, op: &str) -> Result<WinApiHandl
             if rhs_val == 0 {
                 // Clear result to VT_EMPTY and return error
                 engine.mem_write(presult, &[0_u8; VARIANT_SIZE])?;
-                return finish(engine, DISP_E_DIVBYZERO);
+                return ctx.finish(DISP_E_DIVBYZERO);
             }
             lhs_val / rhs_val
         }
         "varmod" | "mod" => {
             if rhs_val == 0 {
                 engine.mem_write(presult, &[0_u8; VARIANT_SIZE])?;
-                return finish(engine, DISP_E_DIVBYZERO);
+                return ctx.finish(DISP_E_DIVBYZERO);
             }
             lhs_val % rhs_val
         }
         _ => 0,
     };
     write_variant_num(engine, presult, out_vt, result)?;
-    finish(engine, 0) // S_OK
+    ctx.finish(0) // S_OK
 }
 
 // ── Variant type conversions: BSTR ← number ────────────────────────────────
@@ -463,7 +453,7 @@ fn handle_var_bstr_from_num(
     let presult = engine.read_rcx()?;
     let raw_val = engine.read_rdx()?;
     if presult == 0 {
-        return finish(engine, E_INVALIDARG);
+        return ctx.finish(E_INVALIDARG);
     }
     let s = match src_vt {
         VT_I4 => format!("{}", raw_val as i32),
@@ -472,7 +462,7 @@ fn handle_var_bstr_from_num(
             f32::from_bits(u32::try_from(raw_val & 0xffff_ffff).unwrap_or(0))
         ),
         VT_R8 | VT_DATE => format!("{}", f64::from_bits(raw_val)),
-        _ => return finish(engine, DISP_E_MEMBERNOTFOUND),
+        _ => return ctx.finish(DISP_E_MEMBERNOTFOUND),
     };
     let units: Vec<u16> = s.encode_utf16().collect();
     let bstr = alloc_bstr(engine, state, &units)?;
@@ -480,7 +470,7 @@ fn handle_var_bstr_from_num(
     engine.mem_write(presult.wrapping_add(2), &[0_u8; 6])?;
     engine.mem_write(presult.wrapping_add(VARIANT_DATA_OFF), &bstr.to_le_bytes())?;
     engine.mem_write(presult.wrapping_add(16), &[0_u8; 8])?;
-    finish(engine, 0) // S_OK
+    ctx.finish(0) // S_OK
 }
 
 // ── Variant type conversions: number ← BSTR ────────────────────────────────
@@ -496,19 +486,19 @@ fn handle_var_num_from_bstr(
     let presult = engine.read_rcx()?;
     let psrc = engine.read_rdx()?;
     if presult == 0 || psrc == 0 {
-        return finish(engine, E_INVALIDARG);
+        return ctx.finish(E_INVALIDARG);
     }
     let vt = read_vt(engine, psrc)?;
     if vt != VT_BSTR {
         // Try to read a numeric source and convert directly.
         let (_svt, val) = read_variant_num(engine, psrc)?;
         write_variant_num(engine, presult, out_vt, val)?;
-        return finish(engine, 0);
+        return ctx.finish(0);
     }
     let bstr = read_bstr_field(engine, psrc)?;
     if bstr == 0 {
         write_variant_num(engine, presult, out_vt, 0)?;
-        return finish(engine, 0);
+        return ctx.finish(0);
     }
     let mut len_bytes = [0_u8; 4];
     engine.mem_read(bstr.wrapping_sub(4), &mut len_bytes)?;
@@ -531,7 +521,7 @@ fn handle_var_num_from_bstr(
         _ => 0,
     };
     write_variant_num(engine, presult, out_vt, val)?;
-    finish(engine, 0)
+    ctx.finish(0)
 }
 
 // ── Variant type conversions: num ← num ────────────────────────────────────
@@ -548,11 +538,11 @@ fn handle_var_num_from_num(
     let presult = engine.read_rcx()?;
     let psrc = engine.read_rdx()?;
     if presult == 0 || psrc == 0 {
-        return finish(engine, E_INVALIDARG);
+        return ctx.finish(E_INVALIDARG);
     }
     let (_svt, val) = read_variant_num(engine, psrc)?;
     write_variant_num(engine, presult, out_vt, val)?;
-    finish(engine, 0)
+    ctx.finish(0)
 }
 
 // ── SafeArray family ───────────────────────────────────────────────────────
@@ -637,7 +627,7 @@ fn handle_safe_array_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let cb_elements = engine.read_r8()? & 0xffff_ffff;
     let n_dims = usize::try_from(c_dims).unwrap_or(0);
     if n_dims == 0 || n_dims > 32 || rg_bounds == 0 {
-        return finish(engine, 0);
+        return ctx.finish(0);
     }
     let mut dims = Vec::with_capacity(n_dims);
     let mut total_bytes = 1_u64;
@@ -659,7 +649,7 @@ fn handle_safe_array_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         .heap
         .alloc_coherent(engine, total_bytes);
     if data_va == 0 {
-        return finish(engine, 0); // OOM — SafeArrayCreate returns NULL
+        return ctx.finish(0); // OOM — SafeArrayCreate returns NULL
     }
     zero_guest(engine, data_va, total_bytes)?;
     let handle = next_sa_handle();
@@ -671,7 +661,7 @@ fn handle_safe_array_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
             element_size: cb_elements,
         },
     ));
-    finish(engine, handle)
+    ctx.finish(handle)
 }
 
 /// `HRESULT SafeArrayDestroy(SAFEARRAY *psa)`
@@ -689,9 +679,9 @@ fn handle_safe_array_destroy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
                 .heap
                 .free_coherent(engine, data.data_va);
         }
-        finish(engine, 0) // S_OK
+        ctx.finish(0) // S_OK
     } else {
-        finish(engine, E_INVALIDARG)
+        ctx.finish(E_INVALIDARG)
     }
 }
 
@@ -709,9 +699,9 @@ fn handle_safe_array_access_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         if ppv != 0 {
             engine.mem_write(ppv, &data_va.to_le_bytes())?;
         }
-        finish(engine, 0) // S_OK
+        ctx.finish(0) // S_OK
     } else {
-        finish(engine, E_INVALIDARG)
+        ctx.finish(E_INVALIDARG)
     }
 }
 
@@ -720,7 +710,7 @@ fn handle_safe_array_unaccess_data(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     let engine = &mut *ctx.engine;
     let psa = engine.read_rcx()?;
     let found = sa_table().iter().any(|(h, _)| *h == psa);
-    finish(engine, if found { 0 } else { E_INVALIDARG })
+    ctx.finish(if found { 0 } else { E_INVALIDARG })
 }
 
 /// `HRESULT SafeArrayGetElement(SAFEARRAY *psa, LONG *rgIndices, void *pvOut)`
@@ -731,10 +721,10 @@ fn handle_safe_array_get_element(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let pv_out = engine.read_r8()?;
     let table = sa_table();
     let Some(data) = table.iter().find(|(h, _)| *h == psa).map(|(_, d)| d) else {
-        return finish(engine, E_INVALIDARG);
+        return ctx.finish(E_INVALIDARG);
     };
     let Some(off) = flat_offset(engine, data, rg_indices)? else {
-        return finish(engine, E_INVALIDARG);
+        return ctx.finish(E_INVALIDARG);
     };
     let n = usize::try_from(data.element_size).unwrap_or(0);
     let mut buf = vec![0_u8; n];
@@ -742,7 +732,7 @@ fn handle_safe_array_get_element(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     if pv_out != 0 {
         engine.mem_write(pv_out, &buf)?;
     }
-    finish(engine, 0) // S_OK
+    ctx.finish(0) // S_OK
 }
 
 /// `HRESULT SafeArrayPutElement(SAFEARRAY *psa, LONG *rgIndices, void *pvIn)`
@@ -753,10 +743,10 @@ fn handle_safe_array_put_element(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let pv_in = engine.read_r8()?;
     let table = sa_table();
     let Some(data) = table.iter().find(|(h, _)| *h == psa).map(|(_, d)| d) else {
-        return finish(engine, E_INVALIDARG);
+        return ctx.finish(E_INVALIDARG);
     };
     let Some(off) = flat_offset(engine, data, rg_indices)? else {
-        return finish(engine, E_INVALIDARG);
+        return ctx.finish(E_INVALIDARG);
     };
     let n = usize::try_from(data.element_size).unwrap_or(0);
     let mut buf = vec![0_u8; n];
@@ -764,7 +754,7 @@ fn handle_safe_array_put_element(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
         engine.mem_read(pv_in, &mut buf)?;
     }
     engine.mem_write(data.data_va.wrapping_add(off), &buf)?;
-    finish(engine, 0) // S_OK
+    ctx.finish(0) // S_OK
 }
 
 /// `HRESULT SafeArrayGetLBound(SAFEARRAY *psa, UINT nDim, LONG *plLbound)`
@@ -775,16 +765,16 @@ fn handle_safe_array_get_lbound(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let pl = engine.read_r8()?;
     let table = sa_table();
     let Some(data) = table.iter().find(|(h, _)| *h == psa).map(|(_, d)| d) else {
-        return finish(engine, E_INVALIDARG);
+        return ctx.finish(E_INVALIDARG);
     };
     let dim_idx = usize::try_from(n_dim.wrapping_sub(1)).unwrap_or(0);
     let Some((_, lbound)) = data.dims.get(dim_idx).copied() else {
-        return finish(engine, E_INVALIDARG);
+        return ctx.finish(E_INVALIDARG);
     };
     if pl != 0 {
         engine.mem_write(pl, &lbound.to_le_bytes())?;
     }
-    finish(engine, 0) // S_OK
+    ctx.finish(0) // S_OK
 }
 
 /// `HRESULT SafeArrayGetUBound(SAFEARRAY *psa, UINT nDim, LONG *plUbound)`
@@ -795,17 +785,17 @@ fn handle_safe_array_get_ubound(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let pl = engine.read_r8()?;
     let table = sa_table();
     let Some(data) = table.iter().find(|(h, _)| *h == psa).map(|(_, d)| d) else {
-        return finish(engine, E_INVALIDARG);
+        return ctx.finish(E_INVALIDARG);
     };
     let dim_idx = usize::try_from(n_dim.wrapping_sub(1)).unwrap_or(0);
     let Some((count, lbound)) = data.dims.get(dim_idx).copied() else {
-        return finish(engine, E_INVALIDARG);
+        return ctx.finish(E_INVALIDARG);
     };
     let ubound = lbound.wrapping_add(count).wrapping_sub(1);
     if pl != 0 {
         engine.mem_write(pl, &ubound.to_le_bytes())?;
     }
-    finish(engine, 0) // S_OK
+    ctx.finish(0) // S_OK
 }
 
 /// `UINT SafeArrayGetDim(SAFEARRAY *psa)`
@@ -817,7 +807,7 @@ fn handle_safe_array_get_dim(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         .find(|(h, _)| *h == psa)
         .map(|(_, d)| d.dims.len())
         .unwrap_or(0);
-    finish(engine, u64::try_from(dims).unwrap_or(0))
+    ctx.finish(u64::try_from(dims).unwrap_or(0))
 }
 
 // ── IDispatch stubs ────────────────────────────────────────────────────────
@@ -843,11 +833,10 @@ fn handle_disp_get_ids_of_names(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             engine.mem_write(rg_disp_id.wrapping_add(off), &unknown.to_le_bytes())?;
         }
     }
-    finish(engine, 0x8002_0006) // DISP_E_UNKNOWNNAME
+    ctx.finish(0x8002_0006) // DISP_E_UNKNOWNNAME
 }
 
 /// `HRESULT DispInvoke(...)` — KISS: `E_NOTIMPL` (args accepted, unused).
 fn handle_disp_invoke(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    finish(engine, 0x8000_4001) // E_NOTIMPL
+    ctx.finish(0x8000_4001) // E_NOTIMPL
 }

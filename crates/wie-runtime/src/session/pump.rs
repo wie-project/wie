@@ -65,6 +65,38 @@ struct SessionPumpHooks<'a> {
 }
 
 impl<'a> SessionPumpHooks<'a> {
+    /// Shared native-panel bridge dispatch (file dialog, message box, print
+    /// dialog, page setup, print job). Take the bridge out first (it lives
+    /// behind the shared state lock), then drop the guard: the native panel
+    /// blocks the MAIN thread for its whole session, and the winit event loop
+    /// needs that SAME lock to service frame/user events while the panel is up
+    /// (take_frame, reconcile, hit-testing) — holding it across the bridge
+    /// deadlocks into the beachball. This is the GuestCallbackRequested
+    /// pattern. On return, under the lock again: reactivate the primary
+    /// thread, restore the bridge, write the outcome into the pending slot.
+    ///
+    /// Continue: the engine re-executes the fake API stop, the handler
+    /// re-enters and consumes the pending write-back.
+    fn dispatch_native_bridge<B, P>(
+        &self,
+        core: &mut QuantumCore,
+        mut guard: MutexGuard<'_, WinApiState>,
+        take_bridge: impl FnOnce(&mut WinApiState) -> Option<B>,
+        invoke: impl FnOnce(Option<&B>) -> P,
+        finish: impl FnOnce(&mut WinApiState, Option<B>, P),
+    ) -> Step {
+        let bridge = take_bridge(&mut guard);
+        drop(guard);
+        let outcome = invoke(bridge.as_ref());
+        core.with_locked(|_, winapi_state| {
+            if winapi_state.kernel.threads.active.tid != self.primary_tid {
+                winapi_state.kernel.threads.activate(self.primary_tid);
+            }
+            finish(winapi_state, bridge, outcome);
+        });
+        Step::Next
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         entry_point_va: u64,
@@ -820,144 +852,92 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                         }
                         Ok(Step::Next)
                     }
-                    Ok(WinApiControlSignal::FileDialogBridgeRequested { request }) => {
-                        // The native panel (rfd) blocks the MAIN thread for
-                        // the whole session, and the winit event loop needs
-                        // the SAME shared state lock to service frame/user
-                        // events while the panel is up (take_frame, reconcile,
-                        // hit-testing). Holding the lock across the bridge
-                        // deadlocks into the beachball, so drop it for the
-                        // whole panel session — the GuestCallbackRequested
-                        // pattern. Take the bridge out first (it lives behind
-                        // the lock) and restore it on return.
-                        let bridge = guard.window_state().file_dialog_bridge.take();
-                        drop(guard);
-                        let picked = bridge.as_ref().and_then(|bridge| bridge(&request));
-                        core.with_locked(|_, winapi_state| {
-                            if winapi_state.kernel.threads.active.tid != self.primary_tid {
-                                winapi_state.kernel.threads.activate(self.primary_tid);
-                            }
-                            let window_state = winapi_state.window_state();
-                            window_state.file_dialog_bridge = bridge;
-                            if let Some(pending) = window_state.pending_native_file_dialog.as_mut()
-                            {
-                                pending.pick = picked;
-                            }
-                        });
-                        // Continue: the engine re-executes the fake API stop,
-                        // the handler re-enters and writes the pick back.
-                        Ok(Step::Next)
-                    }
-                    Ok(WinApiControlSignal::MessageBoxBridgeRequested { request }) => {
-                        // The native alert (rfd) blocks the MAIN thread for
-                        // the whole session, and the winit event loop needs
-                        // the SAME shared state lock to service frame/user
-                        // events while the alert is up (take_frame, reconcile,
-                        // hit-testing). Holding the lock across the bridge
-                        // deadlocks into the beachball (the confirm-dialog
-                        // hang), so drop it for the whole alert session — the
-                        // GuestCallbackRequested pattern, mirroring the
-                        // file-dialog arm above. Take the bridge out first (it
-                        // lives behind the lock) and restore it on return.
-                        let bridge = guard.present().message_box_bridge.take();
-                        drop(guard);
-                        let picked = bridge.as_ref().map(|bridge| {
-                            bridge(&request.caption, &request.text, request.message_box_type)
-                        });
-                        core.with_locked(|_, winapi_state| {
-                            if winapi_state.kernel.threads.active.tid != self.primary_tid {
-                                winapi_state.kernel.threads.activate(self.primary_tid);
-                            }
-                            winapi_state.present().message_box_bridge = bridge;
-                            if let Some(pending) = winapi_state
-                                .window_state()
-                                .pending_native_message_box
-                                .as_mut()
-                            {
-                                pending.pick = picked;
-                            }
-                        });
-                        Ok(Step::Next)
-                    }
-                    Ok(WinApiControlSignal::PrintDialogBridgeRequested { request }) => {
-                        // The native print panel (NSPrintPanel) blocks the
-                        // MAIN thread for the whole session, and the winit
-                        // event loop needs the SAME shared state lock to
-                        // service frame/user events while the panel is up.
-                        // Holding the lock across the bridge deadlocks into
-                        // the beachball, so drop it for the whole panel
-                        // session — the GuestCallbackRequested pattern,
-                        // mirroring the file-dialog arm above. Take the
-                        // bridge out first (it lives behind the lock) and
-                        // restore it on return.
-                        let bridge = guard.window_state().print_dialog_bridge.take();
-                        drop(guard);
-                        let picked = bridge.as_ref().and_then(|bridge| bridge(&request));
-                        core.with_locked(|_, winapi_state| {
-                            if winapi_state.kernel.threads.active.tid != self.primary_tid {
-                                winapi_state.kernel.threads.activate(self.primary_tid);
-                            }
-                            let window_state = winapi_state.window_state();
-                            window_state.print_dialog_bridge = bridge;
-                            if let Some(pending) = window_state.pending_native_print_dialog.as_mut()
-                            {
-                                pending.pick = picked;
-                            }
-                        });
-                        Ok(Step::Next)
-                    }
-                    Ok(WinApiControlSignal::PageSetupBridgeRequested { request }) => {
-                        // The native page-layout panel (NSPageLayout) blocks
-                        // the MAIN thread for the whole session, and the winit
-                        // event loop needs the SAME shared state lock to
-                        // service frame/user events while the panel is up.
-                        // Holding the lock across the bridge deadlocks into
-                        // the beachball, so drop it for the whole panel
-                        // session — the print-dialog arm above. Take the
-                        // bridge out first (it lives behind the lock) and
-                        // restore it on return.
-                        let bridge = guard.window_state().page_setup_dialog_bridge.take();
-                        drop(guard);
-                        let picked = bridge.as_ref().and_then(|bridge| bridge(&request));
-                        core.with_locked(|_, winapi_state| {
-                            if winapi_state.kernel.threads.active.tid != self.primary_tid {
-                                winapi_state.kernel.threads.activate(self.primary_tid);
-                            }
-                            let window_state = winapi_state.window_state();
-                            window_state.page_setup_dialog_bridge = bridge;
-                            if let Some(pending) = window_state.pending_native_page_setup.as_mut() {
-                                pending.pick = picked;
-                            }
-                        });
-                        Ok(Step::Next)
-                    }
+                    Ok(WinApiControlSignal::FileDialogBridgeRequested { request }) => Ok(self
+                        .dispatch_native_bridge(
+                            core,
+                            guard,
+                            |st| st.window_state().file_dialog_bridge.take(),
+                            |bridge| bridge.and_then(|hook| hook(&request)),
+                            |st, bridge, picked| {
+                                let window_state = st.window_state();
+                                window_state.file_dialog_bridge = bridge;
+                                if let Some(pending) =
+                                    window_state.pending_native_file_dialog.as_mut()
+                                {
+                                    pending.pick = picked;
+                                }
+                            },
+                        )),
+                    Ok(WinApiControlSignal::MessageBoxBridgeRequested { request }) => Ok(self
+                        .dispatch_native_bridge(
+                            core,
+                            guard,
+                            |st| st.present().message_box_bridge.take(),
+                            |bridge| {
+                                bridge.map(|hook| {
+                                    hook(&request.caption, &request.text, request.message_box_type)
+                                })
+                            },
+                            |st, bridge, picked| {
+                                st.present().message_box_bridge = bridge;
+                                if let Some(pending) =
+                                    st.window_state().pending_native_message_box.as_mut()
+                                {
+                                    pending.pick = picked;
+                                }
+                            },
+                        )),
+                    Ok(WinApiControlSignal::PrintDialogBridgeRequested { request }) => Ok(self
+                        .dispatch_native_bridge(
+                            core,
+                            guard,
+                            |st| st.window_state().print_dialog_bridge.take(),
+                            |bridge| bridge.and_then(|hook| hook(&request)),
+                            |st, bridge, picked| {
+                                let window_state = st.window_state();
+                                window_state.print_dialog_bridge = bridge;
+                                if let Some(pending) =
+                                    window_state.pending_native_print_dialog.as_mut()
+                                {
+                                    pending.pick = picked;
+                                }
+                            },
+                        )),
+                    Ok(WinApiControlSignal::PageSetupBridgeRequested { request }) => Ok(self
+                        .dispatch_native_bridge(
+                            core,
+                            guard,
+                            |st| st.window_state().page_setup_dialog_bridge.take(),
+                            |bridge| bridge.and_then(|hook| hook(&request)),
+                            |st, bridge, picked| {
+                                let window_state = st.window_state();
+                                window_state.page_setup_dialog_bridge = bridge;
+                                if let Some(pending) =
+                                    window_state.pending_native_page_setup.as_mut()
+                                {
+                                    pending.pick = picked;
+                                }
+                            },
+                        )),
                     Ok(WinApiControlSignal::PrintJobBridgeRequested { request }) => {
-                        // The native NSPrintOperation blocks the MAIN thread
-                        // for the whole print session, and the winit event
-                        // loop needs the SAME shared state lock to service
-                        // frame/user events while the operation runs. Holding
-                        // the lock across the bridge deadlocks into the
-                        // beachball, so drop it for the whole operation — the
-                        // GuestCallbackRequested pattern, mirroring the
-                        // print-dialog arm above. Take the bridge out first
-                        // (it lives behind the lock) and restore it on return.
-                        let bridge = guard.window_state().print_job_bridge.take();
-                        drop(guard);
                         // The request is moved in BY VALUE (the ~34 MB page
                         // canvases travel straight into the native pipeline —
                         // never cloned).
-                        let succeeded = bridge.as_ref().map(|bridge| bridge(request));
-                        core.with_locked(|_, winapi_state| {
-                            if winapi_state.kernel.threads.active.tid != self.primary_tid {
-                                winapi_state.kernel.threads.activate(self.primary_tid);
-                            }
-                            let window_state = winapi_state.window_state();
-                            window_state.print_job_bridge = bridge;
-                            if let Some(pending) = window_state.pending_native_print_job.as_mut() {
-                                pending.success = succeeded;
-                            }
-                        });
-                        Ok(Step::Next)
+                        Ok(self.dispatch_native_bridge(
+                            core,
+                            guard,
+                            |st| st.window_state().print_job_bridge.take(),
+                            |bridge| bridge.map(|hook| hook(request)),
+                            |st, bridge, succeeded| {
+                                let window_state = st.window_state();
+                                window_state.print_job_bridge = bridge;
+                                if let Some(pending) =
+                                    window_state.pending_native_print_job.as_mut()
+                                {
+                                    pending.success = succeeded;
+                                }
+                            },
+                        ))
                     }
                     Ok(WinApiControlSignal::ChildProcessSpawnRequested {
                         host_path,

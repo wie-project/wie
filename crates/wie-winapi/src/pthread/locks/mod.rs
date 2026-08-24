@@ -20,7 +20,7 @@ use super::{
     BARRIER_SERIAL_THREAD, EAGAIN, EBUSY, EEXIST, EINVAL, ENOENT, EPERM, ETIMEDOUT,
     MUTEX_ERRORCHECK, MUTEX_NORMAL, MUTEX_RECURSIVE, PROCESS_SHARED, PtPending, absolute_deadline,
     is_pt_id, park_on, read_cstr, read_u32, read_u64, ret_errno, ret_int, ret_u64, slice_until,
-    stack_arg, trunc_i32, write_i32, write_u32, write_u64,
+    trunc_i32, write_i32, write_u32, write_u64,
 };
 use crate::{WinApiHandlerResult, WinApiState};
 use cond::{DeadlineSource, cond_id, cond_wait, cond_wake};
@@ -939,6 +939,3 @@ fn sem_unlink(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<Win
 fn set_errno_failed(engine: &mut dyn CpuEngine, code: i32) {
     super::set_errno(engine, code);
 }
-
-/// Keep the shared stack-argument helper reachable from this module.
-const _: fn(&mut dyn CpuEngine, u64) -> u64 = stack_arg;

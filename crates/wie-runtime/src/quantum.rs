@@ -263,23 +263,13 @@ impl<'a> QuantumCore<'a> {
         tid: u32,
         lock_wait_stats: &'a LockWaitStats,
     ) -> Result<Self> {
-        let fake_api_size_u64 =
-            u64::try_from(config.layout.fake_api.size).context("fake API size does not fit u64")?;
-        let fake_api_end = config
-            .layout
-            .fake_api
-            .base
-            .checked_add(fake_api_size_u64)
-            .context("fake API end overflow")?
-            .checked_sub(1)
-            .context("fake API end underflow")?;
         Ok(Self {
             engine,
             config,
             winapi,
             lock_wait_stats,
             tid,
-            fake_api_end,
+            fake_api_end: config.layout.fake_api_end(),
         })
     }
 
@@ -564,6 +554,14 @@ impl<'a> QuantumCore<'a> {
         hooks.dispatch(self, guard, &resolved, address, api_index)
     }
 
+    /// Read `process_dying` under the wait lock, releasing the lock before
+    /// returning: `on_dying` re-acquires the same mutex and would
+    /// self-deadlock if invoked while a guard were still held.
+    fn process_dying(winapi: &Arc<Mutex<WinApiState>>, stats: &LockWaitStats) -> bool {
+        let st = lock_wait(winapi, stats);
+        st.kernel.sync.process_dying
+    }
+
     /// Block on a host wait reason outside the WinAPI lock, observing
     /// `process_dying` so teardown never deadlocks.
     ///
@@ -656,13 +654,7 @@ impl<'a> QuantumCore<'a> {
                     return r;
                 }
                 drain();
-                // Scope the guard: `on_dying` re-acquires the same mutex and
-                // would self-deadlock if invoked while `st` is still held.
-                let dying = {
-                    let st = lock_wait(winapi, stats);
-                    st.kernel.sync.process_dying
-                };
-                if dying {
+                if Self::process_dying(winapi, stats) {
                     on_dying();
                     return wie_winapi::WAIT_FAILED;
                 }
@@ -697,13 +689,7 @@ impl<'a> QuantumCore<'a> {
                     return r;
                 }
                 drain();
-                // Scope the guard: `on_dying` re-acquires the same mutex and
-                // would self-deadlock if invoked while `st` is still held.
-                let dying = {
-                    let st = lock_wait(winapi, stats);
-                    st.kernel.sync.process_dying
-                };
-                if dying {
+                if Self::process_dying(winapi, stats) {
                     on_dying();
                     return wie_winapi::WAIT_FAILED;
                 }

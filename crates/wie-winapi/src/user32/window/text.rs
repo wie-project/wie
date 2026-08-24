@@ -3,6 +3,7 @@
 //! `window.rs`).
 
 use super::class::{find_window, find_window_mut};
+use crate::gdi32::{ArgReg, read_arg};
 use crate::state::WindowFlags;
 use crate::user32::{
     Context, FAKE_WINDOW_HANDLE, HandlerContext, Result, WinApiHandlerResult, WinApiState,
@@ -31,13 +32,9 @@ fn handle_set_window_text_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
 
-    let text_va = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let text_va = read_arg(engine, ArgReg::Rdx, api_name)?;
 
     let known = window_handle == FAKE_WINDOW_HANDLE || is_known_window(state, window_handle);
     let success = known;
@@ -125,17 +122,11 @@ fn handle_get_window_text_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
 
-    let buffer_va = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let buffer_va = read_arg(engine, ArgReg::Rdx, api_name)?;
 
-    let max_characters = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let max_characters = read_arg(engine, ArgReg::R8, api_name)?;
 
     let text = resolve_window_text(state, window_handle);
 
@@ -154,9 +145,7 @@ pub fn handle_get_window_text_length_w(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetWindowTextLengthW")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "GetWindowTextLengthW")?;
 
     let text = resolve_window_text(state, window_handle);
 
@@ -175,9 +164,7 @@ pub fn handle_get_window_text_length_a(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let window_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetWindowTextLengthA")?;
+    let window_handle = read_arg(engine, ArgReg::Rcx, "GetWindowTextLengthA")?;
 
     let text = resolve_window_text(state, window_handle);
 

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 
+use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::{Bitmap, Size};
 use crate::guest_memory::with_typed_write;
 use crate::handles::{Hbitmap, Hbrush, Hdc, Hfont, Hpen};
@@ -60,17 +61,11 @@ fn handle_get_object_impl(
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let object_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let object_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
 
-    let buffer_size = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let buffer_size = read_arg(engine, ArgReg::Rdx, api_name)?;
 
-    let object_buffer_va = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let object_buffer_va = read_arg(engine, ArgReg::R8, api_name)?;
 
     let can_write_bitmap =
         object_handle != 0 && object_buffer_va != 0 && buffer_size >= BITMAP_STRUCT_SIZE;
@@ -145,13 +140,9 @@ pub fn handle_get_stock_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 pub fn handle_select_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let dc_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for SelectObject")?;
+    let dc_handle = read_arg(engine, ArgReg::Rcx, "SelectObject")?;
 
-    let object_handle = engine
-        .read_rdx()
-        .context("failed to read RDX for SelectObject")?;
+    let object_handle = read_arg(engine, ArgReg::Rdx, "SelectObject")?;
 
     // Scope the object-kind checks so the mutable borrow ends before find_dc_mut.
     let object_kind = GdiObject::classify(object_handle, state.gdi_state());
@@ -227,21 +218,13 @@ fn handle_get_text_extent_point_32_impl(
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let device_context_handle = engine
-        .read_rcx()
-        .with_context(|| format!("failed to read RCX for {api_name}"))?;
+    let device_context_handle = read_arg(engine, ArgReg::Rcx, api_name)?;
 
-    let text_va = engine
-        .read_rdx()
-        .with_context(|| format!("failed to read RDX for {api_name}"))?;
+    let text_va = read_arg(engine, ArgReg::Rdx, api_name)?;
 
-    let character_count = engine
-        .read_r8()
-        .with_context(|| format!("failed to read R8 for {api_name}"))?;
+    let character_count = read_arg(engine, ArgReg::R8, api_name)?;
 
-    let size_va = engine
-        .read_r9()
-        .with_context(|| format!("failed to read R9 for {api_name}"))?;
+    let size_va = read_arg(engine, ArgReg::R9, api_name)?;
 
     let count = u32::try_from(character_count & u64::from(u32::MAX))
         .unwrap_or(0)
@@ -290,9 +273,7 @@ fn handle_get_text_extent_point_32_impl(
 pub fn handle_create_compatible_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let _source_device_context = engine
-        .read_rcx()
-        .context("failed to read RCX for CreateCompatibleDC")?;
+    let _source_device_context = read_arg(engine, ArgReg::Rcx, "CreateCompatibleDC")?;
 
     let dc_handle = state.gdi_state().alloc_dc(DcKind::Memory);
 
@@ -308,13 +289,9 @@ pub fn handle_create_compatible_dc(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let hdc = engine
-        .read_rcx()
-        .context("failed to read RCX for GetDeviceCaps")?;
+    let hdc = read_arg(engine, ArgReg::Rcx, "GetDeviceCaps")?;
 
-    let index = engine
-        .read_rdx()
-        .context("failed to read RDX for GetDeviceCaps")?;
+    let index = read_arg(engine, ArgReg::Rdx, "GetDeviceCaps")?;
 
     let is_print = matches!(
         state.gdi_state().find_dc(Hdc::from(hdc)).map(|dc| dc.kind),
@@ -402,15 +379,11 @@ fn print_dc_caps(state: &mut WinApiState, hdc: u64, index: u64) -> u64 {
 /// Handles `GDI32.dll!GetPixel`.
 pub fn handle_get_pixel(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let _device_context_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for GetPixel")?;
+    let _device_context_handle = read_arg(engine, ArgReg::Rcx, "GetPixel")?;
 
-    let _x = engine
-        .read_rdx()
-        .context("failed to read RDX for GetPixel")?;
+    let _x = read_arg(engine, ArgReg::Rdx, "GetPixel")?;
 
-    let _y = engine.read_r8().context("failed to read R8 for GetPixel")?;
+    let _y = read_arg(engine, ArgReg::R8, "GetPixel")?;
 
     ctx.finish(FAKE_PIXEL_COLOR)
 }
@@ -419,9 +392,7 @@ pub fn handle_get_pixel(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 pub fn handle_delete_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let device_context_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for DeleteDC")?;
+    let device_context_handle = read_arg(engine, ArgReg::Rcx, "DeleteDC")?;
 
     // Print DCs own a job whose canvases can be ~34 MB each — drop it with
     // the DC so the pages do not leak for the session's lifetime.
@@ -450,9 +421,7 @@ pub fn handle_delete_dc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 pub fn handle_delete_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
-    let object_handle = engine
-        .read_rcx()
-        .context("failed to read RCX for DeleteObject")?;
+    let object_handle = read_arg(engine, ArgReg::Rcx, "DeleteObject")?;
 
     // Free known GDI objects; the return value preserves the historical
     // "any non-zero handle succeeds" behavior for unknown handles.
