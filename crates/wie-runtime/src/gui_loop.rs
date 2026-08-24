@@ -99,26 +99,47 @@ pub fn run_windowed(session: &mut RuntimeSession, control: &GuiControl) -> Resul
                     // take the frame.
                     return Ok(GuiOutcome::WaitingForMessage);
                 }
-                // After the initial paint, wait on the message signal
-                // condvar.  GuestHandle::post_message calls notify_one(), so
-                // quit/input/resize events wake the guest immediately instead
-                // of on the next 50 ms poll tick.  The 50 ms timeout keeps
-                // WM_TIMER ticking and control.stop observable.
+                // After the initial paint, park until something wakes the
+                // guest. Event sources (Painpoint 1):
+                //   • a posted message — `GuestHandle::post_message` sets the
+                //     trigger flag and notifies this condvar INSTANTLY;
+                //   • the nearest armed guest timer — the wait deadline is
+                //     aligned to `next_timer_deadline` so `WM_TIMER`s fire on
+                //     time instead of being slept past (a fixed-tick wait
+                //     could stall a timer-only guest forever);
+                //   • the 50 ms ceiling — bounds control-flag (`stop`,
+                //     headless capture) and Ctrl+C-under-profiling latency.
+                //
+                // A single bounded wait (no re-arm loop): a spurious wake
+                // costs one cheap empty `run_until_stop` pass.
+                let t0 = std::time::Instant::now();
+                const PARK_CAP: std::time::Duration = std::time::Duration::from_millis(50);
+                let wait = session
+                    .next_timer_deadline()
+                    .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()))
+                    .map(|remaining| remaining.min(PARK_CAP))
+                    .unwrap_or(PARK_CAP);
                 let signal = session.guest_handle().message_signal();
                 if let Some(signal) = signal {
                     let mut triggered = signal.triggered.lock().unwrap_or_else(|e| e.into_inner());
-                    while !*triggered {
+                    if !*triggered {
                         let (guard, _) = signal
                             .cvar
-                            .wait_timeout(triggered, std::time::Duration::from_millis(50))
+                            .wait_timeout(triggered, wait)
                             .unwrap_or_else(|e| e.into_inner());
                         triggered = guard;
                     }
                     // Consume the signal; the message is in the queue.
                     *triggered = false;
                 } else {
-                    // No present state installed — fall back to polling.
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    // No present state installed — fall back to sleeping for
+                    // the same bounded slice.
+                    std::thread::sleep(wait);
+                }
+                if session.profile_enabled() {
+                    session
+                        .profile_mut()
+                        .add_idle_residency_ns(t0.elapsed().as_nanos());
                 }
                 continue;
             }

@@ -509,6 +509,15 @@ pub fn handle_set_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
             "SetTimer"
         );
 
+        // A parked empty-queue GetMessage computed its wake deadline from the
+        // OLD timer table — send a token so it recomputes (hints-never-data:
+        // an unparked receiver just drains the token on its next pass).
+        state
+            .kernel
+            .sync
+            .wake_hub
+            .broadcast(crate::wake::Wake::TimerArmed);
+
         timer_id
     } else {
         0

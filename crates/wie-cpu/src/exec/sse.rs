@@ -100,7 +100,11 @@ fn fp_cmp_pred(pred: i32, a: f64, b: f64) -> bool {
         2 => a <= b,
         3 => a.is_nan() || b.is_nan(),
         4 => a != b,
+        // Negated form is the x86 NLT/NLE encoding: true on unordered (NaN).
+        // `partial_cmp` rewrites obscure that; see doc comment above.
+        #[expect(clippy::neg_cmp_op_on_partial_ord)]
         5 => !(a < b),
+        #[expect(clippy::neg_cmp_op_on_partial_ord)]
         6 => !(a <= b),
         7 => !a.is_nan() && !b.is_nan(),
         _ => false,
@@ -159,9 +163,11 @@ pub(super) fn exec_sse_cmp_fp(
     let new_val = if packed {
         result
     } else {
-        let low_mask: u128 = (esize == 8)
-            .then(|| 0xffff_ffff_ffff_ffff_u128)
-            .unwrap_or(0xffff_ffff);
+        let low_mask: u128 = if esize == 8 {
+            0xffff_ffff_ffff_ffff_u128
+        } else {
+            0xffff_ffff
+        };
         (dst_val & !low_mask) | (result & low_mask)
     };
     write_sse_op(mem, regs, instr, 0, new_val, 16, false)

@@ -23,5 +23,12 @@ cranelift-jit = "0.133"
 cranelift-native = "0.133"
 cranelift-module = "0.133"
 
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "jit_hot_paths"
+harness = false
+
 [lints]
 workspace = true

@@ -601,9 +601,14 @@ pub(crate) fn run_console_interactive(
                 std::process::exit(130);
             }
             wie_runtime::EntryTraceTermination::WaitingForMessage => {
-                // Empty GetMessage with no message source. Park briefly and
-                // let the guest retry; a console game's Sleep loop resumes.
-                wie_winapi::idle::apply_message_park();
+                // Empty GetMessage with no message source. Park event-driven
+                // on the primary wake inbox until a token or the nearest due
+                // timer, capped like the runtime idle loop so Ctrl+C under
+                // `WIE_RUNTIME_PROFILE` stays observable between quanta.
+                let deadline = session.next_timer_deadline();
+                let inbox = session.primary_inbox();
+                inbox.wait_bounded(deadline, std::time::Duration::from_millis(50));
+                inbox.drain();
             }
             wie_runtime::EntryTraceTermination::GuestCallbackRequested { .. } => {
                 // Handled internally by the runtime; keep running.

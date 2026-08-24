@@ -133,6 +133,10 @@ fn materialize_crt_argv(
 pub struct RuntimeSession {
     /// CPU + WinAPI (single struct for both JIT and Iced).
     process: ProcessResources,
+    /// Clone of the session's wake hub (`SyncState::wake_hub`): the outer
+    /// run loop parks the primary thread's inbox through it without taking
+    /// the WinAPI state lock (Painpoint 1).
+    wake_hub: wie_winapi::WakeHub,
     entry_point_va: GuestVa,
     initial_rsp: GuestStackPtr,
     next_api_index: usize,
@@ -186,6 +190,25 @@ impl RuntimeSession {
     #[must_use]
     pub fn entry_point_va(&self) -> u64 {
         self.entry_point_va.0
+    }
+
+    /// The primary guest thread's wake inbox, registered on demand.
+    ///
+    /// The outer run loop parks here while the message queue is empty;
+    /// producers (PostMessage / SetTimer / teardown) deliver tokens.
+    #[must_use]
+    pub fn primary_inbox(&self) -> wie_winapi::ThreadInbox {
+        self.wake_hub.inbox_for(self.process.primary_tid())
+    }
+
+    /// The nearest armed guest timer deadline (`None` when no timer is due
+    /// to fire). Bounds the idle park so `WM_TIMER`s fire promptly.
+    #[must_use]
+    pub fn next_timer_deadline(&self) -> Option<std::time::Instant> {
+        self.process.with_winapi_ref(|st| {
+            st.try_window_state()
+                .and_then(|ws| ws.next_timer_deadline())
+        })
     }
 
     /// Sets the bottle root for guest `C:\…` → host `{root}/drive_c/…` mapping.
@@ -278,6 +301,10 @@ impl RuntimeSession {
             .unwrap_or_else(|e| e.into_inner())
             .messages
             .push(message);
+        // Direct Vec push (the caller owns the full record shape) still owes
+        // parked threads their wake token — `queue.push` broadcasts on its
+        // own; this path must do it explicitly.
+        self.wake_hub.broadcast(wie_winapi::Wake::MessagePosted);
     }
 
     /// Queues one deterministic USER32 message for the guest.
@@ -492,6 +519,9 @@ impl GuestHandle {
 
 impl Drop for RuntimeSession {
     fn drop(&mut self) {
+        // Wake any thread parked on an inbox (Painpoint 1) before reaping:
+        // teardown must never leave a park loop blocked past session death.
+        self.wake_hub.broadcast(wie_winapi::Wake::Shutdown);
         // Reap guest worker threads when the explicit ExitProcess path
         // (session/pump.rs) never ran: early CLI abort, headless idle exit,
         // budget exhaustion, or test teardown. Without this the JoinHandles

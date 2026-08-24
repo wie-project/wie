@@ -32,6 +32,7 @@ pub use iced_cpu::IcedCpu;
 pub use jit::{
     BgCompileProfile, FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitProfile, JitShared,
     JitStats, PROFILE_BUCKETS, PerThreadJitState, TimeBuckets, dump_mem_path_stats,
+    jit_profile_report_lines,
 };
 /// Windows `PAGE_*` constants and software access checks.
 pub use mem::protect;

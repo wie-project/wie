@@ -3,6 +3,12 @@
 //! Clean-room design: park the host thread only on documented blocking waits
 //! (`Sleep(n>0)`, empty `GetMessage` under `YieldOnIdle`). Never park pure
 //! guest spin loops. Micros stay deterministic via [`IdlePolicy::Yield`] default.
+//!
+//! Under [`IdlePolicy::Park`] the empty-`GetMessage` park is EVENT-DRIVEN
+//! (Painpoint 1): the outer loop blocks on the primary thread's
+//! [`crate::wake::ThreadInbox`] until a wake token (`PostMessage`,
+//! `SetTimer`, teardown) or the nearest due timer — no sleep-poll quanta and
+//! no park-count cap. See `crate::wake`.
 
 use std::time::Duration;
 
@@ -89,13 +95,6 @@ pub fn idle_message_park_ms() -> u64 {
 #[must_use]
 pub fn idle_slice_ms() -> u64 {
     parse_u64_env("WIE_IDLE_SLICE_MS").unwrap_or(0)
-}
-
-/// Max empty-message park quanta in one persistent run before yielding to the CLI.
-/// `0` = unlimited. Default 40 (~1 s at 25 ms).
-#[must_use]
-pub fn idle_max_message_parks() -> u32 {
-    parse_u64_env("WIE_IDLE_MAX_PARKS").map_or(40, |v| u32::try_from(v).unwrap_or(u32::MAX))
 }
 
 /// Duration for `Sleep(requested_ms)` under park policy (after cap).

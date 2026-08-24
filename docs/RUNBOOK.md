@@ -82,7 +82,7 @@ The README keeps the shortlist; the complete set lives here.
 | `WIE_GUEST_IO=0` \| `all` | I/O accelerator: default seeks/size in-guest; `all` also guest Read |
 | `WIE_GUEST_MBWC=1` | Guest MultiByte↔WideChar helpers |
 | `WIE_IDLE=busy\|yield\|park` | Host idle policy: micros default **yield**; interactive default **park** |
-| `WIE_IDLE_PARK_MS` / `WIE_IDLE_MAX_PARKS` | Message-park quantum / cap |
+| `WIE_IDLE_PARK_MS` | Message-park quantum (sleep-poll paths only; persistent/GUI idle parks are event-driven) |
 | `WIE_HOST_SLEEP=1` | **Legacy:** `Sleep(n>0)` park only |
 | `WIE_API_TRACE=1` | Full API dump (head+tail only by default) |
 | `WIE_INPUT_SCRIPT=<path>` | GUI input script path |

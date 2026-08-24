@@ -24,10 +24,15 @@ use std::time::Duration;
 /// mutex, so a wake published in that window is seen by the sequence compare
 /// instead of being lost — the classic lost-wakeup race that a bare condvar
 /// plus "notify without holding the waiter's lock" would hit.
+///
+/// Inbox-parked waiters (Painpoint 1) register through
+/// [`WakeQueue::enter_wait`] / [`WakeQueue::exit_wait`]; `wake` also delivers
+/// a token to each registered inbox so an inbox park wakes without polling.
 #[derive(Debug, Default)]
 pub struct WakeQueue {
     seq: Mutex<u64>,
     cv: Condvar,
+    waiters: crate::wake::WaiterRegistry,
 }
 
 impl WakeQueue {
@@ -43,12 +48,25 @@ impl WakeQueue {
         self.seq.lock().map_or(0, |g| *g)
     }
 
+    /// Register an inbox-parked waiter (wait-enter; before the sequence check).
+    pub fn enter_wait(&self, inbox: &crate::wake::ThreadInbox) {
+        self.waiters.enter(inbox);
+    }
+
+    /// Unregister an inbox-parked waiter (wait-exit).
+    pub fn exit_wait(&self, inbox: &crate::wake::ThreadInbox) {
+        self.waiters.exit(inbox);
+    }
+
     /// Publish a wake to every parker that sampled an older sequence.
     pub fn wake(&self) {
         if let Ok(mut g) = self.seq.lock() {
             *g = g.wrapping_add(1);
             self.cv.notify_all();
         }
+        // Tokens are hints: an inbox-parked waiter re-checks its condition on
+        // re-entry regardless of which token it saw.
+        self.waiters.wake_all(crate::wake::Wake::Shutdown);
     }
 
     /// Block until the sequence moves past `observed`, or `timeout` elapses.

@@ -14,6 +14,7 @@ use std::time::Duration;
 use wie_cpu::ThreadContext;
 
 use crate::state::handle_newtype;
+use crate::wake::{ThreadInbox, WaiterRegistry, Wake};
 
 /// `STILL_ACTIVE` — thread has not terminated (`GetExitCodeThread`).
 pub const STILL_ACTIVE: u32 = 259;
@@ -112,6 +113,12 @@ pub struct SyncState {
     pub process_by_pid: HashMap<u32, u64>,
     /// Next guest pid for a spawned child (see [`FIRST_CHILD_PID`]).
     pub(crate) next_child_pid: u32,
+    /// Per-thread wake inboxes (Painpoint 1): guest TID → parked thread's
+    /// channel. Producers (`PostMessage`, `SetTimer`, teardown) send
+    /// [`Wake`] tokens; park sites block on their inbox instead of sleeping
+    /// through poll quanta. Cloned out as an [`Arc`] so producers never need
+    /// the big WinAPI mutex.
+    pub wake_hub: crate::wake::WakeHub,
 }
 
 /// Detached args for one `WaitForMultipleObjects` host park.
@@ -143,6 +150,7 @@ impl SyncState {
             function_tables: HashMap::new(),
             process_by_pid: HashMap::new(),
             next_child_pid: FIRST_CHILD_PID,
+            wake_hub: crate::wake::WakeHub::default(),
         }
     }
 
@@ -167,6 +175,7 @@ impl SyncState {
             exit_code: std::sync::atomic::AtomicU32::new(STILL_ACTIVE),
             finished: Mutex::new(false),
             finished_cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
         });
         self.thread_cpu.insert(tid, ctx);
         self.objects
@@ -183,6 +192,7 @@ impl SyncState {
             manual_reset,
             state: Mutex::new(EventInner { signaled: initial }),
             cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
         });
         self.objects
             .insert(handle, KernelObject::Event(Arc::clone(&obj)));
@@ -204,6 +214,7 @@ impl SyncState {
             maximum,
             state: Mutex::new(SemaphoreInner { count: initial }),
             cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
         });
         self.objects
             .insert(handle, KernelObject::Semaphore(Arc::clone(&obj)));
@@ -266,6 +277,7 @@ impl SyncState {
             exit_code: std::sync::atomic::AtomicU32::new(STILL_ACTIVE),
             finished: Mutex::new(false),
             finished_cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
         });
         self.process_by_pid.insert(pid, handle_u64);
         self.objects
@@ -290,6 +302,7 @@ impl SyncState {
             exit_code: std::sync::atomic::AtomicU32::new(STILL_ACTIVE),
             finished: Mutex::new(false),
             finished_cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
         });
         self.objects
             .insert(handle, KernelObject::Thread(Arc::clone(&obj)));
@@ -410,6 +423,8 @@ pub struct ThreadObject {
     pub finished: Mutex<bool>,
     /// Notified when the thread finishes.
     pub finished_cv: Condvar,
+    /// Inbox-parked joiners (Painpoint 1): `finish` wakes ALL of them.
+    pub waiters: WaiterRegistry,
 }
 
 impl ThreadObject {
@@ -421,6 +436,9 @@ impl ThreadObject {
             *g = true;
             self.finished_cv.notify_all();
         }
+        // Wake inbox-parked joiners (Painpoint 1). Tokens are hints — a
+        // joiner that also waits on something else re-checks and re-parks.
+        self.waiters.wake_all(Wake::Shutdown);
     }
 
     /// Whether the thread has terminated.
@@ -487,6 +505,8 @@ pub struct ProcessObject {
     pub finished: Mutex<bool>,
     /// Notified when the child terminates.
     pub finished_cv: Condvar,
+    /// Inbox-parked waiters (Painpoint 1): `finish` wakes ALL of them.
+    pub waiters: WaiterRegistry,
 }
 
 impl ProcessObject {
@@ -498,6 +518,8 @@ impl ProcessObject {
             *g = true;
             self.finished_cv.notify_all();
         }
+        // Wake inbox-parked waiters (Painpoint 1).
+        self.waiters.wake_all(Wake::Shutdown);
     }
 
     /// Whether the child has terminated.
@@ -555,6 +577,9 @@ pub struct EventObject {
     pub state: Mutex<EventInner>,
     /// Waiters.
     pub cv: Condvar,
+    /// Inbox-parked waiters (Painpoint 1): manual-reset `set` wakes ALL,
+    /// auto-reset `set` wakes exactly ONE (Win32 acquire semantics).
+    pub waiters: WaiterRegistry,
 }
 
 /// Interior of an event (under mutex).
@@ -571,8 +596,14 @@ impl EventObject {
             g.signaled = true;
             if self.manual_reset {
                 self.cv.notify_all();
+                // Manual-reset: every waiter may pass — wake all.
+                drop(g);
+                self.waiters.wake_all(Wake::Shutdown);
             } else {
                 self.cv.notify_one();
+                // Auto-reset: exactly one acquirer wins the state; one token.
+                drop(g);
+                self.waiters.wake_one(Wake::Shutdown);
             }
         }
     }
@@ -643,6 +674,9 @@ pub struct SemaphoreObject {
     pub state: Mutex<SemaphoreInner>,
     /// Waiters for count &gt; 0.
     pub cv: Condvar,
+    /// Inbox-parked waiters (Painpoint 1): `ReleaseSemaphore(n)` wakes ALL
+    /// registered waiters (tokens are hints; losers re-check the count).
+    pub waiters: WaiterRegistry,
 }
 
 /// Interior of a semaphore (under mutex).
@@ -730,12 +764,17 @@ impl SemaphoreObject {
                 self.cv.notify_one();
             }
         }
+        drop(g);
+        // ReleaseSemaphore(n): token to ALL registered waiters — losers
+        // re-check the count and re-park (hints-never-data).
+        self.waiters.wake_all(Wake::Shutdown);
         Some(prev)
     }
 
     /// Wake all waiters during process teardown (does not change count semantics for dying).
     pub fn notify_all(&self) {
         self.cv.notify_all();
+        self.waiters.wake_all(Wake::Shutdown);
     }
 }
 
@@ -790,6 +829,8 @@ pub struct DirectoryWatchObject {
     pub pending: Mutex<Vec<FileNotifyRecord>>,
     /// Waiter notification: a pushed record wakes parked host waits.
     pub cv: Condvar,
+    /// Inbox-parked waiters (Painpoint 1): push / deactivate wake ALL.
+    pub waiters: WaiterRegistry,
     /// False after close/teardown; wakes waiters so they stop blocking.
     pub active: AtomicBool,
     /// The notify watcher, started lazily. `pub(crate)` so the watch module
@@ -823,6 +864,7 @@ impl DirectoryWatchObject {
             mask: AtomicU32::new(0),
             pending: Mutex::new(Vec::new()),
             cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
             active: AtomicBool::new(true),
             watcher: Arc::new(Mutex::new(None)),
         }
@@ -895,6 +937,7 @@ impl DirectoryWatchObject {
     pub fn deactivate(&self) {
         self.active.store(false, Ordering::Release);
         self.cv.notify_all();
+        self.waiters.wake_all(Wake::Shutdown);
     }
 
     /// Queue one change record and wake parked waiters.
@@ -902,6 +945,8 @@ impl DirectoryWatchObject {
         if let Ok(mut guard) = self.pending.lock() {
             guard.push(record);
             self.cv.notify_all();
+            drop(guard);
+            self.waiters.wake_all(Wake::Shutdown);
         }
     }
 }
@@ -992,6 +1037,31 @@ impl WaitTarget {
         }
     }
 
+    /// Register an inbox-parked waiter on this object (wait-enter).
+    ///
+    /// Call BEFORE the first readiness check: a signal landing between the
+    /// check and a later park then always delivers a token (no lost wakeup).
+    pub fn enter_wait(&self, inbox: &ThreadInbox) {
+        match self {
+            Self::Thread(t) => t.waiters.enter(inbox),
+            Self::Event(e) => e.waiters.enter(inbox),
+            Self::Semaphore(s) => s.waiters.enter(inbox),
+            Self::DirectoryWatch(d) => d.waiters.enter(inbox),
+            Self::Process(p) => p.waiters.enter(inbox),
+        }
+    }
+
+    /// Unregister a parked waiter on this object (wait-exit).
+    pub fn exit_wait(&self, inbox: &ThreadInbox) {
+        match self {
+            Self::Thread(t) => t.waiters.exit(inbox),
+            Self::Event(e) => e.waiters.exit(inbox),
+            Self::Semaphore(s) => s.waiters.exit(inbox),
+            Self::DirectoryWatch(d) => d.waiters.exit(inbox),
+            Self::Process(p) => p.waiters.exit(inbox),
+        }
+    }
+
     /// Block until signaled / finished. Returns `WAIT_*` codes.
     pub fn wait(&self, timeout_ms: u32) -> u32 {
         match self {
@@ -1037,8 +1107,10 @@ impl WaitTarget {
 /// Maximum handles for `WaitForMultipleObjects` (Windows `MAXIMUM_WAIT_OBJECTS`).
 pub const MAXIMUM_WAIT_OBJECTS: usize = 64;
 
-/// Wait on multiple detached targets (any or all). Parks with short polls so
-/// the process lock is never held while sleeping.
+/// Wait on multiple detached targets (any or all). Parks event-driven on the
+/// waiter registries: every target's signal delivers a token that wakes the
+/// recheck loop, so there are no fixed poll slices. The process lock is never
+/// held while sleeping.
 ///
 /// Returns `WAIT_OBJECT_0 + index` for wait-any, `WAIT_OBJECT_0` for wait-all,
 /// or `WAIT_TIMEOUT` / `WAIT_FAILED`.
@@ -1055,49 +1127,44 @@ pub fn wait_multiple(targets: &[WaitTarget], wait_all: bool, timeout_ms: u32) ->
     }
 
     let infinite = timeout_ms == INFINITE;
-    let deadline = if infinite {
-        None
-    } else {
-        Some(
-            std::time::Instant::now()
-                .checked_add(Duration::from_millis(u64::from(timeout_ms)))
-                .unwrap_or_else(std::time::Instant::now),
-        )
-    };
+    let deadline = (!infinite).then(|| {
+        std::time::Instant::now()
+            .checked_add(Duration::from_millis(u64::from(timeout_ms)))
+            .unwrap_or_else(std::time::Instant::now)
+    });
 
-    loop {
-        if let Some(code) = multi_try_once(targets, wait_all) {
-            return code;
-        }
-        if let Some(dl) = deadline
-            && std::time::Instant::now() >= dl
-        {
-            return WAIT_TIMEOUT;
-        }
-
-        let slice_ms: u32 = if let Some(dl) = deadline {
-            let rem = dl.saturating_duration_since(std::time::Instant::now());
-            u32::try_from(rem.as_millis().min(25)).unwrap_or(25).max(1)
-        } else {
-            25
-        };
-
-        if wait_all {
-            // Avoid consuming auto-reset units while not all are ready.
-            std::thread::sleep(Duration::from_millis(u64::from(slice_ms.min(5))));
-        } else if let Some(first) = targets.first() {
-            // Park on the first object; if it signals, that is index 0.
-            if first.wait(slice_ms) == WAIT_OBJECT_0 {
-                return WAIT_OBJECT_0;
-            }
-            // Else re-poll the whole set (another handle may have signaled).
-        } else {
-            return WAIT_FAILED;
-        }
+    // Register BEFORE the first re-check (enter → check → park ordering): a
+    // signal landing after registration always delivers a token, and a signal
+    // landing before it is covered by the check itself.
+    let inbox = crate::wake::ThreadInbox::new();
+    for target in targets {
+        target.enter_wait(&inbox);
     }
+    let result = loop {
+        if let Some(code) = multi_try_once(targets, wait_all) {
+            break code;
+        }
+        match deadline {
+            Some(dl) if std::time::Instant::now() >= dl => break WAIT_TIMEOUT,
+            _ => {}
+        }
+        // Bounded tick: tokens wake early; the cap only bounds shutdown
+        // latency (this function has no dying-observation hook of its own —
+        // callers driving INFINITE waits layer that outside).
+        inbox.wait_bounded(deadline, Duration::from_millis(50));
+    };
+    for target in targets {
+        target.exit_wait(&inbox);
+    }
+    result
 }
 
 /// One non-blocking multi-wait attempt. `Some` if satisfied.
+pub fn wait_multiple_step(targets: &[WaitTarget], wait_all: bool) -> Option<u32> {
+    multi_try_once(targets, wait_all)
+}
+
+/// One non-blocking multi-wait attempt (internal). `Some` if satisfied.
 fn multi_try_once(targets: &[WaitTarget], wait_all: bool) -> Option<u32> {
     if wait_all {
         // Threads: readiness is non-destructive. Events/semaphores consume on
@@ -1147,6 +1214,118 @@ impl SyncState {
             out.push(self.wait_target(h)?);
         }
         Some(out)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod wait_registry_tests {
+    use super::*;
+    use crate::wake::ThreadInbox;
+    use std::time::{Duration, Instant};
+
+    /// A manual-reset `SetEvent` delivers a token to every inbox-parked
+    /// waiter; an auto-reset set delivers exactly one.
+    #[test]
+    fn event_set_wakes_registered_inboxes_manual_all_auto_one() {
+        let manual = Arc::new(EventObject {
+            handle: 0xA001,
+            manual_reset: true,
+            state: Mutex::new(EventInner { signaled: false }),
+            cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
+        });
+        let a = ThreadInbox::new();
+        let b = ThreadInbox::new();
+        manual.waiters.enter(&a);
+        manual.waiters.enter(&b);
+        manual.set();
+        assert_eq!(a.drain(), 1, "manual reset wakes A");
+        assert_eq!(b.drain(), 1, "manual reset wakes B");
+
+        let auto = Arc::new(EventObject {
+            handle: 0xA002,
+            manual_reset: false,
+            state: Mutex::new(EventInner { signaled: false }),
+            cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
+        });
+        auto.waiters.enter(&a);
+        auto.waiters.enter(&b);
+        auto.set();
+        let woke_a = a.drain();
+        let woke_b = b.drain();
+        assert_eq!(
+            woke_a + woke_b,
+            1,
+            "auto reset selects exactly one acquirer"
+        );
+    }
+
+    /// `ReleaseSemaphore` and thread finish deliver tokens to ALL registered
+    /// waiters; `exit_wait` stops delivery.
+    #[test]
+    fn semaphore_release_and_thread_finish_wake_all_registered() {
+        let sem = Arc::new(SemaphoreObject {
+            handle: 0xB001,
+            maximum: 4,
+            state: Mutex::new(SemaphoreInner { count: 0 }),
+            cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
+        });
+        let a = ThreadInbox::new();
+        let b = ThreadInbox::new();
+        sem.waiters.enter(&a);
+        sem.waiters.enter(&b);
+        sem.release(1).expect("release");
+        assert_eq!(a.drain(), 1, "semaphore release wakes A");
+        assert_eq!(b.drain(), 1, "semaphore release wakes B");
+
+        let (handle, thread) = SyncState::new().register_thread(7, ThreadContext::default());
+        let target = crate::WaitTarget::Thread(Arc::clone(&thread));
+        let joiner_a = ThreadInbox::new();
+        let joiner_b = ThreadInbox::new();
+        target.enter_wait(&joiner_a);
+        target.enter_wait(&joiner_b);
+        thread.finish(0);
+        assert_eq!(joiner_a.drain(), 1, "finish wakes parked joiner A");
+        assert_eq!(joiner_b.drain(), 1, "finish wakes parked joiner B");
+        assert!(handle > 0, "registered thread returned a handle");
+
+        // exit removes the entry: later signals deliver nothing.
+        target.exit_wait(&joiner_a);
+        thread.finish(1); // idempotent finish still broadcasts — but A exited
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(joiner_a.drain(), 0, "exited waiter receives nothing");
+    }
+
+    /// The rewritten `wait_multiple` returns promptly when one of its targets
+    /// is signaled from another host thread (event-driven, no poll slices).
+    #[test]
+    fn wait_multiple_wakes_on_signal_within_bound() {
+        let mut sync = SyncState::new();
+        let (_h_event, event) = sync.register_event(true, false);
+        let (_h_thread, thread) = sync.register_thread(9, ThreadContext::default());
+        let targets = vec![
+            crate::WaitTarget::Event(Arc::clone(&event)),
+            crate::WaitTarget::Thread(Arc::clone(&thread)),
+        ];
+        let signaler = {
+            let event = Arc::clone(&event);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                event.set();
+            })
+        };
+        let t0 = Instant::now();
+        let result = wait_multiple(&targets, false, 5_000);
+        assert_eq!(result, WAIT_OBJECT_0, "the event index satisfied the wait");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "signal-driven wake must be prompt, took {:?}",
+            t0.elapsed()
+        );
+        signaler.join().expect("signaler");
     }
 }
 
@@ -1224,6 +1403,7 @@ mod directory_watch_tests {
             exit_code: std::sync::atomic::AtomicU32::new(STILL_ACTIVE),
             finished: Mutex::new(false),
             finished_cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
         });
         assert!(!obj.is_finished(), "a fresh child is running");
         assert_eq!(
@@ -1258,6 +1438,7 @@ mod directory_watch_tests {
             exit_code: std::sync::atomic::AtomicU32::new(STILL_ACTIVE),
             finished: Mutex::new(false),
             finished_cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
         });
         let waiter_clone = Arc::clone(&waiter_obj);
         let waiter = std::thread::spawn(move || waiter_clone.wait_until_finished(5_000));

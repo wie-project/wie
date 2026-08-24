@@ -33,47 +33,69 @@ use crate::mem::GuestMemory;
 use crate::regs::RegFile;
 use ahash::HashMap;
 use ahash::HashMapExt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
-/// Per-entry wait cell for background compiles.
+/// Per-entry completion token for background compiles.
 ///
-/// A mutex + condvar pair lets a guest thread block **only** on the entry it
-/// is about to execute (the worker calls [`Self::notify_all`] when it resolves
-/// that entry), instead of waiting on the whole queue. `notify_all` needs no
-/// lock; the mutex exists solely so `wait_timeout` is well-defined.
+/// One-shot `std::sync::mpsc` channel: the worker sends exactly once when it
+/// resolves the entry (install / fail / drop), and a guest thread blocks in
+/// `recv_timeout` for the remaining budget directly — no chunked condvar
+/// polling, so there is no 1 ms latency floor. A token sent before the waiter
+/// arrives buffers in the channel; `wait_timeout` still returns immediately.
+///
+/// The cell also carries the visit threshold that governed the promotion, so
+/// a later wait timeout can re-arm cooldown hysteresis (doubling) even when
+/// the waiting thread never computed the threshold itself (re-entry into an
+/// already-Queued entry).
 pub(super) struct BgWaitCell {
-    lock: Mutex<()>,
-    cv: Condvar,
+    /// Sender half; taken and fired once by [`Self::notify_all`].
+    tx: Mutex<Option<mpsc::Sender<()>>>,
+    /// Receiver half; taken once by the first waiter. Later waiters get
+    /// `None` from [`Self::wait_timeout`] and fall back to cache re-checks.
+    rx: Mutex<Option<mpsc::Receiver<()>>>,
+    /// Visit threshold that governed this promotion (cooldown doubling base).
+    thr: AtomicU32,
 }
 
 impl BgWaitCell {
-    pub(super) fn new() -> Arc<Self> {
+    pub(super) fn new(thr: u32) -> Arc<Self> {
+        let (tx, rx) = mpsc::channel();
         Arc::new(Self {
-            lock: Mutex::new(()),
-            cv: Condvar::new(),
+            tx: Mutex::new(Some(tx)),
+            rx: Mutex::new(Some(rx)),
+            thr: AtomicU32::new(thr),
         })
     }
 
-    /// Wake all waiters for this entry (worker install/fail/drop paths).
-    fn notify_all(&self) {
-        self.cv.notify_all();
+    /// Fire the one-shot completion token (worker install/fail/drop paths).
+    ///
+    /// Idempotent: a second call finds the sender taken and does nothing.
+    /// `pub(super)` so JIT-module tests can fire tokens directly.
+    pub(super) fn notify_all(&self) {
+        if let Some(tx) = self.tx.lock().unwrap().take() {
+            // A missing waiter is fine — the token buffers until recv.
+            let _ = tx.send(());
+        }
     }
 
-    /// Block until woken or `timeout` elapses. Spurious wakeups return early —
-    /// callers must re-check the cache state.
-    pub(super) fn wait_timeout(&self, timeout: Duration) {
-        // The lock guards only the condvar wait (no panic-capable work is done
-        // while holding it), so a poison would mean a hard invariant violation
-        // we cannot recover from — treat it as an unrecoverable fault.
-        let guard = self.lock.lock().expect("bg wait lock poisoned");
-        let (guard, _timed_out) = self
-            .cv
-            .wait_timeout(guard, timeout)
-            .expect("condvar wait_timeout");
-        drop(guard);
+    /// Block until the token fires or `timeout` elapses.
+    ///
+    /// Returns `true` when woken by the token; `false` when the budget ran
+    /// out or another waiter already consumed the receiver (callers must
+    /// re-check the cache state either way).
+    pub(super) fn wait_timeout(&self, timeout: Duration) -> bool {
+        let Some(rx) = self.rx.lock().unwrap().take() else {
+            return false;
+        };
+        rx.recv_timeout(timeout).is_ok()
+    }
+
+    /// Threshold that governed this promotion (cooldown doubling base).
+    pub(super) fn threshold(&self) -> u32 {
+        self.thr.load(Ordering::Relaxed)
     }
 }
 
@@ -86,6 +108,13 @@ pub(super) enum BgEnqueueOutcome {
     Ready,
     /// Worker unavailable / queue full / block not compilable: caller falls
     /// back to inline compilation (or iced for NotPure).
+    ///
+    /// Invariant: this is the ONLY outcome that permits inline compilation
+    /// while a worker might still be alive. A dedup hit (another thread
+    /// already queued this exact rip) returns `Queued`-dedup as
+    /// [`BgEnqueueOutcome::Unavailable`] only when the worker is gone;
+    /// callers re-check [`JitShared::entry_queued`] before inlining so a
+    /// live worker's in-flight block is never compiled twice.
     Unavailable,
 }
 
@@ -147,6 +176,11 @@ pub struct JitShared {
     /// Lock-free background-compile timing (worker writes, per-thread
     /// snapshots read via [`super::JitCpu::stats`]).
     pub bg_compile: BgCompileProfile,
+    /// Approximate number of items currently queued or in flight on the
+    /// background worker (incremented on enqueue, decremented per processed
+    /// item). Backpressure signal: a deep queue raises the local promotion
+    /// threshold instead of feeding a backlog guests will time out on.
+    pub bg_queue_depth: AtomicU64,
     /// Test-only latch forcing the background path on for this instance
     /// (env-independent, and per-`JitShared` so parallel unit tests cannot
     /// interfere with each other).
@@ -184,6 +218,7 @@ impl JitShared {
             bg_compiles: AtomicU64::new(0),
             bg_fast_api: Mutex::new(Arc::from(Vec::new())),
             bg_compile: BgCompileProfile::default(),
+            bg_queue_depth: AtomicU64::new(0),
             #[cfg(test)]
             bg_force: AtomicBool::new(false),
         }
@@ -193,6 +228,14 @@ impl JitShared {
     /// (on for real runs, off under `cfg(test)`) or the test latch.
     pub(super) fn bg_enabled_here(&self) -> bool {
         JitConfig::get().bg_enabled() || self.bg_force_test()
+    }
+
+    /// Whether `rip` is currently `Queued` in the cache — a background
+    /// compile for this exact block is already in flight, so a caller that
+    /// just got [`BgEnqueueOutcome::Unavailable`] must not inline-compile it
+    /// while the worker lives (that would build the block twice).
+    pub(super) fn entry_queued(&self, rip: u64) -> bool {
+        matches!(self.cache.pin().get(&rip), Some(CacheEntry::Queued(_)))
     }
 
     #[cfg(test)]
@@ -267,37 +310,55 @@ impl JitShared {
         }
     }
 
-    /// Worker main loop: compile queued blocks, install Ready entries, wake
-    /// waiters. Exits when the channel disconnects (shared state dropped).
+    /// Worker main loop: compile queued blocks, install Ready entries, fire
+    /// completion tokens. Exits when the channel disconnects (shared state
+    /// dropped).
+    ///
+    /// Batch-drain: after each blocking `recv`, the loop pulls every item
+    /// already queued via `try_recv` before sleeping again, so a promotion
+    /// burst costs one wakeup instead of one wakeup per block.
     fn bg_worker_main(shared: &Weak<Self>, rx: &Receiver<(u64, BlockKind)>) {
-        while let Ok((rip, kind)) = rx.recv() {
+        while let Ok(first) = rx.recv() {
             let Some(shared) = shared.upgrade() else {
                 break;
             };
-            let mem_gen_before = shared.mem_gen.load(Ordering::Acquire);
-            // Arc clone: refcount bump only (table is built once per engine).
-            let fast_api = shared.bg_fast_api.lock().unwrap().clone();
-            let start = Instant::now();
-            let compiled = shared.compile_from_kind_shared(fast_api.as_ref(), rip, kind);
-            let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
-            let insns = compiled.as_ref().map_or(0, |c| u64::from(c.insn_count));
-            shared.bg_compile.record(insns, us);
-            // If guest memory was remapped (map/protect/free) or a code page
-            // write is pending while we compiled, the cached bytes may be
-            // stale — drop the result and let the guest re-request.
-            let stale = shared.mem_gen.load(Ordering::Acquire) != mem_gen_before
-                || compiled.as_ref().is_some_and(|c| {
-                    let len =
-                        usize::try_from(c.guest_end.saturating_sub(c.guest_start)).unwrap_or(0);
-                    shared.pending_code_write_overlaps(c.guest_start, len)
-                });
-            if stale {
-                shared.bg_install_drop(rip);
-            } else {
-                match compiled {
-                    Some(c) => shared.bg_install_ready(rip, c),
-                    None => shared.bg_install_never(rip),
-                }
+            shared.bg_process_one(first);
+            // Batch-drain: pull every currently-queued item before blocking
+            // again so a promotion burst costs one wakeup, not one per block.
+            // We hold a strong `shared` for the whole batch, so teardown
+            // cannot land mid-drain.
+            while let Ok(item) = rx.try_recv() {
+                shared.bg_process_one(item);
+            }
+        }
+    }
+
+    /// Compile + install one queued job (shared by the blocking and
+    /// batch-drain paths). Decrements [`Self::bg_queue_depth`] exactly once.
+    fn bg_process_one(&self, (rip, kind): (u64, BlockKind)) {
+        self.bg_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        let mem_gen_before = self.mem_gen.load(Ordering::Acquire);
+        // Arc clone: refcount bump only (table is built once per engine).
+        let fast_api = self.bg_fast_api.lock().unwrap().clone();
+        let start = Instant::now();
+        let compiled = self.compile_from_kind_shared(fast_api.as_ref(), rip, kind);
+        let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let insns = compiled.as_ref().map_or(0, |c| u64::from(c.insn_count));
+        self.bg_compile.record(insns, us);
+        // If guest memory was remapped (map/protect/free) or a code page
+        // write is pending while we compiled, the cached bytes may be
+        // stale — drop the result and let the guest re-request.
+        let stale = self.mem_gen.load(Ordering::Acquire) != mem_gen_before
+            || compiled.as_ref().is_some_and(|c| {
+                let len = usize::try_from(c.guest_end.saturating_sub(c.guest_start)).unwrap_or(0);
+                self.pending_code_write_overlaps(c.guest_start, len)
+            });
+        if stale {
+            self.bg_install_drop(rip);
+        } else {
+            match compiled {
+                Some(c) => self.bg_install_ready(rip, c),
+                None => self.bg_install_never(rip),
             }
         }
     }
@@ -371,7 +432,7 @@ impl JitShared {
                         // Rate-limited: first REJECT_WARN_MAX rejections at
                         // WARN (unique enough to triage), the tail at DEBUG.
                         let n = REJECTION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let msg_args = (format_args!("{rip:#x}"), bytes_len, n + 1, format!("{e}"));
+                        let msg_args = (format_args!("{rip:#x}"), bytes_len, n + 1, e.to_string());
                         if n < REJECT_WARN_MAX {
                             tracing::warn!(
                                 rip = format_args!("{}", msg_args.0),
@@ -591,6 +652,15 @@ pub struct PerThreadJitState {
     /// Shadow return-stack depth.
     pub shadow_sp: u64,
     pub shadow_ret: [u64; lower::SHADOW_DEPTH],
+    /// Sampling counter for the iced-residue opcode histogram (increments
+    /// every iced step; the decode+bucket happens only every Nth step and
+    /// only when `WIE_JIT_OPCODE_HISTO` is on).
+    pub opcode_sample_i: u32,
+    /// Visit threshold selected by the most recent miss-path promotion
+    /// decision. Consumed by `enqueue_bg` when it builds the wait cell (the
+    /// cell carries the threshold so a later timeout can double it for
+    /// cooldown hysteresis). Owned by the thread; no synchronization needed.
+    pub pending_promote_thr: u32,
 }
 
 // SAFETY: TLB/pin raw pointers are non-owning views of guest mmap arenas.
@@ -625,6 +695,8 @@ impl PerThreadJitState {
             edge_ic_rr: 0,
             shadow_sp: 0,
             shadow_ret: [0; lower::SHADOW_DEPTH],
+            opcode_sample_i: 0,
+            pending_promote_thr: 0,
         }
     }
 }

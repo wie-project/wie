@@ -37,6 +37,7 @@ use config::JitConfig;
 use lower::CompiledBlock;
 use shared::BgWaitCell;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// All 16 dirty bits set (GPR or XMM bank): the "everything is dirty" sentinel
 /// for trampolines / fault paths that cannot track individual registers.
@@ -77,7 +78,10 @@ pub enum CacheEntry {
     /// Do not retry decode/compile at this VA (cold fail or non-pure).
     Never,
     /// Visit counter + compile threshold (threshold fixed on first sight so we
-    /// do not re-decode for UCRT peek on every warmup visit).
+    /// do not re-decode for UCRT peek on every warmup visit). Also doubles as
+    /// the cooldown state: a wait timeout re-inserts the entry with
+    /// `visits: 0` and a doubled `thr` (hysteresis, capped), so a stalled
+    /// block keeps interpreting instead of triggering an inline double-compile.
     Hot { visits: u32, thr: u32 },
     /// Enqueued for background compilation. The [`BgWaitCell`] wakes guest
     /// threads waiting specifically for this entry (the worker calls
@@ -110,11 +114,70 @@ impl UcrtImportIds {
     }
 }
 
-/// Dump helper mem-path histogram when `WIE_JIT_MEM_TRACE=1` or `WIE_EXEC_TRACE=1`.
+/// Dump mem-path histogram when `WIE_JIT_MEM_TRACE=1` or `WIE_EXEC_TRACE=1`.
+///
+/// Also surfaces two Phase-0 counters through the same call site (the runtime
+/// profile's `finalize_profile` invokes this unconditionally, and each section
+/// carries its own gate):
+/// - the background-promotion outcome ledger (printed whenever any outcome
+///   was recorded),
+/// - the sampled iced-residue opcode histogram (`WIE_JIT_OPCODE_HISTO=1`).
 pub fn dump_mem_path_stats(s: &JitStats) {
-    if !JitConfig::get().mem_path_trace_enabled() {
-        return;
+    if JitConfig::get().mem_path_trace_enabled() {
+        dump_mem_path_histogram(s);
     }
+    // Promotion outcome ledger: per-enqueue resolution of the background
+    // compile pipeline. Printed whenever anything was recorded.
+    if let Some(line) = bg_ledger_line(s) {
+        tracing::error!("{line}");
+    }
+    // Sampled opcode histogram over the interpreted residue (opt-in).
+    if JitConfig::get().opcode_hist_enabled() {
+        dump_opcode_histogram();
+    }
+}
+
+/// Background-promotion outcome ledger rendered as one report line.
+///
+/// `None` while nothing was recorded (quiet by default).
+fn bg_ledger_line(s: &JitStats) -> Option<String> {
+    let ledger_total = s
+        .bg_promo_hit_ready
+        .saturating_add(s.bg_promo_stalled_ok)
+        .saturating_add(s.bg_promo_timed_out)
+        .saturating_add(s.bg_promo_cooled_down)
+        .saturating_add(s.bg_promo_deferred);
+    if ledger_total == 0 {
+        return None;
+    }
+    Some(format!(
+        "[wie] jit_bg_ledger: hit_ready={} stalled_ok={} timed_out={} cooled_down={} deferred={} (total={ledger_total})",
+        s.bg_promo_hit_ready,
+        s.bg_promo_stalled_ok,
+        s.bg_promo_timed_out,
+        s.bg_promo_cooled_down,
+        s.bg_promo_deferred
+    ))
+}
+
+/// Report lines for the `=== WIE_RUNTIME_PROFILE ===` block: the promotion
+/// ledger and the sampled iced-residue opcode histogram
+/// (`WIE_JIT_OPCODE_HISTO=1`). Rendered into the report itself so they print
+/// on every profile path — SIGINT included — without depending on a tracing
+/// subscriber being installed (tracing is silent under a default RUST_LOG).
+#[must_use]
+pub fn jit_profile_report_lines(s: &JitStats) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(line) = bg_ledger_line(s) {
+        out.push(line);
+    }
+    if JitConfig::get().opcode_hist_enabled() {
+        out.extend(opcode_histogram_lines());
+    }
+    out
+}
+
+fn dump_mem_path_histogram(s: &JitStats) {
     let helpers = s.load_calls.saturating_add(s.store_calls);
     tracing::error!(
         "[wie] mem_path helpers={helpers} load={} store={}",
@@ -166,6 +229,64 @@ pub fn dump_mem_path_stats(s: &JitStats) {
             fmt(s.mem_addr_outside),
         );
     }
+}
+
+/// Dump the sampled iced-residue opcode histogram (`WIE_JIT_OPCODE_HISTO=1`).
+///
+/// Buckets are keyed by the iced-x86 mnemonic discriminant; names are
+/// resolved through `Mnemonic::try_from`. Top 60 shown, like
+/// [`crate::exec::dump_iced_counters`], but sampled (every 64th step) so it
+/// can stay on for whole-session profiling.
+fn dump_opcode_histogram() {
+    let lines = opcode_histogram_lines();
+    if lines.is_empty() {
+        tracing::error!("[wie] jit_opcode_hist: empty (no sampled steps)");
+        return;
+    }
+    for line in &lines {
+        tracing::error!("{line}");
+    }
+}
+
+/// Render the sampled iced-residue opcode histogram as report lines.
+///
+/// Buckets are keyed by the iced-x86 mnemonic discriminant; names are
+/// resolved through `Mnemonic::try_from`. Top 60 shown, like
+/// [`crate::exec::dump_iced_counters`], but sampled (every 64th step) so it
+/// can stay on for whole-session profiling. Empty when the gate is off or no
+/// samples were taken.
+fn opcode_histogram_lines() -> Vec<String> {
+    let mut pairs: Vec<(u64, usize)> = Vec::new();
+    for (i, c) in pipeline::OPCODE_HISTO.iter().enumerate() {
+        let count = c.load(Ordering::Relaxed);
+        if count > 0 {
+            pairs.push((count, i));
+        }
+    }
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    pairs.sort_by_key(|a| std::cmp::Reverse(*a));
+    let total: u64 = pairs.iter().map(|(c, _)| *c).sum();
+    let samples = pipeline::OPCODE_SAMPLES.load(Ordering::Relaxed);
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "--- jit iced-residue opcode histogram (sampled 1/{}: {samples} samples, total={total}) ---",
+        pipeline::OPCODE_SAMPLE_EVERY
+    ));
+    let show = pairs.len().min(60);
+    for (count, idx) in pairs.iter().take(show) {
+        let name = iced_x86::Mnemonic::try_from(*idx)
+            .map_or_else(|_| format!("Mnemonic({idx})"), |m| format!("{m:?}"));
+        // Integer tenths of a percent (avoid f64 cast_precision_loss).
+        let pct = count.saturating_mul(1000).checked_div(total).unwrap_or(0);
+        lines.push(format!("{count:>10}  {:3}.{}%  {name}", pct / 10, pct % 10));
+    }
+    if pairs.len() > show {
+        lines.push(format!("  … {} more mnemonics", pairs.len() - show));
+    }
+    lines.push("--- end ---".to_owned());
+    lines
 }
 
 /// Lightweight counters for `WIE_CPU=jit` diagnostics.
@@ -235,6 +356,19 @@ pub struct JitStats {
     pub pin_allow_bits: u64,
     /// Adaptive-JIT cost-model instrumentation (timing + decision counters).
     pub profile: JitProfile,
+    /// Promotion ledger: enqueues already `Ready` when handed to the worker
+    /// (the worker beat us — pure bookkeeping, no wait).
+    pub bg_promo_hit_ready: u64,
+    /// Promotion ledger: waits that resolved to a Ready block within budget.
+    pub bg_promo_stalled_ok: u64,
+    /// Promotion ledger: waits that exhausted their budget.
+    pub bg_promo_timed_out: u64,
+    /// Promotion ledger: timeouts converted into a cooldown re-arm
+    /// (`Hot { visits: 0, thr: doubled }`) instead of an inline compile.
+    pub bg_promo_cooled_down: u64,
+    /// Promotion ledger: crossings skipped because the compile queue was too
+    /// deep (backpressure) or another thread already queued the same block.
+    pub bg_promo_deferred: u64,
 }
 #[cfg(test)]
 #[allow(clippy::expect_used)]
@@ -251,7 +385,7 @@ mod tests {
     use block::BlockKind;
     use config::JitConfig;
     use lower::{JitCtx, chain_table_insert};
-    use pipeline::ranges_overlap;
+    use pipeline::{next_cooldown_thr, ranges_overlap};
     use shared::{BgEnqueueOutcome, BgWaitCell};
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -547,21 +681,23 @@ mod tests {
             .expect("write");
         cpu.write_rip(base).expect("rip");
 
-        // Eager first visit (hotness 0 in tests): enqueue + wait + run compiled.
-        // The block may run via the worker's Ready install OR the inline
-        // fallback if the worker misses the wait budget — both produce the same
-        // executed code, so only the outcomes are asserted.
+        // Eager first visit (hotness 0 in tests): enqueue + bounded wait.
+        // The block may run via the worker's Ready install within the wait
+        // budget, or — on a timeout (slow first compile in debug) — via the
+        // cooldown path: one interpreted visit now, Ready installed by the
+        // worker shortly after. Both produce identical guest state, so only
+        // the outcomes are asserted; Ready is polled for below.
         let (result, _retired) = cpu.step_one().expect("step");
         assert!(matches!(result, StepResult::Continue));
         assert_eq!(cpu.thread.regs.rax(), 0x2a);
-        assert!(cpu.has_ready_at(base), "a Ready block must be installed");
         // The worker processes the queued job regardless of who won the race;
         // poll (bounded) for its install so the shared counters are settled.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while cpu.stats().bg_compiles < 1 {
+        while cpu.stats().bg_compiles < 1 || !cpu.has_ready_at(base) {
             assert!(Instant::now() < deadline, "worker install timed out");
             std::thread::sleep(Duration::from_millis(5));
         }
+        assert!(cpu.has_ready_at(base), "a Ready block must be installed");
         assert!(cpu.shared.chain_ids.pin().contains_key(&base));
         assert!(
             cpu.shared.cache_epoch.load(Ordering::Relaxed) >= 1,
@@ -606,7 +742,7 @@ mod tests {
         // No worker spawned (fresh engine, nothing enqueued): waiting must
         // return immediately so the caller falls back to inline compilation.
         let mut cpu = JitCpu::open_x86_64();
-        let cell = BgWaitCell::new();
+        let cell = BgWaitCell::new(100);
         let r = cpu.wait_bg_ready(0x1022_0000_u64, &cell);
         assert!(r.is_none());
         assert_eq!(cpu.stats().compile_stall_fallback, 0);
@@ -679,15 +815,310 @@ mod tests {
             Some(CacheEntry::Hot { visits: 2, .. })
         ));
 
-        // Visit 2: next=3, not < 3 → crossed → compile.
+        // Visit 2: next=3, not < 3 → crossed. Background is disabled in the
+        // unit suite (no bg_force), so enqueue reports Unavailable and the
+        // inline fallback compiles — the ONLY path allowed to do so.
         cpu.write_rip(base).expect("rip");
+        let inline_before = cpu.stats().profile.inline_compiles;
         let (result, _) = cpu.step_one().expect("step 2");
         assert!(matches!(result, StepResult::Continue));
         assert!(cpu.has_ready_at(base), "threshold crossed → compiled");
+        assert!(
+            cpu.stats().profile.inline_compiles > inline_before,
+            "Unavailable outcome must still inline-compile"
+        );
+        let s = cpu.stats();
+        assert_eq!(s.bg_promo_timed_out, 0);
+        assert_eq!(s.bg_promo_cooled_down, 0);
+        assert_eq!(s.compile_stall_fallback, 0, "no wait happened on this path");
 
         // Invalidation clears the compiled block (SMC / unmap path).
         cpu.invalidate_code_range(base, 8);
         assert!(!cpu.has_ready_at(base), "invalidation must drop the block");
+
+        // --- Cooldown × invalidation interleaving ---
+        // Arm a cooldown near its threshold, then invalidate the range:
+        // only Ready entries are dropped, so the cooldown entry survives
+        // and keeps its hysteresis threshold.
+        cpu.shared.cache.pin().insert(
+            base,
+            CacheEntry::Hot {
+                visits: 198,
+                thr: 200,
+            },
+        );
+        cpu.invalidate_code_range(base, 8);
+        assert!(
+            matches!(
+                cpu.shared.cache.pin().get(&base),
+                Some(CacheEntry::Hot {
+                    visits: 198,
+                    thr: 200
+                })
+            ),
+            "invalidation must not clobber a cooldown entry"
+        );
+        // Crossing after invalidation recompiles from the CURRENT bytes.
+        cpu.write_rip(base).expect("rip");
+        let (result, _) = cpu.step_one().expect("re-cross visit 1");
+        assert!(matches!(result, StepResult::Continue));
+        assert!(!cpu.has_ready_at(base), "visit 1 below threshold");
+        cpu.write_rip(base).expect("rip");
+        let (result, _) = cpu.step_one().expect("re-cross visit 2");
+        assert!(matches!(result, StepResult::Continue));
+        assert!(
+            cpu.has_ready_at(base),
+            "post-invalidation re-cross compiles"
+        );
+        cpu.invalidate_code_range(base, 8);
+        assert!(
+            !cpu.has_ready_at(base),
+            "second invalidation drops it again"
+        );
+
+        // Reverse order — Ready invalidated while a fresh Hot counter is
+        // growing: the counter survives, next crossing recompiles.
+        cpu.shared.cache.pin().insert(
+            base,
+            CacheEntry::Hot {
+                visits: 201,
+                thr: 202,
+            },
+        );
+        cpu.invalidate_code_range(base, 8);
+        cpu.write_rip(base).expect("rip");
+        let (result, _) = cpu.step_one().expect("counter-survives step");
+        assert!(matches!(result, StepResult::Continue));
+        assert!(
+            cpu.has_ready_at(base),
+            "surviving counter re-crosses immediately"
+        );
+    }
+
+    // --- Timeout → Cooldown (never inline while the worker lives) ---
+
+    /// Simulated stalled worker: an alive `bg_alive` flag with nobody draining
+    /// the queue. The wait must consume its budget, NOT compile inline, and
+    /// re-arm the entry as a doubled-threshold cooldown.
+    #[test]
+    fn bg_timeout_arms_cooldown_never_inline_compiles() {
+        let mut cpu = JitCpu::open_x86_64();
+        let base = 0x1032_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        cpu.mem_write(base, &[0xb8, 0x2a, 0x00, 0x00, 0x00, 0x90, 0x0f, 0x0b])
+            .expect("code");
+        // Alive-but-stalled worker: no thread will ever resolve this entry.
+        cpu.shared.bg_alive.store(true, Ordering::Relaxed);
+        let cell = BgWaitCell::new(100);
+        cpu.shared
+            .cache
+            .pin()
+            .insert(base, CacheEntry::Queued(Arc::clone(&cell)));
+
+        cpu.write_rip(base).expect("rip");
+        let (result, retired) = cpu.step_one().expect("step");
+        assert!(matches!(result, StepResult::Continue));
+        assert_eq!(retired, 1, "stalled wait must fall back to ONE iced insn");
+        assert!(
+            matches!(
+                cpu.shared.cache.pin().get(&base),
+                Some(CacheEntry::Hot {
+                    visits: 0,
+                    thr: 200
+                })
+            ),
+            "timeout must re-arm as Hot {{ visits: 0, thr: doubled }}"
+        );
+        assert!(
+            !cpu.has_ready_at(base),
+            "no inline compile while worker alive"
+        );
+        let s = cpu.stats();
+        assert_eq!(s.compile_stall_fallback, 0, "inline fallback must not fire");
+        assert_eq!(s.bg_promo_timed_out, 1);
+        assert_eq!(s.bg_promo_cooled_down, 1);
+        assert_eq!(s.bg_promo_stalled_ok, 0);
+
+        // Invalidation leaves the Queued/Cooldown machinery untouched: a
+        // range invalidate over a still-Queued entry is a no-op (only Ready
+        // blocks are dropped) and must not panic or corrupt state.
+        cpu.invalidate_code_range(base, 8);
+        assert!(matches!(
+            cpu.shared.cache.pin().get(&base),
+            Some(CacheEntry::Hot {
+                visits: 0,
+                thr: 200
+            })
+        ));
+    }
+
+    /// Successive timeouts double the cooldown threshold again and again;
+    /// the cap holds.
+    #[test]
+    fn bg_cooldown_hysteresis_doubles_then_quadruples() {
+        let mut cpu = JitCpu::open_x86_64();
+        let base = 0x1033_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        cpu.shared.bg_alive.store(true, Ordering::Relaxed);
+        let thr_sequence = [100_u32, 200, 400];
+        for (i, &thr) in thr_sequence.iter().enumerate() {
+            let cell = BgWaitCell::new(thr);
+            cpu.shared
+                .cache
+                .pin()
+                .insert(base, CacheEntry::Queued(Arc::clone(&cell)));
+            let r = cpu.wait_bg_ready(base, &cell);
+            assert!(r.is_none(), "stalled worker never resolves (iter {i})");
+            let want = next_cooldown_thr(thr);
+            assert!(
+                matches!(
+                    cpu.shared.cache.pin().get(&base),
+                    Some(CacheEntry::Hot { visits: 0, thr }) if *thr == want
+                ),
+                "timeout {i}: expected doubled threshold {want}"
+            );
+        }
+        let s = cpu.stats();
+        assert_eq!(s.bg_promo_timed_out, 3);
+        assert_eq!(s.bg_promo_cooled_down, 3);
+        // Cap respected end-to-end: doubling from ≥ cap/2 pins at the cap.
+        let cell = BgWaitCell::new(30_000);
+        cpu.shared
+            .cache
+            .pin()
+            .insert(base, CacheEntry::Queued(Arc::clone(&cell)));
+        assert!(cpu.wait_bg_ready(base, &cell).is_none());
+        assert!(matches!(
+            cpu.shared.cache.pin().get(&base),
+            Some(CacheEntry::Hot {
+                visits: 0,
+                thr: 40_000
+            })
+        ));
+    }
+
+    /// A cooled-down block re-promotes once its raised threshold is crossed
+    /// and the real worker installs the Ready block.
+    #[test]
+    fn bg_cooldown_repromotes_and_installs_after_crossing() {
+        let mut cpu = JitCpu::open_x86_64();
+        cpu.shared.bg_force.store(true, Ordering::Relaxed);
+        let base = 0x1034_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        cpu.mem_write(base, &[0xb8, 0x2a, 0x00, 0x00, 0x00, 0x90, 0x0f, 0x0b])
+            .expect("code");
+        // Cooldown armed near its threshold: two more visits cross it.
+        cpu.shared.cache.pin().insert(
+            base,
+            CacheEntry::Hot {
+                visits: 198,
+                thr: 200,
+            },
+        );
+        for _ in 0..2 {
+            cpu.write_rip(base).expect("rip");
+            let (result, _) = cpu.step_one().expect("step");
+            assert!(matches!(result, StepResult::Continue));
+        }
+        // Second crossing enqueued to the real worker; poll for install.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cpu.has_ready_at(base) {
+            assert!(
+                Instant::now() < deadline,
+                "worker never installed after re-promotion"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(cpu.stats().bg_compiles >= 1);
+        let s = cpu.stats();
+        assert_eq!(s.bg_promo_timed_out, 0);
+        assert_eq!(s.bg_promo_deferred, 0);
+    }
+
+    /// Backpressure: a deep compile queue defers promotion (doubled threshold)
+    /// instead of enqueueing into a backlog guests would time out on.
+    #[test]
+    fn bg_backpressure_deep_queue_defers_promotion() {
+        let mut cpu = JitCpu::open_x86_64();
+        cpu.shared.bg_force.store(true, Ordering::Relaxed);
+        let base = 0x1035_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        cpu.mem_write(base, &[0xb8, 0x2a, 0x00, 0x00, 0x00, 0x90, 0x0f, 0x0b])
+            .expect("code");
+        // Simulate a saturated queue.
+        cpu.shared.bg_queue_depth.store(600, Ordering::Relaxed);
+        cpu.shared.cache.pin().insert(
+            base,
+            CacheEntry::Hot {
+                visits: 99,
+                thr: 100,
+            },
+        );
+        cpu.write_rip(base).expect("rip");
+        let enq_before = cpu.stats().profile.bg_enqueues;
+        let (result, _) = cpu.step_one().expect("step");
+        assert!(matches!(result, StepResult::Continue));
+        assert_eq!(
+            cpu.stats().profile.bg_enqueues,
+            enq_before,
+            "deep queue must skip enqueue"
+        );
+        assert!(
+            matches!(
+                cpu.shared.cache.pin().get(&base),
+                Some(CacheEntry::Hot {
+                    visits: 0,
+                    thr: 200
+                })
+            ),
+            "backpressure must re-arm a doubled threshold"
+        );
+        assert_eq!(cpu.stats().bg_promo_deferred, 1);
+        assert!(!cpu.has_ready_at(base));
+
+        // Queue drained → the same block promotes normally again.
+        cpu.shared.bg_queue_depth.store(0, Ordering::Relaxed);
+        cpu.shared.cache.pin().insert(
+            base,
+            CacheEntry::Hot {
+                visits: 199,
+                thr: 200,
+            },
+        );
+        cpu.write_rip(base).expect("rip");
+        let _ = cpu.step_one().expect("step after drain");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cpu.has_ready_at(base) {
+            assert!(
+                Instant::now() < deadline,
+                "worker never installed after drain"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     // --- B4: integer-SIMD JIT family — iced vs JIT dual-path gates ---

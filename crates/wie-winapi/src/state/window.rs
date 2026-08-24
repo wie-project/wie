@@ -661,6 +661,17 @@ pub struct WindowState {
 }
 
 impl WindowState {
+    /// The earliest next-fire deadline across armed timers, if any.
+    ///
+    /// Read by the runtime idle park (Painpoint 1) so an empty-queue
+    /// `GetMessage` park wakes exactly when the nearest `WM_TIMER` is due
+    /// instead of on a fixed poll tick. A brief state-lock read — never held
+    /// across the park itself.
+    #[must_use]
+    pub fn next_timer_deadline(&self) -> Option<std::time::Instant> {
+        self.timers.iter().map(|timer| timer.next_fire).min()
+    }
+
     /// Record the write-back slot for an in-flight `CreateProcessW/A` spawn.
     ///
     /// The handler calls this on its first entry (state lock held) before

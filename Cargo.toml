@@ -37,6 +37,8 @@ papaya = "0.2"
 
 clap = { version = "4.5", features = ["derive"] }
 
+criterion = "0.5"
+
 [workspace.lints.rust]
 # `deny` (not `forbid`) so wie-cpu can allow unsafe for Cranelift JIT entry points.
 unsafe_code = "deny"

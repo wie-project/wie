@@ -47,6 +47,7 @@ pub mod user32;
 pub mod uxtheme;
 pub mod version;
 pub mod vfs;
+pub mod wake;
 pub mod winhttp;
 pub mod wininet;
 pub mod winmm;
@@ -56,12 +57,13 @@ pub use exception::{RuntimeFunction, lookup_function_entry};
 pub use sync_obj::{
     CsWaitQueue, FileMappingObject, INFINITE, KernelHandle, KernelObject, MAXIMUM_WAIT_OBJECTS,
     MultiWaitRequest, PendingSpawn, STILL_ACTIVE, SemaphoreObject, SyncState, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT, WaitTarget, wait_multiple,
+    WAIT_OBJECT_0, WAIT_TIMEOUT, WaitTarget, wait_multiple, wait_multiple_step,
 };
 pub use vfs::{
     VolumeConfig, effective_bottle_root, global_bottle_root, host_path_to_guest,
     seed_default_skeleton,
 };
+pub use wake::{ThreadInbox, Wake, WakeHub};
 #[cfg(test)]
 mod exception_helpers;
 #[cfg(test)]

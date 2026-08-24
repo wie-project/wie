@@ -27,6 +27,10 @@ pub struct RuntimeProfile {
     idle_policy: String,
     idle_parks: u64,
     idle_park_ns: u128,
+    /// Wall nanoseconds spent parked / waiting-for-message per session
+    /// (Painpoint 1): empty-`GetMessage` parks, host object/pthread/CS wait
+    /// parks. The idle-attribution counter from the perf plan.
+    idle_residency_ns: u128,
     frames_published: u64,
     /// Zero-copy hand-backs of the published buffer (`Arc::try_unwrap` hit).
     hand_back_unwrap: u64,
@@ -131,6 +135,12 @@ impl RuntimeProfile {
     #[must_use]
     pub fn idle_park_ns(&self) -> u128 {
         self.idle_park_ns
+    }
+    /// Wall nanoseconds the session spent parked / waiting-for-message:
+    /// empty-`GetMessage` parks plus host object/pthread/CS wait parks.
+    #[must_use]
+    pub fn idle_residency_ns(&self) -> u128 {
+        self.idle_residency_ns
     }
     /// Number of published frames (frame timing enabled only).
     #[must_use]
@@ -252,6 +262,12 @@ impl RuntimeProfile {
         self.idle_park_ns = self.idle_park_ns.saturating_add(park_ns);
     }
 
+    /// Accumulate wall time spent parked / waiting-for-message into the
+    /// idle-residency counter (Painpoint 1 attribution).
+    pub(crate) fn add_idle_residency_ns(&mut self, ns: u128) {
+        self.idle_residency_ns = self.idle_residency_ns.saturating_add(ns);
+    }
+
     /// Set session-init wall time.
     pub(crate) fn set_init_ns(&mut self, ns: u128) {
         self.init_ns = ns;
@@ -294,11 +310,12 @@ impl RuntimeProfile {
         if !self.idle_policy().is_empty() {
             lines.push(format!("idle_policy={}", self.idle_policy()));
         }
-        if self.idle_parks() > 0 || self.idle_park_ns() > 0 {
+        if self.idle_parks() > 0 || self.idle_park_ns() > 0 || self.idle_residency_ns() > 0 {
             lines.push(format!(
-                "idle_parks={} idle_park_ms={:.2}",
+                "idle_parks={} idle_park_ms={:.2} idle_residency_ms={:.2}",
                 self.idle_parks(),
-                self.idle_park_ns() as f64 / 1e6
+                self.idle_park_ns() as f64 / 1e6,
+                self.idle_residency_ns() as f64 / 1e6
             ));
         }
         lines.push(format!(
@@ -423,6 +440,12 @@ impl RuntimeProfile {
                 "  {count:>7}  {:>8.2} ms  {name}",
                 *ns as f64 / 1e6
             ));
+        }
+        // JIT ledger + iced-residue opcode histogram (`WIE_JIT_OPCODE_HISTO=1`).
+        // Part of the report itself so SIGINT prints them like every other
+        // section, without needing a tracing subscriber.
+        if let Some(j) = self.jit() {
+            lines.extend(wie_cpu::jit_profile_report_lines(&j));
         }
         lines.join("\n")
     }
@@ -618,6 +641,22 @@ mod tests {
         assert_eq!(profile.guest_lock_wait_max_ns(), 1_200_000);
         assert_eq!(profile.presenter_lock_wait_ns(), 250_000);
         assert_eq!(profile.presenter_lock_wait_max_ns(), 250_000);
+    }
+
+    /// The idle-residency counter (Painpoint 1) surfaces in the report only
+    /// once it recorded park time, and its getter mirrors the stored value.
+    #[test]
+    fn report_emits_idle_residency_when_recorded() {
+        let mut profile = RuntimeProfile::default();
+        assert!(
+            !profile.report().contains("idle_residency_ms"),
+            "no park time → no residency line"
+        );
+        profile.add_idle_residency_ns(1_500_000);
+        profile.record_idle_park(1_500_000);
+        let report = profile.report();
+        assert!(report.contains("idle_residency_ms=1.50"), "{report}");
+        assert_eq!(profile.idle_residency_ns(), 1_500_000);
     }
 
     /// A snapshot fold (the `sync_lock_wait_stats` shape) copies the

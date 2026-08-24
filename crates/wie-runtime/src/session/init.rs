@@ -287,14 +287,22 @@ impl super::RuntimeSession {
         }
         let entry_point_va = init.entry_point_va;
         let initial_rsp = init.initial_rsp;
-        let process = Self::build_process(init)?;
+        let mut process = Self::build_process(init)?;
         // Arm the lock-wait timing gate alongside the frame-timing gate:
         // both live behind the same `profile_enabled` flag.
         if profile_enabled {
             process.lock_wait_stats.set_enabled(true);
         }
+        // Wire the wake hub (Painpoint 1): queue pushes broadcast tokens to
+        // parked threads, and the session keeps a hub clone so the outer
+        // loop can park on the primary inbox without the state lock.
+        let wake_hub = process.with_mut(|_, st| {
+            st.wire_wake_hub();
+            st.kernel.sync.wake_hub.clone()
+        });
         Ok(Self {
             process,
+            wake_hub,
             entry_point_va,
             initial_rsp,
             next_api_index: 0,

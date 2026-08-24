@@ -12,7 +12,9 @@
 use super::ALL_DIRTY_BITS;
 use super::JitStats;
 use super::block::{self, BlockKind, decode_pure_gpr_block, pure_is_self_loop};
-use super::config::JitConfig;
+use super::config::{
+    BG_QUEUE_CAP, COOLDOWN_THRESHOLD_CAP, JitConfig, WORK_THRESHOLD_CEILING, WORK_THRESHOLD_FLOOR,
+};
 use super::fast_api::{FastApiKind, JitFastPathConfig, install_heap_layout};
 use super::gen_tlb::GenTlb;
 use super::lower::{
@@ -26,8 +28,59 @@ use crate::exec::{self, StepResult};
 use crate::mem::{self, GuestMemory, PAGE_SIZE, PAGE_SIZE_USIZE};
 use crate::regs::Rflags;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// Sample every Nth iced step into the opcode histogram.
+pub(super) const OPCODE_SAMPLE_EVERY: u32 = 64;
+
+/// Sampled iced-residue opcode histogram, keyed by the iced-x86 mnemonic
+/// discriminant (`WIE_JIT_OPCODE_HISTO=1` to record + emit). Recording is
+/// sampled (1/64 steps) and env-gated so the hot path pays one relaxed load
+/// when off; the bucket write is a relaxed fetch_add.
+pub(super) static OPCODE_HISTO: LazyLock<Box<[AtomicU64]>> = LazyLock::new(|| {
+    std::iter::repeat_with(|| AtomicU64::new(0))
+        .take(2048)
+        .collect()
+});
+/// Total samples taken (for the dump header).
+pub(super) static OPCODE_SAMPLES: AtomicU64 = AtomicU64::new(0);
+
+/// Park quantum for a co-waiter whose one-shot token receiver was already
+/// taken by another thread (rare: two guest threads executing the same
+/// not-yet-compiled block). The primary waiter wakes instantly; co-waiters
+/// re-check the cache at this cadence until the budget runs out.
+const BG_COWAIT_QUANTUM: Duration = Duration::from_micros(200);
+
+/// Queue depth at or above which waiting for this entry's compile is futile:
+/// the worker is several block-latencies behind, so the wait budget would
+/// expire unserved. At sustained backlog nearly every full-budget stall timed
+/// out (measured 65 %), so past this depth we skip straight to cooldown
+/// hysteresis and keep interpreting instead of blocking the guest thread.
+const BG_WAIT_SKIP_DEPTH: u64 = 4;
+
+/// Decode the instruction at `rip` and bucket its mnemonic. Runs on the
+/// sampling seam only (every [`OPCODE_SAMPLE_EVERY`]th iced step).
+fn record_opcode_sample(mem: &GuestMemory, rip: u64) {
+    let mut fetch_buf = [0_u8; 15];
+    let Ok(n) = mem.fetch_into(rip, &mut fetch_buf) else {
+        return;
+    };
+    let Some(bytes) = fetch_buf.get(..n) else {
+        return;
+    };
+    let mut decoder = iced_x86::Decoder::with_ip(64, bytes, rip, iced_x86::DecoderOptions::NONE);
+    let instr = decoder.decode();
+    if instr.is_invalid() {
+        return;
+    }
+    let m = instr.mnemonic() as usize;
+    OPCODE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    if let Some(bucket) = OPCODE_HISTO.get(m) {
+        bucket.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 impl JitCpu {
     /// Open hybrid JIT on the host ISA (ARM64 on Apple Silicon).
@@ -304,18 +357,29 @@ impl JitCpu {
                     CacheEntry::Never => { /* fall through to iced */ }
                     CacheEntry::Queued(notify) => {
                         // About to execute the entry the worker is compiling:
-                        // block only for this entry, and only briefly. On timeout
-                        // (queue backlog / dead worker) fall back to inline.
+                        // block only for this entry, and only briefly. On
+                        // timeout the wait re-arms the entry as a doubled
+                        // threshold (`Hot`) — cooldown — so we keep
+                        // interpreting instead of inline-compiling the same
+                        // block the worker is already building. Inline is
+                        // reserved for a dead worker.
                         if let Some(compiled) = self.wait_bg_ready(rip, &notify) {
                             let meta = CompiledRunMeta::from(&compiled);
                             return Ok(self.finish_compiled(rip, meta));
                         }
-                        if let Some(compiled) = self.try_compile(rip) {
-                            let meta = CompiledRunMeta::from(&compiled);
-                            self.insert_ready(rip, compiled);
-                            return Ok(self.finish_compiled(rip, meta));
+                        if !self.shared.bg_alive.load(Ordering::Relaxed) {
+                            self.stats.compile_stall_fallback =
+                                self.stats.compile_stall_fallback.saturating_add(1);
+                            if let Some(compiled) = self.try_compile(rip) {
+                                let meta = CompiledRunMeta::from(&compiled);
+                                self.insert_ready(rip, compiled);
+                                return Ok(self.finish_compiled(rip, meta));
+                            }
+                            self.mark_never(rip);
                         }
-                        self.mark_never(rip);
+                        // Worker alive: cooldown was armed by the timed-out
+                        // wait (or another waiter resolved/re-decided it) —
+                        // fall through to iced this visit.
                     }
                     CacheEntry::Hot { visits, thr } => {
                         let next = visits.saturating_add(1);
@@ -331,21 +395,53 @@ impl JitCpu {
                             // Inline compilation is only the fallback.
                             self.stats.profile.hot_compiles =
                                 self.stats.profile.hot_compiles.saturating_add(1);
-                            let kind = {
-                                let mem = self.shared.mem.read().unwrap();
-                                block::decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip)
-                            };
-                            match self.enqueue_bg(rip, &kind) {
-                                BgEnqueueOutcome::Queued(_) | BgEnqueueOutcome::Ready => {
-                                    // Continue on iced this visit.
-                                }
-                                BgEnqueueOutcome::Unavailable => {
-                                    if let Some(compiled) = self.try_compile_from_kind(rip, kind) {
-                                        let meta = CompiledRunMeta::from(&compiled);
-                                        self.insert_ready(rip, compiled);
-                                        return Ok(self.finish_compiled(rip, meta));
+                            // Backpressure: a deep compile queue means guests
+                            // would stall past their wait budget anyway. Defer
+                            // promotion (doubled threshold) instead of feeding
+                            // the backlog; the block re-promotes after it.
+                            if self.bg_queue_too_deep() {
+                                self.defer_promotion(rip, thr);
+                            } else {
+                                let kind = {
+                                    let mem = self.shared.mem.read().unwrap();
+                                    block::decode_pure_gpr_block(
+                                        &mem,
+                                        self.thread.hooks.as_ref(),
+                                        rip,
+                                    )
+                                };
+                                self.thread.pending_promote_thr = thr;
+                                match self.enqueue_bg(rip, &kind) {
+                                    BgEnqueueOutcome::Queued(_) => {
+                                        // Continue on iced this visit; the wait
+                                        // (if any) happens when this thread is
+                                        // about to execute the entry.
                                     }
-                                    self.mark_never(rip);
+                                    BgEnqueueOutcome::Ready => {
+                                        self.stats.bg_promo_hit_ready =
+                                            self.stats.bg_promo_hit_ready.saturating_add(1);
+                                    }
+                                    BgEnqueueOutcome::Unavailable
+                                        if self.shared.entry_queued(rip)
+                                            && self.shared.bg_alive.load(Ordering::Relaxed) =>
+                                    {
+                                        // Another thread already queued this exact
+                                        // block: never build it twice — keep iced.
+                                        self.stats.bg_promo_deferred =
+                                            self.stats.bg_promo_deferred.saturating_add(1);
+                                    }
+                                    BgEnqueueOutcome::Unavailable => {
+                                        // Worker dead / disabled / queue send failed:
+                                        // inline compilation is permitted here.
+                                        if let Some(compiled) =
+                                            self.try_compile_from_kind(rip, kind)
+                                        {
+                                            let meta = CompiledRunMeta::from(&compiled);
+                                            self.insert_ready(rip, compiled);
+                                            return Ok(self.finish_compiled(rip, meta));
+                                        }
+                                        self.mark_never(rip);
+                                    }
                                 }
                             }
                         }
@@ -371,50 +467,80 @@ impl JitCpu {
                     pure_insns,
                     JitConfig::get().pure_loop_hotness(),
                     JitConfig::get().hotness_threshold(),
+                    JitConfig::get().target_work(),
                     JitConfig::get().eager_block_insns(),
                 );
                 if eager {
                     // Eager compile: the entry is required NOW (there may be no
                     // revisit). Prefer the background worker and block briefly
-                    // on this entry only; inline compile is the fallback.
+                    // on this entry only. On timeout the wait converts to a
+                    // cooldown re-arm — inline compilation stays reserved for a
+                    // dead/unavailable worker.
                     self.stats.profile.eager_compiles =
                         self.stats.profile.eager_compiles.saturating_add(1);
-                    match self.enqueue_bg(rip, &kind) {
-                        BgEnqueueOutcome::Queued(notify) => {
-                            if let Some(compiled) = self.wait_bg_ready(rip, &notify) {
-                                let meta = CompiledRunMeta::from(&compiled);
-                                return Ok(self.finish_compiled(rip, meta));
+                    if self.bg_queue_too_deep() {
+                        // Backpressure: don't feed the backlog; re-promote soon
+                        // via the (doubled) visit threshold instead.
+                        self.defer_promotion(rip, thr);
+                    } else {
+                        self.thread.pending_promote_thr = thr;
+                        match self.enqueue_bg(rip, &kind) {
+                            BgEnqueueOutcome::Queued(notify) => {
+                                if let Some(compiled) = self.wait_bg_ready(rip, &notify) {
+                                    let meta = CompiledRunMeta::from(&compiled);
+                                    return Ok(self.finish_compiled(rip, meta));
+                                }
+                                if !self.shared.bg_alive.load(Ordering::Relaxed) {
+                                    // Deadline missed AND worker gone: inline
+                                    // compile replaces the Queued entry.
+                                    self.stats.compile_stall_fallback =
+                                        self.stats.compile_stall_fallback.saturating_add(1);
+                                    if let Some(compiled) = self.try_compile_from_kind(rip, kind) {
+                                        let meta = CompiledRunMeta::from(&compiled);
+                                        self.insert_ready(rip, compiled);
+                                        return Ok(self.finish_compiled(rip, meta));
+                                    }
+                                    self.mark_never(rip);
+                                }
+                                // Worker alive: cooldown armed by the timed-out
+                                // wait (or the entry resolved/vanished mid-wait)
+                                // — fall through to iced this visit.
                             }
-                            // Deadline missed — compile inline (replaces Queued).
-                            if let Some(compiled) = self.try_compile_from_kind(rip, kind) {
-                                let meta = CompiledRunMeta::from(&compiled);
-                                self.insert_ready(rip, compiled);
-                                return Ok(self.finish_compiled(rip, meta));
+                            BgEnqueueOutcome::Ready => {
+                                // Worker beat us: the cache already holds Ready.
+                                self.stats.bg_promo_hit_ready =
+                                    self.stats.bg_promo_hit_ready.saturating_add(1);
+                                let compiled = {
+                                    let cache = self.shared.cache.pin();
+                                    cache.get(&rip).and_then(|e| match e {
+                                        CacheEntry::Ready(c) => Some(*c),
+                                        _ => None,
+                                    })
+                                };
+                                if let Some(compiled) = compiled {
+                                    let meta = CompiledRunMeta::from(&compiled);
+                                    return Ok(self.finish_compiled(rip, meta));
+                                }
+                                // Vanished (invalidated mid-flight) — fall through to iced.
                             }
-                            self.mark_never(rip);
-                        }
-                        BgEnqueueOutcome::Ready => {
-                            // Worker beat us: the cache already holds Ready.
-                            let compiled = {
-                                let cache = self.shared.cache.pin();
-                                cache.get(&rip).and_then(|e| match e {
-                                    CacheEntry::Ready(c) => Some(*c),
-                                    _ => None,
-                                })
-                            };
-                            if let Some(compiled) = compiled {
-                                let meta = CompiledRunMeta::from(&compiled);
-                                return Ok(self.finish_compiled(rip, meta));
+                            BgEnqueueOutcome::Unavailable => {
+                                if self.shared.entry_queued(rip)
+                                    && self.shared.bg_alive.load(Ordering::Relaxed)
+                                {
+                                    // Dedup hit: another thread already queued this
+                                    // exact block. Never build it twice — keep iced;
+                                    // it resolves Ready shortly.
+                                    self.stats.bg_promo_deferred =
+                                        self.stats.bg_promo_deferred.saturating_add(1);
+                                } else if let Some(compiled) = self.try_compile_from_kind(rip, kind)
+                                {
+                                    let meta = CompiledRunMeta::from(&compiled);
+                                    self.insert_ready(rip, compiled);
+                                    return Ok(self.finish_compiled(rip, meta));
+                                } else {
+                                    self.mark_never(rip);
+                                }
                             }
-                            // Vanished (invalidated mid-flight) — fall through to iced.
-                        }
-                        BgEnqueueOutcome::Unavailable => {
-                            if let Some(compiled) = self.try_compile_from_kind(rip, kind) {
-                                let meta = CompiledRunMeta::from(&compiled);
-                                self.insert_ready(rip, compiled);
-                                return Ok(self.finish_compiled(rip, meta));
-                            }
-                            self.mark_never(rip);
                         }
                     }
                 } else {
@@ -430,6 +556,19 @@ impl JitCpu {
         self.thread.shadow_sp = 0;
         self.stats.iced_insns = self.stats.iced_insns.saturating_add(1);
         self.stats.profile.iced_fallbacks = self.stats.profile.iced_fallbacks.saturating_add(1);
+        // Sampled opcode histogram over the interpreted residue (Phase-0
+        // counter): bucket the mnemonic of every Nth step, only when enabled.
+        // The sampling counter always advances so the interval is stable.
+        self.thread.opcode_sample_i = self.thread.opcode_sample_i.wrapping_add(1);
+        if self
+            .thread
+            .opcode_sample_i
+            .is_multiple_of(OPCODE_SAMPLE_EVERY)
+            && JitConfig::get().opcode_hist_enabled()
+        {
+            let mem = self.shared.mem.read().unwrap();
+            record_opcode_sample(&mem, self.thread.regs.rip);
+        }
         // Inline step_once_result: push RIP trace, call exec::step, update counters.
         {
             let rip = self.thread.regs.rip;
@@ -479,11 +618,13 @@ impl JitCpu {
         if tx.try_send((rip, kind.clone())).is_err() {
             return BgEnqueueOutcome::Unavailable;
         }
+        // One in-flight item the worker has not processed yet.
+        self.shared.bg_queue_depth.fetch_add(1, Ordering::Relaxed);
         // Transition the entry (only from Hot/absent; never clobber Ready/Never).
         let cache = self.shared.cache.pin();
         match cache.get(&rip) {
             None | Some(CacheEntry::Hot { .. }) => {
-                let cell = BgWaitCell::new();
+                let cell = BgWaitCell::new(self.thread.pending_promote_thr);
                 cache.insert(rip, CacheEntry::Queued(Arc::clone(&cell)));
                 self.stats.profile.bg_enqueues = self.stats.profile.bg_enqueues.saturating_add(1);
                 BgEnqueueOutcome::Queued(cell)
@@ -496,13 +637,25 @@ impl JitCpu {
     /// Wait (bounded) for the background worker to resolve `rip`.
     ///
     /// The guest only reaches this when it is about to execute the entry. The
-    /// wait is per-entry (the cell from the Queued entry, not the whole queue)
-    /// and time-boxed by [`JitConfig::bg_wait_timeout`]; on timeout the caller falls back
-    /// to inline compilation so a worker stall can never deadlock the guest.
+    /// wait is per-entry (the one-shot token cell from the Queued entry, not
+    /// the whole queue) and time-boxed by [`JitConfig::bg_wait_timeout`].
+    ///
+    /// On budget exhaustion the entry is re-armed as **cooldown** —
+    /// `Hot { visits: 0, thr: doubled }` (hysteresis; each successive timeout
+    /// doubles further, capped) — and `None` is returned. A deep queue skips
+    /// the wait entirely and takes the same cooldown path. Callers must NOT
+    /// inline-compile while the worker is alive: the block is already in
+    /// flight on the queue. Inline fallback stays reserved for a dead worker.
+    ///
     /// Returns the Ready block once installed.
     pub(super) fn wait_bg_ready(&mut self, rip: u64, cell: &BgWaitCell) -> Option<CompiledBlock> {
         if !self.shared.bg_alive.load(Ordering::Relaxed) {
-            return None; // worker gone: inline fallback
+            return None; // worker gone: inline fallback (no cooldown armed)
+        }
+        if self.shared.bg_queue_depth.load(Ordering::Relaxed) >= BG_WAIT_SKIP_DEPTH {
+            self.stats.bg_promo_deferred = self.stats.bg_promo_deferred.saturating_add(1);
+            self.arm_cooldown(rip, cell.threshold());
+            return None;
         }
         let budget = JitConfig::get().bg_wait_timeout();
         let start = Instant::now();
@@ -513,7 +666,8 @@ impl JitCpu {
                     Some(CacheEntry::Ready(c)) => Some(BgWaitState::Ready(*c)),
                     Some(CacheEntry::Never) => Some(BgWaitState::Never),
                     Some(CacheEntry::Queued(_)) => None,
-                    // Re-decided or invalidated while we waited: inline fallback.
+                    // Re-decided or invalidated while we waited: no cooldown
+                    // (the entry is gone / someone else owns its fate).
                     Some(CacheEntry::Hot { .. }) | None => return None,
                 }
             };
@@ -525,6 +679,8 @@ impl JitCpu {
                     );
                     self.stats.profile.bg_wait_hits =
                         self.stats.profile.bg_wait_hits.saturating_add(1);
+                    self.stats.bg_promo_stalled_ok =
+                        self.stats.bg_promo_stalled_ok.saturating_add(1);
                     return Some(c);
                 }
                 Some(BgWaitState::Never) => return None, // worker failed → iced
@@ -537,17 +693,74 @@ impl JitCpu {
                     .stats
                     .compile_stall_us
                     .saturating_add(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
-                self.stats.compile_stall_fallback =
-                    self.stats.compile_stall_fallback.saturating_add(1);
                 self.stats.profile.bg_wait_timeouts =
                     self.stats.profile.bg_wait_timeouts.saturating_add(1);
+                self.stats.bg_promo_timed_out = self.stats.bg_promo_timed_out.saturating_add(1);
+                // Cooldown, not inline compile: re-arm with a doubled threshold
+                // so this block keeps interpreting while the worker catches up.
+                self.arm_cooldown(rip, cell.threshold());
                 return None;
             }
-            // Chunked wait: a notification that races with our re-check (or a
-            // spurious wakeup) costs at most one 1 ms chunk, never the whole
-            // budget. The loop re-checks the cache after each wake.
-            cell.wait_timeout(budget.saturating_sub(elapsed).min(Duration::from_millis(1)));
+            // One-shot token wait: block in recv_timeout for the remaining
+            // budget. A token racing our cache re-check buffers in the
+            // channel (no lost wakeup, no 1 ms polling floor). A co-waiter
+            // whose receiver was already taken gets `false` and briefly parks
+            // before re-checking the cache.
+            if !cell.wait_timeout(budget.saturating_sub(elapsed)) {
+                std::thread::sleep(BG_COWAIT_QUANTUM);
+            }
         }
+    }
+
+    /// Re-arm a timed-out background compile as cooldown hysteresis.
+    ///
+    /// Inserts `Hot { visits: 0, thr: doubled }` so the block keeps running
+    /// interpreted and re-promotes only after the raised threshold. Only ever
+    /// replaces Hot/Queued/absent entries — never Ready or Never.
+    fn arm_cooldown(&mut self, rip: u64, prev_thr: u32) {
+        let thr = next_cooldown_thr(prev_thr);
+        let inserted = {
+            let cache = self.shared.cache.pin();
+            match cache.get(&rip) {
+                None | Some(CacheEntry::Hot { .. }) | Some(CacheEntry::Queued(_)) => {
+                    cache.insert(rip, CacheEntry::Hot { visits: 0, thr });
+                    true
+                }
+                _ => false,
+            }
+        };
+        if inserted {
+            tracing::debug!(
+                start = format_args!("{rip:#x}"),
+                prev_thr,
+                thr,
+                "jit bg wait timeout → cooldown"
+            );
+            self.stats.bg_promo_cooled_down = self.stats.bg_promo_cooled_down.saturating_add(1);
+        }
+    }
+
+    /// Backpressure deferral: skip the enqueue entirely and raise the local
+    /// promotion threshold (doubled) so the block re-promotes later instead of
+    /// queueing behind a backlog guests would time out on anyway.
+    fn defer_promotion(&mut self, rip: u64, prev_thr: u32) {
+        let thr = next_cooldown_thr(prev_thr);
+        {
+            let cache = self.shared.cache.pin();
+            match cache.get(&rip) {
+                None | Some(CacheEntry::Hot { .. }) => {
+                    cache.insert(rip, CacheEntry::Hot { visits: 0, thr });
+                }
+                _ => {}
+            }
+        }
+        self.stats.bg_promo_deferred = self.stats.bg_promo_deferred.saturating_add(1);
+    }
+
+    /// Whether the compile queue is deep enough that a fresh enqueue would
+    /// likely stall past the guest's wait budget (one relaxed atomic load).
+    fn bg_queue_too_deep(&self) -> bool {
+        self.shared.bg_queue_depth.load(Ordering::Relaxed) > BG_QUEUE_CAP as u64 / 2
     }
 
     /// Re-insert every Ready block into this thread's late-bound chain table.
@@ -918,15 +1131,18 @@ pub(super) fn ranges_overlap(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
 /// Select the visit threshold and eagerness for a decoded block.
 ///
 /// Fast-UCRT blocks always compile eagerly. Self-loops use the dedicated loop
-/// hotness. Otherwise the fixed hotness threshold applies, except that a Pure
-/// block with a large lowerable body length (`pure_insns >= eager_block_insns`)
-/// also compiles eagerly on first sight: one-shot cold-init code never revisits
-/// enough times to cross the fixed threshold, so it must skip the wait or it
-/// runs forever on iced.
+/// hotness. Otherwise promotion is **work-weighted**: a block of N
+/// instructions promotes after `clamp(target_work / N, FLOOR, CEILING)`
+/// visits — accumulated interpreted work exceeding predicted compile cost ×
+/// margin — so a 9-insn block keeps ≈100 visits (the historical flat
+/// behavior) while a 90-insn block needs only ~10. A `fixed_hotness` of `0`
+/// (forced under `cfg(test)`) means "compile everything eagerly on first
+/// sight" and bypasses the size model entirely. The eager-by-size rule
+/// (`pure_insns >= eager_block_insns`, default off) additionally forces a
+/// first-sight compile.
 ///
 /// Returns `(threshold, eager)`. `eager` is true when the block must compile
-/// on its first visit (fast-UCRT, a zero fixed threshold, or a large Pure body).
-/// `eager_block_insns == 0` disables the large-body rule.
+/// on its first visit. `eager_block_insns == 0` disables the large-body rule.
 #[must_use]
 pub(super) fn select_hot_threshold(
     is_ucrt: bool,
@@ -934,17 +1150,43 @@ pub(super) fn select_hot_threshold(
     pure_insns: usize,
     loop_hotness: u32,
     fixed_hotness: u32,
+    target_work: u64,
     eager_block_insns: usize,
 ) -> (u32, bool) {
     if is_ucrt {
         (2, true)
     } else if is_loop {
         (loop_hotness, loop_hotness == 0)
-    } else if eager_block_insns > 0 && pure_insns >= eager_block_insns {
-        (fixed_hotness, true)
+    } else if fixed_hotness == 0 {
+        // Unit-suite / forced-eager regime: byte-for-byte deterministic.
+        (0, true)
     } else {
-        (fixed_hotness, fixed_hotness == 0)
+        let thr = work_weighted_threshold(pure_insns, target_work);
+        let eager = eager_block_insns > 0 && pure_insns >= eager_block_insns;
+        (thr, eager)
     }
+}
+
+/// Size-aware visit threshold: `clamp(TARGET_WORK / max(insns, 1), FLOOR,
+/// CEILING)` ([`WORK_THRESHOLD_FLOOR`] / [`WORK_THRESHOLD_CEILING`]).
+#[must_use]
+pub(super) fn work_weighted_threshold(insns: usize, target_work: u64) -> u32 {
+    let n = insns.max(1) as u64;
+    let raw = target_work / n;
+    // Clamp in u64 space, then narrow: the ceiling keeps the cast total.
+    raw.clamp(
+        u64::from(WORK_THRESHOLD_FLOOR),
+        u64::from(WORK_THRESHOLD_CEILING),
+    ) as u32
+}
+
+/// Cooldown hysteresis: each wait timeout doubles the block's threshold,
+/// capped at [`COOLDOWN_THRESHOLD_CAP`] so a pathological block cannot defer
+/// its promotion forever. A zero base (unit-suite regime) stays zero, which
+/// makes the very next visit re-promote immediately.
+#[must_use]
+pub(super) fn next_cooldown_thr(prev_thr: u32) -> u32 {
+    prev_thr.saturating_mul(2).min(COOLDOWN_THRESHOLD_CAP)
 }
 
 /// Follow PE import thunks / short jumps to the final callee VA.
@@ -1016,50 +1258,78 @@ pub(super) fn resolve_thunk_va(mem: &GuestMemory, mut va: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::select_hot_threshold;
+    use super::super::shared::BgWaitCell;
+    use super::{
+        JitCpu, OPCODE_HISTO, OPCODE_SAMPLES, next_cooldown_thr, record_opcode_sample,
+        select_hot_threshold, work_weighted_threshold,
+    };
+    use crate::CpuEngine;
+    use crate::mem::protect;
+    use crate::mem::{MEM_COMMIT, MEM_RESERVE};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
-    const CUTOFF: usize = 48; // mirrored default; kept explicit so the test is self-contained
+    const TARGET: u64 = 900; // mirrored default; kept explicit so tests are self-contained
+    const CUTOFF: usize = 48;
 
-    /// A large Pure body on first sight must compile eagerly (bypasses the
-    /// fixed visit wait) so one-shot cold init leaves the interpreter.
+    // --- Work-weighted promotion math ---
+
+    /// A 9-insn block keeps ≈100 visits — the historical flat threshold.
     #[test]
-    fn large_pure_body_compiles_eagerly() {
-        let (thr, eager) = select_hot_threshold(false, false, CUTOFF, 8, 100, CUTOFF);
+    fn nine_insn_block_keeps_historical_threshold() {
+        assert_eq!(work_weighted_threshold(9, TARGET), 100);
+        let (thr, eager) = select_hot_threshold(false, false, 9, 8, 100, TARGET, 0);
         assert_eq!(thr, 100);
-        assert!(eager, "large pure body must compile eagerly");
+        assert!(!eager, "mid-size block stays visit-gated");
     }
 
-    /// A short Pure body stays visit-gated: it must NOT compile eagerly, so
-    /// short-block compile thrash does not regress.
+    /// Tiny blocks clamp at the ceiling: however cheap a compile would be,
+    /// the threshold never exceeds 10_000 visits (reached only via a large
+    /// `target_work` override); `max(N,1)` guards division by zero.
     #[test]
-    fn short_pure_body_stays_visit_gated() {
-        let (thr, eager) = select_hot_threshold(false, false, 4, 8, 100, CUTOFF);
-        assert_eq!(thr, 100);
-        assert!(!eager, "short pure body must remain visit-gated");
+    fn tiny_block_clamps_at_ceiling() {
+        // Default target keeps a 1-insn block at its raw quotient.
+        assert_eq!(work_weighted_threshold(1, TARGET), 900);
+        assert_eq!(work_weighted_threshold(0, TARGET), 900); // max(N,1)
+        // Ceiling engages when the quotient would exceed it.
+        assert_eq!(work_weighted_threshold(1, 100_000), 10_000);
     }
 
-    /// `eager_block_insns == 0` disables the large-body rule entirely; even a
-    /// huge body falls back to the fixed threshold (diagnosability switch).
+    /// Huge blocks clamp at the floor: even a 96-insn (or larger) body
+    /// promotes after at most 8 revisits.
     #[test]
-    fn zero_cutoff_disables_large_body_rule() {
-        let (thr, eager) = select_hot_threshold(false, false, 10_000, 8, 100, 0);
-        assert_eq!(thr, 100);
-        assert!(!eager, "cutoff 0 must leave the body visit-gated");
+    fn huge_block_clamps_at_floor() {
+        assert_eq!(work_weighted_threshold(96, TARGET), 9);
+        assert_eq!(work_weighted_threshold(usize::MAX, TARGET), 8);
+        let (thr, eager) = select_hot_threshold(false, false, 96, 8, 100, TARGET, 0);
+        assert_eq!(thr, 9);
+        assert!(!eager);
     }
 
-    /// Fast-UCRT blocks always compile eagerly regardless of body length or
-    /// disabled cutoff.
+    /// Knob override: raising `target_work` raises every threshold
+    /// proportionally (900 → 1800 doubles the 9-insn threshold).
+    #[test]
+    fn target_work_override_scales_thresholds() {
+        assert_eq!(work_weighted_threshold(9, 1_800), 200);
+        assert_eq!(work_weighted_threshold(90, 18_000), 200);
+        // An override below the floor still clamps up to it.
+        assert_eq!(work_weighted_threshold(4, 4), 8);
+    }
+
+    /// Fast-UCRT blocks always compile eagerly regardless of body length,
+    /// cutoff, or regime.
     #[test]
     fn ucrt_always_eager() {
-        assert!(select_hot_threshold(true, false, 1, 8, 100, CUTOFF).1);
-        assert!(select_hot_threshold(true, false, 1, 8, 100, 0).1);
+        assert!(select_hot_threshold(true, false, 1, 8, 100, TARGET, 0).1);
+        assert!(select_hot_threshold(true, false, 1, 8, 0, TARGET, 48).1);
     }
 
-    /// Self-loops use the dedicated loop hotness, not the large-body rule; with
-    /// a nonzero loop hotness they are not eager.
+    /// Self-loops use the dedicated loop hotness, not the size model; with a
+    /// nonzero loop hotness they are not eager.
     #[test]
     fn self_loop_uses_loop_hotness_not_body_rule() {
-        let (thr, eager) = select_hot_threshold(false, true, 10_000, 8, 100, CUTOFF);
+        let (thr, eager) = select_hot_threshold(false, true, 10_000, 8, 100, TARGET, CUTOFF);
         assert_eq!(thr, 8);
         assert!(
             !eager,
@@ -1067,11 +1337,149 @@ mod tests {
         );
     }
 
-    /// A zero fixed hotness (unit-suite regime) compiles everything eagerly,
-    /// independent of body size.
+    /// A zero regime switch (unit-suite value) compiles everything eagerly,
+    /// independent of body size — this is the byte-for-byte deterministic
+    /// path the unit suite relies on.
     #[test]
-    fn zero_fixed_hotness_is_eager() {
-        assert!(select_hot_threshold(false, false, 4, 8, 0, CUTOFF).1);
-        assert!(select_hot_threshold(false, false, 4, 8, 0, 0).1);
+    fn zero_fixed_hotness_is_eager_regardless_of_size() {
+        assert_eq!(
+            select_hot_threshold(false, false, 4, 8, 0, TARGET, 0),
+            (0, true)
+        );
+        assert_eq!(
+            select_hot_threshold(false, false, 10_000, 8, 0, TARGET, 48),
+            (0, true)
+        );
+    }
+
+    /// The eager-by-size rule is off by default (`eager_block_insns == 0`)
+    /// but still works when re-enabled via env: a large Pure body compiles
+    /// eagerly with its work-weighted threshold as cooldown base.
+    #[test]
+    fn eager_by_size_rule_disabled_then_reenableable() {
+        // Default: disabled — large bodies are visit-gated.
+        let (thr, eager) = select_hot_threshold(false, false, 96, 8, 100, TARGET, 0);
+        assert!(!eager);
+        assert_eq!(thr, 9);
+        // Re-enabled: same body goes eager on first sight.
+        let (thr, eager) = select_hot_threshold(false, false, 96, 8, 100, TARGET, 48);
+        assert!(eager, "large pure body must compile eagerly when enabled");
+        assert_eq!(thr, work_weighted_threshold(96, TARGET));
+    }
+
+    // --- Cooldown hysteresis math ---
+
+    /// Each timeout doubles the threshold; the cap holds at CEILING×4.
+    #[test]
+    fn cooldown_doubling_and_cap() {
+        assert_eq!(next_cooldown_thr(100), 200);
+        assert_eq!(next_cooldown_thr(200), 400);
+        assert_eq!(next_cooldown_thr(40_000), 40_000, "cap respected");
+        assert_eq!(
+            next_cooldown_thr(30_000),
+            40_000,
+            "doubling saturates into cap"
+        );
+        // Zero base (unit-suite regime) stays zero → immediate re-promotion.
+        assert_eq!(next_cooldown_thr(0), 0);
+    }
+
+    // --- One-shot completion token ---
+
+    /// A token fired BEFORE the wait must resolve immediately: no 1 ms
+    /// polling floor. The second `wait_timeout` finds the receiver taken and
+    /// returns false right away (co-waiter contract: re-check the cache).
+    #[test]
+    fn bg_wait_cell_buffered_token_resolves_without_floor() {
+        let cell = BgWaitCell::new(8);
+        cell.notify_all();
+        let start = Instant::now();
+        assert!(cell.wait_timeout(Duration::from_secs(5)));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "buffered token must return promptly (generous CI bound)"
+        );
+        assert!(!cell.wait_timeout(Duration::from_millis(50)));
+    }
+
+    /// A token arriving mid-wait wakes the waiter well before a generous
+    /// budget expires.
+    #[test]
+    fn bg_wait_cell_token_wakes_before_budget_expiry() {
+        let cell = BgWaitCell::new(4);
+        let c = Arc::clone(&cell);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            c.notify_all();
+        });
+        let start = Instant::now();
+        assert!(
+            cell.wait_timeout(Duration::from_secs(5)),
+            "token must arrive"
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(15),
+            "woke before token was sent"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2_000),
+            "token must wake the waiter promptly, not on chunk boundaries"
+        );
+    }
+
+    /// An unfired token consumes exactly its budget (bounded stall).
+    #[test]
+    fn bg_wait_cell_silent_token_consumes_budget_then_times_out() {
+        let cell = BgWaitCell::new(2);
+        let start = Instant::now();
+        assert!(!cell.wait_timeout(Duration::from_millis(30)));
+        assert!(start.elapsed() >= Duration::from_millis(25));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    // --- Sampled opcode histogram ---
+
+    /// Sampling buckets by mnemonic discriminant; names round-trip through
+    /// `Mnemonic::try_from` for the dump.
+    #[test]
+    fn opcode_histogram_buckets_known_mnemonics() {
+        let mut cpu = JitCpu::open_x86_64();
+        let base = 0x1036_0000_u64;
+        cpu.virtual_alloc(
+            base,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        // `mov eax, 0x2a; ud2`.
+        cpu.mem_write(base, &[0xb8, 0x2a, 0x00, 0x00, 0x00, 0x0f, 0x0b])
+            .expect("code");
+        let mov_bucket = iced_x86::Mnemonic::Mov as usize;
+        let before = OPCODE_HISTO[mov_bucket].load(Ordering::Relaxed);
+        let samples_before = OPCODE_SAMPLES.load(Ordering::Relaxed);
+        {
+            let mem = cpu.shared.mem.read().unwrap();
+            record_opcode_sample(&mem, base);
+        }
+        assert_eq!(
+            OPCODE_HISTO[mov_bucket].load(Ordering::Relaxed),
+            before + 1,
+            "`mov` sample must land in its mnemonic bucket"
+        );
+        assert_eq!(OPCODE_SAMPLES.load(Ordering::Relaxed), samples_before + 1);
+        // The dump resolves bucket indices back to names.
+        assert_eq!(
+            iced_x86::Mnemonic::try_from(mov_bucket).unwrap(),
+            iced_x86::Mnemonic::Mov
+        );
+        // Invalid bytes are silently not sampled.
+        let bad = OPCODE_SAMPLES.load(Ordering::Relaxed);
+        {
+            let mem = cpu.shared.mem.read().unwrap();
+            record_opcode_sample(&mem, base.wrapping_add(5)); // ud2 — valid but distinct
+        }
+        assert!(OPCODE_SAMPLES.load(Ordering::Relaxed) > bad);
     }
 }

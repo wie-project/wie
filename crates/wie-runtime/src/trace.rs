@@ -273,8 +273,11 @@ pub fn run_micro_exe_with_options(
 /// Runs until the runtime yields waiting for a message or another terminal condition.
 ///
 /// Under [`wie_winapi::IdlePolicy::Park`] (default for persistent when
-/// `WIE_IDLE` is unset), empty `GetMessage` parks the host for short quanta and
-/// re-enters until a message arrives or `WIE_IDLE_MAX_PARKS` is hit (then yields).
+/// `WIE_IDLE` is unset), an empty `GetMessage` parks EVENT-DRIVEN on the
+/// primary thread's wake inbox (Painpoint 1): `PostMessage` / `SetTimer` /
+/// teardown deliver tokens, and otherwise the park wakes exactly when the
+/// nearest guest timer is due. There is no park-count cap — teardown is
+/// explicit via [`wie_winapi::Wake::Shutdown`].
 pub fn run_persistent_until_yield(
     path: &std::path::Path,
     max_api: usize,
@@ -312,8 +315,11 @@ pub fn run_persistent_until_yield_with_options(
     let mut final_rip = 0;
     let mut final_rsp = 0;
     let mut remaining_api = max_api;
-    let mut message_parks: u32 = 0;
-    let max_parks = wie_winapi::idle::idle_max_message_parks();
+
+    // Park ceiling for one empty-queue wait: tokens (`PostMessage`,
+    // `SetTimer`, shutdown) wake EARLY; the cap only bounds control-flag /
+    // signal latency while nothing is armed.
+    const PARK_CAP: std::time::Duration = std::time::Duration::from_millis(50);
 
     let termination = loop {
         if remaining_api == 0 {
@@ -329,18 +335,23 @@ pub fn run_persistent_until_yield_with_options(
 
         match run_summary.termination {
             EntryTraceTermination::WaitingForMessage if idle.should_park_message() => {
-                let unlimited = max_parks == 0;
-                if !unlimited && message_parks >= max_parks {
-                    break EntryTraceTermination::WaitingForMessage;
-                }
+                // Event-driven park: block on the primary inbox until a wake
+                // token arrives or the nearest due guest timer expires, then
+                // re-enter GetMessage (the guest is still at its fake-API
+                // entry; the handler re-checks queue and timers itself).
                 let t0 = Instant::now();
-                wie_winapi::idle::apply_message_park();
+                let inbox = session.primary_inbox();
+                // Drain stale hints from earlier activity so this park waits
+                // only for NEW events (a missed drain would just spin once).
+                inbox.drain();
+                let deadline = session.next_timer_deadline();
+                inbox.wait_bounded(deadline, PARK_CAP);
                 let park_ns = t0.elapsed().as_nanos();
-                message_parks = message_parks.saturating_add(1);
                 if session.profile_enabled() {
-                    session.profile_mut().record_idle_park(park_ns);
+                    let profile = session.profile_mut();
+                    profile.record_idle_park(park_ns);
+                    profile.add_idle_residency_ns(park_ns);
                 }
-                // Re-enter GetMessage (guest still at fake-API entry).
             }
             other => break other,
         }

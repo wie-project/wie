@@ -138,9 +138,7 @@ fn strlen_lfstrip_line_no_false_positive() {
                 "off={off}: BOTH WRONG got={:#x} expect={expect:#x} (qword={x:#018x})",
                 iced.gpr(2)
             ));
-        } else if expect != 0
-            && off + 8 <= line.len() - 1
-            && line[off..off + 8].iter().all(|&b| b != 0)
+        } else if expect != 0 && off + 8 < line.len() && line[off..off + 8].iter().all(|&b| b != 0)
         {
             failures.push(format!(
                 "off={off}: FALSE-POSITIVE NUL detected (qword={x:#018x} has no NUL)"

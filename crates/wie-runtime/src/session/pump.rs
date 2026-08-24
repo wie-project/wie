@@ -599,6 +599,13 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                     .record_handler(t0.elapsed().as_nanos(), false, export_key.as_deref());
             }
             guard.kernel.sync.process_dying = true;
+            // Wake every inbox-parked thread (Painpoint 1): teardown is
+            // explicit — no park loop may outlive the process decision.
+            guard
+                .kernel
+                .sync
+                .wake_hub
+                .broadcast(wie_winapi::Wake::Shutdown);
             // Flush buffered CRT console output (printf/puts buffer in the
             // guest stream; fwrite bypasses it). Windows flushes stdout at
             // process exit — without this, trailing printf output is silently
@@ -1181,6 +1188,11 @@ impl super::RuntimeSession {
         let mut events: Vec<EntryTraceEvent> = Vec::new();
         let mut termination = EntryTraceTermination::ApiLimit;
 
+        // Painpoint 1 park state: the primary thread's wake inbox and the
+        // accumulated idle-residency for this run segment (parked wall time).
+        let inbox = self.primary_inbox();
+        let mut park_residency_ns: u128 = 0;
+
         let mut hooks = SessionPumpHooks::new(
             self.entry_point_va.0,
             &mut self.entry_reached,
@@ -1280,10 +1292,13 @@ impl super::RuntimeSession {
                         HostParkReason::CriticalSection { cs } => {
                             // Clone queue under lock, park **without** process
                             // locks so the CS owner can Leave and wake us.
+                            let t0 = Instant::now();
                             let q = self
                                 .process
                                 .with_mut(|_, st| wie_winapi::kernel32::resolve_cs_queue(st, cs));
                             q.park_brief();
+                            park_residency_ns =
+                                park_residency_ns.saturating_add(t0.elapsed().as_nanos());
                             // Retry Enter: per-thread engine keeps primary
                             // regs; only restore TLS.
                             self.process.with_mut(|_eng, st| {
@@ -1300,31 +1315,46 @@ impl super::RuntimeSession {
                             let target = self.process.with_mut(|_, st| {
                                 wie_winapi::kernel32::resolve_wait_target(st, handle)
                             });
+                            // Event-driven infinite wait (Painpoint 1):
+                            // register on the object's waiter registry FIRST,
+                            // then block on the inbox — a signal from any
+                            // peer thread delivers a token instead of the old
+                            // 50 ms poll slices. Tokens are hints; every wake
+                            // re-checks the object state. The 50 ms cap only
+                            // bounds `process_dying` / spawn-drain latency.
+                            let t0 = Instant::now();
                             let result = match target {
-                                Some(t) => {
-                                    // Slice infinite waits: drain nested
-                                    // CreateThread from workers and observe
-                                    // process_dying.
+                                Some(target) => {
                                     if timeout_ms == wie_winapi::INFINITE {
+                                        target.enter_wait(&inbox);
+                                        let mut result = wie_winapi::WAIT_FAILED;
                                         loop {
-                                            let r = t.wait(50);
-                                            if r == wie_winapi::WAIT_OBJECT_0 {
-                                                break r;
+                                            if target.try_wait() {
+                                                result = wie_winapi::WAIT_OBJECT_0;
+                                                break;
                                             }
                                             let _ = self.process.drain_spawns();
                                             let dying = self
                                                 .process
                                                 .with_winapi_ref(|st| st.kernel.sync.process_dying);
                                             if dying {
-                                                break wie_winapi::WAIT_FAILED;
+                                                break;
                                             }
+                                            inbox.wait_bounded(
+                                                None,
+                                                std::time::Duration::from_millis(50),
+                                            );
                                         }
+                                        target.exit_wait(&inbox);
+                                        result
                                     } else {
-                                        t.wait(timeout_ms)
+                                        target.wait(timeout_ms)
                                     }
                                 }
                                 None => wie_winapi::WAIT_FAILED,
                             };
+                            park_residency_ns =
+                                park_residency_ns.saturating_add(t0.elapsed().as_nanos());
                             self.process.with_mut(|eng, st| {
                                 st.kernel.threads.activate(primary_tid);
                                 let _ = eng.return_from_win64_api(u64::from(result)).map_err(|e| {
@@ -1338,31 +1368,83 @@ impl super::RuntimeSession {
                             // spawns so the worker can start executing guest
                             // code.
                             let _ = self.process.drain_spawns();
-                            // Yield briefly so the handler can re-check its
-                            // condition (WakeQueue park) on re-entry.
-                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            // Event-driven pthread park (Painpoint 1): the
+                            // handler queued a PtPark (queue + observed wake
+                            // sequence + bounded slice). Block on the inbox
+                            // until the queue's wake sequence moves (its
+                            // registry delivers tokens), the slice expires,
+                            // or the process starts dying — then re-enter the
+                            // idempotent handler.
+                            let t0 = Instant::now();
+                            let park = self
+                                .process
+                                .with_mut(|_, st| wie_winapi::pthread::take_park(st, primary_tid));
+                            match park {
+                                Some(park) => {
+                                    let deadline = Instant::now() + park.slice;
+                                    park.queue.enter_wait(&inbox);
+                                    loop {
+                                        if park.queue.observe() != park.observed {
+                                            break;
+                                        }
+                                        if Instant::now() >= deadline {
+                                            break;
+                                        }
+                                        let dying = self
+                                            .process
+                                            .with_winapi_ref(|st| st.kernel.sync.process_dying);
+                                        if dying {
+                                            break;
+                                        }
+                                        let _ = self.process.drain_spawns();
+                                        inbox.wait_bounded(
+                                            Some(deadline),
+                                            std::time::Duration::from_millis(50),
+                                        );
+                                    }
+                                    park.queue.exit_wait(&inbox);
+                                }
+                                None => {
+                                    // No queued park (spurious re-entry):
+                                    // brief yield so the handler can
+                                    // re-check its condition.
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                            }
+                            park_residency_ns =
+                                park_residency_ns.saturating_add(t0.elapsed().as_nanos());
                         }
                         HostParkReason::WaitMultiple => {
                             let _ = self.process.drain_spawns();
                             let req = self
                                 .process
                                 .with_mut(|_, st| st.kernel.sync.multi_wait.remove(&primary_tid));
+                            let t0 = Instant::now();
                             let result = match req {
                                 Some(req) => {
                                     let targets = self.process.with_mut(|_, st| {
                                         st.kernel.sync.wait_targets(&req.handles)
                                     });
                                     match targets {
-                                        Some(ts) => {
+                                        Some(targets) => {
                                             if req.timeout_ms == wie_winapi::INFINITE {
+                                                // Event-driven multi-wait:
+                                                // register on EVERY target's
+                                                // waiter registry, then
+                                                // re-check on each token.
+                                                for target in &targets {
+                                                    target.enter_wait(&inbox);
+                                                }
+                                                let mut result = wie_winapi::WAIT_FAILED;
                                                 loop {
-                                                    let r = wie_winapi::wait_multiple(
-                                                        &ts,
-                                                        req.wait_all,
-                                                        50,
-                                                    );
-                                                    if r != wie_winapi::WAIT_TIMEOUT {
-                                                        break r;
+                                                    if let Some(code) =
+                                                        wie_winapi::wait_multiple_step(
+                                                            &targets,
+                                                            req.wait_all,
+                                                        )
+                                                    {
+                                                        result = code;
+                                                        break;
                                                     }
                                                     let _ = self.process.drain_spawns();
                                                     let dying =
@@ -1370,12 +1452,22 @@ impl super::RuntimeSession {
                                                             st.kernel.sync.process_dying
                                                         });
                                                     if dying {
-                                                        break wie_winapi::WAIT_FAILED;
+                                                        break;
                                                     }
+                                                    // INFINITE wait: no deadline,
+                                                    // tokens + 50 ms liveness cap.
+                                                    inbox.wait_bounded(
+                                                        None,
+                                                        std::time::Duration::from_millis(50),
+                                                    );
                                                 }
+                                                for target in &targets {
+                                                    target.exit_wait(&inbox);
+                                                }
+                                                result
                                             } else {
                                                 wie_winapi::wait_multiple(
-                                                    &ts,
+                                                    &targets,
                                                     req.wait_all,
                                                     req.timeout_ms,
                                                 )
@@ -1386,6 +1478,8 @@ impl super::RuntimeSession {
                                 }
                                 None => wie_winapi::WAIT_FAILED,
                             };
+                            park_residency_ns =
+                                park_residency_ns.saturating_add(t0.elapsed().as_nanos());
                             self.process.with_mut(|eng, st| {
                                 st.kernel.threads.activate(primary_tid);
                                 let _ = eng.return_from_win64_api(u64::from(result)).map_err(|e| {
@@ -1401,6 +1495,25 @@ impl super::RuntimeSession {
 
         let charged_api = hooks.charged_api;
         drop(hooks);
+
+        // Fold this segment's parked wall time into the idle-residency
+        // counter (Painpoint 1). The hooks borrow owns `profile` during the
+        // loop; only after dropping it can we write.
+        if self.profile_enabled {
+            self.profile.add_idle_residency_ns(park_residency_ns);
+        }
+
+        // Terminal session stops (guest exit / host interrupt / diagnostics)
+        // wake every inbox-parked thread: teardown is explicit.
+        if matches!(
+            termination,
+            EntryTraceTermination::ExitProcess { .. }
+                | EntryTraceTermination::RuntimeStop(_)
+                | EntryTraceTermination::UnsupportedApi(_)
+                | EntryTraceTermination::HostInterrupt
+        ) {
+            self.wake_hub.broadcast(wie_winapi::Wake::Shutdown);
+        }
 
         // Per-frame timing sample — sync present accumulators into the
         // profile and log host-stop / iced-vs-jit deltas on publish. Locks

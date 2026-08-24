@@ -19,6 +19,28 @@ use std::time::Duration;
 /// unbounded backlog.
 pub(super) const BG_QUEUE_CAP: usize = 1024;
 
+/// Work-weighted promotion target (`WIE_JIT_TARGET_WORK`, default 900).
+///
+/// A block of N instructions promotes after `clamp(TARGET_WORK / N, FLOOR,
+/// CEILING)` visits, i.e. when accumulated interpreted work exceeds the
+/// predicted compile cost × margin. 900 keeps a 9-insn block at ≈100 visits —
+/// the historical flat-threshold behavior — while a 90-insn block now needs
+/// only ~10 revisits to justify its ~10× larger compile cost.
+pub(super) const WORK_TARGET_DEFAULT: u64 = 900;
+
+/// Lower clamp on the size-aware visit threshold: even a huge block promotes
+/// after this many revisits (compile cost never justifies waiting longer).
+pub(super) const WORK_THRESHOLD_FLOOR: u32 = 8;
+
+/// Upper clamp on the size-aware visit threshold: a tiny block never waits
+/// longer than this, however cheap its compile would be.
+pub(super) const WORK_THRESHOLD_CEILING: u32 = 10_000;
+
+/// Hysteresis cap for cooldown thresholds: each wait timeout doubles the
+/// block's threshold, capped at CEILING×4 so a pathological block cannot
+/// defer its promotion forever.
+pub(super) const COOLDOWN_THRESHOLD_CAP: u32 = WORK_THRESHOLD_CEILING * 4;
+
 /// JIT memory lower mode (`WIE_JIT_MEM`).
 ///
 /// - unset / `sticky` — sticky-TLB IR + **stack pin** (4.1b); helpers use all
@@ -48,6 +70,8 @@ pub(super) struct JitConfig {
     hotness_threshold: u32,
     pure_loop_hotness: u32,
     eager_block_insns: usize,
+    target_work: u64,
+    opcode_hist_enabled: bool,
     jit_mem_mode: JitMemMode,
     mem_path_trace: bool,
     super_mode: SuperMode,
@@ -82,8 +106,18 @@ impl JitConfig {
             // warmup). Default 8; tests 0.
             pure_loop_hotness: env_u32("WIE_JIT_LOOP_HOTNESS", 8, true),
             // Large one-shot Pure blocks skip the fixed hotness wait (see
-            // `eager_block_insns_from_env`). Default 48; `=0` disables.
+            // `eager_block_insns_from_env`). Default 0 (disabled — the size
+            // rule lost its arithmetic justification, see perf-plan §4);
+            // `>0` re-enables for diagnosis.
             eager_block_insns: eager_block_insns_from_env(),
+            // Work-weighted promotion target (`WIE_JIT_TARGET_WORK`).
+            target_work: target_work_from_env(),
+            // Sampled opcode histogram over the iced residue
+            // (`WIE_JIT_OPCODE_HISTO=1`); surfaced by the profile dump.
+            opcode_hist_enabled: matches!(
+                std::env::var("WIE_JIT_OPCODE_HISTO"),
+                Ok(v) if v == "1" || v.eq_ignore_ascii_case("true")
+            ),
             jit_mem_mode: match std::env::var("WIE_JIT_MEM") {
                 Ok(v)
                     if v.eq_ignore_ascii_case("slow")
@@ -199,9 +233,10 @@ impl JitConfig {
         }
     }
 
-    /// Compile after this many visits to the same guest entry (skip cold code).
-    /// Default 100: lower values cut residual iced but thrash short non-loop
-    /// blocks on 7za and increase wall. Tests use 0.
+    /// Hotness regime switch. Nonzero selects work-weighted promotion (the
+    /// numeric value is no longer the visit count itself); `0` — forced under
+    /// `cfg(test)` — means "compile everything eagerly on first sight" so the
+    /// unit suite stays byte-for-byte deterministic.
     #[must_use]
     pub(super) fn hotness_threshold(&self) -> u32 {
         self.hotness_threshold
@@ -216,12 +251,27 @@ impl JitConfig {
 
     /// One-shot eager-compile cutoff. Pure, non-loop, non-UCRT blocks with at
     /// least this many guest instructions (lowerable body length) compile on
-    /// first sight instead of waiting out the fixed hotness threshold. This
-    /// tunes interpreter-bound cold init off iced; short fragments stay
-    /// visit-gated so short-block compile thrash does not regress. `0` disables.
+    /// first sight instead of waiting out the visit threshold. Default 0
+    /// (disabled): a one-shot large block costs far more compiled than
+    /// interpreted whenever it does not revisit, so eager-by-size is a loss —
+    /// set `WIE_JIT_EAGER_BLOCK_INSNS` to re-enable for diagnosis.
     #[must_use]
     pub(super) fn eager_block_insns(&self) -> usize {
         self.eager_block_insns
+    }
+
+    /// Work-weighted promotion target: a block of N instructions promotes
+    /// after `clamp(target_work / N, WORK_THRESHOLD_FLOOR,
+    /// WORK_THRESHOLD_CEILING)` visits (`WIE_JIT_TARGET_WORK`).
+    #[must_use]
+    pub(super) fn target_work(&self) -> u64 {
+        self.target_work
+    }
+
+    /// Sampled opcode histogram over the iced residue (`WIE_JIT_OPCODE_HISTO=1`).
+    #[must_use]
+    pub(super) fn opcode_hist_enabled(&self) -> bool {
+        self.opcode_hist_enabled
     }
 
     /// Whether Cranelift may emit inline sticky-TLB load/store (not helper-only).
@@ -308,12 +358,12 @@ impl JitConfig {
 /// forever; the default (100) is far below this cap.
 const HOTNESS_THRESHOLD_MAX: u32 = 1_000_000;
 
-/// Parse the fixed hotness threshold from `WIE_JIT_HOTNESS_THRESHOLD`.
+/// Parse the hotness regime switch from `WIE_JIT_HOTNESS_THRESHOLD`.
 ///
-/// Default 100 (the historical fixed threshold). Parsed safely and clamped to
-/// `[1, HOTNESS_THRESHOLD_MAX]` so an invalid or absurd value cannot break the
-/// block-decision path. Under `cfg(test)` the threshold is 0 so every block
-/// compiles eagerly (deterministic unit suite).
+/// Nonzero (default 100) selects work-weighted promotion; the value itself no
+/// longer sets a visit count. `0` forces eager-everything. Under `cfg(test)`
+/// the switch is 0 so every block compiles eagerly on first sight
+/// (deterministic unit suite).
 fn hotness_threshold_from_env() -> u32 {
     if cfg!(test) {
         return 0;
@@ -322,20 +372,34 @@ fn hotness_threshold_from_env() -> u32 {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(100);
-    raw.clamp(1, HOTNESS_THRESHOLD_MAX)
+    raw.clamp(0, HOTNESS_THRESHOLD_MAX)
 }
 
 /// Eager-compile cutoff for large one-shot Pure blocks (`WIE_JIT_EAGER_BLOCK_INSNS`).
 ///
-/// Default 48. `0` disables eager-by-size, so every non-loop block waits out
-/// the fixed hotness threshold (useful for diagnosing compile-thrash regressions).
-/// The decision cost is a usize compare during decode; when the fixed hotness
-/// is already `0` (unit suite) the block compiles eagerly regardless.
+/// Default 0: disabled. The original rationale failed arithmetic — a one-shot
+/// 96-insn block costs ~9 µs interpreted vs ~1 ms compiled, so forcing a
+/// first-sight compile is a ~100× loss whenever the block does not revisit.
+/// A positive value re-enables the rule for diagnosis. The decision cost is a
+/// usize compare during decode; when the regime switch is already `0` (unit
+/// suite) the block compiles eagerly regardless.
 fn eager_block_insns_from_env() -> usize {
     std::env::var("WIE_JIT_EAGER_BLOCK_INSNS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(48)
+        .unwrap_or(0)
+}
+
+/// Parse the work-weighted promotion target from `WIE_JIT_TARGET_WORK`.
+///
+/// Default 900 (keeps a 9-insn block at ≈100 visits). Clamped to a sane range
+/// so an absurd override cannot pin every threshold at a clamp boundary.
+fn target_work_from_env() -> u64 {
+    let raw = std::env::var("WIE_JIT_TARGET_WORK")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(WORK_TARGET_DEFAULT);
+    raw.clamp(16, 10_000_000)
 }
 
 /// Parse `name` as `u32`, falling back to `default` on absence/invalid input.

@@ -453,6 +453,18 @@ impl WinApiState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    /// Point the message queue's wake hub at [`SyncState::wake_hub`].
+    ///
+    /// Called once at session init: after this, EVERY handler-side
+    /// `queue.push` (PostMessage, PostQuitMessage, synthesized WM_TIMER /
+    /// WM_PAINT, …) delivers a wake token to any parked guest thread without
+    /// touching per-push call sites. Idempotent.
+    pub fn wire_wake_hub(&mut self) {
+        let hub = self.kernel.sync.wake_hub.clone();
+        self.lock_message_queue().wake = hub;
+    }
+
     /// Mutable access to D3D9 state (devices, textures, surfaces).
     pub fn d3d9(&mut self) -> &mut D3D9State {
         self.dll_states.get_or_init::<D3D9State>(DllId::D3D9)

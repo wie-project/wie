@@ -53,6 +53,13 @@ impl GuestHandle {
                 *triggered = true;
             }
             queue.signal.cvar.notify_one();
+            // Wake a guest parked on its per-thread inbox (Painpoint 1): the
+            // queue carries the session's wake hub (wired at init), so host
+            // input injection delivers a token without touching the big
+            // state mutex. An unwired (default) queue broadcasts into an
+            // empty hub — a no-op. Tokens are hints: the parked pump
+            // re-checks the queue filter on wake.
+            queue.wake.broadcast(wie_winapi::Wake::MessagePosted);
         }
     }
 

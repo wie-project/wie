@@ -858,20 +858,9 @@ pub fn handle_post_quit_message(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     );
 
     let mut queue = state.lock_message_queue();
-    let time = queue.next_message_time;
-    queue.next_message_time = time
-        .checked_add(1)
-        .context("PostQuitMessage: message time overflow")?;
-
-    queue.messages.push(QueuedWindowMessage {
-        window_handle: crate::handles::Hwnd::NULL,
-        message: WM_QUIT,
-        word_parameter: exit_code,
-        long_parameter: 0,
-        time,
-        point_x: 0,
-        point_y: 0,
-    });
+    // `push` stamps the message and broadcasts a MessagePosted wake token to
+    // any parked GetMessage (Painpoint 1).
+    queue.push(crate::handles::Hwnd::NULL, WM_QUIT, exit_code, 0)?;
 
     let return_address = engine
         .return_from_win64_api(0)

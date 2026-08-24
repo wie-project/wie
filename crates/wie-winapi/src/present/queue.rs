@@ -44,6 +44,10 @@ pub struct MessageQueue {
     pub next_message_time: u32,
     /// Cross-thread signal: a message was posted.
     pub signal: Arc<MessageSignal>,
+    /// Wake hub for parked guest threads (Painpoint 1). Wired at session
+    /// init to the SAME hub as [`crate::sync_obj::SyncState::wake_hub`]; a
+    /// default (unwired) queue broadcasts into an empty hub — a no-op.
+    pub wake: crate::wake::WakeHub,
     /// Number of modal dialogs currently open on this queue.
     ///
     /// Incremented by `CreateDialogParamA/W`, decremented when a `WM_QUIT`
@@ -61,6 +65,7 @@ impl Default for MessageQueue {
             messages: Vec::with_capacity(64),
             next_message_time: 0,
             signal: Arc::new(MessageSignal::new()),
+            wake: crate::wake::WakeHub::default(),
             dialog_depth: 0,
         }
     }
@@ -93,6 +98,10 @@ impl MessageQueue {
             point_x: 0,
             point_y: 0,
         });
+        // A queued message may unblock a parked GetMessage — send one token
+        // per push. Tokens are hints: a woken pump re-checks the queue and
+        // re-parks when nothing matches its filter.
+        self.wake.broadcast(crate::wake::Wake::MessagePosted);
         Ok(())
     }
 }
