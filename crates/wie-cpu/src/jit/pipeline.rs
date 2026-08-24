@@ -94,6 +94,7 @@ impl JitCpu {
             stats: JitStats::default(),
             last_mem_gen: 0,
             chain_sync_epoch: 0,
+            chain_watermark: 0,
         }
     }
 
@@ -113,6 +114,7 @@ impl JitCpu {
             stats: JitStats::default(),
             last_mem_gen: 0,
             chain_sync_epoch: 0,
+            chain_watermark: 0,
         }
     }
 
@@ -756,26 +758,49 @@ impl JitCpu {
         self.shared.bg_queue_depth.load(Ordering::Relaxed) > BG_QUEUE_CAP as u64 / 2
     }
 
-    /// Re-insert every Ready block into this thread's late-bound chain table.
+    /// Bring this thread's chain table up to date with the shared cache.
     ///
-    /// Runs only when the shared `cache_epoch` advanced (background installs),
-    /// so worker-compiled blocks chain from compiled code exactly like inline
-    /// compiles would have.
+    /// Two modes:
+    /// - after a hard invalidation (`chain_sync_epoch == u64::MAX`, table was
+    ///   cleared) rebuild from the whole Ready cache — rare;
+    /// - otherwise consume only installs since this thread's watermark from
+    ///   [`JitShared::recent_installs`], validating each VA is still `Ready`
+    ///   (an install later invalidated is skipped, never linked). This turns
+    ///   the per-epoch O(cache) walk — one measured run did 5,130 walks ×
+    ///   593-entry width on the guest thread — into O(new installs).
     pub(super) fn resync_chain_table(&mut self) {
         if !JitConfig::get().chain_enabled() {
             return;
         }
-        let cache = self.shared.cache.pin();
         let mut inserted = 0_u64;
-        for (va, entry) in cache.iter() {
-            if let CacheEntry::Ready(c) = entry {
-                let fn_ptr = c.func as usize as u64;
-                chain_table_insert(self.thread.chain_slots.as_mut(), *va, fn_ptr);
-                inserted += 1;
+        if self.chain_sync_epoch == u64::MAX {
+            let cache = self.shared.cache.pin();
+            for (va, entry) in cache.iter() {
+                if let CacheEntry::Ready(c) = entry {
+                    let fn_ptr = c.func as usize as u64;
+                    chain_table_insert(self.thread.chain_slots.as_mut(), *va, fn_ptr);
+                    inserted += 1;
+                }
+            }
+            self.chain_watermark = self.shared.recent_installs_len();
+        } else {
+            let (delta, watermark) = self.shared.installs_since(self.chain_watermark);
+            self.chain_watermark = watermark;
+            if !delta.is_empty() {
+                // Validate before linking: an install that raced an
+                // invalidation may no longer be Ready.
+                let cache = self.shared.cache.pin();
+                for va in delta {
+                    if let Some(CacheEntry::Ready(c)) = cache.get(&va) {
+                        let fn_ptr = c.func as usize as u64;
+                        chain_table_insert(self.thread.chain_slots.as_mut(), va, fn_ptr);
+                        inserted += 1;
+                    }
+                }
             }
         }
-        // G5 counters: resync frequency and width quantify the O(cache)
-        // per-epoch cost every guest thread pays between block executions.
+        // G5 counters: resync frequency and width quantify the per-epoch
+        // cost every guest thread pays between block executions.
         self.stats.chain.resyncs = self.stats.chain.resyncs.saturating_add(1);
         self.stats.chain.resync_entries = self.stats.chain.resync_entries.saturating_add(inserted);
     }

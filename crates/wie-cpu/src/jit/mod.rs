@@ -63,6 +63,10 @@ pub struct JitCpu {
     /// `u64::MAX` means "dirty — resync on next dispatch" (set after the table
     /// is cleared).
     pub(crate) chain_sync_epoch: u64,
+    /// How far into [`JitShared::recent_installs`] this thread has consumed.
+    /// Delta-resync (G5): link only new installs instead of walking the whole
+    /// Ready cache on every epoch advance.
+    pub(crate) chain_watermark: usize,
 }
 
 // SAFETY: Arc<JitShared> is Send + Sync (via unsafe impl above).
