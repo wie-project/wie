@@ -46,6 +46,21 @@ perf regressions fail PRs; nothing enforces it. Every change below is gated on t
 
 Exit criteria: baseline JSONs committed; idle-spin share quantified.
 
+### Test & benchmark protocol (applies to every phase)
+
+- **Tests:** always `cargo nextest run --workspace` (same runner as `scripts/check.sh`).
+- **Dev loop:** debug builds only until *all* phases above are complete. Debug timings
+  are meaningless for this work — never draw performance conclusions from them.
+- **Final benchmark** — one release run when everything is done:
+  1. `cargo build -p wie-cli --release`
+  2. Run the profiled workload under `WIE_RUNTIME_PROFILE=1` for exactly **40 s**
+     (matches the baseline capture's wall time).
+  3. Stop the process with **SIGINT** and verify the signal path prints the runtime
+     profile summary. Making that SIGINT→profile handoff deterministic is itself part
+     of the Phase 0 harness — if it is flaky or silent, fix it there first.
+  4. Compare the printed profile against the committed baseline JSONs
+     (wall/CPU %, stall totals, iced share, idle attribution).
+
 ---
 
 ## 3. Painpoint 1 — Idle: event-driven park via per-thread channels
