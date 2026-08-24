@@ -21,8 +21,13 @@ pub fn dump_mem_path_stats(s: &JitStats) {
         dump_mem_path_histogram(s);
     }
     // Promotion outcome ledger: per-enqueue resolution of the background
-    // compile pipeline. Printed whenever anything was recorded.
-    if let Some(line) = bg_ledger_line(s) {
+    // compile pipeline. Diagnostic-only here (explicit trace knobs) — the
+    // runtime profile report carries it on every profiling path, so a bare
+    // run stays silent. An ERROR-styled line for routine bookkeeping reads
+    // as a failure that did not happen.
+    if JitConfig::get().mem_path_trace_enabled()
+        && let Some(line) = bg_ledger_line(s)
+    {
         tracing::error!("{line}");
     }
     // Sampled opcode histogram over the interpreted residue (opt-in).
