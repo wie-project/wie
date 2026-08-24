@@ -90,6 +90,156 @@ fn fp64(op: FpOp, a: f64, b: f64) -> f64 {
     }
 }
 
+/// SSE compare predicate (imm8 0..7). NaN semantics per IEEE-754 as encoded
+/// by the x86 table: LT/LE false on NaN, UNORD true on NaN, NEQ true on NaN,
+/// NLT/NLE true on NaN, ORD false on NaN.
+fn fp_cmp_pred(pred: i32, a: f64, b: f64) -> bool {
+    match pred {
+        0 => a == b,
+        1 => a < b,
+        2 => a <= b,
+        3 => a.is_nan() || b.is_nan(),
+        4 => a != b,
+        5 => !(a < b),
+        6 => !(a <= b),
+        7 => !a.is_nan() && !b.is_nan(),
+        _ => false,
+    }
+}
+
+/// `CMPPD/CMPPS/CMPSS/CMPSD (xmm, xmm/m, imm8)` — FP compare producing an
+/// all-ones/zero lane mask. Scalar forms modify only the low element and
+/// preserve the destination's upper bits.
+pub(super) fn exec_sse_cmp_fp(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+    packed: bool,
+    double: bool,
+) -> Result<(), StepExecError> {
+    if instr.op_kind(0) != OpKind::Register || !instr.op_register(0).is_xmm() {
+        return Err(StepExecError::Cpu(CpuError::Message(
+            "fp cmp destination must be xmm".into(),
+        )));
+    }
+    if instr.op_count() < 3 || instr.op_kind(2) != OpKind::Immediate8 {
+        return Err(StepExecError::Cpu(CpuError::Message(
+            "fp cmp missing imm8 predicate".into(),
+        )));
+    }
+    let pred = (instr.immediate(2) & 0xff) as u8 as i32;
+    let esize = if double { 8_usize } else { 4 };
+    let lanes = if packed { 16 / esize } else { 1 };
+
+    // Source: full vector for packed forms; low element only for scalar.
+    let src_bits = if packed { 128 } else { esize * 8 };
+    let src = read_sse_op(mem, regs, instr, 1, src_bits / 8)?;
+
+    // Destination register value (upper bits preserved for scalar forms).
+    let dst_reg = instr.op_register(0);
+    let dst_val = regs.read_xmm(dst_reg)?;
+
+    let mut result: u128 = 0;
+    for lane in 0..lanes {
+        let shift = (lane * esize * 8) as u32;
+        let mask = if double {
+            let raw = (src >> shift) as u64;
+            let a = f64::from_bits((dst_val >> shift) as u64);
+            let b = f64::from_bits(raw);
+            bool_mask(fp_cmp_pred(pred, a, b), esize)
+        } else {
+            let raw = ((src >> shift) & 0xffff_ffff) as u32;
+            let a = f32::from_bits(((dst_val >> shift) & 0xffff_ffff) as u32);
+            let b = f32::from_bits(raw);
+            bool_mask(fp_cmp_pred(pred, f64::from(a), f64::from(b)), esize)
+        };
+        result |= (mask as u128) << shift;
+    }
+
+    let new_val = if packed {
+        result
+    } else {
+        let low_mask: u128 = (esize == 8)
+            .then(|| 0xffff_ffff_ffff_ffff_u128)
+            .unwrap_or(0xffff_ffff);
+        (dst_val & !low_mask) | (result & low_mask)
+    };
+    write_sse_op(mem, regs, instr, 0, new_val, 16, false)
+}
+
+fn bool_mask(v: bool, esize: usize) -> u64 {
+    if v {
+        match esize {
+            4 => u64::from(u32::MAX),
+            _ => u64::MAX,
+        }
+    } else {
+        0
+    }
+}
+
+/// `RCPPS/RCPSS/RSQRTPS/RSQRTSS` — packed/scalar reciprocal and reciprocal
+/// square-root of packed singles. Real hardware computes these approximately;
+/// we use exact IEEE ops, which is within the documented tolerance envelope.
+pub(super) fn exec_sse_rcp_rsqrt(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+    packed: bool,
+    recip_sqrt: bool,
+) -> Result<(), StepExecError> {
+    let esize = 4_usize;
+    let lanes = if packed { 16 / esize } else { 1 };
+    let src_bits = if packed { 128 } else { esize * 8 };
+    let src = read_sse_op(mem, regs, instr, 1, src_bits / 8)?;
+
+    let mut result: u128 = 0;
+    for lane in 0..lanes {
+        let shift = (lane * esize * 8) as u32;
+        let a = f32::from_bits(((src >> shift) & 0xffff_ffff) as u32);
+        let v = if recip_sqrt { 1.0 / a.sqrt() } else { 1.0 / a };
+        result |= (u128::from(v.to_bits())) << shift;
+    }
+
+    // Scalar forms preserve the destination's upper bits.
+    if packed {
+        write_sse_op(mem, regs, instr, 0, result, 16, false)
+    } else {
+        let dst_reg = instr.op_register(0);
+        let dst_val = regs.read_xmm(dst_reg)?;
+        let low_mask: u128 = 0xffff_ffff;
+        write_sse_op(
+            mem,
+            regs,
+            instr,
+            0,
+            (dst_val & !low_mask) | (result & low_mask),
+            16,
+            false,
+        )
+    }
+}
+
+/// `MOVMSKPD/MOVMSKPS r32, xmm` — pack the sign bit of each FP element into
+/// the low bits of the destination GPR (remaining bits zeroed).
+pub(super) fn exec_sse_movmsk(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+    double: bool,
+) -> Result<(), StepExecError> {
+    let src = read_sse_op(mem, regs, instr, 1, 16)? as u64;
+    let (lanes, esize_bits) = if double { (2_usize, 64_u64) } else { (4, 32) };
+    let mut mask: u64 = 0;
+    for lane in 0..lanes {
+        let shift = lane as u64 * esize_bits;
+        let sign = (src >> (shift + esize_bits - 1)) & 1;
+        mask |= sign << lane;
+    }
+    regs.write_reg(instr.op_register(0), mask)?;
+    Ok(())
+}
+
 pub(super) fn exec_sse_scalar_fp(
     mem: &GuestMemory,
     regs: &mut RegFile,
@@ -814,6 +964,21 @@ pub(super) fn exec_sse_cvtpd2ps(
     write_sse_op(mem, regs, instr, 0, r, XMM_BYTES, false)
 }
 
+/// `Cvttpd2dq xmm, xmm/m128` — convert two packed doubles to two packed signed
+/// dwords with TRUNCATION toward zero. The upper 64 bits of the destination
+/// are zeroed.
+pub(super) fn exec_sse_cvttpd2dq(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let src = read_sse_op(mem, regs, instr, 1, XMM_BYTES)?;
+    let lo = sse_cvt(SseCvtOp::Cvttpd2dq, src as u64);
+    let hi = sse_cvt(SseCvtOp::Cvttpd2dq, (src >> QWORD_BITS) as u64);
+    let r = u128::from(lo) | (u128::from(hi) << DWORD_BITS);
+    write_sse_op(mem, regs, instr, 0, r, XMM_BYTES, false)
+}
+
 /// `Cvtsd2ss xmm, xmm/m64` — convert the low double to a single; bits 32-127
 /// of the destination are preserved.
 pub(super) fn exec_sse_cvtsd2ss(
@@ -1371,6 +1536,8 @@ pub(crate) fn sse_cvt(op: SseCvtOp, a: u64) -> u64 {
         }
         // One f64 lane (the 64-bit input half) → i32 dword, MXCSR round-nearest.
         SseCvtOp::Cvtpd2dq => u64::from(f64_to_i32_round(f64::from_bits(a)) as u32),
+        // 1 f64 lane (64-bit half) → i32 (truncate toward zero).
+        SseCvtOp::Cvttpd2dq => u64::from(f64_to_i32_trunc(f64::from_bits(a)) as u32),
         // One f64 lane → f32 bits (one single lane of the packed result).
         SseCvtOp::Cvtpd2ps => u64::from((f64::from_bits(a) as f32).to_bits()),
         // Scalar converts: one lane, 32/64-bit result.

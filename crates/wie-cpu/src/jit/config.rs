@@ -55,7 +55,6 @@ pub(super) struct JitConfig {
     bg_enabled: bool,
     bg_wait_timeout: Duration,
     opt_level: &'static str,
-    verifier_enabled: bool,
     simd_enabled: bool,
     tlb_neon_enabled: bool,
     string_inline_enabled: bool,
@@ -181,13 +180,6 @@ impl JitConfig {
                 }
                 _ => "speed",
             },
-            // Run the Cranelift IR verifier only when `WIE_JIT_VERIFY=1`.
-            // (Never on under `cfg(test)` automatically — every release-mode
-            // test run would pay the verifier tax on every compile.)
-            verifier_enabled: matches!(
-                std::env::var("WIE_JIT_VERIFY"),
-                Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-            ),
             // Emit Cranelift SIMD types for SSE (`WIE_JIT_SIMD=0` disables).
             simd_enabled: !matches!(
                 std::env::var("WIE_JIT_SIMD"),
@@ -288,12 +280,6 @@ impl JitConfig {
     #[must_use]
     pub(super) fn opt_level(&self) -> &'static str {
         self.opt_level
-    }
-
-    /// Run the Cranelift IR verifier only when `WIE_JIT_VERIFY=1`.
-    #[must_use]
-    pub(super) fn verifier_enabled(&self) -> bool {
-        self.verifier_enabled
     }
 
     /// Emit Cranelift SIMD types for SSE (`WIE_JIT_SIMD=0` disables).

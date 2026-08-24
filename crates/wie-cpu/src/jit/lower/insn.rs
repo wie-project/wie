@@ -8,9 +8,9 @@ use super::flags::{
 };
 use super::gpr::{
     Arith, lower_arith, lower_arith_lazy, lower_bit_test_op, lower_bsf, lower_bsr, lower_bswap,
-    lower_cbw, lower_cmp_test_lazy, lower_cmpxchg, lower_cwd, lower_cwde_cdqe, lower_div,
-    lower_imul, lower_lea, lower_leave, lower_lzcnt, lower_mov, lower_movx, lower_pop, lower_popfq,
-    lower_push, lower_pushfq, lower_xadd, lower_xchg, sext_to_i64,
+    lower_cbw, lower_cmp_test_lazy, lower_cmpxchg, lower_cqto, lower_cwd, lower_cwde_cdqe,
+    lower_div, lower_imul, lower_lea, lower_leave, lower_lzcnt, lower_mov, lower_movx, lower_pop,
+    lower_popfq, lower_push, lower_pushfq, lower_xadd, lower_xchg, sext_to_i64,
 };
 use super::sse::{
     lower_sse_int_binop, lower_sse_mov, lower_sse_movd, lower_sse_movhlps, lower_sse_movhps,
@@ -266,6 +266,7 @@ pub(super) fn lower_insn(
         Mnemonic::Cwde | Mnemonic::Cdqe => lower_cwde_cdqe(bcx, instr, gpr, dirty),
         Mnemonic::Cbw => lower_cbw(bcx, gpr, dirty),
         Mnemonic::Cwd => lower_cwd(bcx, gpr, dirty),
+        Mnemonic::Cqo => lower_cqto(bcx, gpr, dirty),
         Mnemonic::Lea => lower_lea(bcx, instr, gpr, dirty, mem),
         Mnemonic::Push => lower_push(bcx, instr, gpr, dirty, *rflags, mem),
         Mnemonic::Pop => lower_pop(bcx, instr, gpr, dirty, *rflags, mem),

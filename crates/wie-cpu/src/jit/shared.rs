@@ -11,6 +11,11 @@
 
 use super::CacheEntry;
 use super::block::{self, BlockKind};
+
+// [verifier-rejection warn rate-limit] First REJECT_WARN_MAX rejections log at
+// WARN; the tail logs at DEBUG so pathological guests don't spam the console.
+const REJECT_WARN_MAX: usize = 50;
+static REJECTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 use super::config::{BG_QUEUE_CAP, JitConfig};
 use super::engine::JitEngine;
 use super::fast_api::FastApiKind;
@@ -355,10 +360,42 @@ impl JitShared {
                 };
                 let mut eng_guard = self.engine.lock().unwrap();
                 let eng = eng_guard.as_mut()?;
-                compile_block(
+                match compile_block(
                     eng, rip, &insns, end_rip, term, call_fast, &chain_map, bytes_len,
-                )
-                .ok()
+                ) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        // Verifier/codegen rejection: the block's IR failed a
+                        // lowering or verification pass. Surface it loudly,
+                        // then fall back to interpretation for this block.
+                        // Rate-limited: first REJECT_WARN_MAX rejections at
+                        // WARN (unique enough to triage), the tail at DEBUG.
+                        let n = REJECTION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let msg_args = (format_args!("{rip:#x}"), bytes_len, n + 1, format!("{e}"));
+                        if n < REJECT_WARN_MAX {
+                            tracing::warn!(
+                                rip = format_args!("{}", msg_args.0),
+                                bytes_len = msg_args.1,
+                                rejection_seq = msg_args.2,
+                                error = %msg_args.3,
+                                "jit compile rejected by verifier/codegen — \
+                                 block falls back to the interpreter"
+                            );
+                        } else {
+                            tracing::debug!(
+                                rip = format_args!("{}", msg_args.0),
+                                bytes_len = msg_args.1,
+                                rejection_seq = msg_args.2,
+                                error = %msg_args.3,
+                                "jit compile rejected by verifier/codegen — \
+                                 block falls back to the interpreter"
+                            );
+                        }
+                        use cranelift_module::Module;
+                        eng.module.clear_context(&mut eng.ctx);
+                        None
+                    }
+                }
             }
             BlockKind::NotPure => None,
         }

@@ -609,143 +609,6 @@ impl QuantumHooks for SessionPumpHooks<'_> {
             // self-tests exit with the failing stage's code and trace the
             // reason through OutputDebugStringA before exiting).
             if exit_code != 0 {
-                // [VER] temporary: dump Doom Retro's s_VERSION (char* at guest
-                // 0x1404bb560) so the failing version check's actual value is visible.
-                {
-                    let engine = core.engine();
-                    let mut p = [0_u8; 8];
-                    if engine.mem_read(0x1404_bb56_0, &mut p).is_ok() {
-                        let sptr = u64::from_le_bytes(p);
-                        let mut s = [0_u8; 96];
-                        let mut out = String::new();
-                        if sptr != 0 && engine.mem_read(sptr, &mut s).is_ok() {
-                            for b in s {
-                                if b == 0 {
-                                    break;
-                                }
-                                out.push(b as char);
-                            }
-                        }
-                        eprintln!(
-                            "[VER] s_VERSION var@0x1404bb560 ptr={sptr:#x} content=\"{out}\""
-                        );
-                        // [VER] temporary: char-class chain integrity vs exe file
-                        {
-                            let exe = std::fs::read("real_exes/doomretro/doomretro.exe")
-                                .unwrap_or_default();
-                            let va2off = |va: u64| -> Option<usize> {
-                                Some(match va {
-                                    0x1400_0100_0..0x1401_5600_00 => {
-                                        (va - 0x1400_0000_0 - 0x1000 + 0x400) as usize
-                                    }
-                                    0x1401_5600_00..0x1401_b200_00 => {
-                                        (va - 0x1400_0000_0 - 0x1560_00 + 0x1552_00) as usize
-                                    }
-                                    _ => (va - 0x1400_0000_0 - 0x1b20_00 + 0x1b0a_00) as usize,
-                                })
-                            };
-                            let mut mode = [0_u8; 4];
-                            let _ = engine.mem_read(0x1405_7145_c, &mut mode);
-                            eprintln!(
-                                "[VER] MODE global@0x14057145c = {:#x}",
-                                u32::from_le_bytes(mode)
-                            );
-                            // [VER] temporary: dump deh_strlookup[0] (the VERSION
-                            // entry: {ppstr, lookup, assigned}) — assigned != 0
-                            // proves the key was processed.
-                            let mut e0 = [0_u8; 24];
-                            if engine.mem_read(0x1404_bba50, &mut e0).is_ok() {
-                                let pp = u64::from_le_bytes(e0[0..8].try_into().unwrap_or([0; 8]));
-                                let lk = u64::from_le_bytes(e0[8..16].try_into().unwrap_or([0; 8]));
-                                let asg =
-                                    u32::from_le_bytes(e0[16..20].try_into().unwrap_or([0; 4]));
-                                let mut nm = [0_u8; 12];
-                                let _ = engine.mem_read(lk, &mut nm);
-                                let name: String = nm
-                                    .iter()
-                                    .take_while(|&&b| b != 0)
-                                    .map(|&b| b as char)
-                                    .collect();
-                                let mut sv = [0_u8; 40];
-                                let mut val = String::new();
-                                let sptr =
-                                    u64::from_le_bytes(e0[0..8].try_into().unwrap_or([0; 8]));
-                                let _ = engine.mem_read(pp, &mut sv[..8]);
-                                let vp = u64::from_le_bytes(sv[..8].try_into().unwrap_or([0; 8]));
-                                let _ = engine.mem_read(vp, &mut sv);
-                                for b in sv {
-                                    if b == 0 {
-                                        break;
-                                    }
-                                    val.push(b as char);
-                                }
-                                eprintln!(
-                                    "[VER] strlookup[0] name={name:?} ppstr={pp:#x} -> string-ptr={vp:#x} string={val:?} assigned={asg}"
-                                );
-                            }
-                            // [VER] temporary: which strlookup string-vars were
-                            // reassigned to heap pointers (proves BEX processing)?
-                            let mut vars = vec![0_u8; 0xC00];
-                            if engine.mem_read(0x1404_bb400, &mut vars).is_ok() {
-                                let mut n = 0_u32;
-                                for (k, chunk) in vars.chunks_exact(8).enumerate() {
-                                    let v = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
-                                    // heap-ish pointers under WIE: above the
-                                    // exe image, below 64 GiB
-                                    if (0x1_0000_0000..0x10_0000_0000).contains(&v) {
-                                        eprintln!(
-                                            "[VER] ASSIGNED var@{:#x} -> heap {v:#x}",
-                                            0x1404_bb400 + (k * 8) as u64
-                                        );
-                                        n += 1;
-                                    }
-                                }
-                                eprintln!("[VER] ASSIGNED count={n}");
-                                // deref each reassigned var to identify its key text
-                                for (k, chunk) in vars.chunks_exact(8).enumerate() {
-                                    let v = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
-                                    if !(0x1_0000_0000..0x10_0000_0000).contains(&v) {
-                                        continue;
-                                    }
-                                    let va = 0x1404_bb400 + (k * 8) as u64;
-                                    let mut sb = [0_u8; 40];
-                                    let mut txt = String::new();
-                                    if engine.mem_read(v, &mut sb).is_ok() {
-                                        for b in sb {
-                                            if b == 0 {
-                                                break;
-                                            }
-                                            txt.push(b as char);
-                                        }
-                                    }
-                                    eprintln!("[VER] Deref var@{va:#x} = {txt:?}");
-                                }
-                            }
-                            for (va, len) in [
-                                (0x1401_b21c_0_u64, 16_u64),
-                                (0x1401_b21d_0_u64, 16),
-                                (0x1401_58f_d0_u64, 32),
-                            ] {
-                                let mut g = vec![0_u8; len as usize];
-                                if engine.mem_read(va, &mut g).is_ok() {
-                                    if let Some(o) = va2off(va) {
-                                        let f = exe.get(o..o + len as usize).unwrap_or(&[]);
-                                        eprintln!(
-                                            "[VER] CHAIN va={va:#x} guest={:02x?} file={:02x?} match={}",
-                                            g,
-                                            f,
-                                            g == f
-                                        );
-                                    }
-                                } else {
-                                    eprintln!("[VER] CHAIN va={va:#x} UNREADABLE");
-                                }
-                            }
-                        }
-                    } else {
-                        eprintln!("[VER] s_VERSION slot unreadable");
-                    }
-                }
                 tracing::error!(
                     exit_code,
                     "guest exited with a non-zero code (see the guest's OutputDebugStringA trace for the failing stage)"
@@ -1352,6 +1215,17 @@ impl super::RuntimeSession {
             if hooks.noisy_api >= max_noisy_api {
                 termination = EntryTraceTermination::ApiLimit;
                 break;
+            }
+
+            // Profiling Ctrl+C stop: with `WIE_RUNTIME_PROFILE` armed, a
+            // SIGINT ends the whole session here instead of reaching the
+            // guest as a key event. Checked at the top of every iteration so
+            // responsiveness is bounded by one quantum/API-stop boundary;
+            // gate-off cost is a single cached-bool load (no env access in
+            // this hot loop).
+            if wie_winapi::console::take_ctrlc_for_profile_stop() {
+                termination = EntryTraceTermination::HostInterrupt;
+                break 'outer;
             }
 
             // Start any CreateThread workers before the next quantum.

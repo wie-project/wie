@@ -656,8 +656,13 @@ impl<'a> QuantumCore<'a> {
                     return r;
                 }
                 drain();
-                let st = lock_wait(winapi, stats);
-                if st.kernel.sync.process_dying {
+                // Scope the guard: `on_dying` re-acquires the same mutex and
+                // would self-deadlock if invoked while `st` is still held.
+                let dying = {
+                    let st = lock_wait(winapi, stats);
+                    st.kernel.sync.process_dying
+                };
+                if dying {
                     on_dying();
                     return wie_winapi::WAIT_FAILED;
                 }
@@ -692,8 +697,13 @@ impl<'a> QuantumCore<'a> {
                     return r;
                 }
                 drain();
-                let st = lock_wait(winapi, stats);
-                if st.kernel.sync.process_dying {
+                // Scope the guard: `on_dying` re-acquires the same mutex and
+                // would self-deadlock if invoked while `st` is still held.
+                let dying = {
+                    let st = lock_wait(winapi, stats);
+                    st.kernel.sync.process_dying
+                };
+                if dying {
                     on_dying();
                     return wie_winapi::WAIT_FAILED;
                 }

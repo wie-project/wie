@@ -527,6 +527,16 @@ pub(super) fn chain_table_clear(chain_slots: &mut [ChainSlot]) {
 
 mod analysis;
 mod emit;
+
+/// MemFlags valid for `bitcast`: endianness only — the verifier rejects
+/// notrap/aligned/alias-region bits on a pure register reinterpretation.
+pub(super) fn bitcast_flags(
+    _f: cranelift_codegen::ir::MemFlagsData,
+) -> cranelift_codegen::ir::MemFlagsData {
+    let mut f = cranelift_codegen::ir::MemFlagsData::new();
+    f.set_endianness(cranelift_codegen::ir::Endianness::Little);
+    f
+}
 mod flags;
 mod gpr;
 mod insn;
@@ -551,6 +561,7 @@ use gpr::{
 use insn::{PendingFlags, ShiftKind, flush_pending};
 use mem::{call_load, call_store, hoist_pin_slot};
 
+pub(super) use gpr::wie_div64;
 pub(super) use mem::{
     wie_jit_chain_lookup, wie_jit_host_span, wie_jit_load, wie_jit_store, wie_jit_string,
 };
@@ -588,7 +599,25 @@ pub(super) fn compile_block(
     let has_mem = block_has_mem(insns)
         || matches!(term, Some(BlockTerm::Call { .. } | BlockTerm::Ret))
         || has_fast_call;
-    let has_sse = live_xmm.iter().any(|&x| x);
+    // A block may only WRITE xmm (pure converts like cvttpd2dq) without ever
+    // reading one — defs must count too, or helper refs stay None and the
+    // lowering aborts with "cvt helper missing".
+    let has_sse = live_xmm.iter().any(|&x| x)
+        || def_xmm.iter().any(|&x| x)
+        // Scalar converts with a memory source / GPR destination (and the
+        // movmsk family) touch no XMM register operand; register scans alone
+        // miss them.
+        || insns.iter().any(|d| {
+            matches!(
+                d.instr.mnemonic(),
+                Mnemonic::Cvttss2si
+                    | Mnemonic::Cvtss2si
+                    | Mnemonic::Cvttsd2si
+                    | Mnemonic::Cvtsd2si
+                    | Mnemonic::Movmskpd
+                    | Mnemonic::Movmskps
+            )
+        });
     let has_string = block_has_string(insns);
     let has_fp = block_has_fp(insns);
     let need_fp_helpers = has_fp && !JitConfig::get().simd_enabled();
@@ -741,6 +770,8 @@ pub(super) fn compile_block(
         } else {
             None
         };
+        // 64-bit DIV/IDIV helper — always available (div writes only GPRs).
+        let div64_ref = Some(eng.module.declare_func_in_func(eng.div64_id, bcx.func));
         // Dynamic chain lookup (late-bound successors + ret targets).
         let lookup_ref = eng.module.declare_func_in_func(eng.lookup_id, bcx.func);
 
@@ -960,6 +991,7 @@ pub(super) fn compile_block(
                     sse_fp_unop_ref,
                     sse_fp_binop_ref,
                     sse_cvt_ref,
+                    div64_ref,
                     flags,
                     guest_flags,
                     exit,
@@ -1090,6 +1122,7 @@ pub(super) fn compile_block(
                 sse_fp_unop_ref,
                 sse_fp_binop_ref,
                 sse_cvt_ref,
+                div64_ref,
                 flags,
                 guest_flags,
                 exit,

@@ -774,6 +774,20 @@ mod tests {
             matches!(result, StepResult::Continue),
             "jit result {result:?}"
         );
+        // The bg compiler installs asynchronously; with the IR verifier
+        // enabled (always-on) its first compile of a block costs a bit more.
+        // Wait briefly for the install rather than racing it. A block that
+        // genuinely cannot JIT falls back to interpretation immediately
+        // (iced_insns > 0) and fails fast below.
+        if cpu.stats().iced_insns == 0 && !cpu.has_ready_at(SIMD_BASE) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !cpu.has_ready_at(SIMD_BASE)
+                && cpu.stats().iced_insns == 0
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         assert!(
             cpu.has_ready_at(SIMD_BASE),
             "block must compile, not run iced"

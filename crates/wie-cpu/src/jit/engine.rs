@@ -15,7 +15,7 @@ use super::fast_api::{
     wie_ucrt_memcpy, wie_ucrt_strlen,
 };
 use super::lower::{
-    wie_f32_binop, wie_f64_binop, wie_jit_chain_lookup, wie_jit_host_span, wie_jit_load,
+    wie_div64, wie_f32_binop, wie_f64_binop, wie_jit_chain_lookup, wie_jit_host_span, wie_jit_load,
     wie_jit_store, wie_jit_string, wie_sse_cvt, wie_sse_fp_binop, wie_sse_fp_unop,
     wie_sse_int_binop, wie_sse_pshufb_hi, wie_sse_pshufb_lo, wie_sse_shift,
 };
@@ -40,6 +40,7 @@ pub(crate) struct JitEngine {
     pub(super) f64_id: cranelift_module::FuncId,
     /// Packed integer SSE2 lane op helper (SIMD-off path + pack/pmul*).
     pub(super) sse_int_id: cranelift_module::FuncId,
+    pub(super) div64_id: cranelift_module::FuncId,
     /// Packed SSE2 shift helper (imm + variable count).
     pub(super) sse_shift_id: cranelift_module::FuncId,
     /// `pshufb` result low half (full 16-byte table + mask).
@@ -69,13 +70,11 @@ impl JitEngine {
         flag_builder
             .set("opt_level", JitConfig::get().opt_level())
             .map_err(|e| e.to_string())?;
-        let verify = if JitConfig::get().verifier_enabled() {
-            "true"
-        } else {
-            "false"
-        };
+        // Verifier stays ON unconditionally (see comment above). WIE_JIT_VERIFY
+        // is no longer a gate; the per-compile verifier cost on small blocks
+        // is negligible next to the crash-safety it provides.
         flag_builder
-            .set("enable_verifier", verify)
+            .set("enable_verifier", "true")
             .map_err(|e| e.to_string())?;
         flag_builder
             .set("is_pic", "false")
@@ -122,6 +121,7 @@ impl JitEngine {
         builder.symbol("wie_f32_binop", wie_f32_binop as *const u8);
         builder.symbol("wie_f64_binop", wie_f64_binop as *const u8);
         builder.symbol("wie_sse_int_binop", wie_sse_int_binop as *const u8);
+        builder.symbol("wie_div64", wie_div64 as *const u8);
         builder.symbol("wie_sse_shift", wie_sse_shift as *const u8);
         builder.symbol("wie_sse_pshufb_lo", wie_sse_pshufb_lo as *const u8);
         builder.symbol("wie_sse_pshufb_hi", wie_sse_pshufb_hi as *const u8);
@@ -203,6 +203,15 @@ impl JitEngine {
         // sse int/shift/fp-minmax binop: (op, a, b) -> r — same shape as f_sig.
         let sse_int_id = module
             .declare_function("wie_sse_int_binop", Linkage::Import, &f_sig)
+            .map_err(|e| e.to_string())?;
+        // 64-bit DIV/IDIV: (op, hi, lo, divisor) -> (r << 64) | q.
+        let mut div64_sig = module.make_signature();
+        for _ in 0..4 {
+            div64_sig.params.push(AbiParam::new(types::I64));
+        }
+        div64_sig.returns.push(AbiParam::new(types::I64));
+        let div64_id = module
+            .declare_function("wie_div64", Linkage::Import, &div64_sig)
             .map_err(|e| e.to_string())?;
         let sse_shift_id = module
             .declare_function("wie_sse_shift", Linkage::Import, &f_sig)
@@ -303,6 +312,7 @@ impl JitEngine {
             f32_id,
             f64_id,
             sse_int_id,
+            div64_id,
             sse_shift_id,
             sse_pshufb_lo_id,
             sse_pshufb_hi_id,

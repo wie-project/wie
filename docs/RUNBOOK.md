@@ -72,7 +72,7 @@ The README keeps the shortlist; the complete set lives here.
 | `WIE_JIT_VERIFY=1` | Enable Cranelift IR verifier outside tests |
 | `WIE_FIXED_CLOCK=1` | Freeze the guest clock table (deterministic runs) |
 | `WIE_D3D9_SCALE=2\|4\|8` | D3D9 render resolution divisor (quarter-scale = 4; Present upscales to the window) |
-| `WIE_RUNTIME_PROFILE=1` | Wall/CPU%, host stops, JIT counters, `mem_backend` |
+| `WIE_RUNTIME_PROFILE=1` | Wall/CPU%, host stops, JIT counters, `mem_backend`. While armed, **Ctrl+C** stops the session cleanly at the next quantum/API-stop boundary, dumps the report to stderr and exits 130; guest Ctrl+C delivery is suppressed while profiling |
 | `WIE_PROCESS_HEAP_MB` | Guest process-heap size in MiB (default **512**) |
 | `WIE_API_JOURNAL=path` | Per-API journal for backend A/B diffs |
 | `WIE_ROOT` / `--root` | Optional bottle override for guest `C:\` file APIs (default: per-user app-data bottle at `~/Library/Application Support/WIE/bottle`, created on demand) |

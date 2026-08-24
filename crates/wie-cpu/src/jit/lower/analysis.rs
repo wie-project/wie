@@ -85,7 +85,9 @@ pub(super) fn load_xmm_pair(
     if JitConfig::get().simd_enabled() {
         // Single 128-bit load → Neon Q reg; split for lo/hi SSA compatibility.
         let v = bcx.ins().load(types::I8X16, flags, p, 0);
-        let as_i64x2 = bcx.ins().bitcast(types::I64X2, flags, v);
+        let as_i64x2 = bcx
+            .ins()
+            .bitcast(types::I64X2, super::bitcast_flags(flags), v);
         xmm[idx * 2] = bcx.ins().extractlane(as_i64x2, 0);
         xmm[idx * 2 + 1] = bcx.ins().extractlane(as_i64x2, 1);
     } else {
@@ -114,7 +116,8 @@ pub(super) fn pair_to_i8x16(
     let mut v = bcx.ins().splat(types::I64X2, zero);
     v = bcx.ins().insertlane(v, lo, 0);
     v = bcx.ins().insertlane(v, hi, 1);
-    bcx.ins().bitcast(types::I8X16, flags, v)
+    bcx.ins()
+        .bitcast(types::I8X16, super::bitcast_flags(flags), v)
 }
 
 pub(super) fn i8x16_to_pair(
@@ -122,7 +125,9 @@ pub(super) fn i8x16_to_pair(
     flags: MemFlagsData,
     v: Value,
 ) -> (Value, Value) {
-    let as_i64x2 = bcx.ins().bitcast(types::I64X2, flags, v);
+    let as_i64x2 = bcx
+        .ins()
+        .bitcast(types::I64X2, super::bitcast_flags(flags), v);
     let lo = bcx.ins().extractlane(as_i64x2, 0);
     let hi = bcx.ins().extractlane(as_i64x2, 1);
     (lo, hi)

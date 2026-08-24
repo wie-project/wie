@@ -257,6 +257,8 @@ pub(crate) enum SseCvtOp {
     Cvtsd2ss = 17,
     /// 1 f32 lane → f64 bits (scalar cvtss2sd).
     Cvtss2sd = 18,
+    /// 1 f64 lane (64-bit half) → i32 (truncate toward zero).
+    Cvttpd2dq = 19,
 }
 
 impl SseCvtOp {

@@ -360,7 +360,9 @@ pub(super) fn emit_one_unit(
         }
         (CopyUnit::Bytes8, InlineCopySrc::Fill { pattern }) => {
             // Reuse the I8X16 splat: every 8-byte half carries the pattern.
-            let as_i64x2 = bcx.ins().bitcast(types::I64X2, mem.guest_flags, pattern);
+            let as_i64x2 =
+                bcx.ins()
+                    .bitcast(types::I64X2, super::bitcast_flags(mem.guest_flags), pattern);
             bcx.ins().extractlane(as_i64x2, 0)
         }
         (CopyUnit::Bytes8, InlineCopySrc::Move { src_host }) => {
@@ -389,18 +391,27 @@ pub(super) fn stos_splat_pattern(
             let w = bcx.ins().band(rax, m);
             let w16 = bcx.ins().ireduce(types::I16, w);
             let s = bcx.ins().splat(types::I16X8, w16);
-            Some(bcx.ins().bitcast(types::I8X16, mem.flags, s))
+            Some(
+                bcx.ins()
+                    .bitcast(types::I8X16, super::bitcast_flags(mem.flags), s),
+            )
         }
         4 => {
             let m = iconst_u64(bcx, 0xffff_ffff);
             let d = bcx.ins().band(rax, m);
             let d32 = bcx.ins().ireduce(types::I32, d);
             let s = bcx.ins().splat(types::I32X4, d32);
-            Some(bcx.ins().bitcast(types::I8X16, mem.flags, s))
+            Some(
+                bcx.ins()
+                    .bitcast(types::I8X16, super::bitcast_flags(mem.flags), s),
+            )
         }
         8 => {
             let s = bcx.ins().splat(types::I64X2, rax);
-            Some(bcx.ins().bitcast(types::I8X16, mem.flags, s))
+            Some(
+                bcx.ins()
+                    .bitcast(types::I8X16, super::bitcast_flags(mem.flags), s),
+            )
         }
         _ => None,
     }

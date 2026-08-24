@@ -532,6 +532,37 @@ pub fn restore_terminal() {
     host_term::restore_now();
 }
 
+/// True when profiling is armed (`WIE_RUNTIME_PROFILE` set): Ctrl+C stops the
+/// emulated session for a profile report instead of reaching the guest.
+///
+/// Cached once at first read — safe to poll per event-loop iteration without
+/// an env lookup per call.
+pub fn profile_sigint_armed() -> bool {
+    host_term::profile_sigint_armed()
+}
+
+/// Install the SIGINT/SIGTERM/`atexit` hooks eagerly, before any session
+/// starts.
+///
+/// The hooks normally install lazily when a console session enters cbreak
+/// mode, which micro and `--gui` runs never do — with profiling armed the CLI
+/// calls this up front so Ctrl+C is observable there too. Repeat calls are
+/// no-ops; harmless when profiling is off.
+pub fn ensure_hooks_installed() {
+    host_term::ensure_hooks_installed();
+}
+
+/// Consume a pending Ctrl+C for the profiling-stop path (`WIE_RUNTIME_PROFILE`
+/// armed): returns `true` exactly once per signal, restoring the terminal.
+///
+/// With the gate off this returns `false` without touching the pending flag,
+/// whose owner is then the guest key-delivery drain — so a disabled profile
+/// never steals the guest's Ctrl+C. See [`host_term`] internals for the full
+/// ownership and ordering argument.
+pub fn take_ctrlc_for_profile_stop() -> bool {
+    host_term::take_ctrlc_for_profile_stop()
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {

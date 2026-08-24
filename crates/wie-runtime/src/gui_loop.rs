@@ -53,6 +53,10 @@ pub enum GuiOutcome {
     ApiBudgetExhausted,
     /// Guest is waiting for messages and no presenter is attached.
     WaitingForMessage,
+    /// The host stopped the session: Ctrl+C arrived while
+    /// `WIE_RUNTIME_PROFILE` was armed. Not a guest exit — the presenter owns
+    /// reporting (profile dump + status 130) from here.
+    HostInterrupt,
 }
 
 /// Run the guest in headless GUI mode.
@@ -130,6 +134,12 @@ pub fn run_windowed(session: &mut RuntimeSession, control: &GuiControl) -> Resul
                 // local, so continuing resets the quantum.  Tests keep their
                 // budgets because they drive run_until_stop directly.
                 continue;
+            }
+            EntryTraceTermination::HostInterrupt => {
+                // Ctrl+C under `WIE_RUNTIME_PROFILE`: unwind cleanly so the
+                // presenter can finalize and print the profile report before
+                // the event loop ends (the session lives on THIS thread).
+                return Ok(GuiOutcome::HostInterrupt);
             }
             _ => {
                 return Ok(GuiOutcome::ApiBudgetExhausted);

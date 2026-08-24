@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use wie_runtime::GuestHandle;
 use wie_runtime::MenuNode;
 use wie_runtime::RuntimeSession;
-use wie_runtime::{GuiControl, run_windowed};
+use wie_runtime::{GuiControl, GuiOutcome, run_windowed};
 use wie_winapi::handles::Hwnd;
 use wie_winapi::user32::Dimension;
 
@@ -52,6 +52,10 @@ pub(crate) enum WieEvent {
         #[allow(dead_code)]
         code: i32,
     },
+    /// Ctrl+C under `WIE_RUNTIME_PROFILE` stopped the guest thread cleanly:
+    /// the profile report is already printed (the guest thread owns the
+    /// session); the loop exits so the CLI can report status 130.
+    HostInterrupt,
     /// A macOS menu-bar item was clicked; the muda event carries the guest
     /// menu item id as a string-form [`muda::MenuId`].
     #[cfg(target_os = "macos")]
@@ -607,6 +611,10 @@ struct WieApp {
     /// Menu items the menu bar was last rebuilt with (cheap change check).
     #[cfg(target_os = "macos")]
     last_menu_items: Arc<Vec<MenuNode>>,
+    /// Set when the guest thread reported a profiling Ctrl+C stop
+    /// ([`WieEvent::HostInterrupt`]); read after `run_app` returns to exit
+    /// with status 130.
+    host_interrupt_exit: bool,
 }
 
 impl ApplicationHandler<WieEvent> for WieApp {
@@ -793,6 +801,12 @@ impl ApplicationHandler<WieEvent> for WieApp {
             WieEvent::GuestExited { code: _ } => {
                 event_loop.exit();
             }
+            WieEvent::HostInterrupt => {
+                // The guest thread already printed the profile report; record
+                // WHY the loop ended so `run_gui_windowed` exits 130.
+                self.host_interrupt_exit = true;
+                event_loop.exit();
+            }
         }
     }
 }
@@ -887,7 +901,7 @@ pub fn run_gui_windowed(
                 match RuntimeSession::new_with_options(
                     &staged.run_path,
                     wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
-                    wie_runtime::DEFAULT_LAYOUT,
+                    wie_runtime::DEFAULT_LAYOUT.with_env_overrides(),
                     session_options,
                 ) {
                     Ok(mut session) => {
@@ -1040,9 +1054,25 @@ pub fn run_gui_windowed(
                         let _ = tx.send(handle);
 
                         // Run the guest.
-                        let _result = run_windowed(&mut session, &control);
+                        let run_t0 = std::time::Instant::now();
+                        let result = run_windowed(&mut session, &control);
+                        // Ctrl+C under `WIE_RUNTIME_PROFILE`: THIS thread owns
+                        // the session, so the profile report can only print
+                        // here — the event loop never had access to it (same
+                        // shape as gui/headless.rs). CPU-time deltas stay 0;
+                        // wall time plus the JIT/host counters are the part a
+                        // manual Ctrl+C collection cares about.
+                        let interrupted = matches!(&result, Ok(GuiOutcome::HostInterrupt));
+                        if interrupted && session.profile_enabled() {
+                            session.finalize_profile(run_t0.elapsed().as_nanos(), 0, 0);
+                            eprintln!("{}", session.profile().report());
+                        }
                         let code = control.exit_code.load(std::sync::atomic::Ordering::SeqCst);
-                        let _ = proxy.send_event(WieEvent::GuestExited { code });
+                        if interrupted {
+                            let _ = proxy.send_event(WieEvent::HostInterrupt);
+                        } else {
+                            let _ = proxy.send_event(WieEvent::GuestExited { code });
+                        }
                     }
                     Err(e) => tracing::error!("session: {e}"),
                 }
@@ -1081,11 +1111,23 @@ pub fn run_gui_windowed(
         menu_bar: crate::gui::menu_bar::MacMenuBar::new(proxy.clone()),
         #[cfg(target_os = "macos")]
         last_menu_items: Arc::new(Vec::new()),
+        host_interrupt_exit: false,
     };
 
     event_loop
         .run_app(&mut app)
-        .map_err(|e| anyhow::anyhow!("event loop: {e}"))
+        .map_err(|e| anyhow::anyhow!("event loop: {e}"))?;
+
+    // Profiling Ctrl+C stop: report status 130 (128 + SIGINT, the Unix
+    // convention for "terminated by Ctrl+C"). A direct exit is acceptable
+    // here: the event loop has fully finished and the guest thread already
+    // printed the report; the atexit terminal hook (installed with the signal
+    // hooks) re-runs the idempotent restore, so no drop-guard teardown is
+    // skipped on the GUI path.
+    if app.host_interrupt_exit {
+        std::process::exit(130);
+    }
+    Ok(())
 }
 
 #[cfg(all(test, target_os = "macos"))]

@@ -96,6 +96,27 @@ pub enum EntryTraceTermination {
         /// Description of the requested callback.
         request: wie_winapi::GuestCallbackRequest,
     },
+
+    /// The HOST stopped the session: Ctrl+C arrived while
+    /// `WIE_RUNTIME_PROFILE` was armed. Not a guest exit — carries no exit
+    /// code and must not surface as a [`RuntimeStop`](Self::RuntimeStop)
+    /// diagnostic; the CLI dumps the profile report and exits 130 (128 +
+    /// SIGINT).
+    HostInterrupt,
+}
+
+/// Guest exit code carried by a termination, if any.
+///
+/// Only [`EntryTraceTermination::ExitProcess`] names an exit code. Every other
+/// stop — including [`EntryTraceTermination::HostInterrupt`], which is the
+/// host ending the session, not the guest exiting — maps to `None`, so the
+/// CLI can distinguish "guest failed its expected code" from "user pressed
+/// Ctrl+C under profiling" without string-matching terminations.
+pub(crate) fn termination_exit_code(termination: &EntryTraceTermination) -> Option<u32> {
+    match termination {
+        EntryTraceTermination::ExitProcess { code } => Some(*code),
+        _ => None,
+    }
 }
 
 fn run_session_to_summary(
@@ -237,10 +258,7 @@ pub fn run_micro_exe_with_options(
     } else {
         None
     };
-    let exit_code = match run.termination {
-        EntryTraceTermination::ExitProcess { code } => Some(code),
-        _ => None,
-    };
+    let exit_code = termination_exit_code(&run.termination);
     Ok(MicroRunSummary {
         path: path.display().to_string(),
         entry_point_va,
@@ -343,4 +361,41 @@ pub fn run_persistent_until_yield_with_options(
         final_rsp,
         profile,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EntryTraceTermination, termination_exit_code};
+
+    /// The exit-code mapping is load-bearing for the CLI: `HostInterrupt` must
+    /// read as "no guest exit code" (the report + status 130 path), never as a
+    /// failed expect-code check.
+    #[test]
+    fn only_exit_process_carries_an_exit_code() {
+        assert_eq!(
+            termination_exit_code(&EntryTraceTermination::ExitProcess { code: 42 }),
+            Some(42)
+        );
+        assert_eq!(
+            termination_exit_code(&EntryTraceTermination::ApiLimit),
+            None
+        );
+        assert_eq!(
+            termination_exit_code(&EntryTraceTermination::WaitingForMessage),
+            None
+        );
+        assert_eq!(
+            termination_exit_code(&EntryTraceTermination::RuntimeStop("x".to_owned())),
+            None
+        );
+        assert_eq!(
+            termination_exit_code(&EntryTraceTermination::UnsupportedApi("api".to_owned())),
+            None
+        );
+        // The profiling Ctrl+C stop is a HOST decision — no guest code exists.
+        assert_eq!(
+            termination_exit_code(&EntryTraceTermination::HostInterrupt),
+            None
+        );
+    }
 }

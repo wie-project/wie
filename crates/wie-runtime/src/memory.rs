@@ -409,6 +409,15 @@ impl RuntimeMemoryLayout {
                 }
             }
         }
+        if let Ok(v) = std::env::var("WIE_NO_HOOK_SLICES") {
+            match v.trim().parse::<usize>() {
+                Ok(n) if n > 0 => self.no_hook_slice_limit = n,
+                _ => tracing::warn!(
+                    value = %v,
+                    "invalid WIE_NO_HOOK_SLICES; keeping default no-hook slice limit"
+                ),
+            }
+        }
         self
     }
 }

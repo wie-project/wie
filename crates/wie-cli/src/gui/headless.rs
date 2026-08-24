@@ -40,7 +40,7 @@ pub fn run_screenshot(
     let mut session = RuntimeSession::new_with_options(
         &staged.run_path,
         wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
-        wie_runtime::DEFAULT_LAYOUT,
+        wie_runtime::DEFAULT_LAYOUT.with_env_overrides(),
         wie_runtime::SessionOptions {
             current_directory: staged.guest_current_directory,
             // Forward guest argv after the module name (same entries the

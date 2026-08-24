@@ -589,6 +589,7 @@ pub(super) struct MemEnv {
     pub(super) sse_fp_binop_ref: Option<FuncRef>,
     /// Integer↔FP convert helper.
     pub(super) sse_cvt_ref: Option<FuncRef>,
+    pub(super) div64_ref: Option<FuncRef>,
     /// Stack region pin (slot 0), hoisted at block entry when inline mem is on.
     pub(super) stack_pin: Option<HoistedPin>,
     /// Data pins (slots 1..): process heap + VirtualAlloc spans, after sticky.

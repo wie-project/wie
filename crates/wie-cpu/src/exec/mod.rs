@@ -29,12 +29,13 @@ use gpr::{
 };
 use ops::{ArithOp, BitOp, ShiftKind, cond_from_cmov, cond_from_jcc, cond_from_setcc};
 use sse::{
-    exec_sse_bitwise, exec_sse_byte_shift, exec_sse_comis, exec_sse_cvt_fp_to_gpr,
+    exec_sse_bitwise, exec_sse_byte_shift, exec_sse_cmp_fp, exec_sse_comis, exec_sse_cvt_fp_to_gpr,
     exec_sse_cvt_gpr_to_fp, exec_sse_cvt_packed, exec_sse_cvtdq2pd, exec_sse_cvtpd2dq,
-    exec_sse_cvtpd2ps, exec_sse_cvtps2pd, exec_sse_cvtsd2ss, exec_sse_cvtss2sd, exec_sse_int_binop,
-    exec_sse_minmax_packed, exec_sse_minmax_scalar, exec_sse_mov, exec_sse_movd, exec_sse_movhlps,
-    exec_sse_movhps, exec_sse_movq, exec_sse_packed_fp, exec_sse_pmovmskb, exec_sse_psadbw,
-    exec_sse_pshufb, exec_sse_pshufd, exec_sse_pshuflw_hw, exec_sse_punpck, exec_sse_punpck_lanes,
+    exec_sse_cvtpd2ps, exec_sse_cvtps2pd, exec_sse_cvtsd2ss, exec_sse_cvtss2sd, exec_sse_cvttpd2dq,
+    exec_sse_int_binop, exec_sse_minmax_packed, exec_sse_minmax_scalar, exec_sse_mov,
+    exec_sse_movd, exec_sse_movhlps, exec_sse_movhps, exec_sse_movmsk, exec_sse_movq,
+    exec_sse_packed_fp, exec_sse_pmovmskb, exec_sse_psadbw, exec_sse_pshufb, exec_sse_pshufd,
+    exec_sse_pshuflw_hw, exec_sse_punpck, exec_sse_punpck_lanes, exec_sse_rcp_rsqrt,
     exec_sse_scalar_fp, exec_sse_shift, exec_sse_shufpd, exec_sse_sqrt_packed,
     exec_sse_sqrt_scalar, exec_sse_unpcklpd, is_sse_movsd, sse_int_op, sse_shift_op,
 };
@@ -444,7 +445,6 @@ fn execute_one(
         Mnemonic::Scasq => exec_scas(mem, regs, instr, 8),
         Mnemonic::Cmpsb => exec_cmps(mem, regs, instr, 1),
         Mnemonic::Cmpsw => exec_cmps(mem, regs, instr, 2),
-        Mnemonic::Cmpsd => exec_cmps(mem, regs, instr, 4),
         Mnemonic::Cmpsq => exec_cmps(mem, regs, instr, 8),
 
         // Scalar / packed SSE moves (enough for CRT / memcpy helpers).
@@ -547,6 +547,24 @@ fn execute_one(
         // FP compare → RFLAGS.
         Mnemonic::Comiss | Mnemonic::Ucomiss => exec_sse_comis(mem, regs, instr, false),
         Mnemonic::Comisd | Mnemonic::Ucomisd => exec_sse_comis(mem, regs, instr, true),
+        // FP compare → lane masks. CMPSD is ambiguous with the string op:
+        // the SSE form carries an imm8 predicate (3 operands); the string
+        // form has implicit EDI/ESI operands and no immediate.
+        Mnemonic::Cmppd => exec_sse_cmp_fp(mem, regs, instr, true, true),
+        Mnemonic::Cmpps => exec_sse_cmp_fp(mem, regs, instr, true, false),
+        Mnemonic::Cmpss => exec_sse_cmp_fp(mem, regs, instr, false, false),
+        Mnemonic::Cmpsd if instr.op_count() >= 3 => {
+            exec_sse_cmp_fp(mem, regs, instr, false, true)
+        }
+        // Sign-mask extraction.
+        Mnemonic::Movmskpd => exec_sse_movmsk(mem, regs, instr, true),
+        Mnemonic::Movmskps => exec_sse_movmsk(mem, regs, instr, false),
+        // Reciprocal / reciprocal-sqrt (packed + scalar).
+        Mnemonic::Rcpps => exec_sse_rcp_rsqrt(mem, regs, instr, true, false),
+        Mnemonic::Rcpss => exec_sse_rcp_rsqrt(mem, regs, instr, false, false),
+        Mnemonic::Rsqrtps => exec_sse_rcp_rsqrt(mem, regs, instr, true, true),
+        Mnemonic::Rsqrtss => exec_sse_rcp_rsqrt(mem, regs, instr, false, true),
+        Mnemonic::Cmpsd => exec_cmps(mem, regs, instr, 4),
         // Integer ↔ FP converts.
         Mnemonic::Cvtsi2ss | Mnemonic::Cvtsi2sd => exec_sse_cvt_gpr_to_fp(mem, regs, instr),
         Mnemonic::Cvttss2si
@@ -563,6 +581,7 @@ fn execute_one(
         // CVTPD2DQ / CVTPD2PS: two packed doubles → dwords / singles.
         Mnemonic::Cvtpd2dq => exec_sse_cvtpd2dq(mem, regs, instr),
         Mnemonic::Cvtpd2ps => exec_sse_cvtpd2ps(mem, regs, instr),
+        Mnemonic::Cvttpd2dq => exec_sse_cvttpd2dq(mem, regs, instr),
         // Scalar converts: low lane only, upper destination bits preserved.
         Mnemonic::Cvtsd2ss => exec_sse_cvtsd2ss(mem, regs, instr),
         Mnemonic::Cvtss2sd => exec_sse_cvtss2sd(mem, regs, instr),

@@ -753,7 +753,7 @@ pub(super) fn pair_to_vec(
     ty: Type,
 ) -> Value {
     let v = pair_to_i8x16(bcx, flags, lo, hi);
-    bcx.ins().bitcast(ty, flags, v)
+    bcx.ins().bitcast(ty, super::bitcast_flags(flags), v)
 }
 
 /// Bitcast a 128-bit vector back to a lo/hi u64 pair.
@@ -762,7 +762,9 @@ pub(super) fn vec_to_pair(
     flags: MemFlagsData,
     v: Value,
 ) -> (Value, Value) {
-    let as_i8 = bcx.ins().bitcast(types::I8X16, flags, v);
+    let as_i8 = bcx
+        .ins()
+        .bitcast(types::I8X16, super::bitcast_flags(flags), v);
     i8x16_to_pair(bcx, flags, as_i8)
 }
 

@@ -336,8 +336,12 @@ pub(super) fn lower_sse_cvtdq2pd(
     let d1 = bcx.ins().ireduce(types::I32, hi32);
     let f0 = bcx.ins().fcvt_from_sint(types::F64, d0);
     let f1 = bcx.ins().fcvt_from_sint(types::F64, d1);
-    let lo_bits = bcx.ins().bitcast(types::I64, mem.flags, f0);
-    let hi_bits = bcx.ins().bitcast(types::I64, mem.flags, f1);
+    let lo_bits = bcx
+        .ins()
+        .bitcast(types::I64, super::bitcast_flags(mem.flags), f0);
+    let hi_bits = bcx
+        .ins()
+        .bitcast(types::I64, super::bitcast_flags(mem.flags), f1);
     store_xmm_pair(bcx, mem, xmm, di, lo_bits, hi_bits);
     Ok(())
 }
@@ -366,12 +370,20 @@ pub(super) fn lower_sse_cvtps2pd(
     let lo32 = bcx.ins().ireduce(types::I32, lo);
     let hi32v = bcx.ins().ushr(lo, shift);
     let hi32 = bcx.ins().ireduce(types::I32, hi32v);
-    let f0 = bcx.ins().bitcast(types::F32, mem.flags, lo32);
-    let f1 = bcx.ins().bitcast(types::F32, mem.flags, hi32);
+    let f0 = bcx
+        .ins()
+        .bitcast(types::F32, super::bitcast_flags(mem.flags), lo32);
+    let f1 = bcx
+        .ins()
+        .bitcast(types::F32, super::bitcast_flags(mem.flags), hi32);
     let d0 = bcx.ins().fpromote(types::F64, f0);
     let d1 = bcx.ins().fpromote(types::F64, f1);
-    let lo_bits = bcx.ins().bitcast(types::I64, mem.flags, d0);
-    let hi_bits = bcx.ins().bitcast(types::I64, mem.flags, d1);
+    let lo_bits = bcx
+        .ins()
+        .bitcast(types::I64, super::bitcast_flags(mem.flags), d0);
+    let hi_bits = bcx
+        .ins()
+        .bitcast(types::I64, super::bitcast_flags(mem.flags), d1);
     store_xmm_pair(bcx, mem, xmm, di, lo_bits, hi_bits);
     Ok(())
 }
@@ -654,15 +666,19 @@ pub(super) fn lower_sse_comis(
     };
     let (fa, fb) = if is_double {
         (
-            bcx.ins().bitcast(types::F64, mem.flags, a_lo),
-            bcx.ins().bitcast(types::F64, mem.flags, b_lo),
+            bcx.ins()
+                .bitcast(types::F64, super::bitcast_flags(mem.flags), a_lo),
+            bcx.ins()
+                .bitcast(types::F64, super::bitcast_flags(mem.flags), b_lo),
         )
     } else {
         let a32 = bcx.ins().ireduce(types::I32, a_lo);
         let b32 = bcx.ins().ireduce(types::I32, b_lo);
         (
-            bcx.ins().bitcast(types::F32, mem.flags, a32),
-            bcx.ins().bitcast(types::F32, mem.flags, b32),
+            bcx.ins()
+                .bitcast(types::F32, super::bitcast_flags(mem.flags), a32),
+            bcx.ins()
+                .bitcast(types::F32, super::bitcast_flags(mem.flags), b32),
         )
     };
     let eq = bcx.ins().fcmp(FloatCC::Equal, fa, fb);
@@ -910,19 +926,31 @@ pub(super) fn lower_sse_scalar_fp(
     let _ = b_hi;
     let (new_lo, new_hi) = if JitConfig::get().simd_enabled() {
         if width == FloatWidth::F64 {
-            let fa = bcx.ins().bitcast(types::F64, mem.flags, a_lo);
-            let fb = bcx.ins().bitcast(types::F64, mem.flags, b_lo);
+            let fa = bcx
+                .ins()
+                .bitcast(types::F64, super::bitcast_flags(mem.flags), a_lo);
+            let fb = bcx
+                .ins()
+                .bitcast(types::F64, super::bitcast_flags(mem.flags), b_lo);
             let fr = clif_fbinop(bcx, op, fa, fb);
-            let r = bcx.ins().bitcast(types::I64, mem.flags, fr);
+            let r = bcx
+                .ins()
+                .bitcast(types::I64, super::bitcast_flags(mem.flags), fr);
             (r, a_hi)
         } else {
             // Operate on low f32; merge bits [63:32] of old_lo.
             let a32 = bcx.ins().ireduce(types::I32, a_lo);
             let b32 = bcx.ins().ireduce(types::I32, b_lo);
-            let fa = bcx.ins().bitcast(types::F32, mem.flags, a32);
-            let fb = bcx.ins().bitcast(types::F32, mem.flags, b32);
+            let fa = bcx
+                .ins()
+                .bitcast(types::F32, super::bitcast_flags(mem.flags), a32);
+            let fb = bcx
+                .ins()
+                .bitcast(types::F32, super::bitcast_flags(mem.flags), b32);
             let fr = clif_fbinop(bcx, op, fa, fb);
-            let r32 = bcx.ins().bitcast(types::I32, mem.flags, fr);
+            let r32 = bcx
+                .ins()
+                .bitcast(types::I32, super::bitcast_flags(mem.flags), fr);
             let r64 = bcx.ins().uextend(types::I64, r32);
             let hi32 = iconst_u64(bcx, 0xffff_ffff_0000_0000);
             let cleared = bcx.ins().band(a_lo, hi32);
@@ -978,16 +1006,28 @@ pub(super) fn lower_sse_packed_fp(
         let a8 = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
         let b8 = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
         let (lo, hi) = if width == FloatWidth::F64 {
-            let a = bcx.ins().bitcast(types::F64X2, mem.flags, a8);
-            let b = bcx.ins().bitcast(types::F64X2, mem.flags, b8);
+            let a = bcx
+                .ins()
+                .bitcast(types::F64X2, super::bitcast_flags(mem.flags), a8);
+            let b = bcx
+                .ins()
+                .bitcast(types::F64X2, super::bitcast_flags(mem.flags), b8);
             let c = clif_fbinop(bcx, op, a, b);
-            let c8 = bcx.ins().bitcast(types::I8X16, mem.flags, c);
+            let c8 = bcx
+                .ins()
+                .bitcast(types::I8X16, super::bitcast_flags(mem.flags), c);
             i8x16_to_pair(bcx, mem.flags, c8)
         } else {
-            let a = bcx.ins().bitcast(types::F32X4, mem.flags, a8);
-            let b = bcx.ins().bitcast(types::F32X4, mem.flags, b8);
+            let a = bcx
+                .ins()
+                .bitcast(types::F32X4, super::bitcast_flags(mem.flags), a8);
+            let b = bcx
+                .ins()
+                .bitcast(types::F32X4, super::bitcast_flags(mem.flags), b8);
             let c = clif_fbinop(bcx, op, a, b);
-            let c8 = bcx.ins().bitcast(types::I8X16, mem.flags, c);
+            let c8 = bcx
+                .ins()
+                .bitcast(types::I8X16, super::bitcast_flags(mem.flags), c);
             i8x16_to_pair(bcx, mem.flags, c8)
         };
         store_xmm_pair(bcx, mem, xmm, di, lo, hi);

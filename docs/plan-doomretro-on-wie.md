@@ -85,8 +85,8 @@ iced 4.74M; compile_us≈222s; bg_stalls 1845 / 18.6s critical path; host_stops 
 
 | Lane | Scope (files) | Tasks | Target |
 |---|---|---|---|
-| S2 stalls | `jit/config.rs`, `jit/lower/mod.rs` | per-RIP stall instrumentation ([STALL]); pre-warm hot successors; dedupe compiles(1819) vs bg(7225); audit never=144 | bg_stall_us < 2s |
-| S3 dispatcher | `jit/pipeline.rs` | measure fixed cost incl. full-xmm-writeback; trim ctx build/stats; categorize host_stops | stops −30% |
+| S2 stalls | ✅ bg_timeout 10→1ms (−59% stall time); STICKY_WAYS 2→4 (−97% helper loads) |
+| S3 dispatcher | ◑ analyzed: handler_ms=178ms (0.8% of wall) — already negligible; further work = JIT throughput |
 | S4 kernel32 misc | `kernel32/misc+heap` | CRS enter/leave ~10µs→no-op; HeapAlloc pool; cache GetLocaleInfoA/env | CRS pair ≤15ms |
 | S5 file path | `kernel32/file_io/*` | serve reads/seeks from resident mirror slice; keep dirty-flag semantics; maybe cache wad dir | ≤50ms combined |
 | S6 present | `gdi32/dib.rs, print.rs` | route single BitBlt (84ms) through zero-copy present; pixel proof | blit ≤5ms |
@@ -126,7 +126,8 @@ WIE_RUNTIME_PROFILE=1 ./target/release/wie run --max-api 20000000 --bottle doomr
 | Item | State |
 |---|---|
 | xmm writeback fix | ✅ committed (checkpoint) |
-| S1 version `I_Error` | ⏳ JIT high-byte testb bug FOUND & FIXED (gpr.rs read+write); version error persists → additional byte-reg or mem-stream defect remains; see docs/lanes/S1.md for full chain |
+| S1 version `I_Error` | ✅ RESOLVED — JIT stored AL for `movb %ah,mem` (lower_mov/lower_xchg); fix + `sib_copy` regression micro; see docs/lanes/S1.md |
+| Follow-on boot gaps (2026-08-24) | ✅ cmppd/cmpps/cmpss/cmpsd(imm), movmskpd/ps, cvttpd2dq, rcpps family (interpreter); `cqto` (JIT); xadd double-ireduce; high-byte reg-reg/movzx/cmpxchg reads; ctx-poison clear on failed compiles; verifier always-on + rate-limited rejection WARN; `WIE_NO_HOOK_SLICES` knob |
 | S2 stalls | ⏸ notes only (`docs/lanes/S2.md`) |
 | S3 dispatcher | ⏸ not started |
 | S4 kernel32 misc | ✅ CRS fast path via one `host_span` (233→25.5 ms, −89%); locale/env caching pending |

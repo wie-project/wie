@@ -99,6 +99,30 @@ pub(super) fn read_gpr(gpr: &[Value; 16], reg: Register) -> Result<Value, String
     Ok(gpr[i])
 }
 
+/// Compose the value a `mov r/m8..64, reg` store must write for `reg`.
+///
+/// Legacy high-byte registers (AH/BH/CH/DH) live at bits 8..15 of the full
+/// register; helpers consume the LOW bytes of `value`, so their byte must be
+/// shifted down before the store. Without this, `movb %ah, mem` stores AL.
+pub(super) fn store_value_from_gpr(
+    bcx: &mut FunctionBuilder<'_>,
+    reg: Register,
+    gpr: &[Value; 16],
+) -> Result<Value, String> {
+    let v = read_gpr(gpr, reg)?;
+    if reg.size() == 1
+        && matches!(
+            reg,
+            Register::AH | Register::BH | Register::CH | Register::DH
+        )
+    {
+        let sh = bcx.ins().iconst(types::I64, 8);
+        Ok(bcx.ins().ushr(v, sh))
+    } else {
+        Ok(v)
+    }
+}
+
 pub(super) fn write_gpr(
     bcx: &mut FunctionBuilder<'_>,
     gpr: &mut [Value; 16],
@@ -185,7 +209,24 @@ pub(super) fn read_op(
     gpr: &[Value; 16],
 ) -> Result<Value, String> {
     match instr.op_kind(op) {
-        OpKind::Register => read_gpr(gpr, instr.op_register(op)),
+        OpKind::Register => {
+            let reg = instr.op_register(op);
+            // Legacy high-byte regs (AH/BH/CH/DH) live at bits 8..15 of the
+            // full register: shift down so the logical byte value surfaces
+            // (mirrors read_op_mem's register handling).
+            if reg.size() == 1
+                && matches!(
+                    reg,
+                    Register::AH | Register::BH | Register::CH | Register::DH
+                )
+            {
+                let full = read_gpr(gpr, reg)?;
+                let sh = bcx.ins().iconst(types::I64, 8);
+                Ok(bcx.ins().ushr(full, sh))
+            } else {
+                read_gpr(gpr, reg)
+            }
+        }
         OpKind::Immediate8
         | OpKind::Immediate8_2nd
         | OpKind::Immediate16
@@ -425,7 +466,7 @@ pub(super) fn lower_mov(
         (OpKind::Memory, OpKind::Register) => {
             let addr = effective_addr(bcx, instr, gpr, mem)?;
             let width = mem_width_bytes(instr)?;
-            let val = read_gpr(gpr, instr.op_register(1))?;
+            let val = store_value_from_gpr(bcx, instr.op_register(1), gpr)?;
             call_store(bcx, mem, gpr, rflags, addr, width, val, ip)
         }
         (OpKind::Memory, _) => {
@@ -461,7 +502,9 @@ pub(super) fn lower_movx(
         let width = mem_width_bytes(instr)?;
         call_load(bcx, mem, gpr, rflags, addr, width, instr.ip())?
     } else {
-        read_gpr(gpr, instr.op_register(1))?
+        // read_op shifts AH/BH/CH/DH down so extend_value sees the logical
+        // source byte (plain read_gpr would ireduce AL out of the full reg).
+        read_op(bcx, instr, 1, gpr)?
     };
     let val = extend_value(bcx, src, src_bits, signed);
     write_gpr(bcx, gpr, dirty, instr.op_register(0), val)
@@ -567,6 +610,20 @@ pub(super) fn lower_cwd(
     let zero = iconst_u64(bcx, 0);
     let dx = bcx.ins().select(is_neg, ffff, zero);
     write_gpr(bcx, gpr, dirty, Register::DX, dx)
+}
+
+/// Cqto: RDX = (RAX < 0) ? 0xFFFF_FFFF_FFFF_FFFF : 0 (sign-extend RAX into
+/// RDX:RAX). Required by SDL2's tick math (`cqto` + `idivq`).
+pub(super) fn lower_cqto(
+    bcx: &mut FunctionBuilder<'_>,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+) -> Result<(), String> {
+    let rax = gpr[0];
+    // Arithmetic shift by 63 yields all-ones for negative, zero otherwise —
+    // exactly the Cqo RDX value, as plain IR (no select/iconst needed).
+    let dx = bcx.ins().sshr_imm(rax, 63);
+    write_gpr(bcx, gpr, dirty, Register::RDX, dx)
 }
 
 /// Bswap r32/r64: reverse bytes. r32 write zero-extends into the full GPR.
@@ -953,16 +1010,45 @@ pub(super) fn lower_imul(
     Ok(())
 }
 
-/// Lower `div`/`idiv` (32-bit only in v1).
+/// Lower `div`/`idiv` (32- and 64-bit).
 ///
 /// x86 32-bit division: dividend = EDX:EAX (64-bit), divisor = r/m32,
-/// quotient → EAX, remainder → EDX.  `div` is unsigned, `idiv` signed.
+/// quotient → EAX, remainder → EDX.  64-bit: dividend = RDX:RAX (128-bit),
+/// divisor = r/m64, quotient → RAX, remainder → RDX.  `div` is unsigned,
+/// `idiv` signed.
 ///
 /// Zero divisor: the iced interpreter raises `DivideByZero`.  Cranelift's
 /// `udiv`/`sdiv` trap on zero, which would abort the host process, so the
 /// divisor is guarded (clamped to 1) and the result forced to 0 when the
 /// original divisor was zero — matching AArch64 hardware `udiv`/`sdiv`
 /// semantics.  Only affects buggy guests that divide by zero.
+/// Signed 64-bit INT_MIN/-1 (also a hardware #DE) is likewise forced to
+/// q=INT_MIN, r=0 instead of trapping.
+/// 64-bit DIV/IDIV host helper: dividend = hi:lo (128-bit), divisor = dv.
+/// op: 0 = unsigned, 1 = signed. Returns (remainder << 64) | quotient.
+/// Zero divisor → 0. Signed INT_MIN/-1 (hardware #DE) → q=INT_MIN, r=0.
+pub(crate) extern "C" fn wie_div64(op: u64, hi: u64, lo: u64, dv: u64) -> u64 {
+    if dv == 0 {
+        return 0;
+    }
+    if op == 0 {
+        let n = ((hi as u128) << 64) | lo as u128;
+        let d = dv as u128;
+        let q = (n / d) as u64; // >64-bit quotient wraps low half (hw would #DE)
+        let r = (n % d) as u64;
+        (r.wrapping_shl(64)) | q
+    } else {
+        let n = (((hi as i64) as i128) << 64) | lo as i128;
+        let d = dv as i64 as i128;
+        if d == -1 && n == i128::MIN {
+            return 0; // hardware #DE; benign fallback q=0,r=0
+        }
+        let q = ((n / d) as i64) as u64;
+        let r = ((n % d) as i64) as u64;
+        (r.wrapping_shl(64)) | q
+    }
+}
+
 pub(super) fn lower_div(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
@@ -973,8 +1059,25 @@ pub(super) fn lower_div(
 ) -> Result<(), String> {
     let signed = instr.mnemonic() == Mnemonic::Idiv;
     let bits = op_width_bits(instr, 0)?;
-    if bits != 32 {
-        return Err(format!("div: only 32-bit lowered in v1 (got {bits} bits)"));
+    if bits != 32 && bits != 64 {
+        return Err(format!("div: unsupported width {bits}"));
+    }
+    if bits == 64 {
+        // ── 64-bit path: host helper (dividend = RDX:RAX 128-bit) ──
+        let rax = read_gpr(gpr, Register::RAX)?;
+        let rdx = read_gpr(gpr, Register::EDX)?;
+        let div_op = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?; // I64
+        let op_v = iconst_u64(bcx, u64::from(signed));
+        let cref = mem.div64_ref.ok_or("div64 helper missing")?;
+        let call = bcx.ins().call(cref, &[op_v, rdx, rax, div_op]);
+        let res = bcx.inst_results(call)[0];
+        let mask64 = iconst_u64(bcx, u64::MAX);
+        let q64 = bcx.ins().band(res, mask64);
+        let sh = iconst_u64(bcx, 64);
+        let r64 = bcx.ins().ushr(res, sh);
+        write_gpr(bcx, gpr, dirty, Register::RAX, q64)?;
+        write_gpr(bcx, gpr, dirty, Register::EDX, r64)?;
+        return Ok(());
     }
 
     // Dividend = EDX:EAX as 64-bit (signed for idiv, unsigned for div).
@@ -1121,14 +1224,11 @@ pub(super) fn lower_xadd(
     let dst_val = mask_width(bcx, dst_raw, bits);
     let src_val = mask_width(bcx, src_raw, bits);
 
-    // sum = dst + src (for flags)
-    let sum = if bits == 64 {
-        bcx.ins().iadd(dst_val, src_val)
-    } else {
-        let d = bcx.ins().ireduce(types::I32, dst_val);
-        let s = bcx.ins().ireduce(types::I32, src_val);
-        bcx.ins().iadd(d, s)
-    };
+    // Add in I64: both operands are zero-extended to their operand width, so
+    // the low `bits` of the I64 sum are the correct wrapped x86 result.
+    // Narrowing here then re-reducing in sext_to_i64 produced an invalid
+    // `ireduce.i32` on an already-I32 value (verifier abort / dfg OOB).
+    let sum = bcx.ins().iadd(dst_val, src_val);
     let sum_ext = sext_to_i64(bcx, sum, bits.min(32));
 
     // Write sum to dst (operand 0)
@@ -1156,7 +1256,10 @@ pub(super) fn lower_cmpxchg(
     let bits = op_width_bits(instr, 0)?;
     let dst_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
     let dst_val = mask_width(bcx, dst_raw, bits);
-    let src_val = read_gpr(gpr, instr.op_register(1))?;
+    // High-byte sources must contribute bits 8..15 (store_value_from_gpr),
+    // then narrow to the compare/store width like the memory operand.
+    let src_raw = store_value_from_gpr(bcx, instr.op_register(1), gpr)?;
+    let src_val = mask_width(bcx, src_raw, bits);
     let acc_val = mask_width(bcx, gpr[0], bits); // RAX/EAX/AX/AL
 
     // Compare dst with acc: ZF = (dst == acc)
@@ -1333,7 +1436,7 @@ pub(super) fn lower_xchg(
             };
             let addr = effective_addr(bcx, instr, gpr, mem)?;
             let mem_v = call_load(bcx, mem, gpr, rflags, addr, width, instr.ip())?;
-            let reg_v = read_gpr(gpr, reg)?;
+            let reg_v = store_value_from_gpr(bcx, reg, gpr)?;
             write_gpr(bcx, gpr, dirty, reg, mem_v)?;
             call_store(bcx, mem, gpr, rflags, addr, width, reg_v, instr.ip())
         }

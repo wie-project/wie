@@ -418,6 +418,19 @@ pub(crate) fn run_micro(path: &Path, options: MicroRunOptions<'_>) -> Result<()>
         eprintln!("{}", profile.report());
     }
 
+    // Profiling Ctrl+C stop (`WIE_RUNTIME_PROFILE` armed): the report above
+    // is the deliverable — treat the interrupt as success instead of failing
+    // the expect-code check with "did not reach ExitProcess", then exit 130
+    // (128 + SIGINT). A direct exit is acceptable here: the session Drop
+    // already ran inside `run_micro_exe_with_options`, stderr is unbuffered,
+    // and the atexit terminal hook re-runs the idempotent restore.
+    if matches!(
+        summary.run.termination,
+        wie_runtime::EntryTraceTermination::HostInterrupt
+    ) {
+        std::process::exit(130);
+    }
+
     match summary.exit_code {
         Some(code) if code == options.expect_code => {
             tracing::debug!("run_micro: ok exit={code}");
@@ -472,7 +485,17 @@ pub(crate) fn run_until_yield(
     )?;
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    write_entry_trace_summary(&mut output, &summary)
+    write_entry_trace_summary(&mut output, &summary)?;
+    // Profiling Ctrl+C stop (`WIE_RUNTIME_PROFILE` armed): mirror the other
+    // entries' status 130 (128 + SIGINT). The summary above already carried
+    // the profile report on this entry's established output channel.
+    if matches!(
+        summary.termination,
+        wie_runtime::EntryTraceTermination::HostInterrupt
+    ) {
+        std::process::exit(130);
+    }
+    Ok(())
 }
 
 /// Owns raw-mode entry so the terminal is restored on *every* exit path —
@@ -539,7 +562,7 @@ pub(crate) fn run_console_interactive(
     let mut session = wie_runtime::RuntimeSession::new_with_options(
         &staged.run_path,
         wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
-        wie_runtime::DEFAULT_LAYOUT,
+        wie_runtime::DEFAULT_LAYOUT.with_env_overrides(),
         // Defaults: no guest argv and empty stdin bytes → LiveHost mode, so
         // ReadFile(STD_INPUT_HANDLE) and ReadConsoleInputW read from the host
         // terminal. The staging above used the env roots (or the `--bottle`
@@ -556,10 +579,27 @@ pub(crate) fn run_console_interactive(
     // single `run_until_stop` call, not the session (an interactive game runs
     // until the guest exits).
     let quantum_budget = max_api.unwrap_or(QUANTUM_MAX_API_DEFAULT);
+    let run_t0 = std::time::Instant::now();
     let exit_code = loop {
         let summary = session.run_until_stop(quantum_budget)?;
         match summary.termination {
             wie_runtime::EntryTraceTermination::ExitProcess { code } => break code,
+            wie_runtime::EntryTraceTermination::HostInterrupt => {
+                // Ctrl+C under `WIE_RUNTIME_PROFILE`: this thread owns the
+                // session, so the profile report prints here (the micro path
+                // prints it from the runtime summary instead). CPU-time
+                // deltas stay 0 — wall time plus the JIT/host counters are
+                // the useful part of a manual collection.
+                if session.profile_enabled() {
+                    session.finalize_profile(run_t0.elapsed().as_nanos(), 0, 0);
+                    eprintln!("{}", session.profile().report());
+                }
+                // Exit 130 (128 + SIGINT). `TerminalRawGuard`'s Drop does not
+                // run under `process::exit`, but the restore already happened
+                // in `take_ctrlc_for_profile_stop` and the atexit hook re-runs
+                // it idempotently, so the shell is left intact.
+                std::process::exit(130);
+            }
             wie_runtime::EntryTraceTermination::WaitingForMessage => {
                 // Empty GetMessage with no message source. Park briefly and
                 // let the guest retry; a console game's Sleep loop resumes.

@@ -339,6 +339,16 @@ fn run_entry(
     input_script: Option<PathBuf>,
     guest_args: Vec<String>,
 ) -> Result<()> {
+    // Profiling Ctrl+C (`WIE_RUNTIME_PROFILE` armed): install the signal
+    // hooks BEFORE anything runs. Lazy installation happens only when a
+    // console session enters cbreak mode, which micro and `--gui` runs never
+    // do — the default SIGINT disposition would kill the process there with
+    // no chance to dump the profile report. Gate-off cost: one cached-bool
+    // load; behavior is untouched when profiling is off.
+    if wie_winapi::console::profile_sigint_armed() {
+        wie_winapi::console::ensure_hooks_installed();
+    }
+
     // GUI/screenshot mode takes precedence over persistent/micro.
     if gui || screenshot.is_some() {
         if gui {
