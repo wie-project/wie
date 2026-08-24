@@ -36,21 +36,22 @@ pub fn dump_mem_path_stats(s: &JitStats) {
 /// `None` while nothing was recorded (quiet by default).
 fn bg_ledger_line(s: &JitStats) -> Option<String> {
     let ledger_total = s
-        .bg_promo_hit_ready
-        .saturating_add(s.bg_promo_stalled_ok)
-        .saturating_add(s.bg_promo_timed_out)
-        .saturating_add(s.bg_promo_cooled_down)
-        .saturating_add(s.bg_promo_deferred);
+        .promo
+        .hit_ready
+        .saturating_add(s.promo.stalled_ok)
+        .saturating_add(s.promo.timed_out)
+        .saturating_add(s.promo.cooled_down)
+        .saturating_add(s.promo.deferred);
     if ledger_total == 0 {
         return None;
     }
     Some(format!(
         "[wie] jit_bg_ledger: hit_ready={} stalled_ok={} timed_out={} cooled_down={} deferred={} (total={ledger_total})",
-        s.bg_promo_hit_ready,
-        s.bg_promo_stalled_ok,
-        s.bg_promo_timed_out,
-        s.bg_promo_cooled_down,
-        s.bg_promo_deferred
+        s.promo.hit_ready,
+        s.promo.stalled_ok,
+        s.promo.timed_out,
+        s.promo.cooled_down,
+        s.promo.deferred
     ))
 }
 
@@ -65,48 +66,70 @@ pub fn jit_profile_report_lines(s: &JitStats) -> Vec<String> {
     if let Some(line) = bg_ledger_line(s) {
         out.push(line);
     }
+    if let Some(line) = chain_stats_line(s) {
+        out.push(line);
+    }
     if JitConfig::get().opcode_hist_enabled() {
         out.extend(opcode_histogram_lines());
     }
     out
 }
 
+/// Direct-chaining health as one report line (G5): epoch-advance rate and
+/// resync width are the levers for install-time incremental linking.
+///
+/// `None` while nothing was recorded.
+fn chain_stats_line(s: &JitStats) -> Option<String> {
+    if s.chain.epoch_bumps == 0 && s.chain.resyncs == 0 {
+        return None;
+    }
+    let width = s
+        .chain
+        .resync_entries
+        .checked_div(s.chain.resyncs)
+        .unwrap_or(0);
+    Some(format!(
+        "[wie] jit_chain: epoch_bumps={} resyncs={} avg_width={width} inline_inserts={}",
+        s.chain.epoch_bumps, s.chain.resyncs, s.chain.inline_inserts
+    ))
+}
+
 fn dump_mem_path_histogram(s: &JitStats) {
-    let helpers = s.load_calls.saturating_add(s.store_calls);
+    let helpers = s.mem.load_calls.saturating_add(s.mem.store_calls);
     tracing::error!(
         "[wie] mem_path helpers={helpers} load={} store={}",
-        s.load_calls,
-        s.store_calls
+        s.mem.load_calls,
+        s.mem.store_calls
     );
     tracing::error!(
         "[wie]   resolve: sticky={} multi={} pin={} walk={} cross={} slow={}",
-        s.mem_sticky_hit,
-        s.mem_multi_hit,
-        s.mem_pin_hit,
-        s.mem_walk_hit,
-        s.mem_cross_page,
-        s.mem_slow
+        s.mem.sticky_hit,
+        s.mem.multi_hit,
+        s.mem.pin_hit,
+        s.mem.walk_hit,
+        s.mem.cross_page,
+        s.mem.slow
     );
     tracing::error!(
         "[wie]   sticky_miss: key={} gen={} prot={} swaps={}",
-        s.mem_sticky_miss_key,
-        s.mem_sticky_miss_gen,
-        s.mem_sticky_miss_prot,
-        s.mem_sticky_swaps
+        s.mem.sticky_miss_key,
+        s.mem.sticky_miss_gen,
+        s.mem.sticky_miss_prot,
+        s.mem.sticky_swaps
     );
     tracing::error!(
         "[wie]   addr_vs_pin: stack={} heap={} outside={}",
-        s.mem_addr_stack_pin,
-        s.mem_addr_heap_pin,
-        s.mem_addr_outside
+        s.mem.addr_stack_pin,
+        s.mem.addr_heap_pin,
+        s.mem.addr_outside
     );
     tracing::error!(
         "[wie]   gen: bumps={} peak={}  pins: stack_bytes={:#x} heap_bytes={:#x} allow={:#x}",
-        s.mem_gen_bumps,
-        s.mem_gen_peak,
-        s.pin_stack_bytes,
-        s.pin_heap_bytes,
-        s.pin_allow_bits
+        s.mem.gen_bumps,
+        s.mem.gen_peak,
+        s.mem.pin_stack_bytes,
+        s.mem.pin_heap_bytes,
+        s.mem.pin_allow_bits
     );
     if helpers > 0 {
         let pct10 = |n: u64| -> u64 { n.saturating_mul(1000).checked_div(helpers).unwrap_or(0) };
@@ -116,11 +139,11 @@ fn dump_mem_path_histogram(s: &JitStats) {
         };
         tracing::error!(
             "[wie]   resolve%: multi={}% pin={}% walk={}% key_miss={}% outside={}%",
-            fmt(s.mem_multi_hit),
-            fmt(s.mem_pin_hit),
-            fmt(s.mem_walk_hit),
-            fmt(s.mem_sticky_miss_key),
-            fmt(s.mem_addr_outside),
+            fmt(s.mem.multi_hit),
+            fmt(s.mem.pin_hit),
+            fmt(s.mem.walk_hit),
+            fmt(s.mem.sticky_miss_key),
+            fmt(s.mem.addr_outside),
         );
     }
 }

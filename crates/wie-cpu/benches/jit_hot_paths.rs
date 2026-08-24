@@ -121,12 +121,12 @@ fn bench_exec(c: &mut Criterion) {
     for slot in 0..64 {
         cpu.precompile_at(slot_addr(slot));
     }
-    let s0 = cpu.cpu_stats().expect("stats").jit_insns;
+    let s0 = cpu.cpu_stats().expect("stats").exec.jit_insns;
     for slot in 0..64 {
         cpu.run_until_stop(slot_addr(slot), UNTIL, u64::MAX, usize::MAX, 0, 0)
             .expect("line warmup");
     }
-    let s1 = cpu.cpu_stats().expect("stats").jit_insns;
+    let s1 = cpu.cpu_stats().expect("stats").exec.jit_insns;
     assert!(
         s1.saturating_sub(s0) >= 64 * retired16,
         "JIT did not retire the expected straight-line insns (jit={s1}/{s0})"
@@ -174,7 +174,7 @@ fn bench_exec(c: &mut Criterion) {
     for slot in 0..64 {
         lcpu.precompile_at(STEP_BASE + slot as u64 * CODE_STRIDE);
     }
-    let w0 = lcpu.cpu_stats().expect("stats").jit_insns;
+    let w0 = lcpu.cpu_stats().expect("stats").exec.jit_insns;
     for slot in 0..64 {
         lcpu.run_until_stop(
             STEP_BASE + slot as u64 * CODE_STRIDE,
@@ -186,7 +186,7 @@ fn bench_exec(c: &mut Criterion) {
         )
         .expect("line96 warmup");
     }
-    let w1 = lcpu.cpu_stats().expect("stats").jit_insns;
+    let w1 = lcpu.cpu_stats().expect("stats").exec.jit_insns;
     assert!(
         w1.saturating_sub(w0) >= 64 * retired96,
         "JIT did not retire the expected 96-insn line insns"
@@ -278,9 +278,9 @@ fn bench_compile_sizes(c: &mut Criterion) {
             &prog,
             name,
         );
-        let c0 = cpu.cpu_stats().expect("stats").compiles;
+        let c0 = cpu.cpu_stats().expect("stats").compile.compiles;
         cpu.precompile_at(slot_addr(0));
-        let c1 = cpu.cpu_stats().expect("stats").compiles;
+        let c1 = cpu.cpu_stats().expect("stats").compile.compiles;
         assert!(c1 > c0, "{name}: precompile_at did not compile the block");
 
         g.bench_function(name, |b| {

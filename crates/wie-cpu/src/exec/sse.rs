@@ -378,11 +378,12 @@ pub(super) fn exec_sse_pmovmskb(
     Ok(())
 }
 
-/// `MOVHPS` — move 64 bits between XMM upper half and memory.
+/// `MOVHPS` / `MOVHPD` — move 64 bits between XMM upper half and memory.
 ///
-/// Two forms:
-/// - `MOVHPS xmm, m64`  — load 8 bytes from m64 into xmm[127:64], low 64 unchanged
-/// - `MOVHPS m64, xmm`  — store xmm[127:64] to m64
+/// Two forms each (the pd variant is the 66-prefixed encoding with identical
+/// semantics for its two legal memory forms):
+/// - `MOVHPS/HPD xmm, m64`  — load 8 bytes from m64 into xmm[127:64], low 64 unchanged
+/// - `MOVHPS/HPD m64, xmm`  — store xmm[127:64] to m64
 pub(super) fn exec_sse_movhps(
     mem: &GuestMemory,
     regs: &mut RegFile,
@@ -400,6 +401,36 @@ pub(super) fn exec_sse_movhps(
         let xmm_val = regs.read_xmm(src_reg)?;
         let upper = (xmm_val >> 64) as u64;
         write_sse_op(mem, regs, instr, 0, u128::from(upper), QWORD_BYTES, false)?;
+    }
+    Ok(())
+}
+
+/// `MOVLPS` / `MOVLPD` — move 64 bits between XMM low half and memory.
+///
+/// The pd variant is the 66-prefixed encoding (memory forms only); the ps
+/// variant additionally allows the reg-reg form, which replaces the low
+/// quadword from the source XMM. All forms leave xmm[127:64] untouched.
+/// MSVC's msvcrt `fputs` path emits MOVLPD, so a guest reaching it must not
+/// die with "unimplemented mnemonic".
+///
+/// Forms:
+/// - `MOVLPS/LPD xmm, m64|xmm` — load 8 bytes into xmm[63:0], upper unchanged
+/// - `MOVLPS/LPD m64, xmm`     — store xmm[63:0] to m64
+pub(super) fn exec_sse_movlpd(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    if instr.op0_register().is_xmm() {
+        // Load: `read_sse_op` masks an XMM source to its low quadword.
+        let src = read_sse_op(mem, regs, instr, 1, QWORD_BYTES)?;
+        let old = regs.read_xmm(instr.op_register(0))?;
+        let new = (old & !u128::from(u64::MAX)) | (src & u128::from(u64::MAX));
+        regs.write_xmm(instr.op_register(0), new)?;
+    } else {
+        // Store: write the low quadword of the source XMM to m64.
+        let val = regs.read_xmm(instr.op_register(1))? as u64;
+        write_sse_op(mem, regs, instr, 0, u128::from(val), QWORD_BYTES, false)?;
     }
     Ok(())
 }
@@ -1662,5 +1693,211 @@ fn write_sse_op(
         other => Err(StepExecError::Cpu(CpuError::Message(format!(
             "sse write op kind {other:?}"
         )))),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod lane_move_tests {
+    //! Hand-encoded MOVLPD/MOVHPD/MOVLPS/MOVHPS forms executed through the
+    //! full interpreter dispatch ([`crate::IcedCpu`]); asserts both the
+    //! touched lane and the untouched lanes / memory.
+    //!
+    //! Encodings covered (ModRM 0x01 = mod 00, reg xmm0, rm rcx → [rcx]):
+    //! - `66 0F 12 /r` MOVLPD xmm0, m64      (load low lane)
+    //! - `66 0F 13 /r` MOVLPD m64, xmm0      (store low lane)
+    //! - `66 0F 16 /r` MOVHPD xmm0, m64      (load high lane)
+    //! - `66 0F 17 /r` MOVHPD m64, xmm0      (store high lane)
+    //! - `0F 12 01`    MOVLPS xmm0, m64      (ps sibling, same lane)
+    //! - `0F 13 01`    MOVLPS m64, xmm0
+    //! - `0F 16 01`    MOVHPS xmm0, m64
+    //! - `0F 17 01`    MOVHPS m64, xmm0
+    //! - `0F 12 41 08` MOVLPS xmm0, [rcx+8]  (disp8 addressing)
+    //!
+    //! Note: mod=11 encodings of 0F 12/16 are MOVHLPS/MOVLHPS, not reg-reg
+    //! lane moves — those have no architectural MOVLPS/MOVLPD form.
+
+    use crate::mem::protect;
+    use crate::mem::{MEM_COMMIT, MEM_RESERVE};
+    use crate::regs::RegFile;
+    use crate::{CpuEngine, IcedCpu};
+
+    const BASE: u64 = 0x3000_0000;
+    const DATA: u64 = BASE + 0x1000;
+
+    /// Distinctive pre-state for XMM0: lo/hi halves differ from each other,
+    /// from the memory operand, and from zero.
+    const OLD_LO: u64 = 0x0123_4567_89ab_cdef;
+    const OLD_HI: u64 = 0xfeed_face_dead_beef;
+    const M64: u64 = 0x8000_0001_ffff_0002;
+
+    fn run(code: &[u8], data: &[u8], setup: impl FnOnce(&mut RegFile)) -> IcedCpu {
+        // The decode cache is keyed by rip and shared across fresh CPUs;
+        // flush so sequential cases at the same base re-decode their bytes.
+        crate::exec::iced_decode_cache_flush();
+        let mut cpu = IcedCpu::open_x86_64();
+        cpu.virtual_alloc(
+            BASE,
+            0x2000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc code+data");
+        cpu.mem_write(BASE, code).expect("code");
+        if !data.is_empty() {
+            cpu.mem_write(DATA, data).expect("data");
+        }
+        setup(cpu.regs_mut());
+        cpu.regs_mut().set_gpr_public(1, DATA); // RCX = m64 base
+        cpu.write_rip(BASE).expect("rip");
+        cpu.step_once().expect("step once");
+        cpu
+    }
+
+    fn read_data(cpu: &mut IcedCpu) -> [u8; 8] {
+        let mut buf = [0_u8; 8];
+        cpu.mem_read(DATA, &mut buf).expect("read back data");
+        buf
+    }
+
+    #[test]
+    fn movlpd_load_fills_low_lane_keeps_high() {
+        let cpu = run(&[0x66, 0x0f, 0x12, 0x01], &M64.to_le_bytes(), |r| {
+            r.write_xmm(
+                iced_x86::Register::XMM0,
+                u128::from(OLD_HI) << 64 | u128::from(OLD_LO),
+            )
+            .expect("xmm0");
+        });
+        let want = (u128::from(OLD_HI) << 64) | u128::from(M64);
+        assert_eq!(cpu.regs().xmm_at(0), want, "movlpd load");
+    }
+
+    #[test]
+    fn movlps_mem_load_fills_low_lane_keeps_high() {
+        let cpu = run(&[0x0f, 0x12, 0x01], &M64.to_le_bytes(), |r| {
+            r.write_xmm(
+                iced_x86::Register::XMM0,
+                u128::from(OLD_HI) << 64 | u128::from(OLD_LO),
+            )
+            .expect("xmm0");
+        });
+        let want = (u128::from(OLD_HI) << 64) | u128::from(M64);
+        assert_eq!(cpu.regs().xmm_at(0), want, "movlps mem load");
+    }
+
+    #[test]
+    fn movlpd_store_writes_low_lane_only() {
+        let mut cpu = run(&[0x66, 0x0f, 0x13, 0x01], &[0; 8], |r| {
+            r.write_xmm(
+                iced_x86::Register::XMM0,
+                u128::from(OLD_HI) << 64 | u128::from(OLD_LO),
+            )
+            .expect("xmm0");
+        });
+        assert_eq!(read_data(&mut cpu), OLD_LO.to_le_bytes(), "stored qword");
+        let want = (u128::from(OLD_HI) << 64) | u128::from(OLD_LO);
+        assert_eq!(
+            cpu.regs().xmm_at(0),
+            want,
+            "movlpd store leaves xmm0 intact"
+        );
+    }
+
+    #[test]
+    fn movhpd_load_fills_high_lane_keeps_low() {
+        let cpu = run(&[0x66, 0x0f, 0x16, 0x01], &M64.to_le_bytes(), |r| {
+            r.write_xmm(
+                iced_x86::Register::XMM0,
+                u128::from(OLD_HI) << 64 | u128::from(OLD_LO),
+            )
+            .expect("xmm0");
+        });
+        let want = (u128::from(M64) << 64) | u128::from(OLD_LO);
+        assert_eq!(cpu.regs().xmm_at(0), want, "movhpd load");
+    }
+
+    #[test]
+    fn movhps_load_fills_high_lane_keeps_low() {
+        let cpu = run(&[0x0f, 0x16, 0x01], &M64.to_le_bytes(), |r| {
+            r.write_xmm(
+                iced_x86::Register::XMM0,
+                u128::from(OLD_HI) << 64 | u128::from(OLD_LO),
+            )
+            .expect("xmm0");
+        });
+        let want = (u128::from(M64) << 64) | u128::from(OLD_LO);
+        assert_eq!(cpu.regs().xmm_at(0), want, "movhps load");
+    }
+
+    #[test]
+    fn movhpd_store_writes_high_lane_only() {
+        let mut cpu = run(&[0x66, 0x0f, 0x17, 0x01], &[0; 8], |r| {
+            r.write_xmm(
+                iced_x86::Register::XMM0,
+                u128::from(OLD_HI) << 64 | u128::from(OLD_LO),
+            )
+            .expect("xmm0");
+        });
+        assert_eq!(read_data(&mut cpu), OLD_HI.to_le_bytes(), "stored hi qword");
+        let want = (u128::from(OLD_HI) << 64) | u128::from(OLD_LO);
+        assert_eq!(
+            cpu.regs().xmm_at(0),
+            want,
+            "movhpd store leaves xmm0 intact"
+        );
+    }
+
+    #[test]
+    fn movhps_store_writes_high_lane_only() {
+        let mut cpu = run(&[0x0f, 0x17, 0x01], &[0; 8], |r| {
+            r.write_xmm(
+                iced_x86::Register::XMM0,
+                u128::from(OLD_HI) << 64 | u128::from(OLD_LO),
+            )
+            .expect("xmm0");
+        });
+        assert_eq!(read_data(&mut cpu), OLD_HI.to_le_bytes(), "stored hi qword");
+    }
+
+    #[test]
+    fn movlps_store_writes_low_lane_only() {
+        let mut cpu = run(&[0x0f, 0x13, 0x01], &[0; 8], |r| {
+            r.write_xmm(
+                iced_x86::Register::XMM0,
+                u128::from(OLD_HI) << 64 | u128::from(OLD_LO),
+            )
+            .expect("xmm0");
+        });
+        assert_eq!(read_data(&mut cpu), OLD_LO.to_le_bytes(), "stored lo qword");
+    }
+
+    #[test]
+    fn lane_moves_with_disp8_addressing() {
+        // MOVLPS xmm0, [rcx+8] (0F 12 41 08): displaced addressing must
+        // resolve through effective_address like every other SSE mem form.
+        crate::exec::iced_decode_cache_flush();
+        let mut cpu = IcedCpu::open_x86_64();
+        cpu.virtual_alloc(
+            BASE,
+            0x2000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc");
+        cpu.mem_write(BASE, &[0x0f, 0x12, 0x41, 0x08])
+            .expect("code");
+        cpu.mem_write(DATA + 8, &M64.to_le_bytes()).expect("data");
+        cpu.regs_mut()
+            .write_xmm(
+                iced_x86::Register::XMM0,
+                u128::from(OLD_HI) << 64 | u128::from(OLD_LO),
+            )
+            .expect("xmm0");
+        cpu.regs_mut().set_gpr_public(1, DATA); // RCX = base; insn adds 8
+        cpu.write_rip(BASE).expect("rip");
+        cpu.step_once().expect("step");
+        let want = (u128::from(OLD_HI) << 64) | u128::from(M64);
+        assert_eq!(cpu.regs().xmm_at(0), want, "movlps load [rcx+8]");
     }
 }

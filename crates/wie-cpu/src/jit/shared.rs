@@ -166,6 +166,10 @@ pub struct JitShared {
     /// Bumped on every background cache install. Per-thread engines re-sync
     /// their late-bound chain tables when they observe a new epoch.
     pub cache_epoch: AtomicU64,
+    /// Times [`Self::cache_epoch`] advanced (installs / invalidations).
+    /// Folded into `JitStats::chain_epoch_bumps`: a high rate means every
+    /// guest thread pays an O(cache) chain-table resync between blocks.
+    pub chain_epoch_bumps: AtomicU64,
     /// Total background compiles installed (shared across threads; surfaced in
     /// per-thread [`JitStats`] snapshots).
     pub bg_compiles: AtomicU64,
@@ -215,6 +219,7 @@ impl JitShared {
             bg_spawned: AtomicBool::new(false),
             bg_alive: Arc::new(AtomicBool::new(false)),
             cache_epoch: AtomicU64::new(0),
+            chain_epoch_bumps: AtomicU64::new(0),
             bg_compiles: AtomicU64::new(0),
             bg_fast_api: Mutex::new(Arc::from(Vec::new())),
             bg_compile: BgCompileProfile::default(),
@@ -483,6 +488,7 @@ impl JitShared {
             notify
         };
         self.cache_epoch.fetch_add(1, Ordering::Relaxed);
+        self.chain_epoch_bumps.fetch_add(1, Ordering::Relaxed);
         self.bg_compiles.fetch_add(1, Ordering::Relaxed);
         if let Some(n) = notify {
             n.notify_all();

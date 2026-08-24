@@ -331,6 +331,11 @@ fn is_lowerable(instr: &Instruction) -> bool {
         Mnemonic::Movsd if sse_movsd_is_sse(instr) => sse_mov_is_lowerable(instr, 8),
         Mnemonic::Movq => sse_movq_is_lowerable(instr),
         Mnemonic::Movd => sse_movd_is_lowerable(instr),
+        // Half-lane moves: one 64-bit XMM lane ↔ m64 (movlpd/movhpd and the
+        // legacy ps siblings; msvcrt fputs dies on unlowered movlpd).
+        Mnemonic::Movlps | Mnemonic::Movlpd | Mnemonic::Movhps | Mnemonic::Movhpd => {
+            sse_mov_is_lowerable(instr, 8)
+        }
         // Pmovmskb/Vpmovmskb: r32 ← sign bits of the 16 source-xmm bytes
         // (reg-only form; the VEX prefix decodes to its own mnemonic).
         Mnemonic::Pmovmskb | Mnemonic::Vpmovmskb => {

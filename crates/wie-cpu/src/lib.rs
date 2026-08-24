@@ -30,8 +30,9 @@ pub type ConcurrentHashMap<K, V> = papaya::HashMap<K, V>;
 pub use exec::dump_iced_counters;
 pub use iced_cpu::IcedCpu;
 pub use jit::{
-    BgCompileProfile, FastApiKind, JitCpu, JitFastPathConfig, JitHeapLayout, JitProfile, JitShared,
-    JitStats, PROFILE_BUCKETS, PerThreadJitState, TimeBuckets, dump_mem_path_stats,
+    BgCompileProfile, BgCompileStats, ChainStats, CompileStats, ExecStats, FastApiKind, JitCpu,
+    JitFastPathConfig, JitHeapLayout, JitProfile, JitShared, JitStats, MemPathStats,
+    PROFILE_BUCKETS, PerThreadJitState, PromoLedger, TimeBuckets, dump_mem_path_stats,
     jit_profile_report_lines,
 };
 /// Windows `PAGE_*` constants and software access checks.

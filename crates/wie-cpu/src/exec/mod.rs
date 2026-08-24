@@ -33,10 +33,10 @@ use sse::{
     exec_sse_cvt_gpr_to_fp, exec_sse_cvt_packed, exec_sse_cvtdq2pd, exec_sse_cvtpd2dq,
     exec_sse_cvtpd2ps, exec_sse_cvtps2pd, exec_sse_cvtsd2ss, exec_sse_cvtss2sd, exec_sse_cvttpd2dq,
     exec_sse_int_binop, exec_sse_minmax_packed, exec_sse_minmax_scalar, exec_sse_mov,
-    exec_sse_movd, exec_sse_movhlps, exec_sse_movhps, exec_sse_movmsk, exec_sse_movq,
-    exec_sse_packed_fp, exec_sse_pmovmskb, exec_sse_psadbw, exec_sse_pshufb, exec_sse_pshufd,
-    exec_sse_pshuflw_hw, exec_sse_punpck, exec_sse_punpck_lanes, exec_sse_rcp_rsqrt,
-    exec_sse_scalar_fp, exec_sse_shift, exec_sse_shufpd, exec_sse_sqrt_packed,
+    exec_sse_movd, exec_sse_movhlps, exec_sse_movhps, exec_sse_movlpd, exec_sse_movmsk,
+    exec_sse_movq, exec_sse_packed_fp, exec_sse_pmovmskb, exec_sse_psadbw, exec_sse_pshufb,
+    exec_sse_pshufd, exec_sse_pshuflw_hw, exec_sse_punpck, exec_sse_punpck_lanes,
+    exec_sse_rcp_rsqrt, exec_sse_scalar_fp, exec_sse_shift, exec_sse_shufpd, exec_sse_sqrt_packed,
     exec_sse_sqrt_scalar, exec_sse_unpcklpd, is_sse_movsd, sse_int_op, sse_shift_op,
 };
 use sse_types::{FpOp, SseBitOp};
@@ -471,7 +471,10 @@ fn execute_one(
         }
         Mnemonic::Movd => exec_sse_movd(mem, regs, instr),
         // Move packed floats between XMM upper/lower halves and memory.
-        Mnemonic::Movhps => exec_sse_movhps(mem, regs, instr),
+        // MOVHPD (66-prefixed) shares MOVHPS semantics for its two legal
+        // memory forms; same for MOVLPS/MOVLPD on the low half.
+        Mnemonic::Movhps | Mnemonic::Movhpd => exec_sse_movhps(mem, regs, instr),
+        Mnemonic::Movlps | Mnemonic::Movlpd => exec_sse_movlpd(mem, regs, instr),
         Mnemonic::Movhlps | Mnemonic::Movlhps => exec_sse_movhlps(regs, instr),
         // SSE2 unpack / shuffle / compare.
         Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq => exec_sse_punpck(regs, instr),

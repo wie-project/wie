@@ -253,7 +253,10 @@ impl CpuEngine for IcedCpu {
 
     fn cpu_stats(&self) -> Option<crate::JitStats> {
         Some(crate::JitStats {
-            iced_insns: self.iced_steps,
+            exec: crate::ExecStats {
+                iced_insns: self.iced_steps,
+                ..crate::ExecStats::default()
+            },
             ..crate::JitStats::default()
         })
     }

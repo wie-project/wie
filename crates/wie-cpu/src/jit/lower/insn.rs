@@ -14,8 +14,8 @@ use super::gpr::{
 };
 use super::sse::{
     lower_sse_int_binop, lower_sse_mov, lower_sse_movd, lower_sse_movhlps, lower_sse_movhps,
-    lower_sse_movq, lower_sse_pmovmskb, lower_sse_pshufd, lower_sse_pshuflw_hw, lower_sse_punpck,
-    lower_sse_punpck_lanes, lower_sse_shufpd, sse_int_op, sse_shift_op,
+    lower_sse_movlpd, lower_sse_movq, lower_sse_pmovmskb, lower_sse_pshufd, lower_sse_pshuflw_hw,
+    lower_sse_punpck, lower_sse_punpck_lanes, lower_sse_shufpd, sse_int_op, sse_shift_op,
 };
 use super::sse_fp::{
     FloatBinOp, FloatWidth, lower_sse_bitwise, lower_sse_byte_shift, lower_sse_comis,
@@ -437,7 +437,12 @@ pub(super) fn lower_insn(
         Mnemonic::Movd => lower_sse_movd(bcx, instr, gpr, dirty, *rflags, mem, xmm),
         // Pmovmskb/Vpmovmskb: pack 16 xmm byte sign bits into the low GPR half.
         Mnemonic::Pmovmskb | Mnemonic::Vpmovmskb => lower_sse_pmovmskb(bcx, instr, gpr, dirty, xmm),
-        Mnemonic::Movhps => lower_sse_movhps(bcx, instr, gpr, dirty, *rflags, mem, xmm),
+        Mnemonic::Movhps | Mnemonic::Movhpd => {
+            lower_sse_movhps(bcx, instr, gpr, dirty, *rflags, mem, xmm)
+        }
+        Mnemonic::Movlps | Mnemonic::Movlpd => {
+            lower_sse_movlpd(bcx, instr, gpr, dirty, *rflags, mem, xmm)
+        }
         Mnemonic::Movhlps | Mnemonic::Movlhps => lower_sse_movhlps(bcx, instr, xmm, mem),
         Mnemonic::Xorps | Mnemonic::Xorpd | Mnemonic::Pxor => {
             lower_sse_bitwise(bcx, instr, gpr, *rflags, mem, xmm, SseBit::Xor)

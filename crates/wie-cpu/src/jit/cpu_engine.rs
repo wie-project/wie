@@ -169,7 +169,7 @@ impl CpuEngine for JitCpu {
             if !self.shared.cache.pin().is_empty() {
                 self.clear_compiled();
                 self.invalidate_chain_and_shadow();
-                self.stats.code_invs = self.stats.code_invs.saturating_add(1);
+                self.stats.exec.code_invs = self.stats.exec.code_invs.saturating_add(1);
             }
         } else {
             self.invalidate_code_range(addr, size);
@@ -344,7 +344,7 @@ impl CpuEngine for JitCpu {
                     })
                 };
                 if let Some(meta) = meta {
-                    self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
+                    self.stats.exec.cache_hits = self.stats.exec.cache_hits.saturating_add(1);
                     let (result, retired) = self.finish_compiled(rip, meta);
                     match result {
                         StepResult::Continue => {

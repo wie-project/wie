@@ -123,9 +123,13 @@ impl JitCpu {
     #[must_use]
     pub fn stats(&self) -> JitStats {
         let mut s = self.stats;
-        s.bg_compiles = s
-            .bg_compiles
-            .saturating_add(self.shared.bg_compiles.load(Ordering::Relaxed));
+        s.bg.compiles =
+            s.bg.compiles
+                .saturating_add(self.shared.bg_compiles.load(Ordering::Relaxed));
+        s.chain.epoch_bumps = s
+            .chain
+            .epoch_bumps
+            .saturating_add(self.shared.chain_epoch_bumps.load(Ordering::Relaxed));
         // Fold the worker's lock-free compile timing into the per-thread
         // snapshot so `WIE_RUNTIME_PROFILE` sees background work.
         let bg = &self.shared.bg_compile;
@@ -203,7 +207,7 @@ impl JitCpu {
             }
             self.shared.chain_ids.pin().remove(va);
         }
-        self.stats.code_invs = self.stats.code_invs.saturating_add(1);
+        self.stats.exec.code_invs = self.stats.exec.code_invs.saturating_add(1);
         self.invalidate_chain_and_shadow();
         if JitConfig::get().chain_enabled() {
             let cache = self.shared.cache.pin();
@@ -231,7 +235,7 @@ impl JitCpu {
             if !self.shared.cache.pin().is_empty() {
                 self.clear_compiled();
                 self.invalidate_chain_and_shadow();
-                self.stats.code_invs = self.stats.code_invs.saturating_add(1);
+                self.stats.exec.code_invs = self.stats.exec.code_invs.saturating_add(1);
             }
             return;
         }
@@ -339,7 +343,7 @@ impl JitCpu {
             if let Some(entry) = entry {
                 match entry {
                     CacheEntry::Ready(compiled) => {
-                        self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
+                        self.stats.exec.cache_hits = self.stats.exec.cache_hits.saturating_add(1);
                         let meta = CompiledRunMeta::from(&compiled);
                         return Ok(self.finish_compiled(rip, meta));
                     }
@@ -357,8 +361,8 @@ impl JitCpu {
                             return Ok(self.finish_compiled(rip, meta));
                         }
                         if !self.shared.bg_alive.load(Ordering::Relaxed) {
-                            self.stats.compile_stall_fallback =
-                                self.stats.compile_stall_fallback.saturating_add(1);
+                            self.stats.bg.inline_fallbacks =
+                                self.stats.bg.inline_fallbacks.saturating_add(1);
                             if let Some(compiled) = self.try_compile(rip) {
                                 let meta = CompiledRunMeta::from(&compiled);
                                 self.insert_ready(rip, compiled);
@@ -407,8 +411,8 @@ impl JitCpu {
                                         // about to execute the entry.
                                     }
                                     BgEnqueueOutcome::Ready => {
-                                        self.stats.bg_promo_hit_ready =
-                                            self.stats.bg_promo_hit_ready.saturating_add(1);
+                                        self.stats.promo.hit_ready =
+                                            self.stats.promo.hit_ready.saturating_add(1);
                                     }
                                     BgEnqueueOutcome::Unavailable
                                         if self.shared.entry_queued(rip)
@@ -416,8 +420,8 @@ impl JitCpu {
                                     {
                                         // Another thread already queued this exact
                                         // block: never build it twice — keep iced.
-                                        self.stats.bg_promo_deferred =
-                                            self.stats.bg_promo_deferred.saturating_add(1);
+                                        self.stats.promo.deferred =
+                                            self.stats.promo.deferred.saturating_add(1);
                                     }
                                     BgEnqueueOutcome::Unavailable => {
                                         // Worker dead / disabled / queue send failed:
@@ -482,8 +486,8 @@ impl JitCpu {
                                 if !self.shared.bg_alive.load(Ordering::Relaxed) {
                                     // Deadline missed AND worker gone: inline
                                     // compile replaces the Queued entry.
-                                    self.stats.compile_stall_fallback =
-                                        self.stats.compile_stall_fallback.saturating_add(1);
+                                    self.stats.bg.inline_fallbacks =
+                                        self.stats.bg.inline_fallbacks.saturating_add(1);
                                     if let Some(compiled) = self.try_compile_from_kind(rip, kind) {
                                         let meta = CompiledRunMeta::from(&compiled);
                                         self.insert_ready(rip, compiled);
@@ -497,8 +501,8 @@ impl JitCpu {
                             }
                             BgEnqueueOutcome::Ready => {
                                 // Worker beat us: the cache already holds Ready.
-                                self.stats.bg_promo_hit_ready =
-                                    self.stats.bg_promo_hit_ready.saturating_add(1);
+                                self.stats.promo.hit_ready =
+                                    self.stats.promo.hit_ready.saturating_add(1);
                                 let compiled = {
                                     let cache = self.shared.cache.pin();
                                     cache.get(&rip).and_then(|e| match e {
@@ -519,8 +523,8 @@ impl JitCpu {
                                     // Dedup hit: another thread already queued this
                                     // exact block. Never build it twice — keep iced;
                                     // it resolves Ready shortly.
-                                    self.stats.bg_promo_deferred =
-                                        self.stats.bg_promo_deferred.saturating_add(1);
+                                    self.stats.promo.deferred =
+                                        self.stats.promo.deferred.saturating_add(1);
                                 } else if let Some(compiled) = self.try_compile_from_kind(rip, kind)
                                 {
                                     let meta = CompiledRunMeta::from(&compiled);
@@ -543,7 +547,7 @@ impl JitCpu {
 
         // Iced does not maintain the shadow return stack — drop prediction.
         self.thread.shadow_sp = 0;
-        self.stats.iced_insns = self.stats.iced_insns.saturating_add(1);
+        self.stats.exec.iced_insns = self.stats.exec.iced_insns.saturating_add(1);
         self.stats.profile.iced_fallbacks = self.stats.profile.iced_fallbacks.saturating_add(1);
         // Sampled opcode histogram over the interpreted residue (Phase-0
         // counter): bucket the mnemonic of every Nth step, only when enabled.
@@ -642,7 +646,7 @@ impl JitCpu {
             return None; // worker gone: inline fallback (no cooldown armed)
         }
         if self.shared.bg_queue_depth.load(Ordering::Relaxed) >= BG_WAIT_SKIP_DEPTH {
-            self.stats.bg_promo_deferred = self.stats.bg_promo_deferred.saturating_add(1);
+            self.stats.promo.deferred = self.stats.promo.deferred.saturating_add(1);
             self.arm_cooldown(rip, cell.threshold());
             return None;
         }
@@ -662,14 +666,13 @@ impl JitCpu {
             };
             match state {
                 Some(BgWaitState::Ready(c)) => {
-                    self.stats.compile_stalls = self.stats.compile_stalls.saturating_add(1);
-                    self.stats.compile_stall_us = self.stats.compile_stall_us.saturating_add(
+                    self.stats.bg.waits = self.stats.bg.waits.saturating_add(1);
+                    self.stats.bg.wait_us = self.stats.bg.wait_us.saturating_add(
                         u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
                     );
                     self.stats.profile.bg_wait_hits =
                         self.stats.profile.bg_wait_hits.saturating_add(1);
-                    self.stats.bg_promo_stalled_ok =
-                        self.stats.bg_promo_stalled_ok.saturating_add(1);
+                    self.stats.promo.stalled_ok = self.stats.promo.stalled_ok.saturating_add(1);
                     return Some(c);
                 }
                 Some(BgWaitState::Never) => return None, // worker failed → iced
@@ -677,14 +680,15 @@ impl JitCpu {
             }
             let elapsed = start.elapsed();
             if elapsed >= budget {
-                self.stats.compile_stalls = self.stats.compile_stalls.saturating_add(1);
-                self.stats.compile_stall_us = self
+                self.stats.bg.waits = self.stats.bg.waits.saturating_add(1);
+                self.stats.bg.wait_us = self
                     .stats
-                    .compile_stall_us
+                    .bg
+                    .wait_us
                     .saturating_add(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
                 self.stats.profile.bg_wait_timeouts =
                     self.stats.profile.bg_wait_timeouts.saturating_add(1);
-                self.stats.bg_promo_timed_out = self.stats.bg_promo_timed_out.saturating_add(1);
+                self.stats.promo.timed_out = self.stats.promo.timed_out.saturating_add(1);
                 // Cooldown, not inline compile: re-arm with a doubled threshold
                 // so this block keeps interpreting while the worker catches up.
                 self.arm_cooldown(rip, cell.threshold());
@@ -725,7 +729,7 @@ impl JitCpu {
                 thr,
                 "jit bg wait timeout → cooldown"
             );
-            self.stats.bg_promo_cooled_down = self.stats.bg_promo_cooled_down.saturating_add(1);
+            self.stats.promo.cooled_down = self.stats.promo.cooled_down.saturating_add(1);
         }
     }
 
@@ -743,7 +747,7 @@ impl JitCpu {
                 _ => {}
             }
         }
-        self.stats.bg_promo_deferred = self.stats.bg_promo_deferred.saturating_add(1);
+        self.stats.promo.deferred = self.stats.promo.deferred.saturating_add(1);
     }
 
     /// Whether the compile queue is deep enough that a fresh enqueue would
@@ -762,12 +766,18 @@ impl JitCpu {
             return;
         }
         let cache = self.shared.cache.pin();
+        let mut inserted = 0_u64;
         for (va, entry) in cache.iter() {
             if let CacheEntry::Ready(c) = entry {
                 let fn_ptr = c.func as usize as u64;
                 chain_table_insert(self.thread.chain_slots.as_mut(), *va, fn_ptr);
+                inserted += 1;
             }
         }
+        // G5 counters: resync frequency and width quantify the O(cache)
+        // per-epoch cost every guest thread pays between block executions.
+        self.stats.chain.resyncs = self.stats.chain.resyncs.saturating_add(1);
+        self.stats.chain.resync_entries = self.stats.chain.resync_entries.saturating_add(inserted);
     }
 
     pub(super) fn try_compile(&mut self, rip: u64) -> Option<CompiledBlock> {
@@ -793,10 +803,10 @@ impl JitCpu {
             .compile_from_kind_shared(&self.fast_api, rip, result);
         let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
         let Some(compiled) = compiled else {
-            self.stats.compile_skip = self.stats.compile_skip.saturating_add(1);
+            self.stats.compile.compile_skip = self.stats.compile.compile_skip.saturating_add(1);
             return None;
         };
-        self.stats.compiles = self.stats.compiles.saturating_add(1);
+        self.stats.compile.compiles = self.stats.compile.compiles.saturating_add(1);
         self.stats.profile.inline_compiles = self.stats.profile.inline_compiles.saturating_add(1);
         self.stats.profile.compile_us = self.stats.profile.compile_us.saturating_add(us);
         self.stats
@@ -806,6 +816,7 @@ impl JitCpu {
         if JitConfig::get().chain_enabled() {
             let fn_ptr = compiled.func as usize as u64;
             chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
+            self.stats.chain.inline_inserts = self.stats.chain.inline_inserts.saturating_add(1);
         }
         tracing::debug!(
             start = format_args!("{rip:#x}"),
@@ -823,8 +834,9 @@ impl JitCpu {
         if let Some(inv) = self.run_compiled(entry_rip, meta) {
             (StepResult::InvalidMemory(inv), 0)
         } else {
-            self.stats.jit_insns = self
+            self.stats.exec.jit_insns = self
                 .stats
+                .exec
                 .jit_insns
                 .saturating_add(u64::from(meta.insn_count));
             (
@@ -861,18 +873,19 @@ impl JitCpu {
         }
         // Gen-bump + pin-shape diagnostics (cheap; always on for stats).
         if self.last_mem_gen != 0 && mem_gen > self.last_mem_gen {
-            self.stats.mem_gen_bumps = self
+            self.stats.mem.gen_bumps = self
                 .stats
-                .mem_gen_bumps
+                .mem
+                .gen_bumps
                 .saturating_add(mem_gen.saturating_sub(self.last_mem_gen));
         }
         self.last_mem_gen = mem_gen;
-        if mem_gen > self.stats.mem_gen_peak {
-            self.stats.mem_gen_peak = mem_gen;
+        if mem_gen > self.stats.mem.gen_peak {
+            self.stats.mem.gen_peak = mem_gen;
         }
         {
             let stack = self.thread.pins[0];
-            self.stats.pin_stack_bytes = if stack.is_empty() {
+            self.stats.mem.pin_stack_bytes = if stack.is_empty() {
                 0
             } else {
                 stack.span_bytes()
@@ -893,8 +906,8 @@ impl JitCpu {
                     bits |= (pin.allow & 0b11) << shift;
                 }
             }
-            self.stats.pin_heap_bytes = data_bytes;
-            self.stats.pin_allow_bits = bits;
+            self.stats.mem.pin_heap_bytes = data_bytes;
+            self.stats.mem.pin_allow_bits = bits;
         }
         let mem_guard = self.shared.mem.read().unwrap();
         let mem_ptr = (&raw const *mem_guard).cast_mut();
@@ -962,24 +975,24 @@ impl JitCpu {
         unsafe {
             (meta.func)(std::ptr::from_mut(&mut ctx));
         }
-        self.stats.load_calls = self.stats.load_calls.saturating_add(ctx.load_calls);
-        self.stats.store_calls = self.stats.store_calls.saturating_add(ctx.store_calls);
+        self.stats.mem.load_calls = self.stats.mem.load_calls.saturating_add(ctx.load_calls);
+        self.stats.mem.store_calls = self.stats.mem.store_calls.saturating_add(ctx.store_calls);
         {
             let m = &ctx.mem_path;
             let s = &mut self.stats;
-            s.mem_sticky_hit = s.mem_sticky_hit.saturating_add(m.sticky_hit);
-            s.mem_multi_hit = s.mem_multi_hit.saturating_add(m.multi_hit);
-            s.mem_pin_hit = s.mem_pin_hit.saturating_add(m.pin_hit);
-            s.mem_walk_hit = s.mem_walk_hit.saturating_add(m.walk_hit);
-            s.mem_cross_page = s.mem_cross_page.saturating_add(m.cross_page);
-            s.mem_slow = s.mem_slow.saturating_add(m.slow);
-            s.mem_sticky_miss_key = s.mem_sticky_miss_key.saturating_add(m.sticky_miss_key);
-            s.mem_sticky_miss_gen = s.mem_sticky_miss_gen.saturating_add(m.sticky_miss_gen);
-            s.mem_sticky_miss_prot = s.mem_sticky_miss_prot.saturating_add(m.sticky_miss_prot);
-            s.mem_sticky_swaps = s.mem_sticky_swaps.saturating_add(m.sticky_swaps);
-            s.mem_addr_stack_pin = s.mem_addr_stack_pin.saturating_add(m.addr_in_stack_pin);
-            s.mem_addr_heap_pin = s.mem_addr_heap_pin.saturating_add(m.addr_in_heap_pin);
-            s.mem_addr_outside = s.mem_addr_outside.saturating_add(m.addr_outside_pins);
+            s.mem.sticky_hit = s.mem.sticky_hit.saturating_add(m.sticky_hit);
+            s.mem.multi_hit = s.mem.multi_hit.saturating_add(m.multi_hit);
+            s.mem.pin_hit = s.mem.pin_hit.saturating_add(m.pin_hit);
+            s.mem.walk_hit = s.mem.walk_hit.saturating_add(m.walk_hit);
+            s.mem.cross_page = s.mem.cross_page.saturating_add(m.cross_page);
+            s.mem.slow = s.mem.slow.saturating_add(m.slow);
+            s.mem.sticky_miss_key = s.mem.sticky_miss_key.saturating_add(m.sticky_miss_key);
+            s.mem.sticky_miss_gen = s.mem.sticky_miss_gen.saturating_add(m.sticky_miss_gen);
+            s.mem.sticky_miss_prot = s.mem.sticky_miss_prot.saturating_add(m.sticky_miss_prot);
+            s.mem.sticky_swaps = s.mem.sticky_swaps.saturating_add(m.sticky_swaps);
+            s.mem.addr_stack_pin = s.mem.addr_stack_pin.saturating_add(m.addr_in_stack_pin);
+            s.mem.addr_heap_pin = s.mem.addr_heap_pin.saturating_add(m.addr_in_heap_pin);
+            s.mem.addr_outside = s.mem.addr_outside.saturating_add(m.addr_outside_pins);
         }
         // Guest stores via `GuestMemory::write` leave a pending range;
         // apply selective code invalidation only after the native frame returns.

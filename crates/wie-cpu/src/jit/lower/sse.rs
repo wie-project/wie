@@ -302,7 +302,8 @@ pub(super) fn lower_sse_movd(
     Err("movd form".into())
 }
 
-/// `MOVHPS` — move 64 bits between XMM upper half and memory.
+/// `MOVHPS` / `MOVHPD` — move 64 bits between XMM upper half and memory
+/// (the pd variant is the 66-prefixed encoding with identical semantics).
 pub(super) fn lower_sse_movhps(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
@@ -327,6 +328,43 @@ pub(super) fn lower_sse_movhps(
     let (_, hi) = read_xmm_pair(xmm, r1)?;
     let addr = effective_addr(bcx, instr, gpr, mem)?;
     call_store(bcx, mem, gpr, rflags, addr, 8, hi, ip)
+}
+
+/// `MOVLPS` / `MOVLPD` — move 64 bits between XMM low half and memory.
+///
+/// The pd variant is the 66-prefixed encoding (memory forms only); the ps
+/// variant additionally allows reg-reg, replacing only the low quadword.
+/// All forms leave xmm[127:64] untouched.
+pub(super) fn lower_sse_movlpd(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    _dirty: &mut [bool; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+) -> Result<(), String> {
+    let ip = instr.ip();
+    let r0 = instr.op_register(0);
+    if r0.is_xmm() {
+        // xmm, m64|xmm: replace the low 64 bits, keep the upper half.
+        let lo = match instr.op1_kind() {
+            OpKind::Register => read_xmm_pair(xmm, instr.op_register(1))?.0,
+            OpKind::Memory => {
+                let addr = effective_addr(bcx, instr, gpr, mem)?;
+                call_load(bcx, mem, gpr, rflags, addr, 8, ip)?
+            }
+            _ => return Err("movlpd src".into()),
+        };
+        let (_, old_hi) = read_xmm_pair(xmm, r0)?;
+        store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, lo, old_hi);
+        return Ok(());
+    }
+    // m64, xmm: store the low 64 bits of XMM to memory
+    let r1 = instr.op_register(1);
+    let (lo, _) = read_xmm_pair(xmm, r1)?;
+    let addr = effective_addr(bcx, instr, gpr, mem)?;
+    call_store(bcx, mem, gpr, rflags, addr, 8, lo, ip)
 }
 
 /// `MOVHLPS` / `MOVLHPS` — move packed floats between XMM halves (reg-to-reg only).

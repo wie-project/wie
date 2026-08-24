@@ -115,86 +115,136 @@ impl UcrtImportIds {
     }
 }
 
-/// Lightweight counters for `WIE_CPU=jit` diagnostics.
+/// Execution-path counters: what retired and how the block cache fed it.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct JitStats {
+pub struct ExecStats {
     /// Instructions retired via native blocks.
     pub jit_insns: u64,
     /// Instructions retired via iced fallback.
     pub iced_insns: u64,
+    /// Cache hits (native run).
+    pub cache_hits: u64,
+    /// Selective code-cache invalidations (SMC / X-loss / unmap).
+    pub code_invs: u64,
+}
+
+/// Inline compilation counters on this engine.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CompileStats {
     /// Successful block compiles.
     pub compiles: u64,
     /// Block decode declined or cold skip.
     pub compile_skip: u64,
+}
+
+/// Background-worker compilation and the guest-visible waiting it causes.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BgCompileStats {
     /// Blocks compiled on the background worker (shared counter; merged into
     /// per-thread snapshots by [`JitCpu::stats`]).
-    pub bg_compiles: u64,
+    pub compiles: u64,
     /// Times this thread waited for a background compile (any resolution).
-    pub compile_stalls: u64,
+    pub waits: u64,
     /// Total wall µs this thread spent waiting on background compiles.
-    pub compile_stall_us: u64,
-    /// Background waits that missed the deadline and fell back to inline
-    /// compilation (worker backlog / dead worker visibility).
-    pub compile_stall_fallback: u64,
-    /// Cache hits (native run).
-    pub cache_hits: u64,
+    pub wait_us: u64,
+    /// Inline compilations after a wait gave up (worker dead/unavailable).
+    pub inline_fallbacks: u64,
+}
+
+/// Per-enqueue resolution of the background-promotion pipeline (G5/P2).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PromoLedger {
+    /// Guest arrived while queued and got the compiled block after waiting.
+    pub hit_ready: u64,
+    /// Guest arrived, waited, and the block was already installed on recheck.
+    pub stalled_ok: u64,
+    /// Guest waited out the full budget without resolution.
+    pub timed_out: u64,
+    /// Timed-out entries re-armed as cooldown instead of inline compiling.
+    pub cooled_down: u64,
+    /// Promotions deferred outright (backpressure / skip-depth policy).
+    pub deferred: u64,
+}
+
+/// Direct-chaining health: how often thread chain tables refresh and how
+/// wide each refresh is (G5).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ChainStats {
+    /// Chain-table resyncs on this thread (one per observed cache-epoch
+    /// advance; each is an O(Ready-cache) walk).
+    pub resyncs: u64,
+    /// Ready entries inserted across all resyncs on this thread
+    /// (`resync_entries / resyncs` = average resync width).
+    pub resync_entries: u64,
+    /// Direct chain-table inserts from inline compiles on this thread.
+    pub inline_inserts: u64,
+    /// Shared cache-epoch advances (installs + invalidations), merged from
+    /// [`JitShared::chain_epoch_bumps`] by [`JitCpu::stats`].
+    pub epoch_bumps: u64,
+}
+
+/// Host helper mem-path breakdown for generated-code accesses.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MemPathStats {
     /// Calls into host `wie_jit_load` (TLB hit or miss).
     pub load_calls: u64,
     /// Calls into host `wie_jit_store` (TLB hit or miss).
     pub store_calls: u64,
-    /// Selective code-cache invalidations (SMC / X-loss / unmap).
-    pub code_invs: u64,
-    /// Helper sticky hit after IR miss.
-    pub mem_sticky_hit: u64,
-    /// Helper multi-way TLB hit.
-    pub mem_multi_hit: u64,
-    /// Helper region-pin hit.
-    pub mem_pin_hit: u64,
-    /// Helper page-walk install hit.
-    pub mem_walk_hit: u64,
-    /// Helper cross-page (slow).
-    pub mem_cross_page: u64,
-    /// Helper full slow path (`GuestMemory::{read,write}`).
-    pub mem_slow: u64,
-    /// Sticky miss reason: wrong/empty page key.
-    pub mem_sticky_miss_key: u64,
-    /// Sticky miss reason: generation mismatch.
-    pub mem_sticky_miss_gen: u64,
-    /// Sticky miss reason: R/W denied.
-    pub mem_sticky_miss_prot: u64,
-    /// Sticky hot-page replacements.
-    pub mem_sticky_swaps: u64,
-    /// Helper VA inside stack pin.
-    pub mem_addr_stack_pin: u64,
-    /// Helper VA inside heap pin.
-    pub mem_addr_heap_pin: u64,
-    /// Helper VA outside both pins.
-    pub mem_addr_outside: u64,
-    /// Times `GuestMemory::generation` increased between `run_compiled` entries.
-    pub mem_gen_bumps: u64,
-    /// Peak `mem_gen` observed.
-    pub mem_gen_peak: u64,
-    /// Last stack pin guest span size (0 if empty).
+    /// Resolved by the single-page sticky TLB.
+    pub sticky_hit: u64,
+    /// Resolved by the multi-page TLB.
+    pub multi_hit: u64,
+    /// Resolved by region-direct pin.
+    pub pin_hit: u64,
+    /// Resolved by page-walk.
+    pub walk_hit: u64,
+    /// Cross-page access split across two resolves.
+    pub cross_page: u64,
+    /// Full slow-path resolve (no fast structure hit).
+    pub slow: u64,
+    /// Sticky miss: key mismatch.
+    pub sticky_miss_key: u64,
+    /// Sticky miss: generation mismatch.
+    pub sticky_miss_gen: u64,
+    /// Sticky miss: protection mismatch.
+    pub sticky_miss_prot: u64,
+    /// Sticky TLB entry swaps.
+    pub sticky_swaps: u64,
+    /// Accesses resolved by stack pin.
+    pub addr_stack_pin: u64,
+    /// Accesses resolved by heap pin.
+    pub addr_heap_pin: u64,
+    /// Accesses outside any pinned region.
+    pub addr_outside: u64,
+    /// Memory-generation bumps (protection churn).
+    pub gen_bumps: u64,
+    /// Peak live memory generations.
+    pub gen_peak: u64,
+    /// Stack pin bytes.
     pub pin_stack_bytes: u64,
-    /// Last heap pin guest span size (0 if empty).
+    /// Heap pin bytes.
     pub pin_heap_bytes: u64,
-    /// Last pin allow bits: bit0 stack R, bit1 stack W, bit2 heap R, bit3 heap W.
+    /// Allow-bits pin bytes.
     pub pin_allow_bits: u64,
-    /// Adaptive-JIT cost-model instrumentation (timing + decision counters).
+}
+
+/// Lightweight counters for \`WIE_CPU=jit\` diagnostics, grouped by concern.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct JitStats {
+    /// Execution throughput and block-cache feeding.
+    pub exec: ExecStats,
+    /// Inline compilation counters.
+    pub compile: CompileStats,
+    /// Background-worker compilation and guest-visible waits.
+    pub bg: BgCompileStats,
+    /// Per-enqueue promotion outcomes.
+    pub promo: PromoLedger,
+    /// Direct-chaining health (G5).
+    pub chain: ChainStats,
+    /// Host helper mem-path breakdown for generated-code accesses.
+    pub mem: MemPathStats,
+    /// Decision + compile-timing diagnostics.
     pub profile: JitProfile,
-    /// Promotion ledger: enqueues already `Ready` when handed to the worker
-    /// (the worker beat us — pure bookkeeping, no wait).
-    pub bg_promo_hit_ready: u64,
-    /// Promotion ledger: waits that resolved to a Ready block within budget.
-    pub bg_promo_stalled_ok: u64,
-    /// Promotion ledger: waits that exhausted their budget.
-    pub bg_promo_timed_out: u64,
-    /// Promotion ledger: timeouts converted into a cooldown re-arm
-    /// (`Hot { visits: 0, thr: doubled }`) instead of an inline compile.
-    pub bg_promo_cooled_down: u64,
-    /// Promotion ledger: crossings skipped because the compile queue was too
-    /// deep (backpressure) or another thread already queued the same block.
-    pub bg_promo_deferred: u64,
 }
 #[cfg(test)]
 #[allow(clippy::expect_used)]

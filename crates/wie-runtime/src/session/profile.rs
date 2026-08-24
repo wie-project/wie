@@ -364,17 +364,17 @@ impl RuntimeProfile {
         if let Some(j) = self.jit() {
             lines.push(format!(
                 "jit: insns={} iced={} compiles={} skip={} bg_compiles={} bg_stalls={} bg_stall_us={} bg_fallback={} cache_hits={} load={} store={}",
-                j.jit_insns,
-                j.iced_insns,
-                j.compiles,
-                j.compile_skip,
-                j.bg_compiles,
-                j.compile_stalls,
-                j.compile_stall_us,
-                j.compile_stall_fallback,
-                j.cache_hits,
-                j.load_calls,
-                j.store_calls
+                j.exec.jit_insns,
+                j.exec.iced_insns,
+                j.compile.compiles,
+                j.compile.compile_skip,
+                j.bg.compiles,
+                j.bg.waits,
+                j.bg.wait_us,
+                j.bg.inline_fallbacks,
+                j.exec.cache_hits,
+                j.mem.load_calls,
+                j.mem.store_calls
             ));
             // General JIT decision + compile-timing diagnostics.
             let p = &j.profile;
@@ -577,7 +577,7 @@ impl super::RuntimeSession {
         let (iced, jit) = self
             .process
             .with_mut(|e, _| e.cpu_stats())
-            .map_or((0, 0), |s| (s.iced_insns, s.jit_insns));
+            .map_or((0, 0), |s| (s.exec.iced_insns, s.exec.jit_insns));
         let iced_delta = iced.saturating_sub(self.frame_last_iced);
         let jit_delta = jit.saturating_sub(self.frame_last_jit);
         self.profile.last_frame_host_stops = self

@@ -63,7 +63,7 @@ fn code_inv_x_loss_drops_ready() {
     assert!(!cpu.has_ready_at(base));
     assert!(!cpu.code_pages_overlap(base, 16));
     assert_eq!(cpu.thread.edge_ic_va[0], 0);
-    assert!(cpu.stats().code_invs >= 1);
+    assert!(cpu.stats().exec.code_invs >= 1);
 }
 
 #[test]
@@ -106,10 +106,10 @@ fn code_inv_data_write_leaves_code() {
     )
     .expect("data");
     cpu.test_plant_ready(code, code + 8);
-    let invs = cpu.stats().code_invs;
+    let invs = cpu.stats().exec.code_invs;
     cpu.mem_write(data, &[1, 2, 3, 4]).expect("data write");
     assert!(cpu.has_ready_at(code));
-    assert_eq!(cpu.stats().code_invs, invs);
+    assert_eq!(cpu.stats().exec.code_invs, invs);
     assert_eq!(cpu.thread.edge_ic_va[0], code);
 }
 
@@ -259,7 +259,7 @@ fn flush_instruction_cache_drops_ready_range() {
     assert!(cpu.has_ready_at(base));
     cpu.flush_instruction_cache(base, 16).expect("fic");
     assert!(!cpu.has_ready_at(base));
-    assert!(cpu.stats().code_invs >= 1);
+    assert!(cpu.stats().exec.code_invs >= 1);
 }
 
 #[test]
@@ -318,7 +318,7 @@ fn bg_worker_end_to_end_step() {
     // The worker processes the queued job regardless of who won the race;
     // poll (bounded) for its install so the shared counters are settled.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while cpu.stats().bg_compiles < 1 || !cpu.has_ready_at(base) {
+    while cpu.stats().bg.compiles < 1 || !cpu.has_ready_at(base) {
         assert!(Instant::now() < deadline, "worker install timed out");
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -370,7 +370,7 @@ fn bg_wait_returns_none_without_worker() {
     let cell = BgWaitCell::new(100);
     let r = cpu.wait_bg_ready(0x1022_0000_u64, &cell);
     assert!(r.is_none());
-    assert_eq!(cpu.stats().compile_stall_fallback, 0);
+    assert_eq!(cpu.stats().bg.inline_fallbacks, 0);
 }
 
 #[test]
@@ -453,9 +453,9 @@ fn hot_threshold_crossing_compiles_and_invalidates() {
         "Unavailable outcome must still inline-compile"
     );
     let s = cpu.stats();
-    assert_eq!(s.bg_promo_timed_out, 0);
-    assert_eq!(s.bg_promo_cooled_down, 0);
-    assert_eq!(s.compile_stall_fallback, 0, "no wait happened on this path");
+    assert_eq!(s.promo.timed_out, 0);
+    assert_eq!(s.promo.cooled_down, 0);
+    assert_eq!(s.bg.inline_fallbacks, 0, "no wait happened on this path");
 
     // Invalidation clears the compiled block (SMC / unmap path).
     cpu.invalidate_code_range(base, 8);
@@ -565,10 +565,10 @@ fn bg_timeout_arms_cooldown_never_inline_compiles() {
         "no inline compile while worker alive"
     );
     let s = cpu.stats();
-    assert_eq!(s.compile_stall_fallback, 0, "inline fallback must not fire");
-    assert_eq!(s.bg_promo_timed_out, 1);
-    assert_eq!(s.bg_promo_cooled_down, 1);
-    assert_eq!(s.bg_promo_stalled_ok, 0);
+    assert_eq!(s.bg.inline_fallbacks, 0, "inline fallback must not fire");
+    assert_eq!(s.promo.timed_out, 1);
+    assert_eq!(s.promo.cooled_down, 1);
+    assert_eq!(s.promo.stalled_ok, 0);
 
     // Invalidation leaves the Queued/Cooldown machinery untouched: a
     // range invalidate over a still-Queued entry is a no-op (only Ready
@@ -616,8 +616,8 @@ fn bg_cooldown_hysteresis_doubles_then_quadruples() {
         );
     }
     let s = cpu.stats();
-    assert_eq!(s.bg_promo_timed_out, 3);
-    assert_eq!(s.bg_promo_cooled_down, 3);
+    assert_eq!(s.promo.timed_out, 3);
+    assert_eq!(s.promo.cooled_down, 3);
     // Cap respected end-to-end: doubling from ≥ cap/2 pins at the cap.
     let cell = BgWaitCell::new(30_000);
     cpu.shared
@@ -672,10 +672,10 @@ fn bg_cooldown_repromotes_and_installs_after_crossing() {
         );
         std::thread::sleep(Duration::from_millis(2));
     }
-    assert!(cpu.stats().bg_compiles >= 1);
+    assert!(cpu.stats().bg.compiles >= 1);
     let s = cpu.stats();
-    assert_eq!(s.bg_promo_timed_out, 0);
-    assert_eq!(s.bg_promo_deferred, 0);
+    assert_eq!(s.promo.timed_out, 0);
+    assert_eq!(s.promo.deferred, 0);
 }
 
 /// Backpressure: a deep compile queue defers promotion (doubled threshold)
@@ -722,7 +722,7 @@ fn bg_backpressure_deep_queue_defers_promotion() {
         ),
         "backpressure must re-arm a doubled threshold"
     );
-    assert_eq!(cpu.stats().bg_promo_deferred, 1);
+    assert_eq!(cpu.stats().promo.deferred, 1);
     assert!(!cpu.has_ready_at(base));
 
     // Queue drained → the same block promotes normally again.
@@ -835,10 +835,10 @@ fn simd_dual(code: &[u8], data: &[u8], setup: impl Fn(&mut RegFile)) -> (RegFile
     // Wait briefly for the install rather than racing it. A block that
     // genuinely cannot JIT falls back to interpretation immediately
     // (iced_insns > 0) and fails fast below.
-    if cpu.stats().iced_insns == 0 && !cpu.has_ready_at(SIMD_BASE) {
+    if cpu.stats().exec.iced_insns == 0 && !cpu.has_ready_at(SIMD_BASE) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !cpu.has_ready_at(SIMD_BASE)
-            && cpu.stats().iced_insns == 0
+            && cpu.stats().exec.iced_insns == 0
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -849,10 +849,23 @@ fn simd_dual(code: &[u8], data: &[u8], setup: impl Fn(&mut RegFile)) -> (RegFile
         "block must compile, not run iced"
     );
     assert_eq!(
-        cpu.stats().iced_insns,
+        cpu.stats().exec.iced_insns,
         0,
         "block ran on iced instead of JIT"
     );
+
+    // Both engines ran the same bytes over the same planted data: any
+    // divergence in the 16 data bytes is a store-side lowering bug (loads
+    // leave them untouched, so this is vacuously true for load-form cases).
+    if !data.is_empty() {
+        let mut iced_mem = [0_u8; 16];
+        let mut jit_mem = [0_u8; 16];
+        iced.mem_read(SIMD_DATA, &mut iced_mem)
+            .expect("iced mem readback");
+        cpu.mem_read(SIMD_DATA, &mut jit_mem)
+            .expect("jit mem readback");
+        assert_eq!(iced_mem, jit_mem, "guest memory diverged at SIMD_DATA");
+    }
 
     (iced.regs().clone(), cpu.thread.regs.clone())
 }
@@ -869,6 +882,103 @@ fn assert_same_regs(iced: &RegFile, jit: &RegFile, what: &str) {
 fn set_pair(regs: &mut RegFile, x0: u128, x1: u128) {
     regs.write_xmm(Register::XMM0, x0).expect("xmm0");
     regs.write_xmm(Register::XMM1, x1).expect("xmm1");
+}
+
+#[test]
+fn simd_half_lane_moves_match_iced() {
+    // Half-lane moves (one 64-bit XMM lane ↔ m64). ModRM 0x01 = [rcx] with
+    // RCX = SIMD_DATA. Encodings:
+    // - 66 0F 12/13 /r  MOVLPD load/store   - 0F 12/13 /r  MOVLPS load/store
+    // - 66 0F 16/17 /r  MOVHPD load/store   - 0F 16/17 /r  MOVHPS load/store
+    let old_lo: u64 = 0x0123_4567_89ab_cdef;
+    let old_hi: u64 = 0xfeed_face_dead_beef;
+    let old_xmm = (u128::from(old_hi) << 64) | u128::from(old_lo);
+    let m64: u64 = 0x8000_0001_ffff_0002;
+    let setup_load = |r: &mut RegFile| {
+        set_pair(r, old_xmm, 0);
+        r.set_gpr_public(1, SIMD_DATA);
+    };
+
+    // Loads: the addressed lane is replaced; the other lane is untouched.
+    for (name, bytes, want) in [
+        (
+            "movlpd load",
+            &[0x66, 0x0f, 0x12, 0x01][..],
+            (u128::from(old_hi) << 64) | u128::from(m64),
+        ),
+        (
+            "movlps load",
+            &[0x0f, 0x12, 0x01][..],
+            (u128::from(old_hi) << 64) | u128::from(m64),
+        ),
+        (
+            "movhpd load",
+            &[0x66, 0x0f, 0x16, 0x01][..],
+            (u128::from(m64) << 64) | u128::from(old_lo),
+        ),
+        (
+            "movhps load",
+            &[0x0f, 0x16, 0x01][..],
+            (u128::from(m64) << 64) | u128::from(old_lo),
+        ),
+    ] {
+        let (iced, jit) = simd_dual(bytes, &m64.to_le_bytes(), setup_load);
+        assert_same_regs(&iced, &jit, name);
+        assert_eq!(iced.xmm_at(0), want, "iced {name}");
+        assert_eq!(jit.xmm_at(0), want, "jit {name}");
+    }
+
+    // Stores: memory receives exactly one qword (checked by simd_dual's
+    // cross-engine readback); the source register must stay intact.
+    let zero_setup = |r: &mut RegFile| {
+        set_pair(r, old_xmm, 0);
+        r.set_gpr_public(1, SIMD_DATA);
+    };
+    for (name, bytes) in [
+        ("movlpd store", &[0x66, 0x0f, 0x13, 0x01][..]),
+        ("movlps store", &[0x0f, 0x13, 0x01][..]),
+        ("movhpd store", &[0x66, 0x0f, 0x17, 0x01][..]),
+        ("movhps store", &[0x0f, 0x17, 0x01][..]),
+    ] {
+        let (iced, jit) = simd_dual(bytes, &[0_u8; 8], zero_setup);
+        assert_same_regs(&iced, &jit, name);
+        assert_eq!(
+            iced.xmm_at(0),
+            old_xmm,
+            "{name} must leave the source xmm intact"
+        );
+    }
+
+    // Absolute store-content check: run one store case on a bare iced CPU
+    // (the oracle verified above to match the JIT) and assert what landed
+    // in memory byte-for-byte.
+    let mut cpu = IcedCpu::open_x86_64();
+    cpu.virtual_alloc(
+        SIMD_BASE,
+        0x2000,
+        MEM_RESERVE | MEM_COMMIT,
+        protect::PAGE_EXECUTE_READWRITE,
+    )
+    .expect("alloc");
+    crate::exec::iced_decode_cache_flush();
+    let full = {
+        let mut v = vec![0x66, 0x0f, 0x17, 0x01];
+        v.extend_from_slice(&[0x90, 0x0f, 0x0b]);
+        v
+    };
+    cpu.mem_write(SIMD_BASE, &full).expect("code");
+    cpu.mem_write(SIMD_DATA, &[0_u8; 8]).expect("data");
+    set_pair(cpu.regs_mut(), old_xmm, 0);
+    cpu.regs_mut().set_gpr_public(1, SIMD_DATA);
+    cpu.write_rip(SIMD_BASE).expect("rip");
+    cpu.step_once().expect("step");
+    let mut stored = [0_u8; 8];
+    cpu.mem_read(SIMD_DATA, &mut stored).expect("readback");
+    assert_eq!(
+        stored,
+        old_hi.to_le_bytes(),
+        "movhpd store absolute content"
+    );
 }
 
 #[test]
@@ -1732,7 +1842,7 @@ fn gs_teb_dual(code: &[u8], setup: impl Fn(&mut RegFile)) -> (IcedCpu, JitCpu) {
         "block must compile, not run iced"
     );
     assert_eq!(
-        cpu.stats().iced_insns,
+        cpu.stats().exec.iced_insns,
         0,
         "block ran on iced instead of JIT"
     );
@@ -1881,7 +1991,7 @@ fn last_error_stub_trampoline_uses_engine_gs_base() {
     assert!(matches!(result, StepResult::Continue), "result {result:?}");
     assert!(cpu.has_ready_at(GS_TEB_CODE), "stub compiled as a block");
     assert_eq!(
-        cpu.stats().iced_insns,
+        cpu.stats().exec.iced_insns,
         0,
         "stub must run the hand-written trampoline, not iced"
     );
@@ -1903,7 +2013,7 @@ fn last_error_stub_trampoline_uses_engine_gs_base() {
         "primary binding reads the primary TEB"
     );
     assert_eq!(
-        cpu.stats().compiles,
+        cpu.stats().compile.compiles,
         1,
         "one compiled stub served both thread bindings"
     );
@@ -1936,7 +2046,7 @@ fn last_error_store_trampoline_writes_engine_teb() {
     let (result, _retired) = cpu.step_one().expect("step");
     assert!(matches!(result, StepResult::Continue), "result {result:?}");
     assert_eq!(
-        cpu.stats().iced_insns,
+        cpu.stats().exec.iced_insns,
         0,
         "stub must run the hand-written trampoline, not iced"
     );
