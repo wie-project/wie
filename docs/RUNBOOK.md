@@ -45,11 +45,37 @@ WIE_JIT_MEM=pin  ./scripts/run-micro-suite.sh
 
 ```bash
 WIE_RUNTIME_PROFILE=1 ./target/release/wie run micro-exes/out/long_loop.exe
-# expect ~100% CPU on pure loops; mem_backend=mmap
-
-WIE_JIT_MEM_TRACE=1 WIE_RUNTIME_PROFILE=1 ./target/release/wie run real_exes/7za.exe -- …
-# mem_path helpers=… resolve: sticky= multi= pin= walk= …
+# expect ~100% CPU on pure loops; mem_backend=mmap; mem_path helpers=… resolve: sticky= multi= pin= walk= …
 ```
+
+With `WIE_JIT_OPCODE_HISTO=1` the profile block also ends with the sampled
+iced-residue opcode histogram (top 60 mnemonics) and, when anything was
+recorded, the `[wie] jit_bg_ledger:` promotion-outcome line. Both are part of
+the report itself — they print on SIGINT (`kill -INT`) exactly like the rest,
+no `RUST_LOG` needed. Capture long-running targets only: micro-exes exit in
+milliseconds and the SIGINT path never arms.
+
+```bash
+WIE_JIT_OPCODE_HISTO=1 WIE_RUNTIME_PROFILE=1 ./target/release/wie run real_exes/7za.exe -- b &
+sleep 15 && kill -INT %1   # histogram lands at the end of the profile dump
+```
+
+## Benchmarks & regression gate
+
+Criterion suites live in `crates/wie-cpu/benches/jit_hot_paths.rs`
+(`exec/*`, `compile/*`, `mem/*`). Workflow:
+
+```bash
+./scripts/bench-gate.sh save main          # on a known-good tree
+# …make changes…
+./scripts/bench-gate.sh check main         # exit 1 if median regressed >10%
+./scripts/bench-gate.sh check main 5 exec/ # tighter gate, one group only
+```
+
+Baselines are per-machine (stored under `target/criterion/`, never committed).
+The nightly CI job (`.github/workflows/nightly-bench.yml`) runs the same
+suites for trend visibility; whole-program timing stays with
+`scripts/run-micro-suite.sh` (`long_loop` is the canonical insn-rate probe).
 
 ## Environment knobs (full table)
 
