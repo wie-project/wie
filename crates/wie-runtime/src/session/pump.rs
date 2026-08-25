@@ -617,6 +617,21 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                 .context("failed to read RCX for ExitProcess")?;
             let exit_code = u32::try_from(exit_code_raw & u64::from(u32::MAX))
                 .context("ExitProcess code does not fit u32")?;
+            // Caller RIP ([rsp] at the fake-API stop) attributes the exit to
+            // the guest module that requested it (exe vs SDL2 vs ucrt).
+            let caller_rip = core
+                .engine()
+                .read_rsp()
+                .ok()
+                .and_then(|rsp| {
+                    let mut slot = [0_u8; 8];
+                    core.engine()
+                        .mem_read(rsp, &mut slot)
+                        .ok()
+                        .map(|()| u64::from_le_bytes(slot))
+                })
+                .unwrap_or(0);
+            tracing::warn!(target: "wie_exit", code = exit_code, caller_rip = format_args!("0x{caller_rip:#x}"), "ExitProcess");
             self.events.push(EntryTraceEvent {
                 index: api_index,
                 library: resolved.library.clone().into(),

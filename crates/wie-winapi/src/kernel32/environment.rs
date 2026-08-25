@@ -88,6 +88,7 @@ fn get_environment_variable(
     } else {
         read_guest_ansi_lossy(ctx.engine, name_va, MAX_ENV_CHARS)?
     };
+    tracing::debug!(target: "wie_env", api, name, "GetEnvironmentVariable");
 
     let Some(value) = lookup(ctx, &name) else {
         ctx.state.process.last_error = ERROR_ENVVAR_NOT_FOUND;
