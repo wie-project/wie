@@ -72,6 +72,7 @@ SKIP_EXES=(
 )
 
 EXTRA_ARGS=(
+  "cli_args.exe:-n 3 -m hi"
   "mbwc_lasterror.exe:"
 )
 
