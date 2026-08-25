@@ -95,6 +95,7 @@ impl JitCpu {
             last_mem_gen: 0,
             chain_sync_epoch: 0,
             chain_watermark: 0,
+            seen_invalidate_gen: 0,
         }
     }
 
@@ -115,6 +116,7 @@ impl JitCpu {
             last_mem_gen: 0,
             chain_sync_epoch: 0,
             chain_watermark: 0,
+            seen_invalidate_gen: 0,
         }
     }
 
@@ -166,10 +168,21 @@ impl JitCpu {
         self.stats.profile.never_marks = self.stats.profile.never_marks.saturating_add(1);
     }
 
+    /// Drop every Ready block from the shared cache (full-flush paths).
+    ///
+    /// Repairs only the shared tables plus THIS thread's view; every other
+    /// guest thread's chain table may still map the dropped VAs to stale fn
+    /// pointers. Bumps [`JitShared::invalidate_gen`] so those threads force a
+    /// full chain-table rebuild on their next dispatch. Covers all callers:
+    /// `configure_fast_path`, `install_runtime_hooks`, the
+    /// `FlushInstructionCache` size==0 flush, and the
+    /// `drain_pending_code_writes` overflow flush.
     pub(super) fn clear_compiled(&mut self) {
         self.shared.cache.pin().clear();
         self.shared.chain_ids.pin().clear();
         self.shared.code_pages.lock().unwrap().clear();
+        // Release: pairs with the dispatcher's Acquire load (see below).
+        self.shared.invalidate_gen.fetch_add(1, Ordering::Release);
     }
 
     pub(super) fn invalidate_code_range(&mut self, addr: u64, len: usize) {
@@ -209,6 +222,12 @@ impl JitCpu {
             }
             self.shared.chain_ids.pin().remove(va);
         }
+        // Shared drop signal: other threads' chain tables still map these VAs
+        // to the removed fn pointers and would chain into stale code forever —
+        // this method repairs only the invalidating thread's own state.
+        // Release: pairs with the dispatcher's Acquire load — a thread that
+        // observes this bump must also observe every drop made before it.
+        self.shared.invalidate_gen.fetch_add(1, Ordering::Release);
         self.stats.exec.code_invs = self.stats.exec.code_invs.saturating_add(1);
         self.invalidate_chain_and_shadow();
         if JitConfig::get().chain_enabled() {
@@ -768,8 +787,16 @@ impl JitCpu {
     ///   (an install later invalidated is skipped, never linked). This turns
     ///   the per-epoch O(cache) walk — one measured run did 5,130 walks ×
     ///   593-entry width on the guest thread — into O(new installs).
-    pub(super) fn resync_chain_table(&mut self) {
+    ///
+    /// `current_epoch` is the freshly loaded [`JitShared::cache_epoch`]. It is
+    /// stored into `chain_sync_epoch` HERE, after the rebuild — never pre-
+    /// stored by the caller, which would clobber the `u64::MAX` full-rebuild
+    /// sentinel before this method reads it.
+    pub(super) fn resync_chain_table(&mut self, current_epoch: u64) {
         if !JitConfig::get().chain_enabled() {
+            // Record the epoch even with chaining off so the dispatcher stops
+            // re-entering here on every block.
+            self.chain_sync_epoch = current_epoch;
             return;
         }
         let mut inserted = 0_u64;
@@ -803,6 +830,9 @@ impl JitCpu {
         // cost every guest thread pays between block executions.
         self.stats.chain.resyncs = self.stats.chain.resyncs.saturating_add(1);
         self.stats.chain.resync_entries = self.stats.chain.resync_entries.saturating_add(inserted);
+        // Consume the observed epoch only now: storing it earlier would erase
+        // the `u64::MAX` sentinel before the full-rebuild branch could see it.
+        self.chain_sync_epoch = current_epoch;
     }
 
     pub(super) fn try_compile(&mut self, rip: u64) -> Option<CompiledBlock> {

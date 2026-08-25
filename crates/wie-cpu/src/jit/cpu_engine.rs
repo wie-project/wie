@@ -328,10 +328,21 @@ impl CpuEngine for JitCpu {
             }
             // Pick up background-installed Ready blocks into this thread's
             // chain table (cheap relaxed load; resync only after an install).
+            // Acquire: pairs with the Release bumps — observing the bump makes
+            // the preceding cache drops visible, so the resync's pin() below
+            // cannot re-link entries from a pre-drop snapshot.
+            let inv_gen = self.shared.invalidate_gen.load(Ordering::Acquire);
+            if inv_gen != self.seen_invalidate_gen {
+                // Another thread invalidated compiled code: our thread-local
+                // chain table AND edge IC may map dropped VAs to stale fn
+                // pointers. Purge them locally so the forced full resync
+                // below cannot leave stale entries linked.
+                self.seen_invalidate_gen = inv_gen;
+                self.invalidate_chain_and_shadow();
+            }
             let epoch = self.shared.cache_epoch.load(Ordering::Relaxed);
             if epoch != self.chain_sync_epoch {
-                self.chain_sync_epoch = epoch;
-                self.resync_chain_table();
+                self.resync_chain_table(epoch);
             }
             // Hot chain: run consecutive Ready blocks without re-entering step_one.
             let mut chain_result = None;

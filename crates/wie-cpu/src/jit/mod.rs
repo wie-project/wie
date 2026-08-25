@@ -67,6 +67,12 @@ pub struct JitCpu {
     /// Delta-resync (G5): link only new installs instead of walking the whole
     /// Ready cache on every epoch advance.
     pub(crate) chain_watermark: usize,
+    /// Last [`JitShared::invalidate_gen`] this thread observed. A mismatch
+    /// means some thread dropped compiled code from the shared cache; the
+    /// dispatch loop then arms the `u64::MAX` [`JitCpu::chain_sync_epoch`]
+    /// sentinel so the next resync fully rebuilds the (possibly stale) chain
+    /// table.
+    pub(crate) seen_invalidate_gen: u64,
 }
 
 // SAFETY: Arc<JitShared> is Send + Sync (via unsafe impl above).

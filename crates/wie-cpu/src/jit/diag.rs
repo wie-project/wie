@@ -94,8 +94,8 @@ fn chain_stats_line(s: &JitStats) -> Option<String> {
         .checked_div(s.chain.resyncs)
         .unwrap_or(0);
     Some(format!(
-        "[wie] jit_chain: epoch_bumps={} resyncs={} avg_width={width} inline_inserts={}",
-        s.chain.epoch_bumps, s.chain.resyncs, s.chain.inline_inserts
+        "[wie] jit_chain: epoch_bumps={} resyncs={} avg_width={width} inline_inserts={} code_invs={}",
+        s.chain.epoch_bumps, s.chain.resyncs, s.chain.inline_inserts, s.exec.code_invs
     ))
 }
 

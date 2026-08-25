@@ -173,6 +173,17 @@ pub struct JitShared {
     /// Bumped on every background cache install. Per-thread engines re-sync
     /// their late-bound chain tables when they observe a new epoch.
     pub cache_epoch: AtomicU64,
+    /// Bumped whenever `Ready` entries LEAVE the shared cache (range
+    /// invalidation or a full clear). Unlike [`Self::cache_epoch`], which
+    /// tracks installs only, this signals drops: another thread's chain table
+    /// may still map the dropped VAs to now-stale fn pointers, and only the
+    /// invalidating thread repairs its own table. Engines watch this counter
+    /// and force a full chain-table rebuild whenever it moves.
+    ///
+    /// Release on bump / Acquire on load: observing the bump must also make
+    /// the preceding cache drops visible, so the rebuilding thread's `pin()`
+    /// cannot re-link an entry from a pre-drop snapshot.
+    pub invalidate_gen: AtomicU64,
     /// Times [`Self::cache_epoch`] advanced (installs / invalidations).
     /// Folded into `JitStats::chain_epoch_bumps`: a high rate means every
     /// guest thread pays an O(cache) chain-table resync between blocks.
@@ -241,6 +252,7 @@ impl JitShared {
             bg_spawned: AtomicBool::new(false),
             bg_alive: Arc::new(AtomicBool::new(false)),
             cache_epoch: AtomicU64::new(0),
+            invalidate_gen: AtomicU64::new(0),
             chain_epoch_bumps: AtomicU64::new(0),
             bg_compiles: AtomicU64::new(0),
             bg_fast_api: Mutex::new(Arc::from(Vec::new())),
