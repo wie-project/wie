@@ -37,12 +37,17 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build wie-cli (release)
-        run: cargo build -p wie-cli --release
+      # PGO build: instrumented release -> headless training (criterion
+      # benches; real_exes are not in git so real-workload training is
+      # skipped automatically) -> profile merge -> -Cprofile-use release.
+      - name: Build wie-cli (release, PGO)
+        run: ./scripts/build-release-pgo.sh
 
       - name: Compute release version
         id: version
