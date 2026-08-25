@@ -31,7 +31,7 @@ make -C micro-exes && ./scripts/run-micro-suite.sh
 ./target/release/wie-cli trace <pe>        # first N host API stops
 
 # JIT matrix when touching memory lower / chaining (optional, slower)
-./scripts/check-jit-matrix.sh
+./scripts/run-micro-suite.sh all --matrix
 ```
 
 Building `micro-exes/` requires the mingw cross-compiler: `x86_64-w64-mingw32-gcc` (Homebrew `mingw-w64`). Real-tool testing uses Windows `7za.exe` in `real_exes/` (gitignored; fetch with `./scripts/fetch.sh 7za`).

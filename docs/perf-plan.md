@@ -194,7 +194,7 @@ opportunity cost wherever such blocks are hot.
    superlinear win per instruction.
 3. If histograms show mixed blocks dominating: **block splitting** at non-pure
    instructions so pure prefixes/suffixes compile. Land behind `WIE_JIT_SPLIT=1`;
-   flip the default only after `scripts/check-jit-matrix.sh` passes.
+   flip the default only after `scripts/run-micro-suite.sh all --matrix` passes.
 4. Accept the residual: system/rare opcodes stay iced forever — the interpreter remains
    the correctness oracle.
 
