@@ -483,6 +483,26 @@ impl PresentState {
             self.frames_published = self.frames_published.saturating_add(1);
         }
         self.generation = self.generation.wrapping_add(1);
+        // Sampled content probe: what is actually leaving the guest side?
+        // Every 32nd publish logs three pixels (top-left, centre,
+        // bottom-right) of the published frame.
+        if self.generation.is_multiple_of(32) {
+            let w = usize::try_from(width).unwrap_or(1).max(1);
+            let h = usize::try_from(height).unwrap_or(1).max(1);
+            let px = |x: usize, y: usize| -> u32 {
+                pixels
+                    .get(y.wrapping_mul(w).wrapping_add(x))
+                    .copied()
+                    .unwrap_or(0xDEAD_BEEF)
+            };
+            tracing::debug!(
+                target: "wie_gdi",
+                tl = format_args!("0x{:08x}", px(0, 0)),
+                mid = format_args!("0x{:08x}", px(w / 2, h / 2)),
+                br = format_args!("0x{:08x}", px(w - 1, h - 1)),
+                "publish pixels"
+            );
+        }
         tracing::debug!(
             target: "wiegui",
             hwnd = hwnd.as_u64(),

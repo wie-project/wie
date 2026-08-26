@@ -187,6 +187,13 @@ pub fn handle_select_object(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
                 .map(|dc| dc.selected_font.replace(font).map(Hfont::as_u64)),
             (None, None) => None,
         };
+    tracing::debug!(
+        target: "wie_gdi",
+        dc = format_args!("0x{dc_handle:#x}"),
+        object = format_args!("0x{object_handle:#x}"),
+        replaced = replaced.is_some(),
+        "SelectObject"
+    );
 
     if let Some(replaced) = replaced {
         let return_value = replaced.unwrap_or(FAKE_PREVIOUS_GDI_OBJECT_HANDLE);

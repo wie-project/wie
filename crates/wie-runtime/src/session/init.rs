@@ -887,6 +887,7 @@ impl super::RuntimeSession {
 
         let mut process =
             wie_pe::process_identity_from_host_path_with_args(path, &options.guest_args);
+        tracing::debug!(target: "wie_cmdline", module_path = %process.module_path, cmdline = %process.command_line, "guest command line");
         // The loader defaults the module path to `C:\{name}` (it has no volume
         // knowledge); remap through the volume config when the host path lives
         // under a mapped volume — the bottle's `drive_c` or the D: bridge.

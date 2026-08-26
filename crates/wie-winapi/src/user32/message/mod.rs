@@ -127,6 +127,14 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         write_message_structure(engine, message_address, &queued)?;
         1
     } else {
+        // Queue-empty quiescence for PeekMessage-driven loops. SDL-style games
+        // pump PeekMessageW and never park on GetMessage, so the pump's
+        // WaitingForMessage drain never fires for them — without this, every
+        // coalesced frame stays unpublished and the host window shows its
+        // initial fill forever. Same semantics as that drain: one frame per
+        // full repaint cycle, then the pull-half reconcile.
+        state.present().drain_pending_publishes();
+        state.present().reconcile_and_publish();
         0
     };
 

@@ -276,6 +276,13 @@ fn load_library(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandle
             read_ansi_string_from_cpu(engine, library_name_va, MAX_PATH)?
         };
         let handle = resolve_or_load_dll(&library_name, engine, environment, state);
+        tracing::debug!(
+            target: "wie_modules",
+            library = %library_name,
+            handle = format_args!("0x{handle:#x}"),
+            ok = handle != 0,
+            "LoadLibrary"
+        );
         if handle == 0 {
             state.process.last_error = ERROR_MOD_NOT_FOUND;
         } else {
