@@ -86,6 +86,15 @@ impl GuestHandle {
             .cloned()
     }
 
+    pub fn store_spare_buffer(&self, hwnd: u64, buffer: Vec<u32>) {
+        if let Some(mut state) = self.lock_state() {
+            state
+                .present()
+                .spare_buffers
+                .insert(wie_winapi::handles::Hwnd::from(hwnd), buffer);
+        }
+    }
+
     /// The EDIT control's caret/selection for `hwnd`: `(caret, sel_start,
     /// sel_end)` in character indices. `None` for a non-EDIT window or an
     /// unseeded control. Read by the GUI micro-tests to observe the caret

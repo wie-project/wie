@@ -176,7 +176,7 @@ pub struct PresentState {
     /// Spare buffers reclaimed from previously published frames that the host
     /// has released. Used to avoid cloning 8MB on hand_back_clone fallback
     /// (see ensure_surface). One spare per HWND is enough for steady-state.
-    pub(crate) spare_buffers: ahash::HashMap<crate::handles::Hwnd, Vec<u32>>,
+    pub spare_buffers: ahash::HashMap<crate::handles::Hwnd, Vec<u32>>,
     /// B3.6: HWNDs with deferred (coalesced) publishes pending since the last
     /// drain. Handlers call [`Self::publish_deferred`] instead of
     /// [`Self::publish`]; the runtime drains the set once per repaint cycle at

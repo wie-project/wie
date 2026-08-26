@@ -274,7 +274,12 @@ impl WieApp {
                     }
                     match outcome {
                         PresentOutcome::Drawn => {
-                            rt.last_presented_pixels = Some(presented_pixels);
+                            let old = rt.last_presented_pixels.replace(presented_pixels);
+                            if let Some(old_arc) = old {
+                                if let Ok(vec) = Arc::try_unwrap(old_arc) {
+                                    handle.store_spare_buffer(rt.hwnd.as_u64(), vec);
+                                }
+                            }
                             rt.last_presented_size = Some((dst_w, dst_h));
                             // The frame reached the screen — the next present
                             // starts with a fresh retry budget.
