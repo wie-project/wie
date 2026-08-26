@@ -333,23 +333,18 @@ impl PresentState {
                     pixels
                 }
                 Err(shared) => {
-                    self.hand_back_clone = self.hand_back_clone.saturating_add(1);
-                    // Avoid cloning 8MB each time the host still holds the
-                    // previous frame. Reuse a spare buffer if available (from
-                    // 2 frames ago, already released), otherwise allocate
-                    // fresh. For SDL full-window blits the previous content
-                    // is fully overwritten anyway, so stale spare content is
-                    // fine; for small partial repaints we keep correctness by
-                    // cloning small surfaces (<1M pixels).
                     if let Some(mut spare) = self.spare_buffers.remove(&hwnd) {
                         if spare.len() != needed {
                             spare.resize(needed, 0);
                         }
                         spare
-                    } else if needed < 1024 * 1024 {
-                        shared.to_vec()
                     } else {
-                        vec![0u32; needed]
+                        self.hand_back_clone = self.hand_back_clone.saturating_add(1);
+                        if needed < 1024 * 1024 {
+                            shared.to_vec()
+                        } else {
+                            vec![0u32; needed]
+                        }
                     }
                 }
             };
