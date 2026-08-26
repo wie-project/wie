@@ -1,7 +1,7 @@
-//! Process, heap, file-I/O, module, and environment state types.
+//! Process, file-I/O, module, and environment state types.
 
 use ahash::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::dll_loader;
 use crate::guest_heap::GuestHeap;
@@ -69,10 +69,17 @@ pub struct WinApiEnvironment {
 }
 
 /// Heap and FLS (Fiber-Local Storage) state.
+///
+/// The process heap itself (`GuestHeap`) lives in a dedicated
+/// `Arc<Mutex<GuestHeap>>` shard at the session level (see
+/// `wie_runtime::session`), next to the `Mutex<WinApiState>`. `HeapState`
+/// keeps a clone of that shard so legacy call sites that only have
+/// `&mut WinApiState` still resolve the same heap, but new handlers use
+/// `ctx.heap` directly (order `global -> heap` when both are taken).
 #[derive(Debug, Clone)]
 pub struct HeapState {
-    /// Process heap: segregated freelist + bump (see [`GuestHeap`]).
-    pub heap: GuestHeap,
+    /// Session-level heap shard (clone of `ProcessResources::shared_heap`).
+    pub heap: Arc<Mutex<GuestHeap>>,
     /// Next fake `FLS` index.
     pub next_fls_index: u32,
     /// Fake `FLS` slots.

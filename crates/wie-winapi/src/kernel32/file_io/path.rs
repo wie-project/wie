@@ -739,7 +739,6 @@ mod path_resolve_tests {
 #[cfg(test)]
 mod cwd_tests {
     use super::*;
-    use crate::guest_heap::GuestHeap;
     use crate::state::{
         DllStateMap, FileIoState, HeapState, KernelState, ModuleState, ProcessState,
         WinApiEnvironment,
@@ -788,7 +787,9 @@ mod cwd_tests {
         WinApiState {
             display: crate::DisplayMetrics::default(),
             heap_state: HeapState {
-                heap: GuestHeap::new(0x2000, 0x10000),
+                heap: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::guest_heap::GuestHeap::new(0x2000, 0x10000),
+                )),
                 next_fls_index: 0,
                 fls_slots: Vec::new(),
                 guest_fls_table_va: 0,

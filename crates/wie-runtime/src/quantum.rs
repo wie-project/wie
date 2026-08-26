@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 use wie_cpu::{CodeHookOutcome, CpuEngine, CpuError, InvalidMemoryAccess, RunUntilHook};
 use wie_winapi::{
-    HandlerContext, HostParkReason, WinApiControlSignal, WinApiState,
+    HandlerContext, HostParkReason, WinApiControlSignal, WinApiId, WinApiState,
     kernel32::{resolve_cs_queue, resolve_wait_target},
 };
 
@@ -247,6 +247,8 @@ pub(crate) struct QuantumCore<'a> {
     config: &'a ProcessConfig,
     /// Shared WinAPI state mutex.
     winapi: &'a Arc<Mutex<WinApiState>>,
+    /// Session-level heap shard (`Arc<Mutex<GuestHeap>>` next to `winapi`).
+    heap: &'a Arc<Mutex<wie_winapi::GuestHeap>>,
     /// Lock-free `shared_winapi` wait accumulators (guest-side timing).
     lock_wait_stats: &'a LockWaitStats,
     /// Guest TID this executor drives.
@@ -260,6 +262,7 @@ impl<'a> QuantumCore<'a> {
         engine: &'a mut dyn CpuEngine,
         config: &'a ProcessConfig,
         winapi: &'a Arc<Mutex<WinApiState>>,
+        heap: &'a Arc<Mutex<wie_winapi::GuestHeap>>,
         tid: u32,
         lock_wait_stats: &'a LockWaitStats,
     ) -> Result<Self> {
@@ -267,6 +270,7 @@ impl<'a> QuantumCore<'a> {
             engine,
             config,
             winapi,
+            heap,
             lock_wait_stats,
             tid,
             fake_api_end: config.layout.fake_api_end(),
@@ -312,6 +316,154 @@ impl<'a> QuantumCore<'a> {
         } else {
             wie_winapi::dispatch_winapi(&mut ctx, &resolved.library, &resolved.name)
         }
+    }
+
+    /// Whether `id` is in the heap fast set (`HeapAlloc`/`HeapFree`/`HeapSize`/`HeapReAlloc`).
+    ///
+    /// Hot `HeapAlloc`/`HeapFree` stops bypass the global `WinApiState` mutex
+    /// and run with only the heap shard + engine (order `global -> heap` when
+    /// both are taken). Checked before taking the global guard.
+    fn is_heap_fast(id: WinApiId) -> bool {
+        matches!(
+            id,
+            WinApiId::Kernel32Heapalloc
+                | WinApiId::Kernel32Heapfree
+                | WinApiId::Kernel32Heapsize
+                | WinApiId::Kernel32Heaprealloc
+        )
+    }
+
+    /// Try the heap-only fast path for `address`.
+    ///
+    /// Returns `Some(step)` when `address` resolves to a heap fast id and the
+    /// operation was handled with only the heap shard + engine. `None` means
+    /// the caller should take the global guard and run the normal dispatch.
+    fn try_heap_fast<H: QuantumHooks>(
+        &mut self,
+        address: u64,
+        api_index: usize,
+        hooks: &mut H,
+    ) -> Result<Option<Step>> {
+        let Some(resolved) = resolve_fake_api_at(address, self.soft_apis()) else {
+            return Ok(None);
+        };
+        let Some(id) = resolved.winapi_id else {
+            return Ok(None);
+        };
+        if !Self::is_heap_fast(id) {
+            return Ok(None);
+        }
+        const HEAP_ZERO_MEMORY: u64 = 0x0000_0008;
+        const HEAP_SIZE_FAILURE: u64 = u64::MAX;
+        const ERROR_INVALID_HANDLE: u32 = 6;
+        let heap = Arc::clone(self.heap);
+        let engine: &mut dyn wie_cpu::CpuEngine = &mut *self.engine;
+        let return_value = match id {
+            WinApiId::Kernel32Heapalloc => {
+                let heap_handle = engine.read_rcx()?;
+                let flags = engine.read_rdx()?;
+                let size = engine.read_r8()?;
+                if heap_handle == 0 {
+                    0
+                } else {
+                    let alloc_size = if size == 0 { 1 } else { size };
+                    let addr = heap
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .alloc_coherent(engine, alloc_size);
+                    if addr != 0 && (flags & HEAP_ZERO_MEMORY) != 0 {
+                        let zero_len = heap
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .size_of(addr)
+                            .unwrap_or(alloc_size);
+                        if let Ok(len) = usize::try_from(zero_len)
+                            && len > 0
+                            && !engine.mem_fill(addr, 0, len)
+                        {
+                            let zeros = vec![0_u8; len];
+                            engine.mem_write(addr, &zeros)?;
+                        }
+                    }
+                    addr
+                }
+            }
+            WinApiId::Kernel32Heapfree => {
+                let _heap_handle = engine.read_rcx()?;
+                let _flags = engine.read_rdx()?;
+                let memory = engine.read_r8()?;
+                let ok = if memory == 0 {
+                    true
+                } else {
+                    heap.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .free_coherent(engine, memory)
+                };
+                if !ok {
+                    let mut st = lock_wait(self.winapi, self.lock_wait_stats);
+                    st.process.last_error = ERROR_INVALID_HANDLE;
+                    st.publish_last_error_to_guest(engine);
+                    engine.return_from_win64_api(0)?;
+                    return Ok(Some(Step::Next));
+                }
+                1
+            }
+            WinApiId::Kernel32Heapsize => {
+                let _heap_handle = engine.read_rcx()?;
+                let _flags = engine.read_rdx()?;
+                let memory = engine.read_r8()?;
+                heap.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .size_from_header(engine, memory)
+                    .filter(|&s| s != 0)
+                    .unwrap_or(HEAP_SIZE_FAILURE)
+            }
+            WinApiId::Kernel32Heaprealloc => {
+                let heap_handle = engine.read_rcx()?;
+                let flags = engine.read_rdx()?;
+                let memory = engine.read_r8()?;
+                let new_size = engine.read_r9()?;
+                if heap_handle == 0 || memory == 0 {
+                    0
+                } else if new_size == 0 {
+                    let _ = heap
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .free_coherent(engine, memory);
+                    0
+                } else {
+                    let (new_addr, old_size) = heap
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .realloc_coherent(engine, memory, new_size)?;
+                    if new_addr == 0 {
+                        0
+                    } else if (flags & HEAP_ZERO_MEMORY) == 0 || new_size <= old_size {
+                        new_addr
+                    } else {
+                        let zero_len =
+                            usize::try_from(new_size.saturating_sub(old_size)).unwrap_or(0);
+                        if zero_len > 0 {
+                            let dst = new_addr.wrapping_add(old_size);
+                            if !engine.mem_fill(dst, 0, zero_len) {
+                                let zeros = vec![0_u8; zero_len];
+                                engine.mem_write(dst, &zeros)?;
+                            }
+                        }
+                        new_addr
+                    }
+                }
+            }
+            _ => return Ok(None),
+        };
+        engine.return_from_win64_api(return_value)?;
+        {
+            let mut st = lock_wait(self.winapi, self.lock_wait_stats);
+            st.publish_last_error_to_guest(engine);
+        }
+        let _ = api_index;
+        let _ = hooks;
+        Ok(Some(Step::Next))
     }
 
     /// One iteration of the shared quantum state machine.
@@ -399,6 +551,24 @@ impl<'a> QuantumCore<'a> {
                 if let Some(step) = hooks.on_run_fault(self, &empty, Some(error))? {
                     return Ok(step);
                 }
+            }
+        }
+
+        // Heap fast path: before taking the global WinApiState mutex, check
+        // if the hook hit is a heap fast id (HeapAlloc/Free/Size/ReAlloc).
+        // Those run with only the heap shard + engine, bypassing the global
+        // lock (order `global -> heap` when both are taken, but fast path
+        // takes only heap). Reuses the fast_sync noisy accounting.
+        if let Ok(result) = &run {
+            let outcome = RunUntilHook {
+                code: result.code,
+                invalid_memory: result.invalid_memory,
+            };
+            if outcome.code.hit
+                && !outcome.invalid_memory.hit
+                && let Some(step) = self.try_heap_fast(outcome.code.address, api_index, hooks)?
+            {
+                return Ok(step);
             }
         }
 
@@ -922,6 +1092,7 @@ mod tests {
     fn test_env() -> (
         ProcessConfig,
         Arc<Mutex<WinApiState>>,
+        Arc<Mutex<wie_winapi::GuestHeap>>,
         crate::mt_runtime::LockWaitStats,
     ) {
         let process = ProcessIdentity {
@@ -933,6 +1104,7 @@ mod tests {
         let winapi_state =
             crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
                 .expect("winapi state");
+        let heap = Arc::clone(&winapi_state.heap_state.heap);
         let config = ProcessConfig {
             soft_apis: SoftApiTable::default(),
             environment: crate::memory::default_winapi_environment(
@@ -952,6 +1124,7 @@ mod tests {
         (
             config,
             Arc::new(Mutex::new(winapi_state)),
+            heap,
             crate::mt_runtime::LockWaitStats::new(),
         )
     }
@@ -960,9 +1133,10 @@ mod tests {
         engine: &'a mut MockEngine,
         config: &'a ProcessConfig,
         winapi: &'a Arc<Mutex<WinApiState>>,
+        heap: &'a Arc<Mutex<wie_winapi::GuestHeap>>,
         stats: &'a crate::mt_runtime::LockWaitStats,
     ) -> QuantumCore<'a> {
-        QuantumCore::new(engine, config, winapi, config.primary_tid.0, stats).expect("core")
+        QuantumCore::new(engine, config, winapi, heap, config.primary_tid.0, stats).expect("core")
     }
 
     /// Hooks that use the default (worker) behavior everywhere — for tests of
@@ -1069,7 +1243,7 @@ mod tests {
     /// metadata.
     #[test]
     fn step_activates_and_publishes_last_error_before_dispatch() {
-        let (mut config, winapi, stats) = test_env();
+        let (mut config, winapi, heap, stats) = test_env();
         let (soft_va, _) = config
             .soft_apis
             .intern("KERNEL32.dll", "QuantSink", 0)
@@ -1081,7 +1255,7 @@ mod tests {
             let mut st = lock(&winapi);
             st.kernel.threads.active.last_error = 0x2A;
         }
-        let mut core = core_for(&mut engine, &config, &winapi, &stats);
+        let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = TestHooks::default();
         let step = core.step(&mut hooks).expect("step");
 
@@ -1111,7 +1285,7 @@ mod tests {
     /// RIP 0 before entry: the hook's entry VA becomes the run begin.
     #[test]
     fn zero_rip_begin_resumes_from_entry_va() {
-        let (mut config, winapi, stats) = test_env();
+        let (mut config, winapi, heap, stats) = test_env();
         let (soft_va, _) = config
             .soft_apis
             .intern("KERNEL32.dll", "QuantSink", 0)
@@ -1119,7 +1293,7 @@ mod tests {
         let mut engine = mock_engine();
         engine.rip = 0;
         engine.script.push_back(hook_run(soft_va));
-        let mut core = core_for(&mut engine, &config, &winapi, &stats);
+        let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = TestHooks {
             zero_rip: Some(0x1400_1000),
             ..TestHooks::default()
@@ -1134,11 +1308,11 @@ mod tests {
     /// RAX and never runs a guest quantum.
     #[test]
     fn zero_rip_without_entry_exits_with_rax() {
-        let (config, winapi, stats) = test_env();
+        let (config, winapi, heap, stats) = test_env();
         let mut engine = mock_engine();
         engine.rip = 0;
         engine.rax = 0x2A;
-        let mut core = core_for(&mut engine, &config, &winapi, &stats);
+        let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = TestHooks::default();
 
         let step = core.step(&mut hooks).expect("step");
@@ -1153,10 +1327,10 @@ mod tests {
     /// `PureCompute` step and never reaches resolution.
     #[test]
     fn pure_compute_slice_returns_pure_compute() {
-        let (config, winapi, stats) = test_env();
+        let (config, winapi, heap, stats) = test_env();
         let mut engine = mock_engine();
         engine.script.push_back(compute_run());
-        let mut core = core_for(&mut engine, &config, &winapi, &stats);
+        let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = TestHooks::default();
 
         let step = core.step(&mut hooks).expect("step");
@@ -1191,7 +1365,7 @@ mod tests {
     /// primary `GS_BASE`.
     #[test]
     fn activation_reaffirms_engine_gs_base_each_quantum() {
-        let (config, winapi, stats) = test_env();
+        let (config, winapi, heap, stats) = test_env();
         let worker_teb_va = 0x0000_7000_0040_C000_u64;
         let mut engine = mock_engine();
         // Two pure-compute quanta: both activate (and re-affirm) without any
@@ -1208,7 +1382,7 @@ mod tests {
             activations: 0,
         };
         {
-            let mut core = core_for(&mut engine, &config, &winapi, &stats);
+            let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
             assert!(matches!(
                 core.step(&mut hooks).expect("first step"),
                 Step::PureCompute
@@ -1235,10 +1409,10 @@ mod tests {
     /// activation hook it keeps the fixed `GS_BASE`.
     #[test]
     fn primary_engine_keeps_gs_base_through_quanta() {
-        let (config, winapi, stats) = test_env();
+        let (config, winapi, heap, stats) = test_env();
         let mut engine = mock_engine();
         engine.script.push_back(compute_run());
-        let mut core = core_for(&mut engine, &config, &winapi, &stats);
+        let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = DefaultHooks;
 
         assert!(matches!(
@@ -1261,7 +1435,7 @@ mod tests {
     /// handling runs (worker semantics: hard thread exit, no guest SEH).
     #[test]
     fn run_fault_hook_claims_invalid_memory_as_thread_exit() {
-        let (config, winapi, stats) = test_env();
+        let (config, winapi, heap, stats) = test_env();
         let mut engine = mock_engine();
         engine.script.push_back(Ok(RunUntilHook {
             code: CodeHookOutcome::default(),
@@ -1272,7 +1446,7 @@ mod tests {
                 ..Default::default()
             },
         }));
-        let mut core = core_for(&mut engine, &config, &winapi, &stats);
+        let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = TestHooks {
             run_fault_step: Some(Step::ExitThread(1)),
             ..TestHooks::default()
@@ -1286,12 +1460,12 @@ mod tests {
     /// pending SEH state it stops the session and never journals.
     #[test]
     fn seh_continue_trampoline_without_pending_stops() {
-        let (config, winapi, stats) = test_env();
+        let (config, winapi, heap, stats) = test_env();
         let mut engine = mock_engine();
         engine
             .script
             .push_back(hook_run(wie_winapi::seh_continue_trampoline_va()));
-        let mut core = core_for(&mut engine, &config, &winapi, &stats);
+        let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = TestHooks::default();
 
         let step = core.step(&mut hooks).expect("step");
@@ -1307,12 +1481,12 @@ mod tests {
     /// lock guard (the primary drops it while completing the callback frame).
     #[test]
     fn callback_trampoline_delegates_to_hooks() {
-        let (config, winapi, stats) = test_env();
+        let (config, winapi, heap, stats) = test_env();
         let mut engine = mock_engine();
         engine
             .script
             .push_back(hook_run(DEFAULT_LAYOUT.callback_return_trampoline_va));
-        let mut core = core_for(&mut engine, &config, &winapi, &stats);
+        let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = TestHooks::default();
 
         let step = core.step(&mut hooks).expect("step");
@@ -1328,10 +1502,10 @@ mod tests {
     /// session stops with a diagnostic instead of dispatching.
     #[test]
     fn unresolved_fake_api_stops_session() {
-        let (config, winapi, stats) = test_env();
+        let (config, winapi, heap, stats) = test_env();
         let mut engine = mock_engine();
         engine.script.push_back(hook_run(0x1234));
-        let mut core = core_for(&mut engine, &config, &winapi, &stats);
+        let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = TestHooks::default();
 
         let step = core.step(&mut hooks).expect("step");
@@ -1346,7 +1520,7 @@ mod tests {
     /// process dying, flushes console state, and exits the thread with RCX.
     #[test]
     fn default_dispatch_handles_exit_process() {
-        let (mut config, winapi, stats) = test_env();
+        let (mut config, winapi, heap, stats) = test_env();
         let (exit_va, _) = config
             .soft_apis
             .intern("KERNEL32.dll", "ExitProcess", 0)
@@ -1354,7 +1528,7 @@ mod tests {
         let mut engine = mock_engine();
         engine.rcx = 42;
         engine.script.push_back(hook_run(exit_va));
-        let mut core = core_for(&mut engine, &config, &winapi, &stats);
+        let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = DefaultHooks;
 
         let step = core.step(&mut hooks).expect("step");
@@ -1368,10 +1542,10 @@ mod tests {
     /// path and can claim the hook (primary: the static DllMain return).
     #[test]
     fn claim_hook_locked_claims_the_stop() {
-        let (config, winapi, stats) = test_env();
+        let (config, winapi, heap, stats) = test_env();
         let mut engine = mock_engine();
         engine.script.push_back(hook_run(0x9999));
-        let mut core = core_for(&mut engine, &config, &winapi, &stats);
+        let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = TestHooks {
             claim_step: Some(Step::Next),
             ..TestHooks::default()
@@ -1390,14 +1564,14 @@ mod tests {
     /// API index flows from `prepare_quantum` into `dispatch`.
     #[test]
     fn api_index_flows_from_prepare_into_dispatch() {
-        let (mut config, winapi, stats) = test_env();
+        let (mut config, winapi, heap, stats) = test_env();
         let (soft_va, _) = config
             .soft_apis
             .intern("KERNEL32.dll", "QuantSink", 0)
             .expect("intern");
         let mut engine = mock_engine();
         engine.script.push_back(hook_run(soft_va));
-        let mut core = core_for(&mut engine, &config, &winapi, &stats);
+        let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = TestHooks {
             api_index: 7,
             ..TestHooks::default()
@@ -1417,7 +1591,7 @@ mod tests {
     /// each step with the same core and hooks.
     #[test]
     fn deterministic_stop_sequence_across_quanta() {
-        let (mut config, winapi, stats) = test_env();
+        let (mut config, winapi, heap, stats) = test_env();
         let (soft_va, _) = config
             .soft_apis
             .intern("KERNEL32.dll", "QuantSink", 0)
@@ -1431,7 +1605,7 @@ mod tests {
         engine.script.push_back(compute_run());
         engine.script.push_back(hook_run(soft_va));
         engine.script.push_back(hook_run(exit_va));
-        let mut core = core_for(&mut engine, &config, &winapi, &stats);
+        let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = TestHooks::default();
 
         let s1 = core.step(&mut hooks).expect("quantum 1");
@@ -1452,7 +1626,7 @@ mod tests {
     /// (total + max) while profiling is enabled.
     #[test]
     fn with_locked_times_guest_wait_when_enabled() {
-        let (config, winapi, stats) = test_env();
+        let (config, winapi, heap, stats) = test_env();
         stats.set_enabled(true);
         let mut engine = mock_engine();
         let state_arc = Arc::clone(&winapi);
@@ -1464,7 +1638,7 @@ mod tests {
         });
         let _ = rx.recv();
         {
-            let mut core = core_for(&mut engine, &config, &winapi, &stats);
+            let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
             core.with_locked(|_engine, _st| {});
         }
         let _ = holder.join();

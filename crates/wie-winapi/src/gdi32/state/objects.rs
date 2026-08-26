@@ -187,8 +187,23 @@ pub fn handle_create_compatible_bitmap(
 
 pub(crate) fn next_gdi_bitmap_handle(state: &mut WinApiState) -> Result<u64> {
     // Use bump-heap high bits as a cheap monotonic discriminator.
-    let live = u64::try_from(state.heap_state.heap.live_count()).unwrap_or(0);
-    let index = (state.heap_state.heap.bump_cursor() >> 4).wrapping_add(live);
+    let live = u64::try_from(
+        state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .live_count(),
+    )
+    .unwrap_or(0);
+    let index = (state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bump_cursor()
+        >> 4)
+        .wrapping_add(live);
     let handle = FAKE_GDI_BITMAP_HANDLE_BASE
         .checked_add(index)
         .context("GDI bitmap handle overflow")?;

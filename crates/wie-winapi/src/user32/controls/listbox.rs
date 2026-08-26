@@ -486,7 +486,6 @@ mod tests {
         listbox_scroll_selection_into_view, listbox_scroll_wheel, listbox_visible_rows,
     };
     use crate::gdi32::IRect;
-    use crate::guest_heap::GuestHeap;
     use crate::handles::Hwnd;
     use crate::present::MessageQueue;
     use crate::state::{FileIoState, HeapState, ProcessState};
@@ -502,7 +501,6 @@ mod tests {
     use crate::{DEFAULT_ENVIRONMENT, DllStateMap, KernelState, ModuleState, WinApiState};
     use ahash::HashMap;
     use ahash::HashMapExt;
-    use std::sync::{Arc, Mutex};
 
     /// A minimal `WinApiState` for the scroll-math unit tests (window records,
     /// control states, and a resolvable default font are all that is needed).
@@ -510,14 +508,16 @@ mod tests {
         WinApiState {
             display: crate::DisplayMetrics::default(),
             heap_state: HeapState {
-                heap: GuestHeap::new(0x2000, 0x10000),
+                heap: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::guest_heap::GuestHeap::new(0x2000, 0x10000),
+                )),
                 next_fls_index: 0,
                 fls_slots: Vec::new(),
                 guest_fls_table_va: 0,
             },
             file_io: FileIoState {
                 executable_file_size: 0,
-                executable_file_bytes: Arc::new(Vec::new()),
+                executable_file_bytes: std::sync::Arc::new(Vec::new()),
                 executable_file_cursor: 0,
                 next_find_handle: crate::FindFileHandle::from(0),
                 find_handles: Vec::new(),
@@ -563,7 +563,7 @@ mod tests {
                 seh_pending: HashMap::new(),
             },
             dll_states: DllStateMap::new(),
-            message_queue: Arc::new(Mutex::new(MessageQueue::default())),
+            message_queue: std::sync::Arc::new(std::sync::Mutex::new(MessageQueue::default())),
             module_state: ModuleState {
                 loaded_modules: HashMap::new(),
                 import_resolver: None,

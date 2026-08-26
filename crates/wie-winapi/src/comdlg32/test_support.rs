@@ -1,7 +1,5 @@
 //! Shared test scaffolding for the `comdlg32` submodule tests (guest engines,
 //! session state, and small fixtures).
-
-use crate::guest_heap::GuestHeap;
 use crate::present::MessageQueue;
 use crate::state::{FileIoState, HeapState, ProcessState, WinApiEnvironment};
 use crate::sync_obj::SyncState;
@@ -10,7 +8,6 @@ use crate::user32::{CreateWindowRequest, WS_VISIBLE, WindowClassIdentifier, crea
 use crate::vfs::VolumeConfig;
 use crate::{DEFAULT_ENVIRONMENT, DllStateMap, KernelState, ModuleState, WinApiState};
 use ahash::{HashMap, HashMapExt};
-use std::sync::{Arc, Mutex};
 use wie_cpu::{CpuEngine, IcedCpu};
 
 pub(crate) const STACK_VA: u64 = 0x100_0000;
@@ -39,14 +36,16 @@ pub(crate) fn test_state() -> WinApiState {
     WinApiState {
         display: crate::DisplayMetrics::default(),
         heap_state: HeapState {
-            heap: GuestHeap::new(0x2000, 0x10000),
+            heap: std::sync::Arc::new(std::sync::Mutex::new(crate::guest_heap::GuestHeap::new(
+                0x2000, 0x10000,
+            ))),
             next_fls_index: 0,
             fls_slots: Vec::new(),
             guest_fls_table_va: 0,
         },
         file_io: FileIoState {
             executable_file_size: 0,
-            executable_file_bytes: Arc::new(Vec::new()),
+            executable_file_bytes: std::sync::Arc::new(Vec::new()),
             executable_file_cursor: 0,
             next_find_handle: crate::FindFileHandle::from(0),
             find_handles: Vec::new(),
@@ -92,7 +91,7 @@ pub(crate) fn test_state() -> WinApiState {
             seh_pending: HashMap::new(),
         },
         dll_states: DllStateMap::new(),
-        message_queue: Arc::new(Mutex::new(MessageQueue::default())),
+        message_queue: std::sync::Arc::new(std::sync::Mutex::new(MessageQueue::default())),
         module_state: ModuleState {
             loaded_modules: HashMap::new(),
             import_resolver: None,

@@ -1035,7 +1035,12 @@ fn handle_getaddrinfo(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     let total = 48_u64
         .saturating_add(SOCKADDR_IN_SIZE)
         .saturating_add(name_len);
-    let base = state.heap_state.heap.alloc_coherent(engine, total);
+    let base = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, total);
     if base == 0 {
         return finish(engine, u64::from(WSA_NOT_ENOUGH_MEMORY));
     }
@@ -1087,7 +1092,12 @@ fn handle_freeaddrinfo(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
     let state = &mut *ctx.state;
     let ai = engine.read_rcx()?;
     if ai != 0 {
-        let _ = state.heap_state.heap.free_coherent(engine, ai);
+        let _ = state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_coherent(engine, ai);
     }
     finish(engine, 0)
 }
@@ -1123,7 +1133,12 @@ fn handle_gethostbyname(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         .saturating_add(16)
         .saturating_add(4)
         .saturating_add(name_len);
-    let base = state.heap_state.heap.alloc_coherent(engine, total);
+    let base = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, total);
     if base == 0 {
         return finish_wsa_error(engine, state, WSA_NOT_ENOUGH_MEMORY);
     }
@@ -1188,7 +1203,12 @@ fn handle_inet_ntoa(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
         ws2.ntoa_buf
     };
     if buf == 0 {
-        buf = state.heap_state.heap.alloc_coherent(engine, 16);
+        buf = state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alloc_coherent(engine, 16);
         let ws2 = state.ws2();
         ws2.ntoa_buf = buf;
     }

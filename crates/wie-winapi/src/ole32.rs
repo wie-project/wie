@@ -288,7 +288,11 @@ fn handle_co_create_guid(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 fn handle_co_task_mem_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let cb = engine.read_rcx()?;
-    let va = ctx.state.heap_state.heap.alloc_coherent(engine, cb);
+    let va = ctx
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, cb);
     ctx.finish(va)
 }
 
@@ -297,7 +301,11 @@ fn handle_co_task_mem_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let engine = &mut *ctx.engine;
     let pv = engine.read_rcx()?;
     if pv != 0 {
-        let _ = ctx.state.heap_state.heap.free_coherent(engine, pv);
+        let _ = ctx
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_coherent(engine, pv);
     }
     ctx.finish(0)
 }
@@ -307,34 +315,52 @@ fn handle_co_task_mem_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 /// Reallocates through the guest heap: in-place when the existing block is
 /// large enough, otherwise allocate-copy-free.
 fn handle_co_task_mem_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let pv = engine.read_rcx()?;
-    let cb = engine.read_rdx()?;
-    let heap = &mut ctx.state.heap_state.heap;
+    let pv = ctx.engine.read_rcx()?;
+    let cb = ctx.engine.read_rdx()?;
     if pv == 0 {
-        let va = heap.alloc_coherent(engine, cb);
+        let va = ctx
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alloc_coherent(&mut *ctx.engine, cb);
         return ctx.finish(va);
     }
     if cb == 0 {
-        // Real CoTaskMemRealloc(pv, 0) frees and returns NULL.
-        let _ = heap.free_coherent(engine, pv);
+        let _ = ctx
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_coherent(&mut *ctx.engine, pv);
         return ctx.finish(0);
     }
-    if let Some(same) = heap.try_realloc_in_place(pv, cb) {
-        return ctx.finish(same);
+    let same = ctx
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .try_realloc_in_place(pv, cb);
+    if let Some(s) = same {
+        return ctx.finish(s);
     }
-    let old_size = heap.size_of(pv).unwrap_or(0);
-    let new_va = heap.alloc_coherent(engine, cb);
+    let (old_size, new_va) = {
+        let mut heap = ctx.heap.lock().unwrap_or_else(|e| e.into_inner());
+        let old_size = heap.size_of(pv).unwrap_or(0);
+        let new_va = heap.alloc_coherent(&mut *ctx.engine, cb);
+        (old_size, new_va)
+    };
     if new_va == 0 {
         return ctx.finish(0);
     }
     let copy_len = usize::try_from(old_size.min(cb)).unwrap_or(0);
     if copy_len > 0 {
         let mut buf = vec![0_u8; copy_len];
-        engine.mem_read(pv, &mut buf)?;
-        engine.mem_write(new_va, &buf)?;
+        ctx.engine.mem_read(pv, &mut buf)?;
+        ctx.engine.mem_write(new_va, &buf)?;
     }
-    let _ = heap.free_coherent(engine, pv);
+    let _ = ctx
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free_coherent(&mut *ctx.engine, pv);
     ctx.finish(new_va)
 }
 
@@ -353,7 +379,11 @@ fn handle_string_from_clsid(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let byte_len = u64::try_from(units.len().saturating_mul(2)).unwrap_or(0);
     // NUL terminator + alignment slop; the payload VA is the CoTaskMemFree key.
     let total = byte_len.saturating_add(2).saturating_add(8);
-    let data = ctx.state.heap_state.heap.alloc_coherent(engine, total);
+    let data = ctx
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, total);
     if data != 0 {
         write_utf16_units(engine, data, &units)?;
         engine.mem_write(data.wrapping_add(byte_len), &0_u16.to_le_bytes())?;

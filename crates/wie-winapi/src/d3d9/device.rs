@@ -228,6 +228,8 @@ pub fn handle_device_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             let _ = state
                 .heap_state
                 .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
                 .free_coherent(engine, allocation_address);
 
             state.d3d9().d3d9_device_object_address = 0;
@@ -289,6 +291,8 @@ pub fn handle_direct3d9_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
             let _ = state
                 .heap_state
                 .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
                 .free_coherent(engine, allocation_address);
 
             state.d3d9().d3d9_object_address = 0;

@@ -72,8 +72,10 @@ fn test_engine() -> IcedCpu {
 }
 
 fn test_state() -> WinApiState {
-    let mut heap = GuestHeap::new(0x2000, 0x10000);
-    heap.attach_guest_control(0x2000);
+    let heap = std::sync::Arc::new(std::sync::Mutex::new(GuestHeap::new(0x2000, 0x10000)));
+    heap.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .attach_guest_control(0x2000);
     WinApiState {
         display: crate::DisplayMetrics::default(),
         heap_state: HeapState {
@@ -369,12 +371,26 @@ fn rtl_allocate_heap_maps_null_handle_to_process_heap() {
         result.return_value, 0,
         "NULL heap handle maps to the process heap"
     );
-    assert!(state.heap_state.heap.is_live(result.return_value));
+    assert!(
+        state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_live(result.return_value)
+    );
 
     write_regs(&mut engine, 0, 0, result.return_value, 0);
     let result = dispatch(&mut engine, &mut state, "rtlfreeheap");
     assert_eq!(result.return_value, 1, "RtlFreeHeap returns TRUE");
-    assert!(!state.heap_state.heap.is_live(result.return_value));
+    assert!(
+        !state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_live(result.return_value)
+    );
 }
 
 #[test]

@@ -168,7 +168,7 @@ fn test_enum_display_monitors_null_callback_succeeds() {
         user32::handle_enum_display_monitors(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         1
     );

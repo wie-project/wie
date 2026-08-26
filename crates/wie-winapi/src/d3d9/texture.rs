@@ -432,7 +432,12 @@ fn lock_rect_common(
         }
     }
 
-    let block = state.heap_state.heap.alloc_coherent(engine, total);
+    let block = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, total);
     if block == 0 {
         return Ok(D3DERR_INVALIDCALL); // allocation failed
     }
@@ -498,7 +503,12 @@ fn lock_rect_render_target(
         }
     }
 
-    let block = state.heap_state.heap.alloc_coherent(engine, total);
+    let block = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, total);
     if block == 0 {
         return Ok(D3DERR_INVALIDCALL); // allocation failed
     }
@@ -621,7 +631,12 @@ fn unlock_rect_render_target(
             }
         }
     }
-    let _ = state.heap_state.heap.free_coherent(engine, locked_va);
+    let _ = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free_coherent(engine, locked_va);
     if let Some(record) = state.d3d9().d3d9_render_targets.get_mut(&rt_va) {
         record.locked_va = 0;
         record.locked_rect = None;
@@ -803,7 +818,12 @@ fn unlock_rect_common(
             }
         }
     }
-    let _ = state.heap_state.heap.free_coherent(engine, locked_va);
+    let _ = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free_coherent(engine, locked_va);
     if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va) {
         record.locked_va = 0;
         record.locked_level = 0;
@@ -1001,13 +1021,28 @@ pub fn handle_texture_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
             state.d3d9().d3d9_surface_textures.remove(&surface_va);
             state.d3d9().d3d9_surface_levels.remove(&surface_va);
             let vtable = surface_va.saturating_sub(IDIRECT3DSURFACE9_OBJECT_OFFSET);
-            let _ = state.heap_state.heap.free_coherent(engine, vtable);
+            let _ = state
+                .heap_state
+                .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .free_coherent(engine, vtable);
         }
         if locked_va != 0 {
-            let _ = state.heap_state.heap.free_coherent(engine, locked_va);
+            let _ = state
+                .heap_state
+                .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .free_coherent(engine, locked_va);
         }
         let vtable = this_pointer.saturating_sub(IDIRECT3DTEXTURE9_OBJECT_OFFSET);
-        let _ = state.heap_state.heap.free_coherent(engine, vtable);
+        let _ = state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_coherent(engine, vtable);
         state.d3d9().d3d9_textures.remove(&this_pointer);
         1
     } else {
@@ -1042,7 +1077,12 @@ pub fn handle_surface_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
                 *slot = 0;
             }
             let vtable = this_pointer.saturating_sub(IDIRECT3DSURFACE9_OBJECT_OFFSET);
-            let _ = state.heap_state.heap.free_coherent(engine, vtable);
+            let _ = state
+                .heap_state
+                .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .free_coherent(engine, vtable);
             1
         } else if state
             .d3d9()
@@ -1055,7 +1095,12 @@ pub fn handle_surface_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
                 state.d3d9().d3d9_depth_stencil = 0;
             }
             let vtable = this_pointer.saturating_sub(IDIRECT3DSURFACE9_OBJECT_OFFSET);
-            let _ = state.heap_state.heap.free_coherent(engine, vtable);
+            let _ = state
+                .heap_state
+                .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .free_coherent(engine, vtable);
             1
         } else if state
             .d3d9()
@@ -1069,7 +1114,12 @@ pub fn handle_surface_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
                 state.d3d9().d3d9_render_target = 0;
             }
             let vtable = this_pointer.saturating_sub(IDIRECT3DSURFACE9_OBJECT_OFFSET);
-            let _ = state.heap_state.heap.free_coherent(engine, vtable);
+            let _ = state
+                .heap_state
+                .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .free_coherent(engine, vtable);
             1
         } else {
             0

@@ -821,7 +821,12 @@ pub(super) fn edit_get_handle(
     } else {
         u64::try_from(text.len()).unwrap_or(0).saturating_add(1)
     };
-    let va = state.heap_state.heap.alloc_coherent(engine, size);
+    let va = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, size);
     if va == 0 {
         return Ok(0);
     }

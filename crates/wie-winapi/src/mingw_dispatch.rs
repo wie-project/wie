@@ -21,14 +21,24 @@ pub fn dispatch_stdcpp(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinAp
         // __cxa_allocate_exception(size) → guest heap alloc
         "__cxa_allocate_exception" => {
             let size = engine.read_rcx()?;
-            let addr = state.heap_state.heap.alloc_coherent(engine, size.max(1));
+            let addr = state
+                .heap_state
+                .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .alloc_coherent(engine, size.max(1));
             ctx.finish(addr)
         }
         // __cxa_free_exception(ptr) → guest heap free
         "__cxa_free_exception" => {
             let ptr = engine.read_rcx()?;
             if ptr != 0 {
-                state.heap_state.heap.free_coherent(engine, ptr);
+                state
+                    .heap_state
+                    .heap
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .free_coherent(engine, ptr);
             }
             ctx.finish(0)
         }

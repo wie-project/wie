@@ -909,7 +909,12 @@ fn getclean(engine: &mut dyn CpuEngine, state: &mut WinApiState) -> Result<WinAp
     if existing != 0 {
         return ret_u64(engine, existing);
     }
-    let va = state.heap_state.heap.alloc_coherent(engine, 8);
+    let va = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, 8);
     if va == 0 {
         return ret_u64(engine, 0);
     }

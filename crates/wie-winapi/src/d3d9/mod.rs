@@ -506,7 +506,12 @@ pub(crate) fn allocate_direct3d_block(
     size: u64,
     _allocation_name: &str,
 ) -> u64 {
-    state.heap_state.heap.alloc_coherent(engine, size)
+    state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, size)
 }
 
 pub(crate) fn read_stack_argument(

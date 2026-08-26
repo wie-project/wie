@@ -1,6 +1,6 @@
 //! Shared x86-64 machine-code patching helpers for in-guest stub generation.
 //!
-//! Every guest accelerator (guest I/O, MBWC, heap) emits a code buffer with
+//! Every guest accelerator (guest I/O, MBWC) emits a code buffer with
 //! placeholder branch immediates and patches them once the layout is known.
 //! These helpers are shared across those modules; `clear_bit` is shared with
 //! the stop-bitmap planters.

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 use wie_cpu::{CpuEngine, GuestMemory, IcedCpu, JitCpu, RunUntilHook};
-use wie_winapi::{PendingSpawn, WinApiState};
+use wie_winapi::{GuestHeap, PendingSpawn, WinApiState};
 
 // ── Lock helpers ───────────────────────────────────────────────────────
 
@@ -241,6 +241,10 @@ pub(crate) struct ProcessResources {
     /// guest memory (mmap arenas + page tables). `None` for JIT.
     pub guest_mem: Option<Arc<RwLock<GuestMemory>>>,
     pub shared_winapi: Arc<Mutex<WinApiState>>,
+    /// Session-level heap shard — hot `HeapAlloc`/`HeapFree` stops lock only
+    /// this `Mutex<GuestHeap>` and the engine, bypassing the global
+    /// `WinApiState` mutex (order `global -> heap` when both are taken).
+    pub shared_heap: Arc<Mutex<wie_winapi::GuestHeap>>,
     /// Lock-free `shared_winapi` wait accumulators (Task 7). Shared with
     /// worker threads at spawn and with the presenter's `GuestHandle`.
     pub(crate) lock_wait_stats: Arc<LockWaitStats>,
@@ -302,6 +306,11 @@ impl ProcessResources {
         Arc::clone(&self.shared_winapi)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn heap_arc(&self) -> Arc<Mutex<wie_winapi::GuestHeap>> {
+        Arc::clone(&self.shared_heap)
+    }
+
     /// Clone of the guest message-queue Arc — host posts without locking the
     /// big WinApiState mutex.
     pub(crate) fn message_queue_arc(&self) -> Arc<Mutex<wie_winapi::present::MessageQueue>> {
@@ -334,6 +343,7 @@ impl ProcessResources {
             );
         }
         let shared_winapi = Arc::clone(&self.shared_winapi);
+        let shared_heap = Arc::clone(&self.shared_heap);
         let config = Arc::new(self.config.clone());
         let shared_jit = self.shared_jit.clone();
         let guest_mem = self.guest_mem.clone();
@@ -390,6 +400,7 @@ impl ProcessResources {
                 continue;
             }
             let winapi = Arc::clone(&shared_winapi);
+            let heap = Arc::clone(&shared_heap);
             let cfg = Arc::clone(&config);
             let stats = Arc::clone(&lock_wait_stats);
             let pool = Arc::clone(&worker_teb_pool);
@@ -397,7 +408,7 @@ impl ProcessResources {
             let handle = std::thread::Builder::new()
                 .name(format!("wie-guest-{}", spawn.tid))
                 .stack_size(STACK)
-                .spawn(move || worker_main(engine, winapi, cfg, spawn.tid, stats, teb, pool));
+                .spawn(move || worker_main(engine, winapi, heap, cfg, spawn.tid, stats, teb, pool));
             match handle {
                 Ok(handle) => {
                     tracing::debug!(
@@ -562,16 +573,26 @@ impl QuantumHooks for WorkerHooks {
 /// The TEB release is deliberately the LAST act: the engine is dropped before
 /// the page returns to the pool, so no live engine can access a page that a
 /// future worker reuses.
+#[allow(clippy::too_many_arguments)]
 fn worker_main(
     engine: Box<dyn CpuEngine>,
     shared_winapi: Arc<Mutex<WinApiState>>,
+    shared_heap: Arc<Mutex<GuestHeap>>,
     config: Arc<ProcessConfig>,
     tid: u32,
     lock_wait_stats: Arc<LockWaitStats>,
     teb: wie_cpu::PerThreadTeb,
     worker_teb_pool: Arc<Mutex<WorkerTebPool>>,
 ) {
-    let engine = run_worker(engine, shared_winapi, config, tid, lock_wait_stats, teb);
+    let engine = run_worker(
+        engine,
+        shared_winapi,
+        shared_heap,
+        config,
+        tid,
+        lock_wait_stats,
+        teb,
+    );
     // Engine is dead: its TEB page cannot be accessed anymore. Return the
     // page to the pool for the next worker (re-init zero-fills it).
     drop(engine);
@@ -589,6 +610,7 @@ fn worker_main(
 fn run_worker(
     mut engine: Box<dyn CpuEngine>,
     shared_winapi: Arc<Mutex<WinApiState>>,
+    shared_heap: Arc<Mutex<GuestHeap>>,
     config: Arc<ProcessConfig>,
     tid: u32,
     lock_wait_stats: Arc<LockWaitStats>,
@@ -631,16 +653,22 @@ fn run_worker(
     // per-thread binding.
     engine.set_gs_base(teb.va());
 
-    let mut core =
-        match QuantumCore::new(&mut *engine, &config, &shared_winapi, tid, &lock_wait_stats) {
-            Ok(core) => core,
-            Err(e) => {
-                tracing::error!(tid, error = %e, "failed to build worker quantum executor");
-                let st = lock_wait(&shared_winapi, &lock_wait_stats);
-                finish_tid(&st, tid, 1);
-                return engine;
-            }
-        };
+    let mut core = match QuantumCore::new(
+        &mut *engine,
+        &config,
+        &shared_winapi,
+        &shared_heap,
+        tid,
+        &lock_wait_stats,
+    ) {
+        Ok(core) => core,
+        Err(e) => {
+            tracing::error!(tid, error = %e, "failed to build worker quantum executor");
+            let st = lock_wait(&shared_winapi, &lock_wait_stats);
+            finish_tid(&st, tid, 1);
+            return engine;
+        }
+    };
     let mut hooks = WorkerHooks {
         tid,
         teb_va: teb.va(),
@@ -829,12 +857,14 @@ mod tests {
             primary_tid: GuestTid(wie_winapi::PRIMARY_THREAD_ID),
             static_dll_mains: Vec::new(),
         };
+        let heap = Arc::clone(&winapi_state.heap_state.heap);
         let mut resources = ProcessResources {
             config,
             engine,
             shared_jit: None,
             guest_mem: Some(Arc::clone(&mem)),
             shared_winapi: Arc::new(Mutex::new(winapi_state)),
+            shared_heap: heap,
             lock_wait_stats: Arc::new(LockWaitStats::new()),
             shared_message_queue: Arc::new(
                 Mutex::new(wie_winapi::present::MessageQueue::default()),

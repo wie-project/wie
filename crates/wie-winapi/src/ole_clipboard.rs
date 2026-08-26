@@ -232,6 +232,8 @@ pub(super) fn handle_get_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
         .state
         .heap_state
         .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .alloc_coherent(engine, byte_len.max(16));
     if hglobal == 0 {
         return ctx.finish(E_OUTOFMEMORY);
@@ -334,6 +336,8 @@ fn synthesize_idataobject(
     let block = state
         .heap_state
         .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .alloc_coherent(engine, super::IDATAOBJECT_ALLOCATION_SIZE);
     if block == 0 {
         return Ok(0);
@@ -362,7 +366,6 @@ mod tests {
     use super::*;
     use crate::dispatch_table::resolve_winapi_id;
     use crate::fake_va::FakeVa;
-    use crate::guest_heap::GuestHeap;
     use crate::sync_obj::SyncState;
     use crate::thread::ThreadState;
     use crate::vfs::VolumeConfig;
@@ -412,8 +415,12 @@ mod tests {
     }
 
     fn winapi_state_default() -> WinApiState {
-        let mut heap = GuestHeap::new(0x2000, 0x10000);
-        heap.attach_guest_control(0x2000);
+        let heap = std::sync::Arc::new(std::sync::Mutex::new(crate::guest_heap::GuestHeap::new(
+            0x2000, 0x10000,
+        )));
+        heap.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attach_guest_control(0x2000);
         WinApiState {
             display: crate::DisplayMetrics::default(),
             heap_state: HeapState {

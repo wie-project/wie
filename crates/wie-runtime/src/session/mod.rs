@@ -20,7 +20,7 @@ use crate::mt_runtime::ProcessResources;
 use crate::trace::EntryTraceTermination;
 use ahash::HashMap;
 use anyhow::{Context, Result};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use self::callback::PendingGuestCallback;
 
@@ -139,6 +139,10 @@ fn materialize_crt_argv(
 pub struct RuntimeSession {
     /// CPU + WinAPI (single struct for both JIT and Iced).
     process: ProcessResources,
+    /// Session-level heap shard — hot `HeapAlloc`/`HeapFree` stops lock only
+    /// this `Mutex<GuestHeap>` next to the `Mutex<WinApiState>` in `process`.
+    #[allow(dead_code)]
+    heap: Arc<Mutex<wie_winapi::GuestHeap>>,
     /// Clone of the session's wake hub (`SyncState::wake_hub`): the outer
     /// run loop parks the primary thread's inbox through it without taking
     /// the WinAPI state lock (Painpoint 1).

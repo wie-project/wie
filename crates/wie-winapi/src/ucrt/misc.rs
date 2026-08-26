@@ -96,7 +96,12 @@ pub(crate) fn handle_localtime64(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     // x64 struct tm layout: tm_sec(4), tm_min(4), tm_hour(4), tm_mday(4),
     // tm_mon(4), tm_year(4), tm_wday(4), tm_yday(4), tm_isdst(4) = 36 bytes.
     // Allocate and write from the heap.
-    let va = state.heap_state.heap.alloc_coherent(engine, 36);
+    let va = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, 36);
     if va == 0 {
         return finish(engine, 0);
     }

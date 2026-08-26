@@ -51,7 +51,12 @@ pub(super) fn allocate_gdi_heap_block(
     state: &mut WinApiState,
     size: u64,
 ) -> u64 {
-    state.heap_state.heap.alloc_coherent(engine, size)
+    state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, size)
 }
 
 /// What kind of device context a [`DcRecord`] represents.

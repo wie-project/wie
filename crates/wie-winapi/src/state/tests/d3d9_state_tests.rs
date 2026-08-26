@@ -12,7 +12,7 @@ fn test_d3d9_render_state_typed_round_trip() {
             d3d9::handle_set_render_state(&mut HandlerContext::new(
                 engine,
                 test_environment(),
-                state,
+                state
             )),
             0
         );
@@ -25,7 +25,7 @@ fn test_d3d9_render_state_typed_round_trip() {
             d3d9::handle_get_render_state(&mut HandlerContext::new(
                 engine,
                 test_environment(),
-                state,
+                state
             )),
             0
         );
@@ -154,7 +154,7 @@ fn test_d3d9_render_state_typed_round_trip() {
         d3d9::handle_set_render_state(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0x8876_086c // D3DERR_INVALIDCALL
     );
@@ -180,7 +180,7 @@ fn test_d3d9_fog_alpha_scissor_render_state_round_trip() {
             d3d9::handle_set_render_state(&mut HandlerContext::new(
                 engine,
                 test_environment(),
-                state,
+                state
             )),
             0
         );
@@ -192,7 +192,7 @@ fn test_d3d9_fog_alpha_scissor_render_state_round_trip() {
             d3d9::handle_get_render_state(&mut HandlerContext::new(
                 engine,
                 test_environment(),
-                state,
+                state
             )),
             0
         );
@@ -296,7 +296,7 @@ fn test_d3d9_fog_alpha_scissor_render_state_round_trip() {
             d3d9::handle_set_render_state(&mut HandlerContext::new(
                 &mut engine,
                 test_environment(),
-                &mut state,
+                &mut state
             )),
             0x8876_086c // D3DERR_INVALIDCALL
         );
@@ -354,7 +354,7 @@ fn test_d3d9_get_and_multiply_transform() {
         d3d9::handle_multiply_transform(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -371,7 +371,7 @@ fn test_d3d9_get_and_multiply_transform() {
         d3d9::handle_get_transform(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -387,7 +387,7 @@ fn test_d3d9_get_and_multiply_transform() {
         d3d9::handle_multiply_transform(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -405,7 +405,7 @@ fn test_d3d9_get_and_multiply_transform() {
         d3d9::handle_set_transform(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -414,7 +414,7 @@ fn test_d3d9_get_and_multiply_transform() {
         d3d9::handle_get_transform(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -429,7 +429,7 @@ fn test_d3d9_get_and_multiply_transform() {
         d3d9::handle_get_transform(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -445,7 +445,7 @@ fn test_d3d9_get_and_multiply_transform() {
         d3d9::handle_get_transform(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0x8876_086c
     );
@@ -454,7 +454,7 @@ fn test_d3d9_get_and_multiply_transform() {
         d3d9::handle_multiply_transform(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0x8876_086c
     );
@@ -479,7 +479,7 @@ fn test_d3d9_set_scissor_rect() {
         d3d9::handle_set_scissor_rect(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -498,7 +498,7 @@ fn test_d3d9_set_scissor_rect() {
         d3d9::handle_set_scissor_rect(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0x8876_086c
     );
@@ -524,7 +524,7 @@ fn test_d3d9_stage_state_typed_round_trip() {
             d3d9::handle_set_texture_stage_state(&mut HandlerContext::new(
                 engine,
                 test_environment(),
-                state,
+                state
             )),
             0
         );
@@ -536,7 +536,7 @@ fn test_d3d9_stage_state_typed_round_trip() {
             d3d9::handle_set_sampler_state(&mut HandlerContext::new(
                 engine,
                 test_environment(),
-                state,
+                state
             )),
             0
         );
@@ -548,7 +548,7 @@ fn test_d3d9_stage_state_typed_round_trip() {
             d3d9::handle_get_texture_stage_state(&mut HandlerContext::new(
                 engine,
                 test_environment(),
-                state,
+                state
             )),
             0
         );
@@ -565,7 +565,7 @@ fn test_d3d9_stage_state_typed_round_trip() {
             d3d9::handle_get_sampler_state(&mut HandlerContext::new(
                 engine,
                 test_environment(),
-                state,
+                state
             )),
             0
         );
@@ -738,7 +738,7 @@ fn test_d3d9_set_get_stream_source_null() {
         d3d9::handle_set_stream_source(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -752,7 +752,7 @@ fn test_d3d9_set_get_stream_source_null() {
         d3d9::handle_get_stream_source(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -778,7 +778,7 @@ fn test_d3d9_set_get_indices_null() {
         d3d9::handle_set_indices(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -789,7 +789,7 @@ fn test_d3d9_set_get_indices_null() {
         d3d9::handle_get_indices(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -817,7 +817,7 @@ fn test_d3d9_set_get_vertex_shader_slot_null() {
         d3d9::handle_set_vertex_shader(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -828,7 +828,7 @@ fn test_d3d9_set_get_vertex_shader_slot_null() {
         d3d9::handle_get_vertex_shader(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -852,7 +852,7 @@ fn test_d3d9_set_get_pixel_shader_slot_null() {
         d3d9::handle_set_pixel_shader(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -863,7 +863,7 @@ fn test_d3d9_set_get_pixel_shader_slot_null() {
         d3d9::handle_get_pixel_shader(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -900,7 +900,7 @@ fn test_d3d9_set_get_pixel_shader_constant_f_round_trip() {
         d3d9::handle_set_pixel_shader_constant_f(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -912,7 +912,7 @@ fn test_d3d9_set_get_pixel_shader_constant_f_round_trip() {
         d3d9::handle_get_pixel_shader_constant_f(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -959,7 +959,7 @@ fn test_d3d9_set_get_vertex_shader_constant_f_round_trip() {
         d3d9::handle_set_vertex_shader_constant_f(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -971,7 +971,7 @@ fn test_d3d9_set_get_vertex_shader_constant_f_round_trip() {
         d3d9::handle_get_vertex_shader_constant_f(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1005,7 +1005,7 @@ fn test_d3d9_pixel_shader_release_unknown_returns_zero() {
         d3d9::handle_pixel_shader_release(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1022,7 +1022,7 @@ fn test_d3d9_vertex_shader_release_unknown_returns_zero() {
         d3d9::handle_vertex_shader_release(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );

@@ -68,8 +68,10 @@ fn rax_low_i32(rax: u64) -> i32 {
 
 fn default_winapi_state() -> WinApiState {
     // Simplified default with a bump heap covering [0x2000, 0x10000).
-    let mut heap = GuestHeap::new(0x2000, 0x10000);
-    heap.attach_guest_control(0x2000);
+    let heap = std::sync::Arc::new(std::sync::Mutex::new(GuestHeap::new(0x2000, 0x10000)));
+    heap.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .attach_guest_control(0x2000);
     WinApiState {
         display: crate::DisplayMetrics::default(),
         heap_state: HeapState {
@@ -86,7 +88,7 @@ fn winapi_state_default() -> WinApiState {
     WinApiState {
         display: crate::DisplayMetrics::default(),
         heap_state: HeapState {
-            heap: GuestHeap::new(0x2000, 0x10000),
+            heap: std::sync::Arc::new(std::sync::Mutex::new(GuestHeap::new(0x2000, 0x10000))),
             next_fls_index: 0,
             fls_slots: Vec::new(),
             guest_fls_table_va: 0,

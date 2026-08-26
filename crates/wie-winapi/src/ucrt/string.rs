@@ -1271,6 +1271,8 @@ pub(crate) fn handle_qsort_s(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let key_va = state
         .heap_state
         .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .alloc_coherent(engine, u64::try_from(size).unwrap_or(0));
     if key_va == 0 {
         return finish(engine, i32_status_to_u64(EINVAL));
@@ -1349,7 +1351,12 @@ fn qsort_next(
     qs.i = qs.i.saturating_add(1);
     if qs.i >= qs.count {
         // Done: release the guest key copy and return to the caller.
-        let _ = state.heap_state.heap.free_coherent(engine, qs.key_va);
+        let _ = state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_coherent(engine, qs.key_va);
         engine.write_rsp(qs.return_rsp)?;
         engine.mem_write(qs.return_rsp, &qs.return_va.to_le_bytes())?;
         return finish(engine, 0);

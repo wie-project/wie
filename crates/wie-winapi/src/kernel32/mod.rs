@@ -1,4 +1,4 @@
-//! KERNEL32 handlers: process/thread, console, heap, file I/O, string, and
+//! KERNEL32 handlers: process/thread, console, file I/O, string, and
 //! sync APIs plus the fake process/time constants. Submodules split handlers
 //! by concern; this file re-exports the shared guest-memory/string helpers.
 

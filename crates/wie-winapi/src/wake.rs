@@ -70,7 +70,7 @@ impl ThreadInbox {
     pub fn new() -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         Self {
-            inner: Arc::new(InboxInner {
+            inner: std::sync::Arc::new(InboxInner {
                 tx,
                 rx: std::sync::Mutex::new(rx),
             }),
@@ -80,7 +80,7 @@ impl ThreadInbox {
     /// Whether `self` and `other` share the same underlying channel.
     #[must_use]
     pub fn same_channel(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Send one token (best-effort). Never blocks; a dead receiver drops the
@@ -261,7 +261,6 @@ impl WaiterRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A token sent from another thread reaches a parked waiter within a
@@ -316,12 +315,12 @@ mod tests {
         const SENDERS: usize = 4;
         const PER_SENDER: usize = 250;
         let inbox = ThreadInbox::new();
-        let received = Arc::new(AtomicUsize::new(0));
-        let drainer_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let received = std::sync::Arc::new(AtomicUsize::new(0));
+        let drainer_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let drainer_inbox = inbox.clone();
-        let drainer_received = Arc::clone(&received);
-        let drainer_stop_flag = Arc::clone(&drainer_stop);
+        let drainer_received = std::sync::Arc::clone(&received);
+        let drainer_stop_flag = std::sync::Arc::clone(&drainer_stop);
         let drainer = std::thread::spawn(move || {
             while !drainer_stop_flag.load(Ordering::Relaxed) {
                 let drained = drainer_inbox.drain();

@@ -1308,6 +1308,7 @@ impl super::RuntimeSession {
                 &mut *self.process.engine,
                 &self.process.config,
                 &self.process.shared_winapi,
+                &self.process.shared_heap,
                 primary_tid,
                 &self.process.lock_wait_stats,
             )?;
@@ -1345,6 +1346,7 @@ impl super::RuntimeSession {
                     &mut *self.process.engine,
                     &self.process.config,
                     &self.process.shared_winapi,
+                    &self.process.shared_heap,
                     primary_tid,
                     &self.process.lock_wait_stats,
                 )?;

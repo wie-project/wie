@@ -5,27 +5,33 @@ use super::{
 };
 
 /// Handles `KERNEL32.dll!HeapAlloc`.
+///
+/// Hot path: locks only the heap shard (`Arc<Mutex<GuestHeap>>`) and the
+/// engine. The global `WinApiState` is not touched on the success path.
 pub fn handle_heap_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let heap_handle = engine.read_rcx()?;
-    let flags = engine.read_rdx()?;
-    let size = engine.read_r8()?;
+    let heap_handle = ctx.engine.read_rcx()?;
+    let flags = ctx.engine.read_rdx()?;
+    let size = ctx.engine.read_r8()?;
 
     let return_value = if heap_handle == 0 {
         0
     } else {
-        // Zero-byte requests still need a live block (round-up in GuestHeap).
         let alloc_size = if size == 0 { 1 } else { size };
-        let addr = state.heap_state.heap.alloc_coherent(engine, alloc_size);
+        let addr = {
+            let mut heap = ctx.heap.lock().unwrap_or_else(|e| e.into_inner());
+            heap.alloc_coherent(ctx.engine, alloc_size)
+        };
         if addr != 0 && (flags & HEAP_ZERO_MEMORY) != 0 {
-            let zero_len = state.heap_state.heap.size_of(addr).unwrap_or(alloc_size);
+            let zero_len = {
+                let heap = ctx.heap.lock().unwrap_or_else(|e| e.into_inner());
+                heap.size_of(addr).unwrap_or(alloc_size)
+            };
             if let Ok(len) = usize::try_from(zero_len)
                 && len > 0
-                && !engine.mem_fill(addr, 0, len)
+                && !ctx.engine.mem_fill(addr, 0, len)
             {
                 let zeros = vec![0_u8; len];
-                engine.mem_write(addr, &zeros)?;
+                ctx.engine.mem_write(addr, &zeros)?;
             }
         }
         addr
@@ -34,46 +40,51 @@ pub fn handle_heap_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
     ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!HeapFree`.
+///
+/// Hot path: locks only the heap shard. On failure (invalid handle) the
+/// global `WinApiState` is locked briefly to set `last_error`.
 pub fn handle_heap_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _heap_handle = engine.read_rcx()?;
-    let _flags = engine.read_rdx()?;
-    let memory = engine.read_r8()?;
+    let _heap_handle = ctx.engine.read_rcx()?;
+    let _flags = ctx.engine.read_rdx()?;
+    let memory = ctx.engine.read_r8()?;
 
-    let ok = memory == 0 || state.heap_state.heap.free_coherent(engine, memory);
+    let ok = if memory == 0 {
+        true
+    } else {
+        let mut heap = ctx.heap.lock().unwrap_or_else(|e| e.into_inner());
+        heap.free_coherent(ctx.engine, memory)
+    };
     let return_value = if ok {
         1
     } else {
-        state.process.last_error = ERROR_INVALID_HANDLE;
+        ctx.state.process.last_error = ERROR_INVALID_HANDLE;
         0
     };
 
     ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!HeapReAlloc`.
+///
+/// Hot path: heap shard only (`realloc_coherent` is heap-only).
 pub fn handle_heap_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let heap_handle = engine.read_rcx()?;
-    let flags = engine.read_rdx()?;
-    let memory = engine.read_r8()?;
-    let new_size = engine.read_r9()?;
+    let heap_handle = ctx.engine.read_rcx()?;
+    let flags = ctx.engine.read_rdx()?;
+    let memory = ctx.engine.read_r8()?;
+    let new_size = ctx.engine.read_r9()?;
 
     let return_value = if heap_handle == 0 || memory == 0 {
         0
     } else if new_size == 0 {
-        let _ = state.heap_state.heap.free_coherent(engine, memory);
+        let mut heap = ctx.heap.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = heap.free_coherent(ctx.engine, memory);
         0
     } else {
-        // Move/copy/free shared with CRT realloc; zero-fill stays handler-local.
-        let (new_addr, old_size) = state
-            .heap_state
-            .heap
-            .realloc_coherent(engine, memory, new_size)?;
+        let (new_addr, old_size) = {
+            let mut heap = ctx.heap.lock().unwrap_or_else(|e| e.into_inner());
+            heap.realloc_coherent(ctx.engine, memory, new_size)?
+        };
         let needs_zero_tail = (flags & HEAP_ZERO_MEMORY) != 0 && new_size > old_size;
         if new_addr == 0 {
-            // Allocation failed; the original block stays live (Microsoft Learn).
             0
         } else if !needs_zero_tail {
             new_addr
@@ -82,9 +93,9 @@ pub fn handle_heap_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
             let zero_len = usize::try_from(new_size.saturating_sub(old_size)).unwrap_or(0);
             if zero_len > 0 {
                 let dst_addr = new_addr.wrapping_add(zero_start);
-                if !engine.mem_fill(dst_addr, 0, zero_len) {
+                if !ctx.engine.mem_fill(dst_addr, 0, zero_len) {
                     let zeros = vec![0_u8; zero_len];
-                    engine.mem_write(dst_addr, &zeros)?;
+                    ctx.engine.mem_write(dst_addr, &zeros)?;
                 }
             }
             new_addr
@@ -129,19 +140,19 @@ pub fn handle_heap_set_information(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!HeapSize`.
+///
+/// Hot path: heap shard only.
 pub fn handle_heap_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _heap_handle = engine.read_rcx()?;
-    let _flags = engine.read_rdx()?;
-    let memory = engine.read_r8()?;
+    let _heap_handle = ctx.engine.read_rcx()?;
+    let _flags = ctx.engine.read_rdx()?;
+    let memory = ctx.engine.read_r8()?;
 
-    let return_value = state
-        .heap_state
-        .heap
-        .size_from_header(engine, memory)
-        .filter(|&size| size != 0)
-        .unwrap_or(HEAP_SIZE_FAILURE);
+    let return_value = {
+        let heap = ctx.heap.lock().unwrap_or_else(|e| e.into_inner());
+        heap.size_from_header(ctx.engine, memory)
+            .filter(|&size| size != 0)
+            .unwrap_or(HEAP_SIZE_FAILURE)
+    };
 
     ctx.finish(return_value)
 }
@@ -246,25 +257,24 @@ pub fn handle_global_memory_status_ex(ctx: &mut HandlerContext<'_>) -> Result<Wi
 }
 /// Handles `KERNEL32.dll!LocalAlloc`.
 pub fn handle_local_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _flags = engine
+    let _flags = ctx
+        .engine
         .read_rcx()
         .context("failed to read RCX for LocalAlloc")?;
 
-    let size = engine
+    let size = ctx
+        .engine
         .read_rdx()
         .context("failed to read RDX for LocalAlloc")?;
 
-    let return_value = allocate_fake_heap_block(engine, state, size);
+    let return_value = allocate_fake_heap_block(ctx.engine, &ctx.heap, size);
 
     ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!LocalFree`.
 pub fn handle_local_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let memory = engine
+    let memory = ctx
+        .engine
         .read_rcx()
         .context("failed to read RCX for LocalFree")?;
 
@@ -272,7 +282,11 @@ pub fn handle_local_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         return ctx.finish(0);
     }
 
-    let was_live = state.heap_state.heap.free_coherent(engine, memory);
+    let was_live = ctx
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free_coherent(ctx.engine, memory);
 
     // LocalFree returns NULL on success and the original handle on failure.
     let return_value = if was_live { 0 } else { memory };
@@ -286,17 +300,17 @@ pub fn handle_local_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 /// address (real Windows returns a pointer into the memory object's data —
 /// identical semantics for a fixed heap). Invalid handles return NULL (0).
 pub fn handle_local_lock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let memory = engine
+    let memory = ctx
+        .engine
         .read_rcx()
         .context("failed to read RCX for LocalLock")?;
 
-    let return_value = if memory != 0 && state.heap_state.heap.is_live(memory) {
-        memory
-    } else {
-        0
-    };
+    let is_live = ctx
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_live(memory);
+    let return_value = if memory != 0 && is_live { memory } else { 0 };
 
     ctx.finish(return_value)
 }
@@ -307,15 +321,17 @@ pub fn handle_local_lock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 /// WIE's heap is fixed (handles are direct pointers, no lock counts), so that
 /// distinction cannot arise — documented deviation.
 pub fn handle_local_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let memory = engine
+    let memory = ctx
+        .engine
         .read_rcx()
         .context("failed to read RCX for LocalUnlock")?;
 
-    let live = memory != 0 && state.heap_state.heap.is_live(memory);
+    let live = {
+        let heap = ctx.heap.lock().unwrap_or_else(|e| e.into_inner());
+        memory != 0 && heap.is_live(memory)
+    };
     if !live {
-        state.process.last_error = ERROR_INVALID_HANDLE;
+        ctx.state.process.last_error = ERROR_INVALID_HANDLE;
     }
 
     let return_value = u64::from(live);
@@ -323,25 +339,24 @@ pub fn handle_local_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 }
 /// Handles `KERNEL32.dll!GlobalAlloc`.
 pub fn handle_global_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _flags = engine
+    let _flags = ctx
+        .engine
         .read_rcx()
         .context("failed to read RCX for GlobalAlloc")?;
 
-    let size = engine
+    let size = ctx
+        .engine
         .read_rdx()
         .context("failed to read RDX for GlobalAlloc")?;
 
-    let return_value = allocate_fake_heap_block(engine, state, size);
+    let return_value = allocate_fake_heap_block(ctx.engine, &ctx.heap, size);
 
     ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GlobalFree`.
 pub fn handle_global_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let memory = engine
+    let memory = ctx
+        .engine
         .read_rcx()
         .context("failed to read RCX for GlobalFree")?;
 
@@ -349,7 +364,11 @@ pub fn handle_global_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         return ctx.finish(0);
     }
 
-    let was_live = state.heap_state.heap.free_coherent(engine, memory);
+    let was_live = ctx
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free_coherent(ctx.engine, memory);
 
     // GlobalFree returns NULL on success and the original handle on failure.
     let return_value = if was_live { 0 } else { memory };
@@ -358,31 +377,34 @@ pub fn handle_global_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 }
 /// Handles `KERNEL32.dll!GlobalLock`.
 pub fn handle_global_lock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let memory = engine
+    let memory = ctx
+        .engine
         .read_rcx()
         .context("failed to read RCX for GlobalLock")?;
 
-    let return_value = if state.heap_state.heap.is_live(memory) {
-        memory
-    } else {
-        0
-    };
+    let is_live = ctx
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_live(memory);
+    let return_value = if is_live { memory } else { 0 };
 
     ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GlobalUnlock`.
 pub fn handle_global_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let memory = engine
+    let memory = ctx
+        .engine
         .read_rcx()
         .context("failed to read RCX for GlobalUnlock")?;
 
-    let was_live = state.heap_state.heap.is_live(memory);
+    let was_live = ctx
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_live(memory);
 
-    state.process.last_error = if was_live { 0 } else { ERROR_INVALID_HANDLE };
+    ctx.state.process.last_error = if was_live { 0 } else { ERROR_INVALID_HANDLE };
 
     let return_value = 0;
 
@@ -390,13 +412,17 @@ pub fn handle_global_unlock(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 }
 /// Handles `KERNEL32.dll!GlobalSize`.
 pub fn handle_global_size(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let memory = engine
+    let memory = ctx
+        .engine
         .read_rcx()
         .context("failed to read RCX for GlobalSize")?;
 
-    let return_value = state.heap_state.heap.size_of(memory).unwrap_or(0);
+    let return_value = ctx
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .size_of(memory)
+        .unwrap_or(0);
 
     ctx.finish(return_value)
 }
@@ -483,7 +509,13 @@ pub fn handle_global_delete_atom(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    unused_variables,
+    unused_imports
+)]
 mod tests {
     use super::*;
     use crate::sync_obj::SyncState;
@@ -515,19 +547,19 @@ mod tests {
     }
 
     fn test_state() -> WinApiState {
-        let mut heap = GuestHeap::new(0x2000, 0x10000);
-        heap.attach_guest_control(0x2000);
         WinApiState {
             display: crate::DisplayMetrics::default(),
             heap_state: HeapState {
-                heap,
+                heap: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::guest_heap::GuestHeap::new(0x2000, 0x10000),
+                )),
                 next_fls_index: 0,
                 fls_slots: Vec::new(),
                 guest_fls_table_va: 0,
             },
             file_io: crate::FileIoState {
                 executable_file_size: 0,
-                executable_file_bytes: Arc::new(Vec::new()),
+                executable_file_bytes: std::sync::Arc::new(Vec::new()),
                 executable_file_cursor: 0,
                 next_find_handle: FindFileHandle::from(0),
                 find_handles: Vec::new(),
@@ -573,7 +605,9 @@ mod tests {
                 seh_pending: HashMap::new(),
             },
             dll_states: crate::DllStateMap::new(),
-            message_queue: Arc::new(Mutex::new(crate::present::MessageQueue::default())),
+            message_queue: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::present::MessageQueue::default(),
+            )),
             module_state: ModuleState {
                 loaded_modules: HashMap::new(),
                 import_resolver: None,
@@ -603,10 +637,20 @@ mod tests {
         cpu.write_rsp(STACK_TOP).ok();
     }
 
+    fn test_heap() -> Arc<Mutex<GuestHeap>> {
+        let heap = std::sync::Arc::new(std::sync::Mutex::new(crate::guest_heap::GuestHeap::new(
+            0x2000, 0x10000,
+        )));
+        heap.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attach_guest_control(0x2000);
+        heap
+    }
+
     /// Allocate a block through the LocalAlloc handler and return its handle.
     fn alloc_local(engine: &mut IcedCpu, state: &mut WinApiState, size: u64) -> u64 {
-        // Initialise the guest heap control bump cursor (0x2000 was attached as
-        // ctrl in `test_state`), otherwise `alloc_coherent` sees bump=0 < base.
+        // Initialise the guest heap control bump cursor (0x2000 is the ctrl va),
+        // otherwise `alloc_coherent` sees bump=0 < base.
         engine
             .mem_write(0x2000, &0x2000_u64.to_le_bytes())
             .expect("write heap bump cursor");
@@ -621,6 +665,7 @@ mod tests {
     fn local_lock_returns_pointer_for_live_block() {
         let mut engine = test_engine();
         let mut state = test_state();
+        let heap = test_heap();
         let handle = alloc_local(&mut engine, &mut state, 64);
         assert_ne!(handle, 0, "LocalAlloc must yield a handle");
 
@@ -648,6 +693,7 @@ mod tests {
     fn local_lock_zero_returns_null() {
         let mut engine = test_engine();
         let mut state = test_state();
+        let heap = test_heap();
         write_regs(&mut engine, 0, 0, 0, 0);
         let result = handle_local_lock(&mut HandlerContext::new(
             &mut engine,
@@ -662,6 +708,7 @@ mod tests {
     fn local_lock_freed_block_returns_null() {
         let mut engine = test_engine();
         let mut state = test_state();
+        let heap = test_heap();
         let handle = alloc_local(&mut engine, &mut state, 64);
         assert_ne!(handle, 0);
 
@@ -687,6 +734,7 @@ mod tests {
     fn local_unlock_invalid_handle_returns_false() {
         let mut engine = test_engine();
         let mut state = test_state();
+        let heap = test_heap();
         write_regs(&mut engine, 0xdead_beef, 0, 0, 0);
         let result = handle_local_unlock(&mut HandlerContext::new(
             &mut engine,
@@ -704,6 +752,7 @@ mod tests {
     fn lock_unlock_round_trip_keeps_block_live() {
         let mut engine = test_engine();
         let mut state = test_state();
+        let heap = test_heap();
         let handle = alloc_local(&mut engine, &mut state, 128);
         assert_ne!(handle, 0);
 
@@ -727,6 +776,13 @@ mod tests {
         .expect("LocalUnlock should succeed")
         .return_value;
         assert_eq!(unlocked, 1);
-        assert!(state.heap_state.heap.is_live(handle));
+        assert!(
+            state
+                .heap_state
+                .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_live(handle)
+        );
     }
 }

@@ -85,7 +85,8 @@ impl Default for GlState {
     }
 }
 
-static GL_STATE: LazyLock<Mutex<GlState>> = LazyLock::new(|| Mutex::new(GlState::default()));
+static GL_STATE: LazyLock<Mutex<GlState>> =
+    LazyLock::new(|| std::sync::Mutex::new(GlState::default()));
 
 /// Lock the GL table, failing closed (`None`) on a poisoned lock so a
 /// panicking thread cannot unwind into the guest.
@@ -1076,6 +1077,8 @@ fn handle_gl_get_string(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
         let allocated = state
             .heap_state
             .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .alloc_coherent(engine, GL_STRING_BUF_SIZE);
         if allocated == 0 {
             return ctx.finish(0);

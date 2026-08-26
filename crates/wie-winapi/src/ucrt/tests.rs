@@ -8,10 +8,9 @@
 #![allow(clippy::expect_used)]
 
 use super::*;
-use crate::{GuestHeap, HeapState, KernelState, ModuleState, ProcessState, WinApiState};
+use crate::{HeapState, KernelState, ModuleState, ProcessState, WinApiState};
 use ahash::HashMap;
 use ahash::HashMapExt;
-use std::sync::{Arc, Mutex};
 
 use crate::sync_obj::SyncState;
 use crate::vfs::VolumeConfig;
@@ -53,8 +52,12 @@ fn write_regs(cpu: &mut IcedCpu, rcx: u64, rdx: u64, r8: u64, r9: u64) {
 /// Zero-heavy default state; none of the UCRT startup handlers touch it beyond
 /// the guest heap used for wide-argv materialization.
 fn test_state() -> WinApiState {
-    let mut heap = GuestHeap::new(0x2000, 0x10000);
-    heap.attach_guest_control(0x2000);
+    let heap = std::sync::Arc::new(std::sync::Mutex::new(crate::guest_heap::GuestHeap::new(
+        0x2000, 0x10000,
+    )));
+    heap.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .attach_guest_control(0x2000);
     WinApiState {
         display: crate::DisplayMetrics::default(),
         heap_state: HeapState {
@@ -65,7 +68,7 @@ fn test_state() -> WinApiState {
         },
         file_io: crate::FileIoState {
             executable_file_size: 0,
-            executable_file_bytes: Arc::new(Vec::new()),
+            executable_file_bytes: std::sync::Arc::new(Vec::new()),
             executable_file_cursor: 0,
             next_find_handle: FindFileHandle::from(0),
             find_handles: Vec::new(),
@@ -108,7 +111,9 @@ fn test_state() -> WinApiState {
             seh_pending: HashMap::new(),
         },
         dll_states: crate::DllStateMap::new(),
-        message_queue: Arc::new(Mutex::new(crate::present::MessageQueue::default())),
+        message_queue: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::present::MessageQueue::default(),
+        )),
         module_state: ModuleState {
             loaded_modules: HashMap::new(),
             import_resolver: None,

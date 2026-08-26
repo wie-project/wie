@@ -736,7 +736,12 @@ fn test_register_window_message_a_and_w_share_cache() {
 fn test_heap_free_double_free_returns_false() {
     let mut engine = test_engine();
     let mut state = winapi_state_default();
-    let p = state.heap_state.heap.alloc(64);
+    let p = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc(64);
     assert_ne!(p, 0);
 
     write_regs(&mut engine, 0x1, 0, p, 0, 0);

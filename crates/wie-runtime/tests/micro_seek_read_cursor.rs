@@ -13,8 +13,6 @@
 //! and asserts that after a seek the bytes read are exactly the bytes at the
 //! offset the `FILE_CURRENT` query returned.
 
-use std::sync::{Arc, Mutex};
-
 use ahash::{HashMap, HashMapExt};
 use wie_cpu::{CpuEngine, IcedCpu, RwxPerms};
 use wie_winapi::{
@@ -70,8 +68,10 @@ fn default_env() -> WinApiEnvironment {
 }
 
 fn default_winapi_state() -> WinApiState {
-    let mut heap = GuestHeap::new(0x2000, 0x10000);
-    heap.attach_guest_control(0x2000);
+    let heap = std::sync::Arc::new(std::sync::Mutex::new(GuestHeap::new(0x2000, 0x10000)));
+    heap.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .attach_guest_control(0x2000);
     WinApiState {
         display: wie_winapi::DisplayMetrics::default(),
         heap_state: HeapState {
@@ -82,7 +82,7 @@ fn default_winapi_state() -> WinApiState {
         },
         file_io: FileIoState {
             executable_file_size: 0,
-            executable_file_bytes: Arc::new(Vec::new()),
+            executable_file_bytes: std::sync::Arc::new(Vec::new()),
             executable_file_cursor: 0,
             next_find_handle: FindFileHandle::from(0),
             find_handles: Vec::new(),
@@ -128,7 +128,7 @@ fn default_winapi_state() -> WinApiState {
             seh_pending: HashMap::new(),
         },
         dll_states: DllStateMap::new(),
-        message_queue: Arc::new(Mutex::new(present::MessageQueue::default())),
+        message_queue: std::sync::Arc::new(std::sync::Mutex::new(present::MessageQueue::default())),
         module_state: ModuleState {
             loaded_modules: HashMap::new(),
             import_resolver: None,

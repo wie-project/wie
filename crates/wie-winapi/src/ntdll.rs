@@ -1,7 +1,7 @@
 //! Handles `ntdll.dll` — the Nt*/Rtl* surface used by modern toolchains
 //! (string dispatch). Stateless: handlers forward to the kernel32
 //! implementations where the semantics match. The Nt* layer maps the NTSTATUS
-//! ABI onto kernel32 handler semantics (handle teardown, heap, virtual memory,
+//! ABI onto kernel32 handler semantics (handle teardown, virtual memory,
 //! sleep, clocks); the Rtl* layer is mostly thin forwards plus guest-memory
 //! primitives.
 //!

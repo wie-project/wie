@@ -224,7 +224,12 @@ fn buffer_release_common(
             None => 0,
         };
         if locked_va != 0 {
-            let _ = state.heap_state.heap.free_coherent(engine, locked_va);
+            let _ = state
+                .heap_state
+                .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .free_coherent(engine, locked_va);
         }
         // Unbind from the device state (a released buffer must not draw).
         let d3d = state.d3d9();
@@ -238,7 +243,12 @@ fn buffer_release_common(
         let vtable = this_pointer
             .checked_sub(object_offset)
             .context("IDirect3DBuffer9 allocation address underflow")?;
-        let _ = state.heap_state.heap.free_coherent(engine, vtable);
+        let _ = state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_coherent(engine, vtable);
     }
     Ok(u64::from(remaining))
 }
@@ -290,6 +300,8 @@ fn buffer_lock_common(
     let block = state
         .heap_state
         .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .alloc_coherent(engine, u64::from(size));
     if block == 0 {
         return Ok(D3DERR_INVALIDCALL); // allocation failed
@@ -325,7 +337,12 @@ fn buffer_unlock_common(
     {
         record.data.copy_from_slice(&bytes);
     }
-    let _ = state.heap_state.heap.free_coherent(engine, locked_va);
+    let _ = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .free_coherent(engine, locked_va);
     if let Some(record) = state.d3d9().d3d9_buffers.get_mut(&this_pointer) {
         record.locked_va = 0;
     }

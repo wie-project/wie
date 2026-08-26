@@ -307,11 +307,7 @@ impl GuestHeap {
     ///
     /// Shared fallback for `HeapReAlloc`, CRT `realloc`, and `HeapSize` — all
     /// must size blocks the in-guest JIT helpers allocated (host table miss).
-    pub(crate) fn size_from_header(
-        &self,
-        engine: &mut dyn wie_cpu::CpuEngine,
-        ptr: u64,
-    ) -> Option<u64> {
+    pub fn size_from_header(&self, engine: &mut dyn wie_cpu::CpuEngine, ptr: u64) -> Option<u64> {
         if let Some(size) = self.live.get(&ptr) {
             return Some(*size);
         }
@@ -329,7 +325,7 @@ impl GuestHeap {
     /// Returns `(address, old_size)`. `address == 0` means the new allocation
     /// failed — per Microsoft Learn the original block stays live. Zero-fill
     /// of a grown tail is the caller's policy (`HEAP_ZERO_MEMORY`), not ours.
-    pub(crate) fn realloc_coherent(
+    pub fn realloc_coherent(
         &mut self,
         engine: &mut dyn wie_cpu::CpuEngine,
         ptr: u64,

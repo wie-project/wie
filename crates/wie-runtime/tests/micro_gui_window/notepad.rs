@@ -3,8 +3,6 @@
 //! File actions (New Window). The font/confirm/save dialog flows live in
 //! `dialogs.rs`.
 
-use std::sync::Arc;
-
 use crate::helpers::{gui_suite_serialize, pump_until_windows_ready, real_exe};
 
 /// In-process repro for the interactive notepad menubar regression: every
@@ -190,7 +188,7 @@ fn notepad_menu_tree_is_stable_across_calls() {
         std::thread::sleep(std::time::Duration::from_millis(10));
         let _ = session.run_until_stop(1_000_000).expect("run");
         let next = handle.window_menu_items();
-        if Arc::ptr_eq(&first, &next) {
+        if std::sync::Arc::ptr_eq(&first, &next) {
             saw_cache_hit = true;
         }
         if next.as_ref() != first.as_ref() {
@@ -334,8 +332,8 @@ fn new_clears_edit_visibly_on_same_frame() {
             .expect("notepad session starts");
     let handle = session.guest_handle();
     // IDNO = "Don't Save" → discard the changes → FileNew clears the edit.
-    let prompt_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let prompt = Arc::clone(&prompt_fired);
+    let prompt_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let prompt = std::sync::Arc::clone(&prompt_fired);
     handle.set_message_box_bridge(Box::new(move |_, _, _| {
         prompt.store(true, std::sync::atomic::Ordering::SeqCst);
         7 // IDNO — discard
@@ -668,8 +666,8 @@ fn new_resets_status_bar_line_col_to_one() {
         wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
             .expect("notepad session starts");
     let handle = session.guest_handle();
-    let prompt_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let prompt = Arc::clone(&prompt_fired);
+    let prompt_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let prompt = std::sync::Arc::clone(&prompt_fired);
     handle.set_message_box_bridge(Box::new(move |_, _, _| {
         prompt.store(true, std::sync::atomic::Ordering::SeqCst);
         7 // IDNO — discard
@@ -784,8 +782,8 @@ fn status_bar_toggle_wakes_with_its_publish() {
     // A wake counter — the wake runs on the guest thread inside publish
     // (which holds the state lock), so it can only bump the counter; the
     // pump loop reads the count around each run_until_stop.
-    let wake_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let wc = Arc::clone(&wake_count);
+    let wake_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let wc = std::sync::Arc::clone(&wake_count);
     handle.set_wake(Box::new(move || {
         wc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }));

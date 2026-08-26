@@ -735,7 +735,12 @@ pub fn handle_pixel_shader_release(ctx: &mut HandlerContext<'_>) -> Result<WinAp
             state.d3d9().d3d9_pixel_shader = 0;
         }
         let vtable = this_pointer.saturating_sub(IDIRECT3DSHADER9_OBJECT_OFFSET);
-        let _ = state.heap_state.heap.free_coherent(engine, vtable);
+        let _ = state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_coherent(engine, vtable);
         1
     } else {
         0
@@ -755,7 +760,12 @@ pub fn handle_vertex_shader_release(ctx: &mut HandlerContext<'_>) -> Result<WinA
             state.d3d9().d3d9_current_vertex_shader = 0;
         }
         let vtable = this_pointer.saturating_sub(IDIRECT3DSHADER9_OBJECT_OFFSET);
-        let _ = state.heap_state.heap.free_coherent(engine, vtable);
+        let _ = state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_coherent(engine, vtable);
         1
     } else {
         0

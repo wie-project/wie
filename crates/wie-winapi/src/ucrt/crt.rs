@@ -224,7 +224,12 @@ fn materialize_wide_env(
     // Even an empty host env yields the 8-byte NULL terminator, so the
     // block is never zero-sized.
     let total = u64::try_from(table_len.saturating_add(body_total)).unwrap_or(0);
-    let base = state.heap_state.heap.alloc_coherent(engine, total);
+    let base = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, total);
     if base == 0 {
         return Ok(()); // OOM — slot stays NULL; guest sees an empty env.
     }
@@ -314,7 +319,12 @@ fn materialize_wide_argv(
     if total == 0 {
         return Ok(());
     }
-    let base = state.heap_state.heap.alloc_coherent(engine, total);
+    let base = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, total);
     if base == 0 {
         return Ok(()); // OOM — slot stays NULL; guest sees an empty argv.
     }

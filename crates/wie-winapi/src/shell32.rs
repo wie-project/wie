@@ -290,6 +290,8 @@ fn handle_command_line_to_argv_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let argv_va = state
         .heap_state
         .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .alloc_coherent(engine, u64::try_from(argv_bytes).unwrap_or(64));
     if argv_va == 0 {
         return finish(engine, 0);
@@ -323,7 +325,12 @@ fn alloc_shell_bstr(
         .saturating_add(u64::from(byte_len))
         .saturating_add(2)
         .saturating_add(8);
-    let raw = state.heap_state.heap.alloc_coherent(engine, total);
+    let raw = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, total);
     if raw == 0 {
         return Ok(0);
     }
@@ -712,8 +719,10 @@ mod tests {
     }
 
     fn test_state() -> WinApiState {
-        let mut heap = GuestHeap::new(0x2000, 0x10000);
-        heap.attach_guest_control(0x2000);
+        let heap = std::sync::Arc::new(std::sync::Mutex::new(GuestHeap::new(0x2000, 0x10000)));
+        heap.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attach_guest_control(0x2000);
         WinApiState {
             display: crate::DisplayMetrics::default(),
             heap_state: HeapState {

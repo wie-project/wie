@@ -1,5 +1,4 @@
 use super::*;
-use crate::guest_heap::GuestHeap;
 use crate::registry::HKEY_CURRENT_USER;
 use crate::state::{
     DllStateMap, FileIoState, HeapState, KernelState, ModuleState, ProcessState, WinApiEnvironment,
@@ -7,7 +6,6 @@ use crate::state::{
 use crate::sync_obj::SyncState;
 use crate::vfs::VolumeConfig;
 use crate::{HandlerContext, RegistryKeyHandle, ThreadState, WinApiState};
-use std::sync::{Arc, Mutex};
 use wie_cpu::{CpuEngine, IcedCpu};
 
 const STACK_VA: u64 = 0x100_0000;
@@ -80,14 +78,16 @@ fn default_winapi_state() -> WinApiState {
     WinApiState {
         display: crate::DisplayMetrics::default(),
         heap_state: HeapState {
-            heap: GuestHeap::new(0x2000, 0x10000),
+            heap: std::sync::Arc::new(std::sync::Mutex::new(crate::guest_heap::GuestHeap::new(
+                0x2000, 0x10000,
+            ))),
             next_fls_index: 0,
             fls_slots: Vec::new(),
             guest_fls_table_va: 0,
         },
         file_io: FileIoState {
             executable_file_size: 0,
-            executable_file_bytes: Arc::new(Vec::new()),
+            executable_file_bytes: std::sync::Arc::new(Vec::new()),
             executable_file_cursor: 0,
             next_find_handle: crate::FindFileHandle::from(0),
             find_handles: Vec::new(),
@@ -133,7 +133,9 @@ fn default_winapi_state() -> WinApiState {
             seh_pending: ahash::HashMap::default(),
         },
         dll_states: DllStateMap::new(),
-        message_queue: Arc::new(Mutex::new(crate::present::MessageQueue::default())),
+        message_queue: std::sync::Arc::new(std::sync::Mutex::new(
+            crate::present::MessageQueue::default(),
+        )),
         module_state: ModuleState {
             loaded_modules: ahash::HashMap::default(),
             import_resolver: None,

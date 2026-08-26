@@ -618,10 +618,12 @@ pub fn handle_sleep(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
 }
 pub(crate) fn allocate_fake_heap_block(
     engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    heap: &std::sync::Arc<std::sync::Mutex<crate::GuestHeap>>,
     size: u64,
 ) -> u64 {
-    state.heap_state.heap.alloc_coherent(engine, size)
+    heap.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, size)
 }
 /// Handles `KERNEL32.dll!MulDiv`.
 pub fn handle_mul_div(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {

@@ -205,7 +205,12 @@ fn write_print_dev_mode(
         h_dev_mode_in
     } else {
         let size = u64::try_from(std::mem::size_of::<DevModeW>()).unwrap_or(0);
-        state.heap_state.heap.alloc_coherent(engine, size)
+        state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alloc_coherent(engine, size)
     };
     if block == 0 {
         return Ok(0);
@@ -265,7 +270,12 @@ fn write_print_dev_names(
         return Ok(h_dev_names_in);
     }
     let size = u64::try_from(bytes.len()).unwrap_or(0);
-    let block = state.heap_state.heap.alloc_coherent(engine, size);
+    let block = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, size);
     if block == 0 {
         return Ok(0);
     }

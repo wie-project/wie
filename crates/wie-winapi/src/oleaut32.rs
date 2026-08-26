@@ -113,7 +113,12 @@ fn alloc_bstr(
         .saturating_add(u64::from(byte_len))
         .saturating_add(2)
         .saturating_add(8);
-    let raw = state.heap_state.heap.alloc_coherent(engine, total);
+    let raw = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, total);
     if raw == 0 {
         return Ok(0);
     }
@@ -185,6 +190,8 @@ fn handle_sys_free_string(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         let _ = state
             .heap_state
             .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .free_coherent(engine, bstr.wrapping_sub(4));
     }
     ctx.finish(0)
@@ -296,6 +303,8 @@ fn free_bstr_if_any(engine: &mut dyn wie_cpu::CpuEngine, state: &mut WinApiState
         let _ = state
             .heap_state
             .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .free_coherent(engine, bstr.wrapping_sub(4));
     }
 }
@@ -562,7 +571,7 @@ struct SafeArrayData {
 /// Live SafeArrays keyed by fake `SAFEARRAY*` handle. Static (not per-session)
 /// because the shared state file owns the DllId table — same pattern as the
 /// UCRT `strtok` static save slot.
-static SAFE_ARRAYS: Mutex<Vec<(u64, SafeArrayData)>> = Mutex::new(Vec::new());
+static SAFE_ARRAYS: Mutex<Vec<(u64, SafeArrayData)>> = std::sync::Mutex::new(Vec::new());
 
 /// Next fake `SAFEARRAY*` handle (counter from `0x5300_0000`).
 fn next_sa_handle() -> u64 {
@@ -644,9 +653,9 @@ fn handle_safe_array_create(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     }
     total_bytes = total_bytes.saturating_mul(cb_elements);
     let data_va = ctx
-        .state
-        .heap_state
         .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .alloc_coherent(engine, total_bytes);
     if data_va == 0 {
         return ctx.finish(0); // OOM — SafeArrayCreate returns NULL
@@ -674,9 +683,9 @@ fn handle_safe_array_destroy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         let (_, data) = table.swap_remove(i);
         if data.data_va != 0 {
             let _ = ctx
-                .state
-                .heap_state
                 .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
                 .free_coherent(engine, data.data_va);
         }
         ctx.finish(0) // S_OK

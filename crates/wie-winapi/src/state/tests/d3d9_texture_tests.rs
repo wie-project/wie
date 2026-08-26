@@ -29,7 +29,7 @@ fn test_d3d9_texture_lock_unlock_round_trip() {
         d3d9::handle_create_texture(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -47,7 +47,7 @@ fn test_d3d9_texture_lock_unlock_round_trip() {
         d3d9::handle_texture_get_surface_level(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -65,7 +65,7 @@ fn test_d3d9_texture_lock_unlock_round_trip() {
         d3d9::handle_surface_lock_rect(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -98,7 +98,7 @@ fn test_d3d9_texture_lock_unlock_round_trip() {
         d3d9::handle_surface_unlock_rect(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -122,7 +122,7 @@ fn test_d3d9_texture_lock_unlock_round_trip() {
         d3d9::handle_set_texture(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -132,7 +132,7 @@ fn test_d3d9_texture_lock_unlock_round_trip() {
         d3d9::handle_get_texture(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -148,7 +148,7 @@ fn test_d3d9_texture_lock_unlock_round_trip() {
         d3d9::handle_texture_release(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         1
     );
@@ -178,7 +178,7 @@ fn test_d3d9_mip_chain_selects_level_surface_and_texels() {
         d3d9::handle_create_texture(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -209,7 +209,7 @@ fn test_d3d9_mip_chain_selects_level_surface_and_texels() {
         d3d9::handle_texture_get_surface_level(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -233,7 +233,7 @@ fn test_d3d9_mip_chain_selects_level_surface_and_texels() {
         d3d9::handle_surface_lock_rect(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -255,7 +255,7 @@ fn test_d3d9_mip_chain_selects_level_surface_and_texels() {
         d3d9::handle_surface_unlock_rect(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -288,7 +288,7 @@ fn test_d3d9_vertex_shader_int_bool_constant_round_trip() {
         d3d9::handle_set_vertex_shader_constant_i(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -305,7 +305,7 @@ fn test_d3d9_vertex_shader_int_bool_constant_round_trip() {
         d3d9::handle_get_vertex_shader_constant_i(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -329,7 +329,7 @@ fn test_d3d9_vertex_shader_int_bool_constant_round_trip() {
         d3d9::handle_set_vertex_shader_constant_b(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -345,7 +345,7 @@ fn test_d3d9_vertex_shader_int_bool_constant_round_trip() {
         d3d9::handle_get_vertex_shader_constant_b(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -381,7 +381,7 @@ fn test_d3d9_texture_unlock_with_rect() {
         d3d9::handle_create_texture(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -397,7 +397,7 @@ fn test_d3d9_texture_unlock_with_rect() {
         d3d9::handle_texture_get_surface_level(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -423,7 +423,7 @@ fn test_d3d9_texture_unlock_with_rect() {
         d3d9::handle_surface_lock_rect(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -445,7 +445,7 @@ fn test_d3d9_texture_unlock_with_rect() {
         d3d9::handle_surface_unlock_rect(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -492,7 +492,7 @@ fn test_d3d9_vertex_buffer_lifecycle_lock_desc_round_trip() {
         d3d9::handle_create_vertex_buffer(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -510,7 +510,7 @@ fn test_d3d9_vertex_buffer_lifecycle_lock_desc_round_trip() {
         d3d9::handle_vertex_buffer_lock(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -533,7 +533,7 @@ fn test_d3d9_vertex_buffer_lifecycle_lock_desc_round_trip() {
         d3d9::handle_vertex_buffer_unlock(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -558,7 +558,7 @@ fn test_d3d9_vertex_buffer_lifecycle_lock_desc_round_trip() {
         d3d9::handle_vertex_buffer_get_desc(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -590,7 +590,7 @@ fn test_d3d9_vertex_buffer_lifecycle_lock_desc_round_trip() {
         d3d9::handle_vertex_buffer_add_ref(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         2
     );
@@ -599,7 +599,7 @@ fn test_d3d9_vertex_buffer_lifecycle_lock_desc_round_trip() {
         d3d9::handle_vertex_buffer_release(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         1
     );
@@ -608,7 +608,7 @@ fn test_d3d9_vertex_buffer_lifecycle_lock_desc_round_trip() {
         d3d9::handle_vertex_buffer_release(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -638,7 +638,7 @@ fn test_d3d9_buffer_form_draw_indexed_primitive() {
         d3d9::handle_set_fvf(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -647,7 +647,7 @@ fn test_d3d9_buffer_form_draw_indexed_primitive() {
         d3d9::handle_begin_scene(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -665,7 +665,7 @@ fn test_d3d9_buffer_form_draw_indexed_primitive() {
         d3d9::handle_create_vertex_buffer(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -680,7 +680,7 @@ fn test_d3d9_buffer_form_draw_indexed_primitive() {
         d3d9::handle_vertex_buffer_lock(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -709,7 +709,7 @@ fn test_d3d9_buffer_form_draw_indexed_primitive() {
         d3d9::handle_vertex_buffer_unlock(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -727,7 +727,7 @@ fn test_d3d9_buffer_form_draw_indexed_primitive() {
         d3d9::handle_create_index_buffer(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -740,7 +740,7 @@ fn test_d3d9_buffer_form_draw_indexed_primitive() {
         d3d9::handle_index_buffer_lock(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -761,7 +761,7 @@ fn test_d3d9_buffer_form_draw_indexed_primitive() {
         d3d9::handle_index_buffer_unlock(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -775,7 +775,7 @@ fn test_d3d9_buffer_form_draw_indexed_primitive() {
         d3d9::handle_set_stream_source(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -784,7 +784,7 @@ fn test_d3d9_buffer_form_draw_indexed_primitive() {
         d3d9::handle_set_indices(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -801,7 +801,7 @@ fn test_d3d9_buffer_form_draw_indexed_primitive() {
         d3d9::handle_get_stream_source(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -824,7 +824,7 @@ fn test_d3d9_buffer_form_draw_indexed_primitive() {
         d3d9::handle_get_indices(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -848,7 +848,7 @@ fn test_d3d9_buffer_form_draw_indexed_primitive() {
         d3d9::handle_draw_indexed_primitive(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -903,7 +903,7 @@ fn test_d3d9_depth_surface_create_bind_and_clear() {
         d3d9::handle_create_depth_stencil_surface(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -926,7 +926,7 @@ fn test_d3d9_depth_surface_create_bind_and_clear() {
         d3d9::handle_create_depth_stencil_surface(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0x8876_086c // D3DERR_INVALIDCALL
     );
@@ -937,7 +937,7 @@ fn test_d3d9_depth_surface_create_bind_and_clear() {
         d3d9::handle_set_depth_stencil_surface(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -950,7 +950,7 @@ fn test_d3d9_depth_surface_create_bind_and_clear() {
         d3d9::handle_clear(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -975,7 +975,7 @@ fn test_d3d9_depth_surface_create_bind_and_clear() {
         d3d9::handle_get_depth_stencil_surface(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -991,7 +991,7 @@ fn test_d3d9_depth_surface_create_bind_and_clear() {
         d3d9::handle_surface_release(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         1
     );
@@ -1024,7 +1024,7 @@ fn test_d3d9_index_buffer_get_desc() {
         d3d9::handle_create_index_buffer(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1043,7 +1043,7 @@ fn test_d3d9_index_buffer_get_desc() {
         d3d9::handle_index_buffer_get_desc(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1095,7 +1095,7 @@ fn test_d3d9_texture_get_level_count() {
         d3d9::handle_create_texture(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1140,7 +1140,7 @@ fn test_d3d9_surface_get_desc() {
         d3d9::handle_create_render_target(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1158,7 +1158,7 @@ fn test_d3d9_surface_get_desc() {
         d3d9::handle_surface_get_desc(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );

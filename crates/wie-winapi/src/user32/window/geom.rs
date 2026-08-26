@@ -718,8 +718,10 @@ mod tests {
     /// Zero-heavy default state; the geometry handlers only touch the window
     /// records and the message queue.
     fn test_state() -> WinApiState {
-        let mut heap = GuestHeap::new(0x2000, 0x10000);
-        heap.attach_guest_control(0x2000);
+        let heap = std::sync::Arc::new(std::sync::Mutex::new(GuestHeap::new(0x2000, 0x10000)));
+        heap.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .attach_guest_control(0x2000);
         WinApiState {
             display: crate::DisplayMetrics::default(),
             heap_state: HeapState {

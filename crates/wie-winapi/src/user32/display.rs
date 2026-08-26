@@ -267,7 +267,12 @@ pub fn handle_enum_display_monitors(ctx: &mut HandlerContext<'_>) -> Result<WinA
     // it, so point it at the session's DisplayMetrics desktop geometry the
     // rest of the fake surface reports rather than NULL.
     let display = state.display;
-    let rect_va = state.heap_state.heap.alloc_coherent(engine, 16);
+    let rect_va = state
+        .heap_state
+        .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .alloc_coherent(engine, 16);
     if rect_va != 0 {
         write_guest_i32(engine, checked_address(rect_va, 0, "lprcMonitor.left"), 0)?;
         write_guest_i32(engine, checked_address(rect_va, 4, "lprcMonitor.top"), 0)?;

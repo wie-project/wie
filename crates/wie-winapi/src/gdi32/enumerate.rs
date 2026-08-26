@@ -402,6 +402,8 @@ fn start_enumeration(
     let buffer_va = state
         .heap_state
         .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .alloc_coherent(engine, u64::try_from(item_size).unwrap_or(0));
     if buffer_va == 0 {
         return ctx.finish(0);

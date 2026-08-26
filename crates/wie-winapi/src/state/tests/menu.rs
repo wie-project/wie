@@ -81,7 +81,7 @@ fn append_menu_a(
         0,
     );
     assert_return_value!(
-        user32::handle_append_menu_a(&mut HandlerContext::new(engine, test_environment(), state,)),
+        user32::handle_append_menu_a(&mut HandlerContext::new(engine, test_environment(), state)),
         1
     );
 }
@@ -169,7 +169,7 @@ fn test_get_menu_state_by_command_and_position() {
         user32::handle_get_menu_state(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -180,7 +180,7 @@ fn test_get_menu_state_by_command_and_position() {
         user32::handle_get_menu_state(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         u64::from(crate::user32::MF_SEPARATOR)
     );
@@ -191,7 +191,7 @@ fn test_get_menu_state_by_command_and_position() {
         user32::handle_get_menu_state(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         u64::from(u32::MAX)
     );
@@ -209,7 +209,7 @@ fn test_enable_menu_item_mutates_item_state() {
         user32::handle_enable_menu_item(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -234,7 +234,7 @@ fn test_enable_menu_item_mutates_item_state() {
         user32::handle_get_menu_state(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0x0001
     );
@@ -245,7 +245,7 @@ fn test_enable_menu_item_mutates_item_state() {
         user32::handle_enable_menu_item(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0x0001
     );
@@ -257,7 +257,7 @@ fn test_enable_menu_item_mutates_item_state() {
         user32::handle_enable_menu_item(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         u64::from(u32::MAX)
     );
@@ -275,7 +275,7 @@ fn test_check_menu_item_mutates_item_state() {
         user32::handle_check_menu_item(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -284,7 +284,7 @@ fn test_check_menu_item_mutates_item_state() {
         user32::handle_get_menu_state(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0x0008
     );
@@ -295,7 +295,7 @@ fn test_check_menu_item_mutates_item_state() {
         user32::handle_check_menu_item(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0x0008
     );
@@ -304,7 +304,7 @@ fn test_check_menu_item_mutates_item_state() {
         user32::handle_get_menu_state(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -328,7 +328,7 @@ fn test_menu_dirty_flag_semantics() {
         user32::handle_set_menu(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         1
     );
@@ -341,7 +341,7 @@ fn test_menu_dirty_flag_semantics() {
         user32::handle_destroy_menu(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         1
     );
@@ -361,7 +361,7 @@ fn test_menu_dirty_flag_semantics() {
         user32::handle_get_menu_state(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         u64::from(u32::MAX)
     );

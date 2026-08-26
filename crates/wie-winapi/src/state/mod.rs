@@ -686,6 +686,10 @@ impl WinApiState {
 ///
 /// Passed as `HandlerContext` to every handler so adding new context
 /// fields doesn't touch handler signatures and the dispatch table is uniform.
+///
+/// The heap lives in a dedicated `Arc<Mutex<GuestHeap>>` shard at the
+/// session level, next to the `Mutex<WinApiState>`; handlers that need the
+/// heap lock it via `ctx.heap` (order `global -> heap` when both are taken).
 pub struct HandlerContext<'a> {
     /// CPU engine (mem_read / mem_write / register access).
     pub engine: &'a mut dyn CpuEngine,
@@ -693,6 +697,8 @@ pub struct HandlerContext<'a> {
     pub environment: WinApiEnvironment,
     /// Full emulator state.
     pub state: &'a mut WinApiState,
+    /// Session-level heap shard (`Arc<Mutex<GuestHeap>>` in `wie-runtime`).
+    pub heap: Arc<Mutex<crate::GuestHeap>>,
 }
 
 impl<'a> HandlerContext<'a> {
@@ -701,10 +707,12 @@ impl<'a> HandlerContext<'a> {
         environment: WinApiEnvironment,
         state: &'a mut WinApiState,
     ) -> Self {
+        let heap = std::sync::Arc::clone(&state.heap_state.heap);
         Self {
             engine,
             environment,
             state,
+            heap,
         }
     }
 

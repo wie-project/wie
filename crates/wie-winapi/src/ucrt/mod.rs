@@ -398,7 +398,12 @@ fn handle_malloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let ptr = if size == 0 {
         0
     } else {
-        state.heap_state.heap.alloc_coherent(engine, size)
+        state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alloc_coherent(engine, size)
     };
     finish(engine, ptr)
 }
@@ -412,7 +417,12 @@ fn handle_calloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let ptr = if total == 0 {
         0
     } else {
-        let p = state.heap_state.heap.alloc_coherent(engine, total);
+        let p = state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alloc_coherent(engine, total);
         if p != 0 {
             let len = usize::try_from(total).unwrap_or(0);
             let zeros = vec![0_u8; len];
@@ -428,7 +438,12 @@ fn handle_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let state = &mut *ctx.state;
     let ptr = engine.read_rcx()?;
     if ptr != 0 {
-        let _ = state.heap_state.heap.free_coherent(engine, ptr);
+        let _ = state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_coherent(engine, ptr);
     }
     finish(engine, 0)
 }
@@ -442,18 +457,30 @@ fn handle_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
         let p = if new_size == 0 {
             0
         } else {
-            state.heap_state.heap.alloc_coherent(engine, new_size)
+            state
+                .heap_state
+                .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .alloc_coherent(engine, new_size)
         };
         return finish(engine, p);
     }
     if new_size == 0 {
-        let _ = state.heap_state.heap.free_coherent(engine, ptr);
+        let _ = state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .free_coherent(engine, ptr);
         return finish(engine, 0);
     }
     // Move-or-stay realloc shared with HeapReAlloc; the CRT path never zero-fills.
     let (new_addr, _old_size) = state
         .heap_state
         .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .realloc_coherent(engine, ptr, new_size)?;
     finish(engine, new_addr)
 }

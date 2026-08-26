@@ -236,6 +236,7 @@ pub(crate) struct SessionInit {
     pub(crate) engine: Box<dyn wie_cpu::CpuEngine>,
     pub(crate) environment: wie_winapi::WinApiEnvironment,
     pub(crate) winapi_state: wie_winapi::WinApiState,
+    pub(crate) heap: Arc<Mutex<wie_winapi::GuestHeap>>,
     pub(crate) soft_apis: SoftApiTable,
     pub(crate) layout: RuntimeMemoryLayout,
     pub(crate) stop_bitmap: Arc<[u8]>,
@@ -254,6 +255,7 @@ impl SessionInit {
         engine: Box<dyn wie_cpu::CpuEngine>,
         environment: wie_winapi::WinApiEnvironment,
         winapi_state: wie_winapi::WinApiState,
+        heap: Arc<Mutex<wie_winapi::GuestHeap>>,
         soft_apis: SoftApiTable,
         layout: RuntimeMemoryLayout,
         stop_bitmap: Arc<[u8]>,
@@ -267,6 +269,7 @@ impl SessionInit {
             engine,
             environment,
             winapi_state,
+            heap,
             soft_apis,
             layout,
             stop_bitmap,
@@ -300,8 +303,10 @@ impl super::RuntimeSession {
             st.wire_wake_hub();
             st.kernel.sync.wake_hub.clone()
         });
+        let heap = Arc::clone(&process.shared_heap);
         Ok(Self {
             process,
+            heap,
             wake_hub,
             entry_point_va,
             initial_rsp,
@@ -325,6 +330,7 @@ impl super::RuntimeSession {
             engine,
             environment,
             winapi_state,
+            heap,
             soft_apis,
             layout,
             stop_bitmap,
@@ -342,6 +348,7 @@ impl super::RuntimeSession {
             static_dll_mains,
         };
         let shared_winapi = Arc::new(Mutex::new(winapi_state));
+        let shared_heap = heap;
         // Clone the message-queue Arc so the host can post input without ever
         // locking the big WinApiState mutex.
         let shared_message_queue = {
@@ -362,6 +369,7 @@ impl super::RuntimeSession {
             shared_jit,
             guest_mem,
             shared_winapi,
+            shared_heap,
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
             shared_message_queue,
             worker_joins: Vec::new(),
@@ -994,6 +1002,9 @@ impl super::RuntimeSession {
         let executable_file_bytes = pe_bytes.clone();
 
         let mut winapi_state = default_winapi_state(&layout, executable_file_bytes, &process)?;
+        // Session-level heap shard: clone the Arc inside WinApiState so the
+        // global `WinApiState` mutex and the heap mutex are distinct locks.
+        let heap = Arc::clone(&winapi_state.heap_state.heap);
         // Real host display metrics when the GUI entry captured them; the
         // default fake desktop otherwise. Every dimension source on the
         // WinAPI surface reads `winapi_state.display`.
@@ -1093,9 +1104,8 @@ impl super::RuntimeSession {
         };
         winapi_state.file_io.stdin_bytes = options.stdin_bytes;
         winapi_state.file_io.stdin_cursor = 0;
-        winapi_state
-            .heap_state
-            .heap
+        heap.lock()
+            .unwrap_or_else(|e| e.into_inner())
             .attach_guest_control(guest_heap_cfg.ctrl_va);
 
         // Set the import resolver for dynamic DLL loading.
@@ -1206,6 +1216,7 @@ impl super::RuntimeSession {
             engine,
             environment,
             winapi_state,
+            Arc::clone(&heap),
             soft_apis,
             layout,
             stop_bitmap,

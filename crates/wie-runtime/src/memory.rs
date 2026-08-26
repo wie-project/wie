@@ -520,7 +520,10 @@ pub(crate) fn default_winapi_state(
     Ok(wie_winapi::WinApiState {
         display: wie_winapi::DisplayMetrics::default(),
         heap_state: wie_winapi::HeapState {
-            heap: wie_winapi::GuestHeap::new(layout.process_heap.base, heap_end),
+            heap: std::sync::Arc::new(std::sync::Mutex::new(wie_winapi::GuestHeap::new(
+                layout.process_heap.base,
+                heap_end,
+            ))),
             next_fls_index: 1,
             fls_slots: Vec::new(),
             guest_fls_table_va: layout.guest_fls_table.base,

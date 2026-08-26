@@ -174,7 +174,12 @@ fn create_window_ex_impl(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<Win
     // If there is a window procedure, send WM_CREATE via guest callback
     if window_proc != 0 {
         // Allocate CREATESTRUCT in guest memory (0x50 bytes)
-        let cs_va = state.heap_state.heap.alloc_coherent(engine, 0x50);
+        let cs_va = state
+            .heap_state
+            .heap
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alloc_coherent(engine, 0x50);
         if cs_va == 0 {
             // Allocation failed — return HWND without WM_CREATE
             return ctx.finish(hwnd);

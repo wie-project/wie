@@ -506,7 +506,6 @@ mod tests {
         pen_color,
     };
     use crate::gdi32::{handle_get_device_caps, handle_get_stock_object, handle_rectangle};
-    use crate::guest_heap::GuestHeap;
     use crate::guest_memory::{read_i32, read_u8, write_i32, write_u64};
     use crate::handles::{Hbrush, Hdc, Hpen};
     use crate::state::{
@@ -582,7 +581,9 @@ mod tests {
         WinApiState {
             display: crate::DisplayMetrics::default(),
             heap_state: HeapState {
-                heap: GuestHeap::new(0x2000, 0x10000),
+                heap: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::guest_heap::GuestHeap::new(0x2000, 0x10000),
+                )),
                 next_fls_index: 0,
                 fls_slots: Vec::new(),
                 guest_fls_table_va: 0,

@@ -323,9 +323,9 @@ pub fn handle_get_clipboard_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     };
     let size = u64::try_from(bytes.len()).context("clipboard payload length overflow")?;
     let va = ctx
-        .state
-        .heap_state
         .heap
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .alloc_coherent(engine, size.max(16));
     if va == 0 {
         ctx.state.process.last_error = ERROR_OUTOFMEMORY;
@@ -402,7 +402,13 @@ pub(crate) fn read_hglobal_bytes(
             Ok(bytes)
         }
         _ => {
-            if let Some(size) = state.heap_state.heap.size_of(hglobal) {
+            if let Some(size) = state
+                .heap_state
+                .heap
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .size_of(hglobal)
+            {
                 let size = usize::try_from(size)
                     .unwrap_or(HGLOBAL_READ_CAP)
                     .min(HGLOBAL_READ_CAP);

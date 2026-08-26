@@ -17,7 +17,7 @@ fn test_d3d9_caps_declare_pixel_shader_pipeline() {
         d3d9::handle_get_device_caps(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0 // D3D_OK
     );
@@ -73,7 +73,7 @@ fn test_d3d9_clear_fills_whole_backbuffer() {
         d3d9::handle_clear(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -120,7 +120,7 @@ fn test_d3d9_clear_fills_only_requested_rects() {
         d3d9::handle_clear(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -157,7 +157,7 @@ fn test_d3d9_begin_end_scene_flags() {
         d3d9::handle_begin_scene(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -171,7 +171,7 @@ fn test_d3d9_begin_end_scene_flags() {
         d3d9::handle_begin_scene(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0x8876_086c // D3DERR_INVALIDCALL
     );
@@ -180,7 +180,7 @@ fn test_d3d9_begin_end_scene_flags() {
         d3d9::handle_end_scene(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -194,7 +194,7 @@ fn test_d3d9_begin_end_scene_flags() {
         d3d9::handle_end_scene(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0x8876_086c
     );
@@ -224,7 +224,7 @@ fn test_d3d9_set_transform_and_viewport_state() {
         d3d9::handle_set_transform(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -252,7 +252,7 @@ fn test_d3d9_set_transform_and_viewport_state() {
         d3d9::handle_set_viewport(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -269,7 +269,7 @@ fn test_d3d9_set_transform_and_viewport_state() {
         d3d9::handle_get_viewport(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -298,7 +298,7 @@ fn test_d3d9_draw_primitive_up_rasterizes_triangle() {
         d3d9::handle_set_fvf(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -307,7 +307,7 @@ fn test_d3d9_draw_primitive_up_rasterizes_triangle() {
         d3d9::handle_begin_scene(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -320,7 +320,7 @@ fn test_d3d9_draw_primitive_up_rasterizes_triangle() {
         d3d9::handle_clear(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -355,7 +355,7 @@ fn test_d3d9_draw_primitive_up_rasterizes_triangle() {
         d3d9::handle_draw_primitive_up(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -387,7 +387,7 @@ fn test_d3d9_draw_primitive_up_rasterizes_triangle() {
         d3d9::handle_end_scene(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -396,7 +396,7 @@ fn test_d3d9_draw_primitive_up_rasterizes_triangle() {
         d3d9::handle_present(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -423,7 +423,7 @@ fn test_d3d9_present_publishes_surface_frame() {
         d3d9::handle_present(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -461,7 +461,7 @@ fn test_d3d9_create_render_target_allocates_surface() {
         d3d9::handle_create_render_target(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -492,7 +492,7 @@ fn test_d3d9_create_render_target_allocates_surface() {
         d3d9::handle_create_render_target(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0x8876_086c_u64
     );
@@ -525,7 +525,7 @@ fn test_d3d9_set_get_render_target_binding() {
         d3d9::handle_create_render_target(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -541,7 +541,7 @@ fn test_d3d9_set_get_render_target_binding() {
         d3d9::handle_set_render_target(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -554,7 +554,7 @@ fn test_d3d9_set_get_render_target_binding() {
         d3d9::handle_get_render_target(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -570,7 +570,7 @@ fn test_d3d9_set_get_render_target_binding() {
         d3d9::handle_set_render_target(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -580,7 +580,7 @@ fn test_d3d9_set_get_render_target_binding() {
         d3d9::handle_get_render_target(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -595,7 +595,7 @@ fn test_d3d9_set_get_render_target_binding() {
         d3d9::handle_set_render_target(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0x8876_086c_u64
     );
@@ -631,7 +631,7 @@ fn test_d3d9_clear_and_draw_route_to_bound_render_target() {
         d3d9::handle_create_render_target(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -655,7 +655,7 @@ fn test_d3d9_clear_and_draw_route_to_bound_render_target() {
         d3d9::handle_set_render_target(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -667,7 +667,7 @@ fn test_d3d9_clear_and_draw_route_to_bound_render_target() {
         d3d9::handle_clear(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -695,7 +695,7 @@ fn test_d3d9_clear_and_draw_route_to_bound_render_target() {
         d3d9::handle_set_fvf(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -704,7 +704,7 @@ fn test_d3d9_clear_and_draw_route_to_bound_render_target() {
         d3d9::handle_begin_scene(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -737,7 +737,7 @@ fn test_d3d9_clear_and_draw_route_to_bound_render_target() {
         d3d9::handle_draw_primitive_up(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -780,7 +780,7 @@ fn test_d3d9_clear_and_draw_route_to_bound_render_target() {
         d3d9::handle_surface_get_desc(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -816,7 +816,7 @@ fn test_d3d9_render_target_lock_unlock_round_trip() {
         d3d9::handle_create_render_target(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -833,7 +833,7 @@ fn test_d3d9_render_target_lock_unlock_round_trip() {
         d3d9::handle_surface_lock_rect(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -855,7 +855,7 @@ fn test_d3d9_render_target_lock_unlock_round_trip() {
         d3d9::handle_surface_unlock_rect(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -876,7 +876,7 @@ fn test_d3d9_render_target_lock_unlock_round_trip() {
         d3d9::handle_surface_release(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         1
     );
@@ -912,7 +912,7 @@ fn test_d3d9_draw_primitive_triangle() {
         d3d9::handle_set_fvf(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -922,7 +922,7 @@ fn test_d3d9_draw_primitive_triangle() {
         d3d9::handle_begin_scene(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -936,7 +936,7 @@ fn test_d3d9_draw_primitive_triangle() {
         d3d9::handle_clear(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -954,7 +954,7 @@ fn test_d3d9_draw_primitive_triangle() {
         d3d9::handle_create_vertex_buffer(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -972,7 +972,7 @@ fn test_d3d9_draw_primitive_triangle() {
         d3d9::handle_vertex_buffer_lock(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1008,7 +1008,7 @@ fn test_d3d9_draw_primitive_triangle() {
         d3d9::handle_vertex_buffer_unlock(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1022,7 +1022,7 @@ fn test_d3d9_draw_primitive_triangle() {
         d3d9::handle_set_stream_source(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1033,7 +1033,7 @@ fn test_d3d9_draw_primitive_triangle() {
         d3d9::handle_draw_primitive(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1072,7 +1072,7 @@ fn test_d3d9_draw_primitive_triangle() {
         d3d9::handle_end_scene(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1081,7 +1081,7 @@ fn test_d3d9_draw_primitive_triangle() {
         d3d9::handle_present(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1105,7 +1105,7 @@ fn test_d3d9_clear_sets_dirty_and_present_clears() {
         d3d9::handle_begin_scene(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1126,7 +1126,7 @@ fn test_d3d9_clear_sets_dirty_and_present_clears() {
         d3d9::handle_clear(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1137,7 +1137,7 @@ fn test_d3d9_clear_sets_dirty_and_present_clears() {
         d3d9::handle_end_scene(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );
@@ -1146,7 +1146,7 @@ fn test_d3d9_clear_sets_dirty_and_present_clears() {
         d3d9::handle_present(&mut HandlerContext::new(
             &mut engine,
             test_environment(),
-            &mut state,
+            &mut state
         )),
         0
     );

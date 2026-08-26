@@ -848,7 +848,6 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
-    use crate::guest_heap::GuestHeap;
     use crate::handles::Hdc;
     use crate::present::MessageQueue;
     use crate::sync_obj::SyncState;
@@ -1081,7 +1080,9 @@ mod tests {
         WinApiState {
             display: crate::DisplayMetrics::default(),
             heap_state: HeapState {
-                heap: GuestHeap::new(0x2000, 0x10000),
+                heap: std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::guest_heap::GuestHeap::new(0x2000, 0x10000),
+                )),
                 next_fls_index: 0,
                 fls_slots: Vec::new(),
                 guest_fls_table_va: 0,
