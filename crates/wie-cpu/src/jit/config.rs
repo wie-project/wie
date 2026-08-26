@@ -82,6 +82,39 @@ pub(super) struct JitConfig {
     simd_enabled: bool,
     tlb_neon_enabled: bool,
     string_inline_enabled: bool,
+    jit_workers: usize,
+}
+
+/// Bounds of the background worker-pool size (`WIE_JIT_WORKERS`).
+///
+/// One worker per pool is the floor (a zero-worker pool would strand every
+/// queued job); four is the ceiling because Cranelift compiles are
+/// CPU-bound and guest threads need the remaining cores for execution.
+const JIT_WORKERS_MIN: usize = 1;
+const JIT_WORKERS_MAX: usize = 4;
+
+/// Default background worker-pool size: half the reported parallelism.
+///
+/// Workers exist to overlap Cranelift compiles with guest execution, not to
+/// saturate the machine; halving leaves the other half of the cores to the
+/// 1:1 guest threads. Clamped so a single-core host still gets one worker.
+fn jit_workers_default() -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    (cores / 2).clamp(JIT_WORKERS_MIN, JIT_WORKERS_MAX)
+}
+
+/// Parse the background worker-pool size from `WIE_JIT_WORKERS`.
+///
+/// Absent or invalid input falls back to [`jit_workers_default`]; explicit
+/// values clamp into `[JIT_WORKERS_MIN, JIT_WORKERS_MAX]` like the siblings.
+fn jit_workers_from_env() -> usize {
+    match std::env::var("WIE_JIT_WORKERS") {
+        Ok(v) => v.parse::<usize>().map_or_else(
+            |_| jit_workers_default(),
+            |n| n.clamp(JIT_WORKERS_MIN, JIT_WORKERS_MAX),
+        ),
+        Err(_) => jit_workers_default(),
+    }
 }
 
 static CONFIG: OnceLock<JitConfig> = OnceLock::new();
@@ -230,6 +263,8 @@ impl JitConfig {
                 std::env::var("WIE_STRING_INLINE"),
                 Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             ),
+            // Background worker-pool size (`WIE_JIT_WORKERS`).
+            jit_workers: jit_workers_from_env(),
         }
     }
 
@@ -349,6 +384,13 @@ impl JitConfig {
     #[must_use]
     pub(super) fn string_inline_enabled(&self) -> bool {
         self.string_inline_enabled
+    }
+
+    /// Background worker-pool size (`WIE_JIT_WORKERS`, default ≈ cores/2,
+    /// clamped to [1, 4]).
+    #[must_use]
+    pub(super) fn jit_workers(&self) -> usize {
+        self.jit_workers
     }
 }
 

@@ -130,6 +130,8 @@ impl JitCpu {
         s.bg.compiles =
             s.bg.compiles
                 .saturating_add(self.shared.bg_compiles.load(Ordering::Relaxed));
+        s.bg.workers = u64::try_from(self.shared.bg_workers_spawned.load(Ordering::Relaxed))
+            .unwrap_or(u64::MAX);
         s.chain.epoch_bumps = s
             .chain
             .epoch_bumps
@@ -433,7 +435,12 @@ impl JitCpu {
                                     )
                                 };
                                 self.thread.pending_promote_thr = thr;
-                                match self.enqueue_bg(rip, &kind, inv_gen) {
+                                // Urgent lane: this thread keeps interpreting
+                                // THIS block now and re-enters the Queued
+                                // entry within one loop iteration, blocking
+                                // on its cell then — the compile latency is
+                                // on this guest thread's critical path.
+                                match self.enqueue_bg(rip, &kind, inv_gen, true) {
                                     BgEnqueueOutcome::Queued(_) => {
                                         // Continue on iced this visit; the wait
                                         // (if any) happens when this thread is
@@ -506,7 +513,9 @@ impl JitCpu {
                         self.defer_promotion(rip, thr);
                     } else {
                         self.thread.pending_promote_thr = thr;
-                        match self.enqueue_bg(rip, &kind, inv_gen) {
+                        // Urgent lane: the caller blocks on this job's cell
+                        // immediately below (`wait_bg_ready`).
+                        match self.enqueue_bg(rip, &kind, inv_gen, true) {
                             BgEnqueueOutcome::Queued(notify) => {
                                 if let Some(compiled) = self.wait_bg_ready(rip, &notify) {
                                     let meta = CompiledRunMeta::from(&compiled);
@@ -619,18 +628,27 @@ impl JitCpu {
         Ok((result, 1))
     }
 
-    /// Hand a block to the background compiler.
+    /// Hand a block to the background compiler pool.
     ///
-    /// Queues the exact decoded block so the worker compiles the same bytes the
+    /// Queues the exact decoded block so a worker compiles the same bytes the
     /// guest classified. `inv_gen` must be the generation snapshot taken
     /// before those bytes were decoded (see the bake-before-decode note in
     /// [`Self::step_one`]). The cache entry transitions to `Queued` only after
-    /// the queue slot is reserved (a full queue must never strand a Queued entry).
+    /// the queue slot is reserved (a full queue must never strand a Queued
+    /// entry).
+    ///
+    /// Lane selection: `urgent == true` marks jobs whose producer blocks (or
+    /// is about to block within one interpreted iteration) on this exact
+    /// compile — both promotion sites below qualify. Speculative prefetches
+    /// (`precompile_deferred_at`) pass `false`. Urgent jobs are processed
+    /// before every normal job already queued (see `BgQueue`'s ordering
+    /// contract).
     pub(super) fn enqueue_bg(
         &mut self,
         rip: u64,
         kind: &BlockKind,
         inv_gen: u64,
+        urgent: bool,
     ) -> BgEnqueueOutcome {
         if !self.shared.bg_enabled_here() || !self.shared.engine_ready.load(Ordering::Relaxed) {
             return BgEnqueueOutcome::Unavailable;
@@ -643,14 +661,13 @@ impl JitCpu {
             self.mark_never(rip);
             return BgEnqueueOutcome::Unavailable;
         }
-        let tx_guard = self.shared.bg_tx.lock().unwrap();
-        let Some(tx) = tx_guard.as_ref() else {
+        let Some(pool) = self.shared.bg_pool_arc() else {
             return BgEnqueueOutcome::Unavailable;
         };
-        if tx.try_send((rip, kind.clone(), inv_gen)).is_err() {
+        if !pool.push(rip, kind.clone(), inv_gen, urgent) {
             return BgEnqueueOutcome::Unavailable;
         }
-        // One in-flight item the worker has not processed yet.
+        // One in-flight item a worker has not processed yet.
         self.shared.bg_queue_depth.fetch_add(1, Ordering::Relaxed);
         // Transition the entry (only from Hot/absent; never clobber Ready/Never).
         let cache = self.shared.cache.pin();

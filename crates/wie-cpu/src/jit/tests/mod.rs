@@ -1,6 +1,7 @@
 // JIT parity / invalidation / background-worker integration tests.
 // Moved out of jit/mod.rs (file-size policy, ADR-002); wired via
 // `#[cfg(test)] #[allow(clippy::expect_used)] mod tests;`.
+mod bg_pool_tests;
 mod chain_tests;
 mod inv_gen_tests;
 mod strlen_repro;
@@ -15,7 +16,7 @@ use block::BlockKind;
 use config::JitConfig;
 use lower::{JitCtx, chain_table_insert};
 use pipeline::{next_cooldown_thr, ranges_overlap};
-use shared::{BgEnqueueOutcome, BgWaitCell};
+use shared::{BgEnqueueOutcome, BgPool, BgWaitCell};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -360,6 +361,7 @@ fn bg_worker_notpure_becomes_never() {
         base,
         &BlockKind::NotPure,
         cpu.shared.invalidate_gen.load(Ordering::Relaxed),
+        true,
     );
     assert!(matches!(outcome, BgEnqueueOutcome::Unavailable));
     assert!(matches!(
@@ -399,12 +401,12 @@ fn bg_worker_dedups_queued_entry() {
     };
     assert!(matches!(kind, BlockKind::Pure { .. }));
     let baked = cpu.shared.invalidate_gen.load(Ordering::Relaxed);
-    let first = cpu.enqueue_bg(base, &kind, baked);
+    let first = cpu.enqueue_bg(base, &kind, baked, true);
     assert!(matches!(first, BgEnqueueOutcome::Queued(_)));
     // A second enqueue of the same rip must not re-queue: either the entry
     // is still Queued (dedup → Unavailable) or the worker already won
     // (Ready). Never a fresh Queued cell.
-    let second = cpu.enqueue_bg(base, &kind, baked);
+    let second = cpu.enqueue_bg(base, &kind, baked, true);
     assert!(
         matches!(
             second,

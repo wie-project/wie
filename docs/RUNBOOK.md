@@ -95,6 +95,7 @@ The README keeps the shortlist; the complete set lives here.
 | `WIE_TLB_NEON=0` | Scalar 4-way TLB tag scan |
 | `WIE_JIT_OPT=speed\|speed_and_size\|none` | Cranelift opt_level (default **speed**) |
 | `WIE_JIT_HOTNESS_THRESHOLD` | **Experimental** fixed hotness threshold override (default **100**; clamped to `[1, 1_000_000]`) |
+| `WIE_JIT_WORKERS` | Background compile worker count (default ≈ `available_parallelism()/2`, clamped `[1, 4]`). More workers cut boot-time compile latency on multicore hosts; workers compete with guest threads for cores while active. |
 | `WIE_JIT_VERIFY=1` | Enable Cranelift IR verifier outside tests |
 | `WIE_FIXED_CLOCK=1` | Freeze the guest clock table (deterministic runs) |
 | `WIE_D3D9_SCALE=2\|4\|8` | D3D9 render resolution divisor (quarter-scale = 4; Present upscales to the window) |

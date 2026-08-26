@@ -51,7 +51,8 @@ fn bg_ledger_line(s: &JitStats) -> Option<String> {
         return None;
     }
     Some(format!(
-        "[wie] jit_bg_ledger: hit_ready={} stalled_ok={} timed_out={} cooled_down={} deferred={} (total={ledger_total})",
+        "[wie] jit_bg_ledger: workers={} hit_ready={} stalled_ok={} timed_out={} cooled_down={} deferred={} (total={ledger_total})",
+        s.bg.workers,
         s.promo.hit_ready,
         s.promo.stalled_ok,
         s.promo.timed_out,

@@ -1,4 +1,5 @@
-//! Process-wide compiled-code cache, guest memory, and the background compiler worker.
+//! Process-wide compiled-code cache, guest memory, and the background
+//! compiler worker pool.
 //!
 //! One [`JitShared`] per process, shared via `Arc` across all per-thread
 //! engines. Wait cells / enqueue outcomes / worker helpers used from
@@ -33,9 +34,10 @@ use crate::mem::GuestMemory;
 use crate::regs::RegFile;
 use ahash::HashMap;
 use ahash::HashMapExt;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 /// Per-entry completion token for background compiles.
@@ -124,6 +126,119 @@ pub(super) enum BgWaitState {
     Never,
 }
 
+/// One queued background-compile job.
+///
+/// `inv_gen` is the generation snapshot taken on the producing guest thread
+/// BEFORE the job's bytes were decoded (see [`JitShared::bg_pool`]).
+pub(super) struct BgJob {
+    /// Guest entry VA of the block.
+    pub(super) rip: u64,
+    /// Decoded block classification, baked at enqueue time.
+    kind: BlockKind,
+    /// Bake-before-decode generation snapshot. Guards depend on it: baking
+    /// an older-or-equal generation guarantees a guard mismatch whenever the
+    /// baked bytes went stale.
+    inv_gen: u64,
+}
+
+/// Mutex-protected work state for the background worker pool: two FIFO lanes
+/// plus the pool shutdown flag.
+///
+/// **Ordering semantics (chosen):** [`Self::pop_job`] drains the urgent lane
+/// FIFO first and only falls to the normal lane when no urgent job exists.
+/// An URGENT job is therefore *started* before every NORMAL job that was
+/// already queued at its enqueue time — and before every job enqueued after
+/// it in either lane. This is a pop-order guarantee, not a global completion
+/// order: with K workers, compiles run concurrently and completions
+/// interleave across workers. It is also not fairness for the normal lane —
+/// a sustained stream of urgents may starve normals; producers hitting the
+/// [`BG_QUEUE_CAP`] depth bound fall back to inline compilation, which caps
+/// how long any backlog can grow.
+pub(super) struct BgQueue {
+    /// Jobs whose producer blocks (or is about to block within one
+    /// interpreted iteration) on this exact compile.
+    urgent: VecDeque<BgJob>,
+    /// Speculative prefetches nobody waits on directly.
+    normal: VecDeque<BgJob>,
+    /// Set by [`JitShared`]'s `Drop` under this mutex: parked workers wake,
+    /// observe it, and exit. Producers can never race it — enqueueing
+    /// requires a strong `Arc<JitShared>`, which defers the drop.
+    shutdown: bool,
+}
+
+impl BgQueue {
+    /// Pop discipline for workers: urgent lane first, then normal lane;
+    /// each lane FIFO. See the type-level ordering contract.
+    pub(super) fn pop_job(&mut self) -> Option<BgJob> {
+        self.urgent.pop_front().or_else(|| self.normal.pop_front())
+    }
+
+    /// Append one job to its lane; `false` when the pool is shutting down or
+    /// the combined depth already sits at [`BG_QUEUE_CAP`] (the caller then
+    /// falls back to inline compilation).
+    fn push(&mut self, job: BgJob, urgent: bool) -> bool {
+        if self.shutdown || self.total_len() >= BG_QUEUE_CAP {
+            return false;
+        }
+        if urgent {
+            self.urgent.push_back(job);
+        } else {
+            self.normal.push_back(job);
+        }
+        true
+    }
+
+    /// Total queued jobs across both lanes (backpressure metric).
+    fn total_len(&self) -> usize {
+        self.urgent.len().saturating_add(self.normal.len())
+    }
+}
+
+/// Shared worker-pool handle: the guarded queue plus its wakeup condvar.
+///
+/// Owned jointly by [`JitShared`] (which flags shutdown on drop) and each
+/// worker thread (which captures an `Arc` clone). Deliberately OUTSIDE
+/// [`JitShared`]: a worker must be able to park on the condvar while holding
+/// only a `Weak<JitShared>` — parking would deadlock teardown if the condvar
+/// lived inside `JitShared`, since keeping it alive would keep the strong
+/// count nonzero forever.
+pub(super) struct BgPool {
+    /// Guarded queue state. Exposed `pub(super)` so JIT-module tests can lock
+    /// it and exercise the real pop discipline directly.
+    pub(super) q: Mutex<BgQueue>,
+    work_available: Condvar,
+}
+
+impl BgPool {
+    pub(super) fn new() -> Self {
+        Self {
+            q: Mutex::new(BgQueue {
+                urgent: VecDeque::new(),
+                normal: VecDeque::new(),
+                shutdown: false,
+            }),
+            work_available: Condvar::new(),
+        }
+    }
+
+    /// Enqueue one job and wake one worker; `false` when rejected (full /
+    /// shutting down). The queue mutex is held only here — never during
+    /// compilation — so producers never wait behind worker installs.
+    pub(super) fn push(&self, rip: u64, kind: BlockKind, inv_gen: u64, urgent: bool) -> bool {
+        let job = BgJob { rip, kind, inv_gen };
+        let accepted = {
+            let mut q = self.q.lock().unwrap();
+            q.push(job, urgent)
+        };
+        if accepted {
+            // One new job → wake exactly one parked worker. Workers batch-
+            // drain, so a burst of pushes still costs few wakeups overall.
+            self.work_available.notify_one();
+        }
+        accepted
+    }
+}
+
 /// Process-wide JIT compilation cache and guest memory, shared across threads.
 /// One instance per process, shared via Arc across all per-thread engines.
 #[doc(hidden)]
@@ -160,14 +275,22 @@ pub struct JitShared {
     pub mem_gen: AtomicU64,
     /// Whether the Cranelift engine was successfully initialized.
     pub engine_ready: AtomicBool,
-    /// Background compiler queue sender. The worker thread owns the receiver
-    /// and dies when this sender drops (i.e. when the last `Arc<JitShared>` goes
-    /// away). `None` when the worker was never spawned or failed to spawn.
-    /// Jobs carry `(rip, decoded kind, invalidate_gen snapshot)`: the
-    /// generation was read on the guest thread BEFORE the bytes were decoded,
-    /// so blocks compiled from pre-invalidation bytes never bake a newer
-    /// generation over them (a high/stale guard miss must be impossible).
-    pub bg_tx: Mutex<Option<SyncSender<(u64, BlockKind, u64)>>>,
+    /// Background compiler worker pool: guarded two-lane queue + wakeup
+    /// condvar, shared with every worker via `Arc`. Workers exit when this
+    /// state drops (its `Drop` flags shutdown and wakes all parked workers),
+    /// which requires the last strong `Arc<JitShared>` to go away — exactly
+    /// like the former channel-disconnect teardown. `None` when the pool was
+    /// never spawned or failed to spawn.
+    ///
+    /// Jobs carry `(rip, decoded kind, invalidate_gen snapshot)` inside
+    /// [`BgJob`]: the generation was read on the guest thread BEFORE the
+    /// bytes were decoded, so blocks compiled from pre-invalidation bytes
+    /// never bake a newer generation over them (a high/stale guard miss must
+    /// be impossible).
+    pub bg_pool: Mutex<Option<Arc<BgPool>>>,
+    /// Worker-pool size recorded at a successful spawn (`bg.workers` stat).
+    /// Zero while no pool was ever started for this instance.
+    pub bg_workers_spawned: AtomicUsize,
     /// Set once the worker thread has been spawned (spawn-once latch).
     pub bg_spawned: AtomicBool,
     /// Whether the background compiler is currently alive (set true on spawn,
@@ -252,7 +375,8 @@ impl JitShared {
             pending_code_overflow: AtomicBool::new(false),
             mem_gen: AtomicU64::new(0),
             engine_ready: AtomicBool::new(engine_ready),
-            bg_tx: Mutex::new(None),
+            bg_pool: Mutex::new(None),
+            bg_workers_spawned: AtomicUsize::new(0),
             bg_spawned: AtomicBool::new(false),
             bg_alive: Arc::new(AtomicBool::new(false)),
             cache_epoch: AtomicU64::new(0),
@@ -323,68 +447,147 @@ impl JitShared {
         self.cache.pin().insert(rip, CacheEntry::Ready(compiled));
     }
 
-    /// Spawn the background compiler thread exactly once.
+    /// Clone of the live pool handle (`None` before spawn / after a failed
+    /// spawn). Callers hold their own `Arc<JitShared>` while using it, so the
+    /// pool cannot be torn down mid-push.
+    pub(super) fn bg_pool_arc(&self) -> Option<Arc<BgPool>> {
+        self.bg_pool.lock().unwrap().clone()
+    }
+
+    /// Spawn the background compiler worker pool exactly once.
     ///
-    /// The thread is detached (no stored join handle): it holds a `Weak` to
-    /// this shared state and dies when the last `Arc` drops (the sender in
-    /// `bg_tx` disconnects, so `recv` errors). This avoids a self-join if the
-    /// worker happens to hold the final strong reference while a job runs.
+    /// K workers ([`JitConfig::jit_workers`], `WIE_JIT_WORKERS`) share one
+    /// [`BgPool`]. Each thread is detached (no stored join handle): it holds
+    /// a `Weak` to this shared state and exits when this state drops — the
+    /// `Drop` impl flags shutdown and wakes every parked worker. This avoids
+    /// a self-join if a worker happens to hold the final strong reference
+    /// while a job runs.
+    ///
+    /// `bg_alive` reflects "any worker alive": set once ≥ 1 worker spawned;
+    /// the last exiting worker clears it. Partial spawn failure (resource
+    /// limits) keeps the successfully spawned subset; total failure reverts
+    /// the spawn latch so callers fall back to inline compilation and a later
+    /// call can retry.
     pub(crate) fn ensure_bg_worker(self: &Arc<Self>) {
         if self.bg_spawned.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (tx, rx) = mpsc::sync_channel::<(u64, BlockKind, u64)>(BG_QUEUE_CAP);
-        *self.bg_tx.lock().unwrap() = Some(tx);
-        let weak = Arc::downgrade(self);
+        let k = JitConfig::get().jit_workers();
+        let pool = Arc::new(BgPool::new());
+        *self.bg_pool.lock().unwrap() = Some(Arc::clone(&pool));
+        // Live-worker countdown: the last exiting worker clears `bg_alive`
+        // so guests stop waiting on a dead pool and inline-compile instead.
+        let remaining = Arc::new(AtomicUsize::new(k));
         let alive = Arc::clone(&self.bg_alive);
-        let spawned = std::thread::Builder::new()
-            .name("wie-jit-bg-compiler".into())
-            .spawn(move || {
-                Self::bg_worker_main(&weak, &rx);
-                alive.store(false, Ordering::Release);
-            });
-        if spawned.is_ok() {
-            // The worker is up (it can only exit after this sender drops,
-            // which requires the shared state to be gone — impossible while
-            // we hold `self`). Guests may enqueue immediately.
-            self.bg_alive.store(true, Ordering::Release);
+        let mut spawned = 0_usize;
+        for i in 0..k {
+            let weak = Arc::downgrade(self);
+            let pool = Arc::clone(&pool);
+            let remaining = Arc::clone(&remaining);
+            let alive = Arc::clone(&alive);
+            let name = format!("wie-jit-bg-{i}");
+            let spawned_ok = std::thread::Builder::new()
+                .name(name)
+                .spawn(move || {
+                    Self::bg_worker_main(&weak, &pool);
+                    if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        alive.store(false, Ordering::Release);
+                    }
+                })
+                .is_ok();
+            if spawned_ok {
+                if spawned == 0 {
+                    // First live worker: open the gate NOW so concurrent
+                    // producers queue instead of inline-compiling while the
+                    // rest of the pool warms up.
+                    self.bg_alive.store(true, Ordering::Release);
+                }
+                spawned = spawned.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        if spawned > 0 {
+            // The pool is up (workers can only exit after this state drops,
+            // which requires the shared state gone — impossible while we
+            // hold `self`). Guests may enqueue immediately.
+            self.bg_workers_spawned.store(spawned, Ordering::Relaxed);
+            // Compensate the live-worker countdown for workers that failed
+            // to spawn so it reaches zero exactly when the real workers do
+            // (otherwise a partially spawned pool could never clear
+            // `bg_alive`).
+            let never_spawned = k - spawned;
+            if never_spawned > 0 {
+                remaining.fetch_sub(never_spawned, Ordering::AcqRel);
+            }
         } else {
-            // Spawn failed (resource limits): revert so callers fall back
-            // to inline compilation and a later call can retry.
+            // Spawn failed entirely (resource limits): revert so callers fall
+            // back to inline compilation and a later call can retry.
             self.bg_spawned.store(false, Ordering::Release);
-            self.bg_tx.lock().unwrap().take();
+            self.bg_pool.lock().unwrap().take();
         }
     }
 
-    /// Worker main loop: compile queued blocks, install Ready entries, fire
-    /// completion tokens. Exits when the channel disconnects (shared state
-    /// dropped).
+    /// Worker main loop: pick jobs urgent-first, compile, install Ready
+    /// entries, fire completion tokens. Exits when this shared state drops
+    /// (its `Drop` sets the shutdown flag under the queue mutex and wakes
+    /// every parked worker).
     ///
-    /// Batch-drain: after each blocking `recv`, the loop pulls every item
-    /// already queued via `try_recv` before sleeping again, so a promotion
-    /// burst costs one wakeup instead of one wakeup per block.
-    fn bg_worker_main(shared: &Weak<Self>, rx: &Receiver<(u64, BlockKind, u64)>) {
-        while let Ok(first) = rx.recv() {
-            let Some(shared) = shared.upgrade() else {
-                break;
+    /// Batch-drain: after each blocking wait, the loop pulls EVERY item
+    /// already queued before sleeping again, so a promotion burst costs one
+    /// wakeup instead of one wakeup per block (semantics preserved from the
+    /// single-worker channel design).
+    ///
+    /// Lock discipline: the queue mutex is held ONLY to select jobs — never
+    /// during compilation — so no path holds it across an install and
+    /// workers cannot deadlock against producers or each other.
+    fn bg_worker_main(shared: &Weak<Self>, pool: &BgPool) {
+        let mut guard = pool.q.lock().unwrap();
+        loop {
+            // Block until a job arrives or the pool shuts down. The flag is
+            // read under the same mutex `JitShared::drop` writes it under,
+            // so there is no lost-wakeup window between check and park.
+            let first = loop {
+                if let Some(job) = guard.pop_job() {
+                    break job;
+                }
+                if guard.shutdown {
+                    return;
+                }
+                guard = pool.work_available.wait(guard).unwrap();
             };
-            shared.bg_process_one(first);
+            drop(guard);
+            // One upgrade per batch: holding a strong ref for the whole
+            // batch guarantees teardown (drop → shutdown flag) cannot land
+            // mid-drain. An upgrade failure here means producers and waiters
+            // are already gone (both need strong refs), so dropping the job
+            // loses nothing observable.
+            let Some(live) = shared.upgrade() else {
+                return;
+            };
+            live.bg_process_one(first);
             // Batch-drain: pull every currently-queued item before blocking
             // again so a promotion burst costs one wakeup, not one per block.
-            // We hold a strong `shared` for the whole batch, so teardown
-            // cannot land mid-drain.
-            while let Ok(item) = rx.try_recv() {
-                shared.bg_process_one(item);
-            }
+            guard = loop {
+                let mut g = pool.q.lock().unwrap();
+                match g.pop_job() {
+                    Some(job) => {
+                        drop(g);
+                        live.bg_process_one(job);
+                    }
+                    None => break g, // queue dry; keep the lock for phase 1
+                }
+            };
         }
     }
 
     /// Compile + install one queued job (shared by the blocking and
     /// batch-drain paths). Decrements [`Self::bg_queue_depth`] exactly once.
     /// `inv_gen` is the generation snapshot taken before the job's bytes were
-    /// decoded (see [`Self::bg_tx`]).
-    fn bg_process_one(&self, (rip, kind, inv_gen): (u64, BlockKind, u64)) {
+    /// decoded (see [`Self::bg_pool`]).
+    fn bg_process_one(&self, job: BgJob) {
         self.bg_queue_depth.fetch_sub(1, Ordering::Relaxed);
+        let BgJob { rip, kind, inv_gen } = job;
         let mem_gen_before = self.mem_gen.load(Ordering::Acquire);
         // Arc clone: refcount bump only (table is built once per engine).
         let fast_api = self.bg_fast_api.lock().unwrap().clone();
@@ -664,6 +867,28 @@ impl JitShared {
 unsafe impl Send for JitShared {}
 #[expect(unsafe_code)]
 unsafe impl Sync for JitShared {}
+
+impl Drop for JitShared {
+    /// Flag pool shutdown and wake every parked worker so they exit promptly.
+    ///
+    /// Runs only at strong-count zero, so no producer can race the flag
+    /// (enqueueing requires a strong ref), and any worker mid-batch holds a
+    /// strong ref that defers this drop until its batch completes. Workers
+    /// clear `bg_alive` themselves as they exit.
+    fn drop(&mut self) {
+        let Some(pool) = self.bg_pool.lock().unwrap().take() else {
+            return; // never spawned (or failed-spawn revert already ran)
+        };
+        {
+            // Write the flag under the queue mutex: a worker either reads it
+            // before parking (this order) or is woken by the notify below.
+            // No lost-wakeup window exists between check and park.
+            let mut q = pool.q.lock().unwrap();
+            q.shutdown = true;
+        }
+        pool.work_available.notify_all();
+    }
+}
 
 /// Per-thread JIT execution state: registers, TLB, chain table, shadow stack.
 /// One instance per guest thread. Not shared.

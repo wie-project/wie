@@ -159,6 +159,10 @@ pub struct BgCompileStats {
     pub wait_us: u64,
     /// Inline compilations after a wait gave up (worker dead/unavailable).
     pub inline_fallbacks: u64,
+    /// Background worker-pool size at spawn (shared counter; merged into
+    /// per-thread snapshots by [`JitCpu::stats`]). Zero while no pool was
+    /// ever started for this `JitShared`.
+    pub workers: u64,
 }
 
 /// Per-enqueue resolution of the background-promotion pipeline (G5/P2).

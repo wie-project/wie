@@ -283,7 +283,11 @@ impl CpuEngine for JitCpu {
             let mem = self.shared.mem.read().unwrap();
             super::block::decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), address)
         };
-        match self.enqueue_bg(address, &kind, inv_gen) {
+        // Normal lane: nobody waits on this job — the compile overlaps with
+        // session init and the miss path waits (bounded) only if the guest
+        // reaches the block before it lands. Urgent jobs (guest-thread
+        // promotions) jump ahead of these.
+        match self.enqueue_bg(address, &kind, inv_gen, false) {
             super::shared::BgEnqueueOutcome::Queued(_) | super::shared::BgEnqueueOutcome::Ready => {
             }
             super::shared::BgEnqueueOutcome::Unavailable => {
