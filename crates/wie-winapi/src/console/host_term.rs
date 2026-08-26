@@ -393,7 +393,11 @@ pub(crate) fn take_ctrlc_for_profile_stop() -> bool {
     pending
 }
 
-/// The cached-once `WIE_RUNTIME_PROFILE` presence gate.
+/// The cached-once diagnostics-SIGINT gate.
+///
+/// Armed by `WIE_RUNTIME_PROFILE` (full report) or `WIE_JIT_OPCODE_HISTO=1`
+/// (histogram-only): either knob makes Ctrl+C stop the session cleanly so the
+/// opt-in diag sections dump instead of the process dying silently.
 ///
 /// Test runs force the value through [`GATE_OVERRIDE`] instead of mutating
 /// the process environment (racy under threads); production reads the env
@@ -405,11 +409,15 @@ fn profile_sigint_gate() -> bool {
     {
         return forced;
     }
-    *PROFILE_SIGINT_GATE.get_or_init(|| std::env::var_os("WIE_RUNTIME_PROFILE").is_some())
+    *PROFILE_SIGINT_GATE.get_or_init(|| {
+        std::env::var_os("WIE_RUNTIME_PROFILE").is_some()
+            || std::env::var_os("WIE_JIT_OPCODE_HISTO").is_some()
+    })
 }
 
-/// True when profiling is armed (`WIE_RUNTIME_PROFILE` set): Ctrl+C stops the
-/// session instead of reaching the guest.
+/// True when profiling is armed (`WIE_RUNTIME_PROFILE` or
+/// `WIE_JIT_OPCODE_HISTO` set): Ctrl+C stops the session instead of reaching
+/// the guest.
 pub(crate) fn profile_sigint_armed() -> bool {
     profile_sigint_gate()
 }

@@ -585,13 +585,17 @@ pub(crate) fn run_console_interactive(
         match summary.termination {
             wie_runtime::EntryTraceTermination::ExitProcess { code } => break code,
             wie_runtime::EntryTraceTermination::HostInterrupt => {
-                // Ctrl+C under `WIE_RUNTIME_PROFILE`: this thread owns the
-                // session, so the profile report prints here (the micro path
-                // prints it from the runtime summary instead). CPU-time
-                // deltas stay 0 — wall time plus the JIT/host counters are
-                // the useful part of a manual collection.
+                // Ctrl+C under `WIE_RUNTIME_PROFILE` or
+                // `WIE_JIT_OPCODE_HISTO`: this thread owns the session, so the
+                // profile report prints here (the micro path prints it from
+                // the runtime summary instead). CPU-time deltas stay 0 — wall
+                // time plus the JIT/host counters are the useful part of a
+                // manual collection. finalize runs for either knob: with only
+                // the histogram armed, profile_enabled() is false but the
+                // gated diag dump (iced counters, opcode histogram) must
+                // still fire.
+                session.finalize_profile(run_t0.elapsed().as_nanos(), 0, 0);
                 if session.profile_enabled() {
-                    session.finalize_profile(run_t0.elapsed().as_nanos(), 0, 0);
                     eprintln!("{}", session.profile().report());
                 }
                 // Exit 130 (128 + SIGINT). `TerminalRawGuard`'s Drop does not

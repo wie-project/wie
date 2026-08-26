@@ -1056,16 +1056,22 @@ pub fn run_gui_windowed(
                         // Run the guest.
                         let run_t0 = std::time::Instant::now();
                         let result = run_windowed(&mut session, &control);
-                        // Ctrl+C under `WIE_RUNTIME_PROFILE`: THIS thread owns
-                        // the session, so the profile report can only print
+                        // Ctrl+C under `WIE_RUNTIME_PROFILE` or
+                        // `WIE_JIT_OPCODE_HISTO`: THIS thread owns the
+                        // session, so the report/diag dump can only print
                         // here — the event loop never had access to it (same
                         // shape as gui/headless.rs). CPU-time deltas stay 0;
                         // wall time plus the JIT/host counters are the part a
-                        // manual Ctrl+C collection cares about.
+                        // manual Ctrl+C collection cares about. finalize runs
+                        // for either knob: with only the histogram armed,
+                        // profile_enabled() is false but the gated diag dump
+                        // (iced counters, opcode histogram) must still fire.
                         let interrupted = matches!(&result, Ok(GuiOutcome::HostInterrupt));
-                        if interrupted && session.profile_enabled() {
+                        if interrupted {
                             session.finalize_profile(run_t0.elapsed().as_nanos(), 0, 0);
-                            eprintln!("{}", session.profile().report());
+                            if session.profile_enabled() {
+                                eprintln!("{}", session.profile().report());
+                            }
                         }
                         let code = control.exit_code.load(std::sync::atomic::Ordering::SeqCst);
                         if interrupted {

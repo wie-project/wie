@@ -631,7 +631,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                         .map(|()| u64::from_le_bytes(slot))
                 })
                 .unwrap_or(0);
-            tracing::warn!(target: "wie_exit", code = exit_code, caller_rip = format_args!("0x{caller_rip:#x}"), "ExitProcess");
+            tracing::warn!(target: "wie_exit", code = exit_code, caller_rip = format_args!("{caller_rip:#x}"), "ExitProcess");
             self.events.push(EntryTraceEvent {
                 index: api_index,
                 library: resolved.library.clone().into(),

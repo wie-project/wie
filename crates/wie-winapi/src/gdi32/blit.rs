@@ -588,7 +588,18 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     // SRCCOPY path: read from source DIB, write to destination surface.
     let Some((src_va, src_stride, src_w, src_h, top_down)) = resolve_src_info(state, hdc_src)
     else {
-        tracing::debug!("BitBlt: invalid source");
+        let dc_bitmap = {
+            let gdi = state.gdi_state();
+            gdi.find_dc(crate::handles::Hdc::from(hdc_src))
+                .map(|dc| dc.selected_bitmap.map(|b| b.as_u64()))
+        };
+        tracing::debug!(
+            target: "wie_gdi",
+            hdc_src = format_args!("0x{hdc_src:#x}"),
+            dc_found = dc_bitmap.is_some(),
+            selected_bitmap = ?dc_bitmap.flatten(),
+            "BitBlt: invalid source"
+        );
         return ctx.finish(1);
     };
     let Some(info) = resolve_dest_info(state, hdc_dst) else {
@@ -639,6 +650,38 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
 
     // B9(c): time the mask copy (copy ①) — only when frame timing is enabled.
     let blit_t0 = crate::present::frame_timing_enabled().then(std::time::Instant::now);
+
+    // Sampled source-pixel probe: is the guest framebuffer carrying real
+    // content, or is every frame blank? Every 512th blit logs three pixels
+    // (top-left, centre, bottom-right of the clipped rect).
+    {
+        use std::cell::Cell;
+        thread_local!(static BLIT_N: Cell<u64> = const { Cell::new(0) });
+        let n = BLIT_N.with(|c| c.replace(c.get().wrapping_add(1)));
+        if n.is_multiple_of(512) {
+            let mut px = |px_x: i32, px_y: i32| -> u32 {
+                let va = src_va
+                    .wrapping_add(i64::from(px_y).wrapping_mul(i64::from(src_stride)) as u64)
+                    .wrapping_add(i64::from(px_x).wrapping_mul(4) as u64);
+                let mut b = [0_u8; 4];
+                if engine.mem_read(va, &mut b).is_ok() {
+                    u32::from_le_bytes(b)
+                } else {
+                    0xDEAD_BEEF
+                }
+            };
+            let mid_x = sx + cw / 2;
+            let mid_y = sy + ch / 2;
+            tracing::debug!(
+                target: "wie_gdi",
+                n,
+                tl = format_args!("0x{:08x}", px(sx, sy)),
+                mid = format_args!("0x{:08x}", px(mid_x, mid_y)),
+                br = format_args!("0x{:08x}", px(sx + cw - 1, sy + ch - 1)),
+                "BitBlt source pixels"
+            );
+        }
+    }
 
     // Blit rows: scope the dest borrow so we can re-borrow state for publish.
     {
