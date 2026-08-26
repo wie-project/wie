@@ -72,6 +72,11 @@ pub(crate) fn install_guest_enum_callback_frame(
 
 /// Shared Win64 callback-frame writer: write the trampoline return address,
 /// clear the shadow space, set RSP/args/RIP.
+///
+/// The extra 8 bytes at `[rsp+0x28]` (the 5th Win64 stack arg) are also zeroed
+/// so a `LPTIMECALLBACK` (`uTimerID, uMsg, dwUser, dw1, dw2`) sees `dw2 == 0`
+/// without a dedicated timer frame. The slot is padding for 4-arg WndProcs and
+/// harmless to zero there.
 fn write_callback_frame(
     engine: &mut dyn CpuEngine,
     trampoline: u64,
@@ -96,6 +101,15 @@ fn write_callback_frame(
     engine
         .mem_write(shadow_address, &[0_u8; 0x20])
         .context("failed to clear guest callback shadow space")?;
+
+    // 5th stack arg slot for timer callbacks (`dw2`): zeroed for all callbacks
+    // (padding for WndProc, required zero for `timeSetEvent`).
+    let stack_arg_addr = frame_rsp
+        .checked_add(0x28)
+        .context("guest callback stack arg address overflow")?;
+    engine
+        .mem_write(stack_arg_addr, &0_u64.to_le_bytes())
+        .context("failed to clear guest callback stack arg")?;
 
     engine
         .write_rsp(frame_rsp)

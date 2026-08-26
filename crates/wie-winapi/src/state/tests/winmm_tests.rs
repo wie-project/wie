@@ -181,3 +181,123 @@ fn test_wave_out_prepare_header_valid_noerror() {
     let result = dispatch_winmm(&mut engine, &mut state, "waveOutPrepareHeader");
     assert_eq!(result, 0, "MMSYSERR_NOERROR");
 }
+
+/// Write the 5th Win64 stack arg (`fuEvent`) for `timeSetEvent` at
+/// `[rsp+0x28]`, like `PeekMessage`'s `wRemoveMsg`.
+fn set_time_set_event_flags(engine: &mut IcedCpu, flags: u32) {
+    let rsp = engine.read_rsp().expect("rsp for flags");
+    engine
+        .mem_write(rsp.wrapping_add(0x28), &flags.to_le_bytes())
+        .expect("write fuEvent flags");
+}
+
+#[test]
+fn test_pop_due_one_shot_zero_delay() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    set_time_set_event_flags(&mut engine, 0); // TIME_ONESHOT
+    write_regs(&mut engine, 0, 1, 0x1234, 0x5678, 0);
+    let handle = dispatch_winmm(&mut engine, &mut state, "timeSetEvent");
+    let due = state
+        .winmm()
+        .timer_records_full()
+        .first()
+        .map_or(0, |r| r.4);
+    let popped = state.pop_due_timers(due);
+    assert_eq!(
+        popped.len(),
+        1,
+        "delay 0 one-shot must be due at its due tick"
+    );
+    assert_eq!(popped.first().map(|d| d.handle), Some(handle));
+    assert_eq!(popped.first().map(|d| d.callback_va), Some(0x1234));
+    assert_eq!(popped.first().map(|d| d.user_data), Some(0x5678));
+    assert_eq!(
+        state.winmm().timer_records().len(),
+        0,
+        "one-shot must be removed after pop"
+    );
+    // Second pop at same tick finds nothing.
+    assert_eq!(state.pop_due_timers(due).len(), 0);
+}
+
+#[test]
+fn test_pop_due_periodic_rearms_and_kill() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let delay = 10_u32;
+    set_time_set_event_flags(&mut engine, 0x0001); // TIME_PERIODIC
+    write_regs(&mut engine, u64::from(delay), 1, 0x1234, 0x5678, 0);
+    let handle = dispatch_winmm(&mut engine, &mut state, "timeSetEvent");
+    let due = state
+        .winmm()
+        .timer_records_full()
+        .first()
+        .map_or(0, |r| r.4);
+    // First fire at due.
+    let first = state.pop_due_timers(due);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first.first().map(|d| d.handle), Some(handle));
+    // Re-armed: due += delay, still present.
+    let rearmed_due = state
+        .winmm()
+        .timer_records_full()
+        .first()
+        .map_or(0, |r| r.4);
+    assert_eq!(rearmed_due, due.wrapping_add(delay));
+    assert_eq!(
+        state.winmm().timer_records_full().first().map(|r| r.5),
+        Some(true),
+        "periodic flag must persist"
+    );
+    // Not yet due at old due.
+    assert_eq!(state.pop_due_timers(due).len(), 0);
+    // Due again at new due.
+    let second = state.pop_due_timers(rearmed_due);
+    assert_eq!(second.len(), 1);
+    assert_eq!(second.first().map(|d| d.handle), Some(handle));
+    // Kill stops periodic.
+    write_regs(&mut engine, handle, 0, 0, 0, 0);
+    assert_eq!(dispatch_winmm(&mut engine, &mut state, "timeKillEvent"), 0);
+    assert_eq!(state.winmm().timer_records().len(), 0);
+    assert_eq!(
+        state.pop_due_timers(rearmed_due.wrapping_add(delay)).len(),
+        0,
+        "killed periodic must not fire again"
+    );
+}
+
+#[test]
+fn test_pop_due_not_due_stays() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    set_time_set_event_flags(&mut engine, 0); // one-shot
+    write_regs(&mut engine, 1000, 1, 0x1234, 0x5678, 0);
+    dispatch_winmm(&mut engine, &mut state, "timeSetEvent");
+    let due = state
+        .winmm()
+        .timer_records_full()
+        .first()
+        .map_or(0, |r| r.4);
+    let not_due = due.wrapping_sub(1);
+    let popped = state.pop_due_timers(not_due);
+    assert_eq!(popped.len(), 0, "timer must not fire before due");
+    assert_eq!(state.winmm().timer_records().len(), 1, "timer stays put");
+}
+
+#[test]
+fn test_pop_next_due_timer_singular() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    set_time_set_event_flags(&mut engine, 0);
+    write_regs(&mut engine, 5, 1, 0x1111, 0x2222, 0);
+    let handle = dispatch_winmm(&mut engine, &mut state, "timeSetEvent");
+    let due = state
+        .winmm()
+        .timer_records_full()
+        .first()
+        .map_or(0, |r| r.4);
+    let one = state.pop_next_due_timer(due);
+    assert_eq!(one.as_ref().map(|d| d.handle), Some(handle));
+    assert_eq!(state.pop_next_due_timer(due), None);
+}

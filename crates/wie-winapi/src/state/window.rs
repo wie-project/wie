@@ -1071,6 +1071,26 @@ pub struct GuestCallbackRequest {
     pub outer_return: OuterReturn,
 }
 
+impl GuestCallbackRequest {
+    /// Construct a WINMM `timeSetEvent` timer callback request.
+    ///
+    /// Win64 ABI: `rcx = handle (uTimerID)`, `rdx = uMsg (0)`, `r8 = user_data
+    /// (dwUser)`, `r9 = 0 (dw1)`, `[rsp+0x28] = 0 (dw2)`. The last stack slot is
+    /// zeroed by the frame writer (`install_guest_callback_frame`).
+    #[must_use]
+    pub fn timer(handle: u64, callback_va: u64, user_data: u64) -> Self {
+        Self {
+            callback_address: callback_va,
+            window_handle: handle,
+            message: 0,
+            word_parameter: user_data,
+            long_parameter: 0,
+            unicode: false,
+            outer_return: OuterReturn::Passthrough,
+        }
+    }
+}
+
 /// A queued fake USER32 message.
 #[derive(Debug, Clone)]
 pub struct QueuedWindowMessage {

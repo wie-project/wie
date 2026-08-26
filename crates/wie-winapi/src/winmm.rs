@@ -18,6 +18,25 @@ const MMSYSERR_NOERROR: u64 = 0;
 /// `MMSYSERR_INVALPARAM` — a required NULL pointer was passed.
 const MMSYSERR_INVALPARAM: u64 = 11;
 
+/// `TIME_ONESHOT` — `timeSetEvent` fires once.
+const TIME_ONESHOT: u32 = 0x0000;
+/// `TIME_PERIODIC` — `timeSetEvent` fires repeatedly.
+const TIME_PERIODIC: u32 = 0x0001;
+
+/// A due multimedia timer ready to fire.
+///
+/// Returned by [`WinmmState::pop_due_timers`]; the pump turns each into a
+/// [`crate::GuestCallbackRequest`] for the guest `LPTIMECALLBACK`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueTimer {
+    /// Timer handle (`uTimerID`).
+    pub handle: u64,
+    /// Guest callback VA (`fptc`).
+    pub callback_va: u64,
+    /// User data (`dwUser`).
+    pub user_data: u64,
+}
+
 /// WINMM timer/audio handle tables (`timeSetEvent`, `waveOut*`), owned by
 /// this module and heap-allocated on first load via `DllId::Winmm`.
 #[derive(Debug, Default)]
@@ -31,17 +50,126 @@ pub struct WinmmState {
 
 /// One live `timeSetEvent` registration.
 ///
-/// WIE runs no host timer thread: the callback is stored, not fired. A guest
-/// that drives its message loop / Sleep will hit the host frequently, but
-/// firing the guest callback from an arbitrary host stop is out of scope for
-/// this milestone (documented no-op).
-#[allow(dead_code)] // stored for the future callback path; only `handle` is read today
+/// Each timer stores its absolute `due_tick_ms` (wrapping `u32` ms since
+/// session epoch) and whether it is periodic. The pump polls
+/// [`WinmmState::pop_due_timers`] at safe boundaries (host stops and the
+/// `WaitingForMessage` idle point) and dispatches due callbacks as guest
+/// `LPTIMECALLBACK` invocations. While a timer callback runs, remaining due
+/// timers wait for the next boundary (reentrancy guard in the pump checks
+/// `pending_callbacks`); a callback that itself calls `timeSetEvent` naturally
+/// enqueues a future record.
+///
+/// `due_tick_ms` uses wrapping `u32` addition so the 49.7-day `GetTickCount`
+/// wrap is transparent (`wrapping_add` / `wrapping_sub` with the 0x8000_0000
+/// half-range test).
 #[derive(Debug)]
 struct WinmmTimerRecord {
     handle: u64,
     delay_ms: u32,
     callback_va: u64,
     user_data: u64,
+    due_tick_ms: u32,
+    periodic: bool,
+}
+
+impl WinmmState {
+    /// Return and remove due timers for `now_tick`.
+    ///
+    /// One-shot timers are removed; periodic timers are re-armed
+    /// (`due_tick_ms += delay_ms`) and remain live. The caller should dispatch
+    /// at most one callback per boundary while `pending_callbacks` is non-empty
+    /// (see pump reentrancy rule) — remaining due timers will be returned on
+    /// the next poll.
+    pub fn pop_due_timers(&mut self, now_tick: u32) -> Vec<DueTimer> {
+        let mut due = Vec::new();
+        let mut index = 0;
+        while index < self.timers.len() {
+            let is_due = {
+                let rec = match self.timers.get(index) {
+                    Some(r) => r,
+                    None => break,
+                };
+                is_due_tick(now_tick, rec.due_tick_ms)
+            };
+            if is_due {
+                let periodic = self.timers.get(index).is_some_and(|r| r.periodic);
+                let delay = self.timers.get(index).map_or(0, |r| r.delay_ms);
+                let handle = self.timers.get(index).map_or(0, |r| r.handle);
+                let callback_va = self.timers.get(index).map_or(0, |r| r.callback_va);
+                let user_data = self.timers.get(index).map_or(0, |r| r.user_data);
+                due.push(DueTimer {
+                    handle,
+                    callback_va,
+                    user_data,
+                });
+                if periodic {
+                    if let Some(rec) = self.timers.get_mut(index) {
+                        rec.due_tick_ms = rec.due_tick_ms.wrapping_add(delay);
+                    }
+                    index = index.saturating_add(1);
+                } else if index < self.timers.len() {
+                    self.timers.remove(index);
+                } else {
+                    break;
+                }
+            } else {
+                index = index.saturating_add(1);
+            }
+        }
+        due
+    }
+
+    /// Pop the next due timer, if any, for `now_tick`.
+    ///
+    /// Like [`Self::pop_due_timers`] but drains at most one entry — the
+    /// pump's per-quantum dispatch uses this to honour the reentrancy rule
+    /// (one callback per boundary).
+    pub fn pop_next_due_timer(&mut self, now_tick: u32) -> Option<DueTimer> {
+        let mut due_index: Option<usize> = None;
+        for (idx, rec) in self.timers.iter().enumerate() {
+            if is_due_tick(now_tick, rec.due_tick_ms) {
+                due_index = Some(idx);
+                break;
+            }
+        }
+        let idx = due_index?;
+        let rec = self.timers.get(idx)?.clone();
+        // Clone fields before mutation.
+        let due = DueTimer {
+            handle: rec.handle,
+            callback_va: rec.callback_va,
+            user_data: rec.user_data,
+        };
+        if rec.periodic {
+            if let Some(slot) = self.timers.get_mut(idx) {
+                slot.due_tick_ms = slot.due_tick_ms.wrapping_add(rec.delay_ms);
+            }
+        } else if idx < self.timers.len() {
+            self.timers.remove(idx);
+        }
+        Some(due)
+    }
+}
+
+impl Clone for WinmmTimerRecord {
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle,
+            delay_ms: self.delay_ms,
+            callback_va: self.callback_va,
+            user_data: self.user_data,
+            due_tick_ms: self.due_tick_ms,
+            periodic: self.periodic,
+        }
+    }
+}
+
+/// Whether `due` is in the past relative to `now` in wrapping `u32` time.
+///
+/// The half-range test matches Windows `GetTickCount` wrap handling: a due
+/// time is considered reached when `now - due < 0x8000_0000`.
+fn is_due_tick(now: u32, due: u32) -> bool {
+    now.wrapping_sub(due) < 0x8000_0000
 }
 
 #[cfg(test)]
@@ -52,6 +180,24 @@ impl WinmmState {
         self.timers
             .iter()
             .map(|t| (t.handle, t.delay_ms, t.callback_va, t.user_data))
+            .collect()
+    }
+
+    /// Test-only projection including `due_tick_ms` and `periodic`.
+    #[cfg(test)]
+    pub(crate) fn timer_records_full(&self) -> Vec<(u64, u32, u64, u64, u32, bool)> {
+        self.timers
+            .iter()
+            .map(|t| {
+                (
+                    t.handle,
+                    t.delay_ms,
+                    t.callback_va,
+                    t.user_data,
+                    t.due_tick_ms,
+                    t.periodic,
+                )
+            })
             .collect()
     }
 }
@@ -105,9 +251,11 @@ pub fn dispatch_winmm_extra(
 /// Signature: `MMRESULT timeSetEvent(UINT uDelay, UINT uResolution,
 /// LPTIMECALLBACK fptc, DWORD_PTR dwUser, UINT fuEvent)`. Allocates a handle
 /// from [`TIMER_HANDLE_BASE`] upward in [`WinmmState`], records the
-/// registration, and returns the handle (nonzero). No host timer thread is
-/// spawned — the callback is documented to fire only when the guest happens
-/// to hit a host stop (YAGNI for the milestone).
+/// registration with `due_tick_ms = now.wrapping_add(delay)` and `periodic`
+/// from `TIME_PERIODIC` in `fuEvent` (the 5th Win64 stack arg at
+/// `[rsp+0x28]`), and returns the handle (nonzero). The host has no timer
+/// thread — the pump polls `pop_due_timers(now)` at safe boundaries and
+/// dispatches the guest `LPTIMECALLBACK` (`uTimerID, uMsg=0, dwUser, 0, 0`).
 pub fn handle_time_set_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -126,6 +274,18 @@ pub fn handle_time_set_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 
     let delay_ms = u32::try_from(delay_raw).context("timeSetEvent delay does not fit u32")?;
 
+    // 5th Win64 arg `fuEvent` at [rsp+0x28] (like PeekMessage's wRemoveMsg).
+    let flags = engine
+        .read_rsp()
+        .ok()
+        .and_then(|rsp| crate::guest_memory::read_u32(engine, rsp.wrapping_add(0x28)).ok())
+        .unwrap_or(TIME_ONESHOT);
+    let periodic = (flags & TIME_PERIODIC) != 0;
+
+    let now_raw = crate::kernel32::clock::tick_count_32();
+    let now = u32::try_from(now_raw & u64::from(u32::MAX)).unwrap_or(0);
+    let due_tick_ms = now.wrapping_add(delay_ms);
+
     let winmm = state.winmm();
     if winmm.next_timer_handle == 0 {
         winmm.next_timer_handle = TIMER_HANDLE_BASE;
@@ -137,6 +297,8 @@ pub fn handle_time_set_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         delay_ms,
         callback_va,
         user_data,
+        due_tick_ms,
+        periodic,
     });
 
     ctx.finish(handle)

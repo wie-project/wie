@@ -624,6 +624,23 @@ impl WinApiState {
             .get_or_init::<crate::winmm::WinmmState>(DllId::Winmm)
     }
 
+    /// Pop due WINMM timers for `now_tick`.
+    ///
+    /// Delegates to [`crate::winmm::WinmmState::pop_due_timers`]. One-shot
+    /// timers are removed, periodic timers are re-armed (`due += delay`).
+    /// See `winmm::WinmmTimerRecord` for reentrancy notes.
+    pub fn pop_due_timers(&mut self, now_tick: u32) -> Vec<crate::winmm::DueTimer> {
+        self.winmm().pop_due_timers(now_tick)
+    }
+
+    /// Pop the next due WINMM timer for `now_tick`, if any.
+    ///
+    /// The pump uses this to dispatch at most one timer per boundary while a
+    /// guest callback is in flight.
+    pub fn pop_next_due_timer(&mut self, now_tick: u32) -> Option<crate::winmm::DueTimer> {
+        self.winmm().pop_next_due_timer(now_tick)
+    }
+
     /// Mutable access to the Internet/HTTP handle tables. Lazy: allocated on
     /// first `WININET` call.
     pub fn wininet(&mut self) -> &mut crate::wininet::WininetState {

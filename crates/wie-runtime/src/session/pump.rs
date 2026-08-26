@@ -609,6 +609,57 @@ impl QuantumHooks for SessionPumpHooks<'_> {
             None
         };
 
+        // WINMM `timeSetEvent` dispatch: if a timer is due, run its
+        // `LPTIMECALLBACK` (`rcx=handle, rdx=0, r8=user_data, r9=0,
+        // [rsp+0x28]=0`) before any other handler. At most one per
+        // quantum, and never while a guest callback is already in flight
+        // (reentrancy guard — matches the `pending_callbacks.is_empty()`
+        // check at `HostPark`).
+        //
+        // The callback that itself calls `timeSetEvent` naturally enqueues a
+        // future record (new `due_tick_ms`); remaining due timers wait for
+        // the next boundary because this arm pops at most one entry per
+        // quantum.
+        if self.pending_callbacks.is_empty() {
+            let now = {
+                let raw = wie_winapi::kernel32::clock::tick_count_32();
+                u32::try_from(raw & u64::from(u32::MAX)).unwrap_or(0)
+            };
+            let due = guard.pop_next_due_timer(now);
+            if let Some(due) = due {
+                let request = wie_winapi::GuestCallbackRequest::timer(
+                    due.handle,
+                    due.callback_va,
+                    due.user_data,
+                );
+                self.charged_api = self.charged_api.saturating_add(1);
+                let outer_library = self.intern_outer_api_name(resolved.library.clone());
+                let outer_name = self.intern_outer_api_name(resolved.name.clone());
+                self.events.push(EntryTraceEvent {
+                    index: api_index,
+                    library: Arc::clone(&outer_library),
+                    name: Arc::clone(&outer_name),
+                    fake_target_va: hook_address,
+                    handled: true,
+                    return_value: None,
+                    return_address: None,
+                });
+                drop(guard);
+                if let Err(error) = self.begin_guest_callback(
+                    core,
+                    request,
+                    outer_library,
+                    outer_name,
+                    hook_address,
+                ) {
+                    return Ok(Step::Stop(EntryTraceTermination::RuntimeStop(format!(
+                        "failed to begin timer callback: {error}"
+                    ))));
+                }
+                return Ok(Step::Next);
+            }
+        }
+
         if resolved.traits.exit_process() {
             let handler_t0 = self.profile_enabled.then(Instant::now);
             let exit_code_raw = core
@@ -760,6 +811,51 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                 // unsupported-API diagnostic below.
                 match error.downcast::<WinApiControlSignal>() {
                     Ok(WinApiControlSignal::WaitingForMessage) => {
+                        // WINMM timer poll at the idle boundary: if a
+                        // `timeSetEvent` timer is due, dispatch its callback
+                        // instead of parking. Reentrancy guard (pending
+                        // callbacks non-empty → wait) matches the per-quantum
+                        // poll above; at most one timer per boundary.
+                        if self.pending_callbacks.is_empty() {
+                            let now = {
+                                let raw = wie_winapi::kernel32::clock::tick_count_32();
+                                u32::try_from(raw & u64::from(u32::MAX)).unwrap_or(0)
+                            };
+                            let due = guard.pop_next_due_timer(now);
+                            if let Some(due) = due {
+                                let request = wie_winapi::GuestCallbackRequest::timer(
+                                    due.handle,
+                                    due.callback_va,
+                                    due.user_data,
+                                );
+                                self.charged_api = self.charged_api.saturating_add(1);
+                                let outer_library =
+                                    self.intern_outer_api_name(resolved.library.clone());
+                                let outer_name = self.intern_outer_api_name(resolved.name.clone());
+                                self.events.push(EntryTraceEvent {
+                                    index: api_index,
+                                    library: Arc::clone(&outer_library),
+                                    name: Arc::clone(&outer_name),
+                                    fake_target_va: hook_address,
+                                    handled: true,
+                                    return_value: None,
+                                    return_address: None,
+                                });
+                                drop(guard);
+                                if let Err(error) = self.begin_guest_callback(
+                                    core,
+                                    request,
+                                    outer_library,
+                                    outer_name,
+                                    hook_address,
+                                ) {
+                                    return Ok(Step::Stop(EntryTraceTermination::RuntimeStop(
+                                        format!("failed to begin timer callback: {error}"),
+                                    )));
+                                }
+                                return Ok(Step::Next);
+                            }
+                        }
                         *self.next_api_index = self
                             .next_api_index
                             .checked_sub(1)
