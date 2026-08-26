@@ -2,6 +2,7 @@
 // Moved out of jit/mod.rs (file-size policy, ADR-002); wired via
 // `#[cfg(test)] #[allow(clippy::expect_used)] mod tests;`.
 mod chain_tests;
+mod inv_gen_tests;
 mod strlen_repro;
 mod testb_high_byte;
 use super::*;
@@ -31,6 +32,7 @@ impl JitCpu {
                 insn_count: 1,
                 guest_start: rip,
                 guest_end,
+                inv_gen: 0,
             },
         );
         if JitConfig::get().chain_enabled() {
@@ -354,7 +356,11 @@ fn bg_worker_notpure_becomes_never() {
     let mut cpu = JitCpu::open_x86_64();
     cpu.shared.bg_force.store(true, Ordering::Relaxed);
     let base = 0x1021_0000_u64;
-    let outcome = cpu.enqueue_bg(base, &BlockKind::NotPure);
+    let outcome = cpu.enqueue_bg(
+        base,
+        &BlockKind::NotPure,
+        cpu.shared.invalidate_gen.load(Ordering::Relaxed),
+    );
     assert!(matches!(outcome, BgEnqueueOutcome::Unavailable));
     assert!(matches!(
         cpu.shared.cache.pin().get(&base),
@@ -392,12 +398,13 @@ fn bg_worker_dedups_queued_entry() {
         block::decode_pure_gpr_block(&mem, cpu.thread.hooks.as_ref(), base)
     };
     assert!(matches!(kind, BlockKind::Pure { .. }));
-    let first = cpu.enqueue_bg(base, &kind);
+    let baked = cpu.shared.invalidate_gen.load(Ordering::Relaxed);
+    let first = cpu.enqueue_bg(base, &kind, baked);
     assert!(matches!(first, BgEnqueueOutcome::Queued(_)));
     // A second enqueue of the same rip must not re-queue: either the entry
     // is still Queued (dedup → Unavailable) or the worker already won
     // (Ready). Never a fresh Queued cell.
-    let second = cpu.enqueue_bg(base, &kind);
+    let second = cpu.enqueue_bg(base, &kind, baked);
     assert!(
         matches!(
             second,

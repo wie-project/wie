@@ -163,7 +163,11 @@ pub struct JitShared {
     /// Background compiler queue sender. The worker thread owns the receiver
     /// and dies when this sender drops (i.e. when the last `Arc<JitShared>` goes
     /// away). `None` when the worker was never spawned or failed to spawn.
-    pub bg_tx: Mutex<Option<SyncSender<(u64, BlockKind)>>>,
+    /// Jobs carry `(rip, decoded kind, invalidate_gen snapshot)`: the
+    /// generation was read on the guest thread BEFORE the bytes were decoded,
+    /// so blocks compiled from pre-invalidation bytes never bake a newer
+    /// generation over them (a high/stale guard miss must be impossible).
+    pub bg_tx: Mutex<Option<SyncSender<(u64, BlockKind, u64)>>>,
     /// Set once the worker thread has been spawned (spawn-once latch).
     pub bg_spawned: AtomicBool,
     /// Whether the background compiler is currently alive (set true on spawn,
@@ -329,7 +333,7 @@ impl JitShared {
         if self.bg_spawned.swap(true, Ordering::AcqRel) {
             return;
         }
-        let (tx, rx) = mpsc::sync_channel::<(u64, BlockKind)>(BG_QUEUE_CAP);
+        let (tx, rx) = mpsc::sync_channel::<(u64, BlockKind, u64)>(BG_QUEUE_CAP);
         *self.bg_tx.lock().unwrap() = Some(tx);
         let weak = Arc::downgrade(self);
         let alive = Arc::clone(&self.bg_alive);
@@ -359,7 +363,7 @@ impl JitShared {
     /// Batch-drain: after each blocking `recv`, the loop pulls every item
     /// already queued via `try_recv` before sleeping again, so a promotion
     /// burst costs one wakeup instead of one wakeup per block.
-    fn bg_worker_main(shared: &Weak<Self>, rx: &Receiver<(u64, BlockKind)>) {
+    fn bg_worker_main(shared: &Weak<Self>, rx: &Receiver<(u64, BlockKind, u64)>) {
         while let Ok(first) = rx.recv() {
             let Some(shared) = shared.upgrade() else {
                 break;
@@ -377,13 +381,15 @@ impl JitShared {
 
     /// Compile + install one queued job (shared by the blocking and
     /// batch-drain paths). Decrements [`Self::bg_queue_depth`] exactly once.
-    fn bg_process_one(&self, (rip, kind): (u64, BlockKind)) {
+    /// `inv_gen` is the generation snapshot taken before the job's bytes were
+    /// decoded (see [`Self::bg_tx`]).
+    fn bg_process_one(&self, (rip, kind, inv_gen): (u64, BlockKind, u64)) {
         self.bg_queue_depth.fetch_sub(1, Ordering::Relaxed);
         let mem_gen_before = self.mem_gen.load(Ordering::Acquire);
         // Arc clone: refcount bump only (table is built once per engine).
         let fast_api = self.bg_fast_api.lock().unwrap().clone();
         let start = Instant::now();
-        let compiled = self.compile_from_kind_shared(fast_api.as_ref(), rip, kind);
+        let compiled = self.compile_from_kind_shared(fast_api.as_ref(), rip, kind, inv_gen);
         let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
         let insns = compiled.as_ref().map_or(0, |c| u64::from(c.insn_count));
         self.bg_compile.record(insns, us);
@@ -410,12 +416,16 @@ impl JitShared {
     /// Identical to the inline path's lowering (same `compile_block`, same
     /// `chain_ids` snapshot for direct chaining, same `call_fast` resolution)
     /// so background output is byte-for-byte the same code — only the *when*
-    /// differs.
+    /// differs. `inv_gen` must be the [`Self::invalidate_gen`] snapshot taken
+    /// before the caller decoded the guest bytes: baking an older-or-equal
+    /// generation guarantees a guard mismatch whenever the baked bytes went
+    /// stale (never bakes a newer gen over pre-invalidation bytes).
     pub(super) fn compile_from_kind_shared(
         &self,
         fast_api: &[(u64, FastApiKind)],
         rip: u64,
         result: BlockKind,
+        inv_gen: u64,
     ) -> Option<CompiledBlock> {
         match result {
             BlockKind::Pure {
@@ -433,6 +443,7 @@ impl JitShared {
                         insn_count: micro.insn_count(),
                         guest_start: rip,
                         guest_end,
+                        inv_gen,
                     });
                 }
 
@@ -461,7 +472,7 @@ impl JitShared {
                 let mut eng_guard = self.engine.lock().unwrap();
                 let eng = eng_guard.as_mut()?;
                 match compile_block(
-                    eng, rip, &insns, end_rip, term, call_fast, &chain_map, bytes_len,
+                    eng, rip, &insns, end_rip, term, call_fast, &chain_map, bytes_len, inv_gen,
                 ) {
                     Ok(c) => Some(c),
                     Err(e) => {

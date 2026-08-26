@@ -343,6 +343,14 @@ impl JitCpu {
     /// Returns `(result, guest_insns_retired)` for budget accounting.
     pub(super) fn step_one(&mut self) -> Result<(StepResult, usize), CpuError> {
         let rip = self.thread.regs.rip;
+        // Bake-before-decode: snapshot the shared invalidation generation
+        // BEFORE any guest bytes are decoded for compilation. A block built
+        // from bytes fetched after this point can only be stale if an
+        // invalidation landed later — which bumps the generation past this
+        // bake, so the emitted guards / chain_tail catch it. Baking after
+        // the decode could instead stamp a NEWER generation over
+        // pre-invalidation bytes and hide a stale block forever.
+        let inv_gen = self.shared.invalidate_gen.load(Ordering::Acquire);
         if let Some(hook) = self.thread.hooks.as_ref()
             && hook.should_host_stop(rip)
         {
@@ -425,7 +433,7 @@ impl JitCpu {
                                     )
                                 };
                                 self.thread.pending_promote_thr = thr;
-                                match self.enqueue_bg(rip, &kind) {
+                                match self.enqueue_bg(rip, &kind, inv_gen) {
                                     BgEnqueueOutcome::Queued(_) => {
                                         // Continue on iced this visit; the wait
                                         // (if any) happens when this thread is
@@ -448,7 +456,7 @@ impl JitCpu {
                                         // Worker dead / disabled / queue send failed:
                                         // inline compilation is permitted here.
                                         if let Some(compiled) =
-                                            self.try_compile_from_kind(rip, kind)
+                                            self.try_compile_from_kind(rip, kind, inv_gen)
                                         {
                                             let meta = CompiledRunMeta::from(&compiled);
                                             self.insert_ready(rip, compiled);
@@ -498,7 +506,7 @@ impl JitCpu {
                         self.defer_promotion(rip, thr);
                     } else {
                         self.thread.pending_promote_thr = thr;
-                        match self.enqueue_bg(rip, &kind) {
+                        match self.enqueue_bg(rip, &kind, inv_gen) {
                             BgEnqueueOutcome::Queued(notify) => {
                                 if let Some(compiled) = self.wait_bg_ready(rip, &notify) {
                                     let meta = CompiledRunMeta::from(&compiled);
@@ -509,7 +517,9 @@ impl JitCpu {
                                     // compile replaces the Queued entry.
                                     self.stats.bg.inline_fallbacks =
                                         self.stats.bg.inline_fallbacks.saturating_add(1);
-                                    if let Some(compiled) = self.try_compile_from_kind(rip, kind) {
+                                    if let Some(compiled) =
+                                        self.try_compile_from_kind(rip, kind, inv_gen)
+                                    {
                                         let meta = CompiledRunMeta::from(&compiled);
                                         self.insert_ready(rip, compiled);
                                         return Ok(self.finish_compiled(rip, meta));
@@ -546,7 +556,8 @@ impl JitCpu {
                                     // it resolves Ready shortly.
                                     self.stats.promo.deferred =
                                         self.stats.promo.deferred.saturating_add(1);
-                                } else if let Some(compiled) = self.try_compile_from_kind(rip, kind)
+                                } else if let Some(compiled) =
+                                    self.try_compile_from_kind(rip, kind, inv_gen)
                                 {
                                     let meta = CompiledRunMeta::from(&compiled);
                                     self.insert_ready(rip, compiled);
@@ -611,9 +622,16 @@ impl JitCpu {
     /// Hand a block to the background compiler.
     ///
     /// Queues the exact decoded block so the worker compiles the same bytes the
-    /// guest classified. The cache entry transitions to `Queued` only after the
-    /// queue slot is reserved (a full queue must never strand a Queued entry).
-    pub(super) fn enqueue_bg(&mut self, rip: u64, kind: &BlockKind) -> BgEnqueueOutcome {
+    /// guest classified. `inv_gen` must be the generation snapshot taken
+    /// before those bytes were decoded (see the bake-before-decode note in
+    /// [`Self::step_one`]). The cache entry transitions to `Queued` only after
+    /// the queue slot is reserved (a full queue must never strand a Queued entry).
+    pub(super) fn enqueue_bg(
+        &mut self,
+        rip: u64,
+        kind: &BlockKind,
+        inv_gen: u64,
+    ) -> BgEnqueueOutcome {
         if !self.shared.bg_enabled_here() || !self.shared.engine_ready.load(Ordering::Relaxed) {
             return BgEnqueueOutcome::Unavailable;
         }
@@ -629,7 +647,7 @@ impl JitCpu {
         let Some(tx) = tx_guard.as_ref() else {
             return BgEnqueueOutcome::Unavailable;
         };
-        if tx.try_send((rip, kind.clone())).is_err() {
+        if tx.try_send((rip, kind.clone(), inv_gen)).is_err() {
             return BgEnqueueOutcome::Unavailable;
         }
         // One in-flight item the worker has not processed yet.
@@ -836,11 +854,14 @@ impl JitCpu {
     }
 
     pub(super) fn try_compile(&mut self, rip: u64) -> Option<CompiledBlock> {
+        // Bake-before-decode (see `step_one`): snapshot the generation before
+        // the block's bytes are read.
+        let inv_gen = self.shared.invalidate_gen.load(Ordering::Acquire);
         let kind = {
             let mem_guard = self.shared.mem.read().unwrap();
             decode_pure_gpr_block(&mem_guard, self.thread.hooks.as_ref(), rip)
         };
-        self.try_compile_from_kind(rip, kind)
+        self.try_compile_from_kind(rip, kind, inv_gen)
     }
 
     /// Compile a block from an already-decoded [`BlockKind`], skipping the
@@ -848,14 +869,20 @@ impl JitCpu {
     ///
     /// Shares the lowering with the background worker ([`JitShared::compile_from_kind_shared`]);
     /// this wrapper adds the per-thread side effects: compile stats and the
-    /// thread-local chain-table entry.
-    fn try_compile_from_kind(&mut self, rip: u64, result: BlockKind) -> Option<CompiledBlock> {
+    /// thread-local chain-table entry. `inv_gen` must be the generation
+    /// snapshot taken before `kind`'s bytes were decoded.
+    fn try_compile_from_kind(
+        &mut self,
+        rip: u64,
+        result: BlockKind,
+        inv_gen: u64,
+    ) -> Option<CompiledBlock> {
         // Compile timing lives at the rare compile seam, so it is always
         // recorded (no cost-model gate needed).
         let start = Instant::now();
         let compiled = self
             .shared
-            .compile_from_kind_shared(&self.fast_api, rip, result);
+            .compile_from_kind_shared(&self.fast_api, rip, result, inv_gen);
         let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
         let Some(compiled) = compiled else {
             self.stats.compile.compile_skip = self.stats.compile.compile_skip.saturating_add(1);
@@ -1024,6 +1051,11 @@ impl JitCpu {
             sticky_rr: self.thread.sticky_rr,
             // Fresh dispatcher entry always starts a new host-chain budget.
             chain_depth: 0,
+            // Emitted guards + chain_tail compare the live shared generation
+            // against the block's compile-time bake; any bump observed here
+            // sends control back to this dispatcher (purge + fresh decode).
+            inv_gen_ptr: std::ptr::from_ref(&self.shared.invalidate_gen),
+            inv_gen_baked: meta.inv_gen,
         };
         drop(mem_guard); // GuestMemory read lock already released; compiled block runs on TLB/pins.
         // SAFETY: func is a finalized Cranelift block; TLB/pins resolve to stable mmap pointers.
@@ -1168,6 +1200,9 @@ impl JitCpu {
 pub(super) struct CompiledRunMeta {
     func: unsafe extern "C" fn(*mut JitCtx),
     insn_count: u32,
+    /// Invalidate-generation baked into the block's guards (also compared by
+    /// Rust-side trampolines via `JitCtx::inv_gen_baked`).
+    inv_gen: u64,
 }
 
 impl From<&CompiledBlock> for CompiledRunMeta {
@@ -1175,6 +1210,7 @@ impl From<&CompiledBlock> for CompiledRunMeta {
         Self {
             func: c.func,
             insn_count: c.insn_count,
+            inv_gen: c.inv_gen,
         }
     }
 }

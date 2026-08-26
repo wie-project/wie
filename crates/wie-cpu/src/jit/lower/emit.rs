@@ -9,8 +9,8 @@ use super::mem::call_load;
 use super::string::lower_string;
 use super::{
     EDGE_IC_SLOTS, MAX_CHAIN_DEPTH, OFF_CHAIN_DEPTH, OFF_EDGE_IC_FN, OFF_EDGE_IC_VA, OFF_FAULT,
-    OFF_RIP, OFF_SHADOW_RET, OFF_SHADOW_SP, SHADOW_DEPTH, TLB_PROT_R, TLB_PROT_W, flag_cond,
-    lower_term,
+    OFF_INV_GEN_PTR, OFF_RIP, OFF_SHADOW_RET, OFF_SHADOW_SP, SHADOW_DEPTH, TLB_PROT_R, TLB_PROT_W,
+    flag_cond, lower_term,
 };
 
 use super::super::block::{BlockStackPinPlan, BlockTerm, DecodedInsn, is_string_op};
@@ -151,6 +151,51 @@ pub(super) fn shadow_pop_check(
     bcx.block_params(cont)[0]
 }
 
+/// Emit the cross-thread code-invalidation guard for a chained edge.
+///
+/// Loads `JitShared::invalidate_gen` through `ctx.inv_gen_ptr` (a sequential
+/// atomic load — on ARM64 an acquire `ldar`, and `other_side_effects` keeps
+/// Cranelift from hoisting or CSE-ing it out of hot backedge loops) and
+/// compares it against the generation baked into this block at compile time.
+///
+/// On mismatch the `on_stale` closure flushes whatever state the caller still
+/// holds in SSA (registers / RIP), then control returns to the Rust
+/// dispatcher exactly like the depth-exceeded exit. The next dispatch sees
+/// the bumped generation, purges its chain table, re-decodes fresh guest
+/// bytes and bakes a fresh generation. A low/benign mismatch read costs one
+/// spurious exit + resync; a high/stale miss is impossible because the bake
+/// happens before guest bytes are decoded.
+///
+/// Returns the continuation block (current position switched onto it) that
+/// execution takes when no invalidation was observed.
+fn emit_inv_gen_check(
+    bcx: &mut FunctionBuilder<'_>,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    inv_gen_baked: u64,
+    on_stale: impl FnOnce(&mut FunctionBuilder<'_>),
+) -> Block {
+    let ptr_slot = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_INV_GEN_PTR));
+    let gen_ptr = bcx.ins().load(types::I64, flags, ptr_slot, 0);
+    let cur_gen = bcx.ins().atomic_load(types::I64, flags, gen_ptr);
+    let baked = iconst_u64(bcx, inv_gen_baked);
+    let stale = bcx.ins().icmp(IntCC::NotEqual, cur_gen, baked);
+    let stale_blk = bcx.create_block();
+    let cont_blk = bcx.create_block();
+    bcx.ins().brif(stale, stale_blk, &[], cont_blk, &[]);
+
+    bcx.switch_to_block(stale_blk);
+    bcx.seal_block(stale_blk);
+    on_stale(bcx);
+    // RIP + GPRs flushed by `on_stale` (or already written by the caller):
+    // pop back to the dispatcher like the depth-exceeded path.
+    bcx.ins().return_(&[]);
+
+    bcx.switch_to_block(cont_blk);
+    bcx.seal_block(cont_blk);
+    cont_blk
+}
+
 /// Writeback + set RIP + call successor (direct or late-bound), then return.
 ///
 /// Uses host C ABI `call`/`call_indirect` (not Tail/`return_call`) so blocks stay
@@ -173,6 +218,8 @@ pub(super) fn emit_chain_or_exit(
     href: Option<FuncRef>,
     lookup_ref: FuncRef,
     block_sig_ref: SigRef,
+    inv_guard: bool,
+    inv_gen_baked: u64,
 ) {
     let rip_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RIP));
     bcx.ins().store(flags, exit_rip, rip_ptr, 0);
@@ -188,6 +235,13 @@ pub(super) fn emit_chain_or_exit(
         rflags_ptr,
         store_flags,
     );
+
+    if inv_guard {
+        // Cross-thread invalidation guard before touching any chain
+        // machinery: RIP (= exit_rip) + GPRs are already flushed above, so a
+        // mismatch just returns to the dispatcher for purge + re-decode.
+        let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, |_| {});
+    }
 
     // Host-stack guard: each hop nests a C frame. Cap and re-enter from Rust.
     let depth_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_CHAIN_DEPTH));
@@ -294,11 +348,34 @@ pub(super) fn lower_self_loop_term(
     chain_refs: &HashMap<u64, FuncRef>,
     lookup_ref: FuncRef,
     block_sig_ref: SigRef,
+    inv_guard: bool,
+    inv_gen_baked: u64,
 ) -> Result<bool, String> {
     match term {
         BlockTerm::Jmp { target } if target == start_rip => {
             // Stay in native SSA — pass live regs as header params (no store/reload).
             let args = loop_header_args(gpr, live, rflags, pass_flags);
+            if inv_guard {
+                // Guarded backedge: on generation mismatch, flush SSA state
+                // (regs + RIP = start_rip) and return to the dispatcher; the
+                // next dispatch re-decodes the loop body from current bytes.
+                let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, |bcx| {
+                    writeback_gprs(
+                        bcx,
+                        ctx_ptr,
+                        flags,
+                        gpr,
+                        gpr_loaded,
+                        Some(gpr_dirty),
+                        rflags,
+                        rflags_ptr,
+                        true,
+                    );
+                    let rip_val = iconst_u64(bcx, start_rip);
+                    let rip_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RIP));
+                    bcx.ins().store(flags, rip_val, rip_ptr, 0);
+                });
+            }
             bcx.ins().jump(loop_header, &args);
             Ok(true)
         }
@@ -317,6 +394,26 @@ pub(super) fn lower_self_loop_term(
                 bcx.seal_block(blk);
                 if va == start_rip {
                     let args = loop_header_args(gpr, live, rflags, pass_flags);
+                    if inv_guard {
+                        // Same guarded backedge for jcc edges that re-enter
+                        // this block.
+                        let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, |bcx| {
+                            writeback_gprs(
+                                bcx,
+                                ctx_ptr,
+                                flags,
+                                gpr,
+                                gpr_loaded,
+                                Some(gpr_dirty),
+                                rflags,
+                                rflags_ptr,
+                                true,
+                            );
+                            let rip_val = iconst_u64(bcx, start_rip);
+                            let rip_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RIP));
+                            bcx.ins().store(flags, rip_val, rip_ptr, 0);
+                        });
+                    }
                     bcx.ins().jump(loop_header, &args);
                 } else {
                     let rv = iconst_u64(bcx, va);
@@ -335,6 +432,8 @@ pub(super) fn lower_self_loop_term(
                         chain_refs.get(&va).copied(),
                         lookup_ref,
                         block_sig_ref,
+                        inv_guard,
+                        inv_gen_baked,
                     );
                 }
             }
@@ -364,6 +463,8 @@ pub(super) fn lower_jcc_chain(
     exit: Block,
     lookup_ref: FuncRef,
     block_sig_ref: SigRef,
+    inv_guard: bool,
+    inv_gen_baked: u64,
 ) -> Result<bool, String> {
     let cond = flag_cond(bcx, rflags, mnemonic)?;
     let taken_blk = bcx.create_block();
@@ -388,6 +489,8 @@ pub(super) fn lower_jcc_chain(
             href,
             lookup_ref,
             block_sig_ref,
+            inv_guard,
+            inv_gen_baked,
         );
     }
     Ok(true)
@@ -639,6 +742,8 @@ pub(super) fn emit_body_and_term(
     chain_refs: &HashMap<u64, FuncRef>,
     lookup_ref: FuncRef,
     block_sig_ref: SigRef,
+    inv_guard: bool,
+    inv_gen_baked: u64,
     gpr_vals: &mut [Value; 16],
     gpr_loaded: &mut [bool; 16],
     gpr_dirty: &mut [bool; 16],
@@ -725,6 +830,8 @@ pub(super) fn emit_body_and_term(
                 chain_refs.get(&return_ip).copied(),
                 lookup_ref,
                 block_sig_ref,
+                inv_guard,
+                inv_gen_baked,
             );
         } else if self_loop {
             let _ = lower_self_loop_term(
@@ -746,6 +853,8 @@ pub(super) fn emit_body_and_term(
                 chain_refs,
                 lookup_ref,
                 block_sig_ref,
+                inv_guard,
+                inv_gen_baked,
             )?;
         } else {
             if let BlockTerm::Call { return_ip, .. } = t {
@@ -783,6 +892,8 @@ pub(super) fn emit_body_and_term(
                         exit,
                         lookup_ref,
                         block_sig_ref,
+                        inv_guard,
+                        inv_gen_baked,
                     )?;
                 }
                 BlockTerm::Jmp { target } | BlockTerm::Call { target, .. } => {
@@ -801,6 +912,8 @@ pub(super) fn emit_body_and_term(
                         chain_refs.get(&target).copied(),
                         lookup_ref,
                         block_sig_ref,
+                        inv_guard,
+                        inv_gen_baked,
                     );
                 }
                 BlockTerm::Ret => {
@@ -819,6 +932,8 @@ pub(super) fn emit_body_and_term(
                         None,
                         lookup_ref,
                         block_sig_ref,
+                        inv_guard,
+                        inv_gen_baked,
                     );
                 }
             }
@@ -839,6 +954,8 @@ pub(super) fn emit_body_and_term(
             None,
             lookup_ref,
             block_sig_ref,
+            inv_guard,
+            inv_gen_baked,
         );
     } else {
         let exit_rip = iconst_u64(bcx, end_rip);
@@ -857,6 +974,8 @@ pub(super) fn emit_body_and_term(
             chain_refs.get(&end_rip).copied(),
             lookup_ref,
             block_sig_ref,
+            inv_guard,
+            inv_gen_baked,
         );
     }
     Ok(())

@@ -275,11 +275,15 @@ impl CpuEngine for JitCpu {
         // session init does not block on Cranelift. The guest cannot reach the
         // stub until it starts executing, so the compile overlaps with the
         // entry-point run; the miss path waits (bounded) if it is not done.
+        // Bake-before-decode: snapshot the invalidation generation first (see
+        // `step_one`) so prewarmed blocks can't bake a newer gen over
+        // pre-invalidation bytes.
+        let inv_gen = self.shared.invalidate_gen.load(Ordering::Acquire);
         let kind = {
             let mem = self.shared.mem.read().unwrap();
             super::block::decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), address)
         };
-        match self.enqueue_bg(address, &kind) {
+        match self.enqueue_bg(address, &kind, inv_gen) {
             super::shared::BgEnqueueOutcome::Queued(_) | super::shared::BgEnqueueOutcome::Ready => {
             }
             super::shared::BgEnqueueOutcome::Unavailable => {

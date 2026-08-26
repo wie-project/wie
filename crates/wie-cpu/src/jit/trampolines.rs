@@ -7,11 +7,13 @@
 
 use super::ALL_DIRTY_BITS;
 use super::block::{BlockTerm, DecodedInsn};
+use super::config::JitConfig;
 use super::lower::{
     CHAIN_SLOTS, JitCtx, MAX_CHAIN_DEPTH, SHADOW_DEPTH, chain_hash, wie_jit_load, wie_jit_store,
 };
 use crate::guest_layout::TEB_LAST_ERROR_OFFSET;
 use iced_x86::{Mnemonic, OpKind, Register};
+use std::sync::atomic::Ordering;
 
 /// Recognized micro-stub patterns that have a hand-written host trampoline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +358,18 @@ fn chain_tail(ctx: &mut JitCtx) {
     // Match Cranelift `emit_chain_or_exit` host-stack cap.
     if ctx.chain_depth >= MAX_CHAIN_DEPTH {
         return;
+    }
+    // Cross-thread invalidation guard — the Rust-side twin of the emitted
+    // hop guard. A micro-stub inside a chain never re-enters the dispatcher
+    // on its own, so a generation bump past this session's bake must decline
+    // chaining here or stale native code keeps running across the edge.
+    if JitConfig::get().chain_enabled() && !ctx.inv_gen_ptr.is_null() {
+        // SAFETY: `inv_gen_ptr` targets `JitShared::invalidate_gen`, whose
+        // `Arc` target lives for the process lifetime.
+        let cur = unsafe { (*ctx.inv_gen_ptr).load(Ordering::Acquire) };
+        if cur != ctx.inv_gen_baked {
+            return;
+        }
     }
     let fn_ptr = chain_lookup(ctx, ctx.rip);
     if fn_ptr == 0 {

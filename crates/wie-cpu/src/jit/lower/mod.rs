@@ -19,6 +19,7 @@ use cranelift_module::{FuncId, Module};
 use iced_x86::{Instruction, Mnemonic, OpKind};
 use std::borrow::Cow;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
 
 /// User-id for the "guest_data" alias region we install on every compiled function.
 ///
@@ -354,6 +355,20 @@ pub(super) struct JitCtx {
     /// When this hits [`MAX_CHAIN_DEPTH`], chaining returns to the Rust dispatcher
     /// with RIP already set so the next block re-enters without nesting.
     pub chain_depth: u64,
+    /// Pointer to [`JitShared::invalidate_gen`] (shared across all engines).
+    ///
+    /// Emitted chain-hop / self-loop backedge guards load the current
+    /// generation through this pointer and compare it against
+    /// [`Self::inv_gen_baked`]; a mismatch returns to the Rust dispatcher so
+    /// a cross-thread code invalidation is observed even when execution never
+    /// leaves chained native code (deep guest recursion). The `Arc<JitShared>`
+    /// target lives for the process lifetime, so the pointer stays valid for
+    /// every `run_compiled`.
+    pub inv_gen_ptr: *const AtomicU64,
+    /// Invalidate-generation value baked into this block's guards at compile
+    /// time. Rust-side trampolines (`chain_tail`) compare the live generation
+    /// against this snapshot with the same contract as the emitted guards.
+    pub inv_gen_baked: u64,
 }
 
 /// Per-`run_compiled` mem helper resolution counters (appended after IR-stable layout).
@@ -415,6 +430,8 @@ pub(super) const OFF_STICKY_PTR: i32 = std::mem::offset_of!(JitCtx, sticky_ptr) 
 pub(super) const OFF_STICKY_PROT: i32 = std::mem::offset_of!(JitCtx, sticky_prot) as i32;
 pub(super) const OFF_STICKY_GEN: i32 = std::mem::offset_of!(JitCtx, sticky_gen) as i32;
 pub(super) const OFF_CHAIN_DEPTH: i32 = std::mem::offset_of!(JitCtx, chain_depth) as i32;
+pub(super) const OFF_INV_GEN_PTR: i32 = std::mem::offset_of!(JitCtx, inv_gen_ptr) as i32;
+pub(super) const OFF_INV_GEN_BAKED: i32 = std::mem::offset_of!(JitCtx, inv_gen_baked) as i32;
 
 /// Max nested host frames for JIT block chaining.
 ///
@@ -447,6 +464,8 @@ const _: () = {
     assert!(std::mem::offset_of!(JitCtx, sticky_prot) as i32 == OFF_STICKY_PROT);
     assert!(std::mem::offset_of!(JitCtx, sticky_gen) as i32 == OFF_STICKY_GEN);
     assert!(std::mem::offset_of!(JitCtx, chain_depth) as i32 == OFF_CHAIN_DEPTH);
+    assert!(std::mem::offset_of!(JitCtx, inv_gen_ptr) as i32 == OFF_INV_GEN_PTR);
+    assert!(std::mem::offset_of!(JitCtx, inv_gen_baked) as i32 == OFF_INV_GEN_BAKED);
     assert!(STICKY_WAYS > 0);
     assert!(std::mem::size_of::<MemPin>() == PIN_STRIDE as usize);
     assert!(std::mem::size_of::<XmmSlot>() == 16);
@@ -470,6 +489,11 @@ pub(super) struct CompiledBlock {
     /// Used for range-selective cache invalidation on `mem_write`.
     pub guest_start: u64,
     pub guest_end: u64,
+    /// [`JitShared::invalidate_gen`] snapshot baked into this block's
+    /// chain-hop / backedge guards at compile time. Carried through
+    /// `CompiledRunMeta` so Rust-side trampolines compare against the same
+    /// generation the emitted guards do.
+    pub inv_gen: u64,
 }
 
 /// SplitMix64 / Fibonacci-hashing golden-ratio multiplier (`2^64 / φ`).
@@ -576,6 +600,7 @@ pub(super) fn compile_block(
     call_fast: Option<FastApiKind>,
     chain: &HashMap<u64, FuncId>,
     bytes_len: u32,
+    inv_gen_baked: u64,
 ) -> Result<CompiledBlock, String> {
     let live = analyze_live_gprs(insns);
     let live_xmm = analyze_live_xmm(insns);
@@ -617,6 +642,12 @@ pub(super) fn compile_block(
         }) if taken == start_rip || not_taken == start_rip => true,
         _ => false,
     };
+
+    // Cross-thread invalidation guards ride on chained edges (direct href
+    // calls, late-bound chain hops, self-loop backedges). With chaining off
+    // those edges don't exist — keep `WIE_JIT_CHAIN=0` codegen identical by
+    // not emitting the guard sequence at all.
+    let inv_guard = JitConfig::get().chain_enabled();
 
     let body: &[DecodedInsn];
     let term_insn: Option<&DecodedInsn>;
@@ -1018,6 +1049,8 @@ pub(super) fn compile_block(
                     chain_refs,
                     lookup_ref,
                     block_sig_ref,
+                    inv_guard,
+                    inv_gen_baked,
                     &mut path_gpr,
                     &mut path_loaded,
                     &mut path_dirty,
@@ -1138,6 +1171,8 @@ pub(super) fn compile_block(
                 chain_refs,
                 lookup_ref,
                 block_sig_ref,
+                inv_guard,
+                inv_gen_baked,
                 &mut gpr_vals,
                 &mut gpr_loaded,
                 &mut gpr_dirty,
@@ -1202,6 +1237,7 @@ pub(super) fn compile_block(
         insn_count: u32::try_from(insns.len()).unwrap_or(0),
         guest_start: start_rip,
         guest_end,
+        inv_gen: inv_gen_baked,
     })
 }
 
