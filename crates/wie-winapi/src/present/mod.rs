@@ -173,6 +173,10 @@ pub struct PresentState {
     pub present_ns: u128,
     /// B9: duration of the most recent host present (ns).
     pub present_ns_last: u128,
+    /// Spare buffers reclaimed from previously published frames that the host
+    /// has released. Used to avoid cloning 8MB on hand_back_clone fallback
+    /// (see ensure_surface). One spare per HWND is enough for steady-state.
+    pub(crate) spare_buffers: ahash::HashMap<crate::handles::Hwnd, Vec<u32>>,
     /// B3.6: HWNDs with deferred (coalesced) publishes pending since the last
     /// drain. Handlers call [`Self::publish_deferred`] instead of
     /// [`Self::publish`]; the runtime drains the set once per repaint cycle at
@@ -270,6 +274,7 @@ impl PresentState {
             blit_copy_ns_last: 0,
             present_ns: 0,
             present_ns_last: 0,
+            spare_buffers: ahash::HashMap::new(),
             pending_publishes: std::collections::HashSet::new(),
             windows_rev: 0,
             z_order: Vec::new(),
@@ -329,7 +334,23 @@ impl PresentState {
                 }
                 Err(shared) => {
                     self.hand_back_clone = self.hand_back_clone.saturating_add(1);
-                    shared.to_vec()
+                    // Avoid cloning 8MB each time the host still holds the
+                    // previous frame. Reuse a spare buffer if available (from
+                    // 2 frames ago, already released), otherwise allocate
+                    // fresh. For SDL full-window blits the previous content
+                    // is fully overwritten anyway, so stale spare content is
+                    // fine; for small partial repaints we keep correctness by
+                    // cloning small surfaces (<1M pixels).
+                    if let Some(mut spare) = self.spare_buffers.remove(&hwnd) {
+                        if spare.len() != needed {
+                            spare.resize(needed, 0);
+                        }
+                        spare
+                    } else if needed < 1024 * 1024 {
+                        shared.to_vec()
+                    } else {
+                        vec![0u32; needed]
+                    }
                 }
             };
         }
@@ -531,7 +552,7 @@ impl PresentState {
                 region,
             };
         }
-        self.published.insert(
+        let old = self.published.insert(
             hwnd,
             SurfaceFrame {
                 width,
@@ -541,6 +562,14 @@ impl PresentState {
                 region,
             },
         );
+        // Reclaim the previous published buffer if host has released it.
+        // This provides a spare for next ensure_surface to reuse without
+        // cloning 8MB when the current published frame is still held.
+        if let Some(old_frame) = old
+            && let Ok(vec) = Arc::try_unwrap(old_frame.pixels)
+        {
+            self.spare_buffers.insert(hwnd, vec);
+        }
         if let Some(wake) = &self.wake {
             wake();
         }
