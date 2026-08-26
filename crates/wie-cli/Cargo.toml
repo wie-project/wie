@@ -73,7 +73,10 @@ rfd = { version = "0.17", default-features = false }
 # take rfd's unparented CFUserNotificationDisplayAlert path (it prints a
 # "will block waiting for a response" line on the main thread), so it shows
 # a bare NSAlert instead.
-objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow", "NSPrintInfo", "NSPrintPanel", "NSPageLayout", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPrintOperation", "NSGraphics", "NSAlert", "NSButton"] }
+# NSScreen: the primary monitor's logical-point frame feeds
+# SessionOptions::display_metrics before the guest thread spawns (winit 0.30
+# exposes monitors only from inside the running loop via ActiveEventLoop).
+objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow", "NSPrintInfo", "NSPrintPanel", "NSPageLayout", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPrintOperation", "NSGraphics", "NSAlert", "NSButton", "NSScreen"] }
 objc2 = { version = "0.5", default-features = false, features = ["std", "alloc"] }
 objc2-foundation = { version = "0.2", default-features = false, features = [
     "dispatch",

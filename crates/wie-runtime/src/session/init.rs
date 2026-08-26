@@ -587,7 +587,8 @@ impl super::RuntimeSession {
                 wie_cpu::RwxPerms::ALL,
             )
             .context("failed to map guest stub data page")?;
-        let stub_page = crate::guest_stubs::build_stub_data_page();
+        let stub_page =
+            crate::guest_stubs::build_stub_data_page(options.display_metrics.unwrap_or_default());
         engine
             .mem_write(layout.guest_stub_data.base, &stub_page)
             .context("failed to write guest stub data page")?;
@@ -993,6 +994,10 @@ impl super::RuntimeSession {
         let executable_file_bytes = pe_bytes.clone();
 
         let mut winapi_state = default_winapi_state(&layout, executable_file_bytes, &process)?;
+        // Real host display metrics when the GUI entry captured them; the
+        // default fake desktop otherwise. Every dimension source on the
+        // WinAPI surface reads `winapi_state.display`.
+        winapi_state.display = options.display_metrics.unwrap_or_default();
         t_phase = phase("winapi-state", t_phase);
         // `default_winapi_state` built its volume config from the environment;
         // re-apply the effective roots so the state's volumes agree with the

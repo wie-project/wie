@@ -825,6 +825,37 @@ impl ApplicationHandler<WieEvent> for WieApp {
 /// absolute `C:`/`D:` file argument exists in the mapped volumes — a missing
 /// one fails the launch with a clear error before the guest thread starts
 /// (the `--gui` contract).
+/// Primary monitor size in LOGICAL points — the guest display contract.
+///
+/// winit 0.30 exposes monitors only from inside the running loop
+/// (`ActiveEventLoop`), but the guest thread spawns before `event_loop.run`,
+/// so the pre-spawn query goes straight to AppKit: `NSScreen.mainScreen`'s
+/// frame is already in points, no scale-factor conversion needed. Requires a
+/// live NSApplication on the main thread — winit's EventLoop build
+/// initializes AppKit on macOS, and this runs right after it.
+#[cfg(target_os = "macos")]
+fn primary_display_metrics() -> Option<wie_winapi::DisplayMetrics> {
+    let marker = objc2_foundation::MainThreadMarker::new()?;
+    let screen = objc2_app_kit::NSScreen::mainScreen(marker)?;
+    let size = screen.frame().size;
+    let width = size.width.round();
+    let height = size.height.round();
+    // Reject degenerate/NaN frames before converting.
+    if !width.is_finite() || width < 1.0 || !height.is_finite() || height < 1.0 {
+        return None;
+    }
+    // Clamp before converting so the f64→i32 step cannot saturate.
+    Some(wie_winapi::DisplayMetrics::new(
+        width.min(f64::from(i32::MAX)) as i32,
+        height.min(f64::from(i32::MAX)) as i32,
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn primary_display_metrics() -> Option<wie_winapi::DisplayMetrics> {
+    None
+}
+
 pub fn run_gui_windowed(
     path: &std::path::Path,
     input_script: Option<std::path::PathBuf>,
@@ -875,6 +906,13 @@ pub fn run_gui_windowed(
     let event_loop = EventLoop::<WieEvent>::with_user_event()
         .build()
         .context("build event loop")?;
+    // Guest display dimensions = the primary monitor's LOGICAL size in
+    // points, captured before the guest thread spawns. winit creates windows
+    // in logical points on Retina macOS, so a guest frame rendered at this
+    // size matches the window's coordinate space 1:1; the presenter's
+    // fullscreen-triangle blit GPU-upscales it across the physical surface.
+    // `None` falls back to DisplayMetrics::DEFAULT via SessionOptions.
+    session_options.display_metrics = primary_display_metrics();
     let proxy = event_loop.create_proxy();
     // Wake-coalescing flag, shared between the guest-thread wake callback
     // and the host event loop. Cloned for the guest thread; the original moves

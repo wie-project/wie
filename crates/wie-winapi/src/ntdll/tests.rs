@@ -75,6 +75,7 @@ fn test_state() -> WinApiState {
     let mut heap = GuestHeap::new(0x2000, 0x10000);
     heap.attach_guest_control(0x2000);
     WinApiState {
+        display: crate::DisplayMetrics::default(),
         heap_state: HeapState {
             heap,
             next_fls_index: 0,

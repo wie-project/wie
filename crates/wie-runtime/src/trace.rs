@@ -234,6 +234,8 @@ pub fn run_micro_exe_with_options(
             bottle_root: options.bottle_root.clone(),
             drive_d_root: options.drive_d_root.clone(),
             current_directory: options.current_directory,
+            // Headless micro/persistent runs keep the default display.
+            display_metrics: None,
         },
     )?;
     // An explicit `None` root means "no bottle, ignore WIE_ROOT" — the

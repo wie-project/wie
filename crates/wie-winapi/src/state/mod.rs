@@ -327,6 +327,65 @@ impl ClipboardState {
     }
 }
 
+/// Guest-visible primary-display dimensions.
+///
+/// The host window is created by winit in LOGICAL points on macOS (Retina),
+/// so the honest guest contract is the monitor's point size: a frame rendered
+/// at these dimensions is GPU-upscaled by the presenter across the full
+/// physical window surface, exactly like a native HiDPI game rendering at
+/// backing-store resolution would be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayMetrics {
+    /// Primary-monitor width in logical points.
+    pub width: i32,
+    /// Primary-monitor height in logical points.
+    pub height: i32,
+}
+
+impl DisplayMetrics {
+    /// The historical fake desktop (`write_monitor_info` reported this before
+    /// real host metrics were plumbed). Headless/persistent runs keep it so
+    /// the micro-suite stays deterministic.
+    pub const DEFAULT: Self = Self::new(1920, 1080);
+
+    pub const fn new(width: i32, height: i32) -> Self {
+        Self { width, height }
+    }
+
+    /// Screen width as the unsigned value the SM_*/caps tables return
+    /// (`u64` because every metric arm returns `u64`; negative dimensions are
+    /// impossible from winit, so the fallback of 0 matches Windows' behavior
+    /// for degenerate metrics).
+    pub fn width_metric(self) -> u64 {
+        u64::try_from(self.width).unwrap_or(0)
+    }
+
+    /// Screen height as the unsigned value the SM_*/caps tables return.
+    pub fn height_metric(self) -> u64 {
+        u64::try_from(self.height).unwrap_or(0)
+    }
+
+    /// HORZSIZE: screen width in millimeters at the 96-dpi logical baseline
+    /// (`px * 25.4 / 96`, rounded half-up so the default 1920 keeps 508).
+    pub fn width_mm(self) -> u64 {
+        let product = i64::from(self.width) * 254;
+        u64::try_from((product + 480) / 960).unwrap_or(0)
+    }
+
+    /// VERTSIZE: screen height in millimeters at the 96-dpi logical baseline
+    /// (rounded half-up so the default 1080 keeps 286).
+    pub fn height_mm(self) -> u64 {
+        let product = i64::from(self.height) * 254;
+        u64::try_from((product + 480) / 960).unwrap_or(0)
+    }
+}
+
+impl Default for DisplayMetrics {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 pub struct WinApiState {
     /// Heap + FLS state.
     pub heap_state: HeapState,
@@ -336,6 +395,12 @@ pub struct WinApiState {
     pub module_state: ModuleState,
     /// Process-level state (error, registry, identity, misc).
     pub process: ProcessState,
+    /// Guest-visible primary display dimensions (logical points on Retina).
+    ///
+    /// Set once at session init from the winit primary monitor; every fake
+    /// dimension source (monitor info, system metrics, device caps, DEVMODE,
+    /// clip cursor) reads it so the whole surface reports one geometry.
+    pub display: DisplayMetrics,
     /// Kernel execution state (threading, sync, SEH).
     pub kernel: KernelState,
     /// On-demand state for optional WIE-hosted DLLs.
@@ -364,6 +429,7 @@ impl std::fmt::Debug for WinApiState {
             .field("dll_states", &self.dll_states)
             .field("module_state", &self.module_state)
             .field("process", &self.process)
+            .field("display", &self.display)
             .field("kernel", &self.kernel)
             .field("message_queue", &self.message_queue)
             .finish()
@@ -638,5 +704,26 @@ impl<'a> HandlerContext<'a> {
             return_address,
             return_value: value,
         })
+    }
+}
+
+#[cfg(test)]
+mod display_metrics_tests {
+    use super::DisplayMetrics;
+
+    #[test]
+    fn mm_sizes_match_the_96_dpi_logical_baseline() {
+        // Defaults preserve the historical table (1920→508, 1080→286).
+        let default = DisplayMetrics::default();
+        assert_eq!(default.width_metric(), 1920);
+        assert_eq!(default.height_metric(), 1080);
+        assert_eq!(default.width_mm(), 508);
+        assert_eq!(default.height_mm(), 286);
+        // A 1728×1117 point monitor scales proportionally (rounded half-up).
+        let custom = DisplayMetrics::new(1728, 1117);
+        assert_eq!(custom.width_metric(), 1728);
+        assert_eq!(custom.height_metric(), 1117);
+        assert_eq!(custom.width_mm(), 457);
+        assert_eq!(custom.height_mm(), 296);
     }
 }

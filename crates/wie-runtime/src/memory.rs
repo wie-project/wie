@@ -518,6 +518,7 @@ pub(crate) fn default_winapi_state(
     let (directinput_var, directinput_value) = SDL_DIRECTINPUT_ENV_PAIR;
 
     Ok(wie_winapi::WinApiState {
+        display: wie_winapi::DisplayMetrics::default(),
         heap_state: wie_winapi::HeapState {
             heap: wie_winapi::GuestHeap::new(layout.process_heap.base, heap_end),
             next_fls_index: 1,

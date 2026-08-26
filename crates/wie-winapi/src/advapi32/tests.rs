@@ -78,6 +78,7 @@ fn test_env() -> WinApiEnvironment {
 /// Default state with a bump heap covering [0x2000, 0x10000).
 fn default_winapi_state() -> WinApiState {
     WinApiState {
+        display: crate::DisplayMetrics::default(),
         heap_state: HeapState {
             heap: GuestHeap::new(0x2000, 0x10000),
             next_fls_index: 0,

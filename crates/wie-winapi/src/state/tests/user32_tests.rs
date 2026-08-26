@@ -632,3 +632,102 @@ fn test_get_window_text_length_a_counts_cp1252_chars() {
         "\"café\" is 4 CP1252 chars, not 5 UTF-8 bytes"
     );
 }
+
+/// With a non-default `DisplayMetrics` (a 1728×1117 logical-point monitor),
+/// `GetMonitorInfoW` fills rcMonitor AND rcWork with that geometry: the work
+/// area equals the full monitor because WIE emulates no taskbar strip.
+#[test]
+fn test_get_monitor_info_w_reports_custom_display_metrics() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.display = crate::DisplayMetrics::new(1728, 1117);
+    // RCX=hMonitor, RDX=MONITORINFO buffer.
+    write_regs(
+        &mut engine,
+        user32::FAKE_MONITOR_HANDLE,
+        0x4000,
+        0,
+        0,
+        STACK_TOP,
+    );
+    assert_return_value!(
+        user32::handle_get_monitor_info_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        1
+    );
+    let read_i32 = |engine: &mut IcedCpu, addr: u64| -> i32 {
+        let mut b = [0_u8; 4];
+        engine.mem_read(addr, &mut b).expect("read MONITORINFO i32");
+        i32::from_le_bytes(b)
+    };
+    // MONITORINFO at 0x4000: rcMonitor @+4..20, rcWork @+20..36, dwFlags @36.
+    assert_eq!(read_i32(&mut engine, 0x4004), 0, "rcMonitor.left");
+    assert_eq!(read_i32(&mut engine, 0x4008), 0, "rcMonitor.top");
+    assert_eq!(read_i32(&mut engine, 0x400C), 1728, "rcMonitor.right");
+    assert_eq!(read_i32(&mut engine, 0x4010), 1117, "rcMonitor.bottom");
+    assert_eq!(read_i32(&mut engine, 0x4014), 0, "rcWork.left");
+    assert_eq!(read_i32(&mut engine, 0x4018), 0, "rcWork.top");
+    assert_eq!(read_i32(&mut engine, 0x401C), 1728, "rcWork.right");
+    assert_eq!(read_i32(&mut engine, 0x4020), 1117, "rcWork.bottom");
+    assert_eq!(read_i32(&mut engine, 0x4024), 1, "MONITORINFOF_PRIMARY");
+}
+
+/// Every width/height-shaped SM_* metric follows the session's
+/// `DisplayMetrics`, so GetSystemMetrics cannot disagree with the monitor
+/// info or the device caps on a non-default display.
+#[test]
+fn test_get_system_metrics_follow_custom_display_metrics() {
+    for (index, expected) in [
+        (0_u64, 1728_u64), // SM_CXSCREEN
+        (1, 1117),         // SM_CYSCREEN
+        (16, 1728),        // SM_CXFULLSCREEN
+        (17, 1117),        // SM_CYFULLSCREEN (no emulated taskbar)
+        (60, 1117),        // SM_CYMAXTRACK
+        (62, 1117),        // SM_CYMAXIMIZED
+        (78, 1728),        // SM_CXVIRTUALSCREEN
+        (79, 1117),        // SM_CYVIRTUALSCREEN
+    ] {
+        let mut engine = test_engine();
+        let mut state = default_winapi_state();
+        state.display = crate::DisplayMetrics::new(1728, 1117);
+        write_regs(&mut engine, index, 0, 0, 0, STACK_TOP);
+        assert_return_value!(
+            user32::handle_get_system_metrics(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            expected
+        );
+    }
+}
+
+/// `EnumDisplaySettingsW` reports the session's `DisplayMetrics` resolution
+/// (not a hardcoded desktop) so SDL's mode enumeration agrees with the rest
+/// of the fake surface.
+#[test]
+fn test_enum_display_settings_w_reports_custom_display_metrics() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.display = crate::DisplayMetrics::new(1728, 1117);
+    // DEVMODEW at 0x5000: dmPelsWidth @+0xAC, dmPelsHeight @+0xB0.
+    write_regs(&mut engine, 0, 0, 0x5000, 0, STACK_TOP);
+    assert_return_value!(
+        user32::handle_enum_display_settings_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        1
+    );
+    let read_u32 = |engine: &mut IcedCpu, addr: u64| -> u32 {
+        let mut b = [0_u8; 4];
+        engine.mem_read(addr, &mut b).expect("read DEVMODE u32");
+        u32::from_le_bytes(b)
+    };
+    assert_eq!(read_u32(&mut engine, 0x50AC), 1728, "dmPelsWidth");
+    assert_eq!(read_u32(&mut engine, 0x50B0), 1117, "dmPelsHeight");
+}

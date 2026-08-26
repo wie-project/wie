@@ -5,10 +5,12 @@ use super::{
     write_guest_u32,
 };
 use crate::gdi32::{ArgReg, read_arg};
+use crate::state::DisplayMetrics;
 
-pub(crate) fn write_fake_monitor_info(
+pub(crate) fn write_monitor_info(
     engine: &mut dyn wie_cpu::CpuEngine,
     monitor_info_va: u64,
+    display: &DisplayMetrics,
 ) -> Result<()> {
     if monitor_info_va == 0 {
         return Ok(());
@@ -23,9 +25,9 @@ pub(crate) fn write_fake_monitor_info(
     // MONITORINFOEXA/W has the same prefix plus device name after offset 40.
     write_guest_u32(engine, monitor_info_va, 40)?;
 
-    // rcMonitor = { left: 0, top: 0, right: 1920, bottom: 1080 }
+    // rcMonitor = { left: 0, top: 0, right: display.width, bottom: display.height }
     // Matches GetDeviceCaps HORZRES/VERTRES and GetSystemMetrics SM_CXSCREEN/
-    // SM_CYSCREEN (all report a 1920×1080 fake display).
+    // SM_CYSCREEN (all report the session's DisplayMetrics).
     write_guest_i32(
         engine,
         checked_address(monitor_info_va, 4, "rcMonitor.left"),
@@ -39,15 +41,16 @@ pub(crate) fn write_fake_monitor_info(
     write_guest_i32(
         engine,
         checked_address(monitor_info_va, 12, "rcMonitor.right"),
-        1920,
+        display.width,
     )?;
     write_guest_i32(
         engine,
         checked_address(monitor_info_va, 16, "rcMonitor.bottom"),
-        1080,
+        display.height,
     )?;
 
-    // rcWork = { left: 0, top: 0, right: 1920, bottom: 1040 } (1080 - 40 taskbar)
+    // rcWork == rcMonitor: WIE emulates no taskbar strip, so the work area is
+    // the full monitor (nothing asserts the old 40-px taskbar heuristic).
     write_guest_i32(
         engine,
         checked_address(monitor_info_va, 20, "rcWork.left"),
@@ -61,12 +64,12 @@ pub(crate) fn write_fake_monitor_info(
     write_guest_i32(
         engine,
         checked_address(monitor_info_va, 28, "rcWork.right"),
-        1920,
+        display.width,
     )?;
     write_guest_i32(
         engine,
         checked_address(monitor_info_va, 32, "rcWork.bottom"),
-        1040,
+        display.height,
     )?;
 
     // MONITORINFOF_PRIMARY
@@ -74,21 +77,31 @@ pub(crate) fn write_fake_monitor_info(
 
     Ok(())
 }
-pub(crate) fn fake_system_metric(metric_index: u64) -> u64 {
-    // Standard SM_* values for a 1920×1080 32-bpp desktop (matches
+pub(crate) fn fake_system_metric(metric_index: u64, display: &DisplayMetrics) -> u64 {
+    // Standard SM_* values for the session's DisplayMetrics desktop (matches
     // GetDeviceCaps HORZRES/VERTRES). Identical return values are merged into
     // one arm (clippy match_same_arms); every metric whose real value is 0
     // (SM_DEBUG, SM_SWAPBUTTON, SM_CYKANJIWINDOW, SM_PENWINDOWS, SM_DBCSENABLED,
     // SM_SECURE, SM_CLEANBOOT, SM_SHOWSOUNDS, SM_SLOWMACHINE, SM_MIDEASTENABLED,
     // SM_MENUDROPALIGNMENT, SM_ARRANGE, SM_NETWORK, SM_XIMSCREEN, …) falls
     // through to `_ => 0`, matching Windows' behavior for invalid SM_* too.
-    match metric_index {
-        // SM_CXSCREEN / SM_CXFULLSCREEN / SM_CXMAXTRACK / SM_CYMAXTRACK /
-        // SM_CXMAXIMIZED / SM_CXVIRTUALSCREEN / SM_CYVIRTUALSCREEN
-        0 | 16 | 59 | 60 | 61 | 78 | 79 => 1920,
+    let width = display.width_metric();
+    let height = display.height_metric();
 
-        // SM_CYSCREEN
-        1 => 1080,
+    match metric_index {
+        // SM_CXSCREEN / SM_CXFULLSCREEN / SM_CXMAXTRACK / SM_CXMAXIMIZED /
+        // SM_CXVIRTUALSCREEN — every width-shaped metric is the display width.
+        0 | 16 | 59 | 61 | 78 => width,
+
+        // SM_CYSCREEN / SM_CYMAXTRACK / SM_CYVIRTUALSCREEN — height-shaped.
+        // (These previously fell into the shared width arm; with real metrics
+        // they report the height like Windows does.)
+        1 | 60 | 79 => height,
+
+        // SM_CYFULLSCREEN / SM_CYMAXIMIZED — no emulated taskbar, so the
+        // maximized height equals the full display height (the old −40 px
+        // taskbar heuristic is gone; nothing asserts it).
+        17 | 62 => height,
 
         // SM_CXVSCROLL / SM_CYHSCROLL / SM_CYVTHUMB / SM_CXHTHUMB /
         // SM_CYVSCROLL / SM_CXHSCROLL
@@ -112,9 +125,6 @@ pub(crate) fn fake_system_metric(metric_index: u64) -> u64 {
 
         // SM_CYMENU
         15 => 20,
-
-        // SM_CYFULLSCREEN / SM_CYMAXIMIZED (1080 − 40 px taskbar)
-        17 | 62 => 1040,
 
         // SM_CXMIN / SM_CXMINTRACK
         28 | 34 => 112,
@@ -155,7 +165,8 @@ pub fn handle_get_system_metrics(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let engine = &mut *ctx.engine;
     let metric_index = read_arg(engine, ArgReg::Rcx, "GetSystemMetrics")?;
 
-    let return_value = fake_system_metric(metric_index);
+    let display = ctx.state.display;
+    let return_value = fake_system_metric(metric_index, &display);
 
     ctx.finish(return_value)
 }
@@ -178,7 +189,7 @@ pub fn handle_get_monitor_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let success = monitor_handle == FAKE_MONITOR_HANDLE && monitor_info_va != 0;
 
     if success {
-        write_fake_monitor_info(engine, monitor_info_va)?;
+        write_monitor_info(engine, monitor_info_va, &ctx.state.display)?;
     }
 
     let return_value = u64::from(success);
@@ -195,7 +206,7 @@ pub fn handle_get_monitor_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let success = monitor_handle == FAKE_MONITOR_HANDLE && monitor_info_va != 0;
 
     if success {
-        write_fake_monitor_info(engine, monitor_info_va)?;
+        write_monitor_info(engine, monitor_info_va, &ctx.state.display)?;
     }
 
     let return_value = u64::from(success);
@@ -253,8 +264,9 @@ pub fn handle_enum_display_monitors(ctx: &mut HandlerContext<'_>) -> Result<WinA
 
     // The visible region of the fake monitor, as the MONITORENUMPROC
     // `lprcMonitor` argument (a RECT). SDL ignores it; other callers may read
-    // it, so point it at the 1920×1080 desktop geometry the rest of the fake
-    // surface reports rather than NULL.
+    // it, so point it at the session's DisplayMetrics desktop geometry the
+    // rest of the fake surface reports rather than NULL.
+    let display = state.display;
     let rect_va = state.heap_state.heap.alloc_coherent(engine, 16);
     if rect_va != 0 {
         write_guest_i32(engine, checked_address(rect_va, 0, "lprcMonitor.left"), 0)?;
@@ -262,12 +274,12 @@ pub fn handle_enum_display_monitors(ctx: &mut HandlerContext<'_>) -> Result<WinA
         write_guest_i32(
             engine,
             checked_address(rect_va, 8, "lprcMonitor.right"),
-            1920,
+            display.width,
         )?;
         write_guest_i32(
             engine,
             checked_address(rect_va, 12, "lprcMonitor.bottom"),
-            1080,
+            display.height,
         )?;
     }
 
@@ -429,7 +441,8 @@ pub fn handle_get_system_metrics_for_dpi(
 
     let dpi = read_arg(engine, ArgReg::Rdx, "GetSystemMetricsForDpi")?;
 
-    let base_value = fake_system_metric(metric_index);
+    let display = ctx.state.display;
+    let base_value = fake_system_metric(metric_index, &display);
     let return_value = scale_system_metric_for_dpi(base_value, dpi)?;
 
     ctx.finish(return_value)

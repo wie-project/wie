@@ -786,6 +786,7 @@ mod cwd_tests {
     /// Default state seeded with cwd `C:\` (mirrors the runtime seed).
     fn winapi_state_default() -> WinApiState {
         WinApiState {
+            display: crate::DisplayMetrics::default(),
             heap_state: HeapState {
                 heap: GuestHeap::new(0x2000, 0x10000),
                 next_fls_index: 0,

@@ -77,10 +77,12 @@ pub fn handle_dialog_box_indirect_param_w(
 }
 /// Handles `USER32.dll!EnumDisplaySettingsW`.
 ///
-/// Reports a 1920×1080@60 DEVMODE for mode 0 and `ENUM_CURRENT_SETTINGS` (-1);
-/// any other mode returns FALSE (the enumeration is exhausted).
+/// Reports a single DEVMODE at the session's DisplayMetrics resolution @60 Hz
+/// for mode 0 and `ENUM_CURRENT_SETTINGS` (-1); any other mode returns FALSE
+/// (the enumeration is exhausted).
 pub fn handle_enum_display_settings_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
+    let display = ctx.state.display;
     let _device = engine.read_rcx()?;
     let mode_index = read_arg(engine, ArgReg::Rdx, "EnumDisplaySettingsW")?;
     let mode_va = read_arg(engine, ArgReg::R8, "EnumDisplaySettingsW")?;
@@ -117,8 +119,10 @@ pub fn handle_enum_display_settings_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
     buf[0x48..0x4C].copy_from_slice(&fields.to_le_bytes()); // dmFields
     // dmPosition = {0,0} (already zeroed), dmDisplayOrientation = DMDO_DEFAULT (0).
     buf[0xA8..0xAC].copy_from_slice(&32_u32.to_le_bytes()); // dmBitsPerPel
-    buf[0xAC..0xB0].copy_from_slice(&1920_u32.to_le_bytes()); // dmPelsWidth
-    buf[0xB0..0xB4].copy_from_slice(&1080_u32.to_le_bytes()); // dmPelsHeight
+    let pels_width = u32::try_from(display.width).unwrap_or(0);
+    let pels_height = u32::try_from(display.height).unwrap_or(0);
+    buf[0xAC..0xB0].copy_from_slice(&pels_width.to_le_bytes()); // dmPelsWidth
+    buf[0xB0..0xB4].copy_from_slice(&pels_height.to_le_bytes()); // dmPelsHeight
     buf[0xB8..0xBC].copy_from_slice(&60_u32.to_le_bytes()); // dmDisplayFrequency
     engine
         .mem_write(mode_va, &buf)
@@ -128,13 +132,14 @@ pub fn handle_enum_display_settings_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
 /// Handles `USER32.dll!EnumDisplaySettingsA` — the ANSI spelling of
 /// `EnumDisplaySettingsW`.
 ///
-/// Reports the same single 1920×1080@60 `DEVMODEA` for mode 0 and
-/// `ENUM_CURRENT_SETTINGS` (-1); any other mode returns FALSE. The fields this
-/// surface writes (`dmSize`, `dmBitsPerPel`, `dmPelsWidth`, `dmPelsHeight`,
-/// `dmDisplayFrequency`) are binary, not text, so the A/W layouts agree here;
-/// this mirrors `EnumDisplaySettingsW` field-for-field.
+/// Reports the same single DisplayMetrics-resolution@60 `DEVMODEA` for mode 0
+/// and `ENUM_CURRENT_SETTINGS` (-1); any other mode returns FALSE. The fields
+/// this surface writes (`dmSize`, `dmBitsPerPel`, `dmPelsWidth`,
+/// `dmPelsHeight`, `dmDisplayFrequency`) are binary, not text, so the A/W
+/// layouts agree here; this mirrors `EnumDisplaySettingsW` field-for-field.
 pub fn handle_enum_display_settings_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
+    let display = ctx.state.display;
     let _device = engine.read_rcx()?;
     let mode_index = read_arg(engine, ArgReg::Rdx, "EnumDisplaySettingsA")?;
     let mode_va = read_arg(engine, ArgReg::R8, "EnumDisplaySettingsA")?;
@@ -172,8 +177,10 @@ pub fn handle_enum_display_settings_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
     buf[0x28..0x2C].copy_from_slice(&fields.to_le_bytes()); // dmFields
     // dmPosition = {0,0} (zeroed), dmDisplayOrientation = DMDO_DEFAULT (0).
     buf[0x68..0x6C].copy_from_slice(&32_u32.to_le_bytes()); // dmBitsPerPel
-    buf[0x6C..0x70].copy_from_slice(&1920_u32.to_le_bytes()); // dmPelsWidth
-    buf[0x70..0x74].copy_from_slice(&1080_u32.to_le_bytes()); // dmPelsHeight
+    let pels_width = u32::try_from(display.width).unwrap_or(0);
+    let pels_height = u32::try_from(display.height).unwrap_or(0);
+    buf[0x6C..0x70].copy_from_slice(&pels_width.to_le_bytes()); // dmPelsWidth
+    buf[0x70..0x74].copy_from_slice(&pels_height.to_le_bytes()); // dmPelsHeight
     buf[0x78..0x7C].copy_from_slice(&60_u32.to_le_bytes()); // dmDisplayFrequency
     engine
         .mem_write(mode_va, &buf)
@@ -471,12 +478,14 @@ pub fn handle_set_window_rgn(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 }
 /// Handles `USER32.dll!SystemParametersInfoA` / `SystemParametersInfoW`.
 ///
-/// The common GET queries SDL probes are answered honestly (work area =
-/// 1920x1080, screen-saver inactive, …); unknown actions return FALSE.
+/// The common GET queries SDL probes are answered honestly (work area = the
+/// session's DisplayMetrics full monitor — WIE emulates no taskbar, screen
+/// saver inactive); unknown actions return FALSE.
 pub fn handle_system_parameters_info_impl(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
+    let display = ctx.state.display;
     let action = read_arg(engine, ArgReg::Rcx, "SystemParametersInfo")?;
     let param = read_arg(engine, ArgReg::Rdx, "SystemParametersInfo")?;
     let value_va = read_arg(engine, ArgReg::R8, "SystemParametersInfo")?;
@@ -488,12 +497,12 @@ pub fn handle_system_parameters_info_impl(
     const SPI_GETMOUSE: u64 = 0x0003;
     match action {
         SPI_GETWORKAREA if value_va != 0 => {
-            // Full-screen work area (1920x1080).
+            // Full-monitor work area (no emulated taskbar).
             let mut b = [0_u8; 16];
             b[0..4].copy_from_slice(&0_i32.to_le_bytes());
             b[4..8].copy_from_slice(&0_i32.to_le_bytes());
-            b[8..12].copy_from_slice(&1920_i32.to_le_bytes());
-            b[12..16].copy_from_slice(&1080_i32.to_le_bytes());
+            b[8..12].copy_from_slice(&display.width.to_le_bytes());
+            b[12..16].copy_from_slice(&display.height.to_le_bytes());
             engine
                 .mem_write(value_va, &b)
                 .context("failed to write SPI work area")?;

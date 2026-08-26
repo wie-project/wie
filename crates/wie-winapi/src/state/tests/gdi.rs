@@ -3,6 +3,37 @@ use super::*;
 
 // --- Gdi32 ---
 
+/// `GetDeviceCaps` on a memory DC reports the session's `DisplayMetrics`
+/// (HORZRES/VERTRES and the mm sizes at the 96-dpi logical baseline) so GDI
+/// probes agree with the monitor info and system metrics.
+#[test]
+fn test_get_device_caps_follows_custom_display_metrics() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.display = crate::DisplayMetrics::new(1728, 1117);
+    let hdc = state.gdi_state().alloc_dc(crate::gdi32::DcKind::Memory);
+    for (index, expected) in [
+        (8_u64, 1728_u64), // HORZRES
+        (10, 1117),        // VERTRES
+        (110, 1728),       // PHYSICALWIDTH
+        (111, 1117),       // PHYSICALHEIGHT
+        (118, 1728),       // DESKTOPHORZRES
+        (117, 1117),       // DESKTOPVERTRES
+        (4, 457),          // HORZSIZE mm (1728 px * 25.4 / 96, rounded)
+        (6, 296),          // VERTSIZE mm (1117 px * 25.4 / 96, rounded)
+    ] {
+        write_regs(&mut engine, hdc.as_u64(), index, 0, 0, STACK_TOP);
+        assert_return_value!(
+            gdi32::handle_get_device_caps(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            expected
+        );
+    }
+}
+
 #[test]
 fn test_text_out_a_returns_cch() {
     let mut engine = test_engine();

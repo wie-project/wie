@@ -7,11 +7,16 @@ use super::config::{
 };
 
 /// Builds metrics/colors tables matching host `fake_system_metric` / `GetSysColor`.
-pub(crate) fn build_stub_data_page() -> Vec<u8> {
+///
+/// Takes the session's [`wie_winapi::DisplayMetrics`] so the in-guest
+/// GetSystemMetrics accelerator reports the same dimensions as the host-side
+/// handler (the table previously hardcoded 1024×768 and drifted).
+pub(crate) fn build_stub_data_page(display: wie_winapi::DisplayMetrics) -> Vec<u8> {
     let mut page = vec![0_u8; 0x500 + CWD_BLOB_SIZE];
     // Metrics
     for i in 0..METRICS_COUNT {
-        let v = fake_system_metric(i as u64) as u32;
+        let v =
+            u32::try_from(fake_system_metric(u64::try_from(i).unwrap_or(0), &display)).unwrap_or(0);
         let off = i * 4;
         page[off..off + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -76,17 +81,20 @@ pub(crate) fn refresh_clock_table(
 }
 
 /// Must match `wie_winapi::user32::fake_system_metric`.
-fn fake_system_metric(metric_index: u64) -> u64 {
+fn fake_system_metric(metric_index: u64, display: &wie_winapi::DisplayMetrics) -> u64 {
     match metric_index {
-        0 | 16 => 1024,
-        1 => 768,
+        // SM_CXSCREEN / SM_CXFULLSCREEN
+        0 | 16 => display.width_metric(),
+        // SM_CYSCREEN
+        1 => display.height_metric(),
         2 | 3 => 17,
         4 => 23,
         5 | 6 | 19 | 80 => 1,
         7 | 8 | 32 | 33 | 36 | 37 => 4,
         11..=14 => 32,
         15 => 20,
-        17 => 728,
+        // SM_CYFULLSCREEN — no emulated taskbar.
+        17 => display.height_metric(),
         28 | 34 => 112,
         29 | 35 => 27,
         30 | 31 => 18,

@@ -82,19 +82,19 @@ pub use thread::{FIRST_WORKER_TID, GuestThread, PRIMARY_THREAD_ID, ThreadState};
 
 mod state;
 pub use state::{
-    ClipboardState, D3D9State, DEFAULT_ENVIRONMENT, DllId, DllStateMap, FileDialogBridge,
-    FileDialogFilter, FileDialogPick, FileDialogPolicy, FileDialogRequest, FileHandle, FileIoState,
-    FindFileHandle, FindHandle, FlsSlot, FontDialogPolicy, GetProcAddressCacheEntry,
-    GlobalAtomRecord, GuestCallbackRequest, GuestIoRuntimeConfig, GuestStdinMode, HandlerContext,
-    HeapAllocation, HeapState, HostFileMount, HostParkReason, ImportResolver, KernelState,
-    KeyboardState, MessageQueueIdlePolicy, ModuleHandle, ModuleState, OpenGuestFile, OuterReturn,
-    PTHREAD_RETURN_TRAMPOLINE_VA, PageSetupDialogBridge, PageSetupDialogPick,
-    PageSetupDialogPolicy, PageSetupDialogRequest, PendingNativePrintJob, PrintDialogBridge,
-    PrintDialogPick, PrintDialogPolicy, PrintDialogRequest, PrintJobBridge, PrintJobRequest,
-    ProcessState, QueuedWindowMessage, RegistryKey, RegistryKeyHandle, ResourceHandle,
-    ResourceRecord, TimerRecord, VirtualGuestFile, WinApiControlSignal, WinApiEnvironment,
-    WinApiState, WindowClassRecord, WindowFlags, WindowRecord, WindowState, WindowsHookRecord,
-    pthread_return_trampoline_va,
+    ClipboardState, D3D9State, DEFAULT_ENVIRONMENT, DisplayMetrics, DllId, DllStateMap,
+    FileDialogBridge, FileDialogFilter, FileDialogPick, FileDialogPolicy, FileDialogRequest,
+    FileHandle, FileIoState, FindFileHandle, FindHandle, FlsSlot, FontDialogPolicy,
+    GetProcAddressCacheEntry, GlobalAtomRecord, GuestCallbackRequest, GuestIoRuntimeConfig,
+    GuestStdinMode, HandlerContext, HeapAllocation, HeapState, HostFileMount, HostParkReason,
+    ImportResolver, KernelState, KeyboardState, MessageQueueIdlePolicy, ModuleHandle, ModuleState,
+    OpenGuestFile, OuterReturn, PTHREAD_RETURN_TRAMPOLINE_VA, PageSetupDialogBridge,
+    PageSetupDialogPick, PageSetupDialogPolicy, PageSetupDialogRequest, PendingNativePrintJob,
+    PrintDialogBridge, PrintDialogPick, PrintDialogPolicy, PrintDialogRequest, PrintJobBridge,
+    PrintJobRequest, ProcessState, QueuedWindowMessage, RegistryKey, RegistryKeyHandle,
+    ResourceHandle, ResourceRecord, TimerRecord, VirtualGuestFile, WinApiControlSignal,
+    WinApiEnvironment, WinApiState, WindowClassRecord, WindowFlags, WindowRecord, WindowState,
+    WindowsHookRecord, pthread_return_trampoline_va,
 };
 
 mod dispatch_table;

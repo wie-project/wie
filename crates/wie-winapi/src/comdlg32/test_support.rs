@@ -37,6 +37,7 @@ pub(crate) fn write_regs(cpu: &mut IcedCpu, rcx: u64, rdx: u64, r8: u64, r9: u64
 }
 pub(crate) fn test_state() -> WinApiState {
     WinApiState {
+        display: crate::DisplayMetrics::default(),
         heap_state: HeapState {
             heap: GuestHeap::new(0x2000, 0x10000),
             next_fls_index: 0,

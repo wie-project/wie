@@ -48,6 +48,12 @@ pub struct SessionOptions {
     /// so relative resource paths resolve from the staged exe's directory
     /// like a normal Windows launch.
     pub current_directory: Option<String>,
+    /// Guest-visible primary-display dimensions, captured from the winit
+    /// primary monitor by the GUI entry point (logical points on Retina).
+    /// `None` (headless / persistent runs) keeps
+    /// [`wie_winapi::DisplayMetrics::DEFAULT`] so micro-suite runs stay
+    /// deterministic.
+    pub display_metrics: Option<wie_winapi::DisplayMetrics>,
 }
 
 /// Guest CRT page layout constants (must match `wie_winapi::ucrt` and guest

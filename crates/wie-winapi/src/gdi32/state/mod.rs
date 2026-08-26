@@ -4,7 +4,7 @@ use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::{Bitmap, Size};
 use crate::guest_memory::with_typed_write;
 use crate::handles::{Hbitmap, Hbrush, Hdc, Hfont, Hpen};
-use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
+use crate::{DisplayMetrics, HandlerContext, WinApiHandlerResult, WinApiState};
 
 mod metrics;
 pub(crate) mod objects;
@@ -289,10 +289,11 @@ pub fn handle_create_compatible_dc(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 
 /// Handles `GDI32.dll!GetDeviceCaps`.
 ///
-/// Returns plausible values for a 1920×1080 32-bpp desktop so Lunar Magic's
-/// display-mode probes succeed without real GDI. Print DCs branch FIRST and
-/// report the print-job geometry (300 DPI, the paper size in device px) —
-/// the canvas always matches whatever this reports.
+/// Returns plausible values for the session's DisplayMetrics desktop at
+/// 96-dpi logical scale so Lunar Magic's display-mode probes succeed without
+/// real GDI. Print DCs branch FIRST and report the print-job geometry (300
+/// DPI, the paper size in device px) — the canvas always matches whatever
+/// this reports.
 pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -307,7 +308,7 @@ pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let return_value = if is_print {
         print_dc_caps(state, hdc, index)
     } else {
-        screen_dc_caps(index)
+        screen_dc_caps(index, state.display)
     };
 
     tracing::debug!(index, return_value, "GetDeviceCaps");
@@ -315,18 +316,19 @@ pub fn handle_get_device_caps(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     ctx.finish(return_value)
 }
 
-/// The fake 1920×1080 screen caps table (shared by non-print DCs and the
-/// print fallback when a `Print`-typed record has no job — a torn state).
-fn screen_dc_caps(index: u64) -> u64 {
+/// The fake screen caps table for the session's DisplayMetrics desktop
+/// (shared by non-print DCs and the print fallback when a `Print`-typed
+/// record has no job — a torn state).
+fn screen_dc_caps(index: u64, display: DisplayMetrics) -> u64 {
     // Common GetDeviceCaps indices from wingdi.h.
     // Identical return values are intentionally merged (clippy match_same_arms).
     match index {
-        0 => 0x4000,                         // DRIVERVERSION
+        0 => 0x4000,                               // DRIVERVERSION
         2 | 26 | 112 | 113 | 119 | 121 => 0, // TECHNOLOGY, PDEVICESIZE, offsets, BLTALIGNMENT, COLORMGMTCAPS
-        4 => 508,                            // HORZSIZE mm (~20")
-        6 => 286,                            // VERTSIZE mm
-        8 | 110 | 118 => 1920,               // HORZRES / PHYSICALWIDTH / DESKTOPHORZRES
-        10 | 111 | 117 => 1080,              // VERTRES / PHYSICALHEIGHT / DESKTOPVERTRES
+        4 => display.width_mm(),             // HORZSIZE mm at the 96-dpi logical baseline
+        6 => display.height_mm(),            // VERTSIZE mm
+        8 | 110 | 118 => display.width_metric(), // HORZRES / PHYSICALWIDTH / DESKTOPHORZRES
+        10 | 111 | 117 => display.height_metric(), // VERTRES / PHYSICALHEIGHT / DESKTOPVERTRES
         12 => 32,                            // BITSPIXEL
         14 | 16 | 18 | 20 | 22 | 36 => 1,    // PLANES, NUMBRUSHES/PENS/MARKERS/FONTS, CLIPCAPS
         24 => u64::MAX,                      // NUMCOLORS (-1 for >8bpp, sign-extended int)
@@ -360,7 +362,7 @@ fn print_dc_caps(state: &mut WinApiState, hdc: u64, index: u64) -> u64 {
             index,
             "GetDeviceCaps: print DC without a job; screen fallback"
         );
-        return screen_dc_caps(index);
+        return screen_dc_caps(index, state.display);
     };
     let (paper_w, paper_h) = job.paper_px;
     let (size_w, size_h) = job.paper_mm;

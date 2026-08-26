@@ -71,6 +71,7 @@ fn default_winapi_state() -> WinApiState {
     let mut heap = GuestHeap::new(0x2000, 0x10000);
     heap.attach_guest_control(0x2000);
     WinApiState {
+        display: crate::DisplayMetrics::default(),
         heap_state: HeapState {
             heap,
             ..winapi_state_default().heap_state
@@ -83,6 +84,7 @@ fn winapi_state_default() -> WinApiState {
     // This must stay in sync with the fields of WinApiState.
     // Only the heap is customised; everything else is default.
     WinApiState {
+        display: crate::DisplayMetrics::default(),
         heap_state: HeapState {
             heap: GuestHeap::new(0x2000, 0x10000),
             next_fls_index: 0,

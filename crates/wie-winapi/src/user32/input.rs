@@ -95,10 +95,11 @@ pub fn handle_get_clip_cursor(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let engine = &mut *ctx.engine;
     let rect_va = read_arg(engine, ArgReg::Rcx, "GetClipCursor")?;
 
+    let display = ctx.state.display;
     let success = rect_va != 0;
     if success {
         // Full desktop-ish clip rect.
-        super::write_window_rect(engine, rect_va, 0, 0, 1920, 1080)?;
+        super::write_window_rect(engine, rect_va, 0, 0, display.width, display.height)?;
     }
 
     let return_value = u64::from(success);

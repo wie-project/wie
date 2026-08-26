@@ -979,6 +979,7 @@ mod tests {
     /// Minimal `WinApiState` for the pure-function tests above.
     fn winapi_state_for_test() -> WinApiState {
         WinApiState {
+            display: crate::DisplayMetrics::default(),
             process: ProcessState {
                 last_error: 0,
                 ..winapi_state_default().process
@@ -997,6 +998,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         WinApiState {
+            display: crate::DisplayMetrics::default(),
             heap_state: HeapState {
                 heap: crate::guest_heap::GuestHeap::new(0x2000, 0x10000),
                 next_fls_index: 0,
