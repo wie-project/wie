@@ -434,42 +434,83 @@ fn blit_row(
         .saturating_add(u64::try_from(src_x_us.saturating_mul(4)).unwrap_or(0));
     let span_len = ch.saturating_mul(stride);
 
-    // ONE mem_read for the entire blit span — a single translation and
-    // bounds check instead of one per row (the old per-row loop dominated
-    // the blit cost for large windows). The span buffer is a thread_local
-    // scratch (`with_blit_scratch`) that only grows, so repeated BitBlt calls
-    // reuse one allocation instead of re-allocating ~span bytes every call.
-    with_blit_scratch(span_len, |scratch| {
-        if engine.mem_read(span_va, scratch).is_err() {
-            return;
-        }
-
+    // Zero-copy fast path: when the span is contiguous within one arena,
+    // `host_slice` borrows it directly without a guest→scratch copy.
+    // Otherwise fall back to a chunked scratch copy (≈64 rows / ~500 KB)
+    // to keep the working set in L2 instead of pulling the full ~8 MB.
+    if let Some(host_slice) = engine.host_slice(span_va, span_len) {
         for row in 0..ch {
-            // Row index within the span (reversed for bottom-up DIBs).
             let span_row = if top_down {
                 row
             } else {
                 ch.saturating_sub(1).saturating_sub(row)
             };
-            // `span_va` already advanced by `src_x * 4`, so the row read is a
-            // plain stride offset — re-adding `src_x` would double the column.
             let src_off = span_row.saturating_mul(stride);
-            let Some(row_slice) = scratch.get(src_off..src_off.saturating_add(row_bytes)) else {
+            let Some(row_slice) = host_slice.get(src_off..src_off.saturating_add(row_bytes)) else {
                 return;
             };
-
             let dst_row = dest_y_us.saturating_add(row);
             let dst_offset = dst_row.saturating_mul(dest_w_us).saturating_add(dest_x_us);
             let dst_end = dst_offset.saturating_add(width_us).min(dest.len());
             let Some(dst_slice) = dest.get_mut(dst_offset..dst_end) else {
                 return;
             };
-
-            // BGRA → 0RGB: DIB pixel is 0xAARRGGBB in LE, mask alpha.
-            // NEON-vectorized (4 px/op) so the conversion is fast even in debug.
             mask_bgra_to_0rgb(dst_slice, row_slice);
         }
-    });
+        return;
+    }
+
+    // Chunked fallback for spans crossing an arena boundary.
+    const CHUNK_ROWS: usize = 64;
+    let mut chunk_start = 0_usize;
+    while chunk_start < ch {
+        let chunk_ch = (ch.saturating_sub(chunk_start)).min(CHUNK_ROWS);
+        let chunk_span_va = if top_down {
+            span_va.saturating_add(u64::try_from(chunk_start.saturating_mul(stride)).unwrap_or(0))
+        } else {
+            let guest_off = ch.saturating_sub(chunk_start).saturating_sub(chunk_ch);
+            span_va.saturating_add(u64::try_from(guest_off.saturating_mul(stride)).unwrap_or(0))
+        };
+        let chunk_span_len = chunk_ch.saturating_mul(stride);
+        let mut failed = false;
+        with_blit_scratch(chunk_span_len, |scratch| {
+            if engine.mem_read(chunk_span_va, scratch).is_err() {
+                failed = true;
+                return;
+            }
+            for row_in_chunk in 0..chunk_ch {
+                let row = chunk_start.saturating_add(row_in_chunk);
+                let scratch_off = if top_down {
+                    row_in_chunk.saturating_mul(stride)
+                } else {
+                    // Guest rows within the chunk are sequential; dest rows
+                    // are reversed, so offset counts from the chunk's end.
+                    chunk_ch
+                        .saturating_sub(1)
+                        .saturating_sub(row_in_chunk)
+                        .saturating_mul(stride)
+                };
+                let Some(row_slice) =
+                    scratch.get(scratch_off..scratch_off.saturating_add(row_bytes))
+                else {
+                    failed = true;
+                    return;
+                };
+                let dst_row = dest_y_us.saturating_add(row);
+                let dst_offset = dst_row.saturating_mul(dest_w_us).saturating_add(dest_x_us);
+                let dst_end = dst_offset.saturating_add(width_us).min(dest.len());
+                let Some(dst_slice) = dest.get_mut(dst_offset..dst_end) else {
+                    failed = true;
+                    return;
+                };
+                mask_bgra_to_0rgb(dst_slice, row_slice);
+            }
+        });
+        if failed {
+            return;
+        }
+        chunk_start = chunk_start.saturating_add(chunk_ch);
+    }
 }
 
 /// Fill a rectangular region of a surface with a constant color.
