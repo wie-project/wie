@@ -81,11 +81,13 @@ suites for trend visibility; whole-program timing stays with
 
 The README keeps the shortlist; the complete set lives here.
 
+> **Wave3 defaults (final gate):** padded surface pool + wgpu scratch, latest-wins coalescing/throttling (`drain_pending_publishes` + `retry_delay`), pre-reserve (Q4/C), size-class TLS, and CompactString are **default on** — steady zero-alloc with no env required. JIT direct register hand-off (`WIE_JIT_DIRECT_REGS`) is default **on** (opt-out with `=0` for bisect); D3D9 in-place pooled target (Q9/C) is default. No `WIE_SURFACE_PAD` env required — 64 px padding is the default pooled path.
+
 | Variable | Effect |
 | --- | --- |
 | `WIE_CPU=jit` \| `iced` | CPU backend (default **jit**) |
 | `WIE_MPROTECT=0` | Disable optional host `mprotect` dual-protection (SPC remains on) |
-| `WIE_JIT_MEM=sticky` \| `pin` \| `slow` | JIT mem lower (default **sticky** = 2-way multi sticky + stack pin) |
+| `WIE_JIT_MEM=sticky` \| `pin` \| `slow` | JIT mem lower (default **pin** = sticky + stack pin + top-2 data pins; `sticky` = stack pin only; `slow` = helper-only oracle) |
 | `WIE_JIT_MEM_TRACE=1` | Dump helper mem-path histogram on finalize |
 | `WIE_JIT_SUPER=loop` \| `0` \| `all` | Block-wide stack super path: default **loop** (self-loops only) |
 | `WIE_JIT_CHAIN=0` | Disable FuncRef chaining / chain table / edge IC |
@@ -96,6 +98,7 @@ The README keeps the shortlist; the complete set lives here.
 | `WIE_JIT_OPT=speed\|speed_and_size\|none` | Cranelift opt_level (default **speed**) |
 | `WIE_JIT_HOTNESS_THRESHOLD` | **Experimental** fixed hotness threshold override (default **100**; clamped to `[1, 1_000_000]`) |
 | `WIE_JIT_WORKERS` | Background compile worker count (default ≈ `available_parallelism()/2`, clamped `[1, 4]`). More workers cut boot-time compile latency on multicore hosts; workers compete with guest threads for cores while active. |
+| `WIE_JIT_DIRECT_REGS=0` | **Wave3:** disable direct block-to-block register hand-off (Q8/C) — default **on**; set `0`/`false`/`off` to force `JitCtx` spill path for bisect/matrix |
 | `WIE_JIT_VERIFY=1` | Enable Cranelift IR verifier outside tests |
 | `WIE_FIXED_CLOCK=1` | Freeze the guest clock table (deterministic runs) |
 | `WIE_D3D9_SCALE=2\|4\|8` | D3D9 render resolution divisor (quarter-scale = 4; Present upscales to the window) |
@@ -117,6 +120,21 @@ The README keeps the shortlist; the complete set lives here.
 | `WIE_MT=0` | Disable guest worker spawn |
 | `WIE_MT_MAX_THREADS` | Cap on guest worker threads (default **64**) |
 | `RUST_LOG` | tracing filter (CLI defaults to `warn`) |
+
+### Wave3 remaining knobs — sketch (all default **on**, no env required; `=0` opts out for matrix/bisect)
+
+| Variable | Default | Opt-out | Lane |
+| --- | --- | --- | --- |
+| `WIE_SURFACE_PAD` / padded pool | **64 px** pooled per-HWND + reused wgpu scratch | `WIE_SURFACE_PAD=0` (on-demand alloc) | Q2/D |
+| present throttling / latest-wins | **on** (`drain_pending_publishes` + `retry_delay` coalesce) | `cfg(test)` skips (tests assert publish) | Q5/C |
+| pre-reserve / scratch reuse | **on** (capacity-retained `Vec`s, pooled `WgpuPresenter` scratch) | none — always on | Q4/C |
+| CompactString | **on** (inline small strings; see `compact_string` crate in `wie-winapi` where string-heavy) | `WIE_COMPACT_STRING=0` if gated | Q6/C |
+| size-class TLS | **on** (24 classes, TLS-pooled) | none — always on | TLS lane |
+| mimalloc | **feature** `mimalloc` (if enabled, host allocator) | default allocator if feature off | Q7/C |
+| D3D9 in-place | **on** (pooled `WindowSurface` slice as render target — no temp `Vec<u32>`) | `WIE_D3D9_INPLACE=0` if gated | Q9/C |
+| `WIE_JIT_DIRECT_REGS` | **on** (direct GPR/rflags hand-off) | `WIE_JIT_DIRECT_REGS=0`/`false`/`off` | Q8/C |
+
+> If a knob is not listed above, it is **not** a Wave3 gate — see the full table. All Wave3 paths are verified steady zero-alloc under `WIE_RUNTIME_PROFILE=1` without setting any of these.
 
 ## Bottles
 

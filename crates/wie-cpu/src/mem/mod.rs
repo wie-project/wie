@@ -8,6 +8,9 @@
 //! - [`PageMap`] / [`protect`] — Windows page state + software permission checks
 //! - [`GuestMemory`] — facade used by iced/JIT (SPC on read/write/fetch)
 
+#![allow(unsafe_code)]
+
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod alloc;
@@ -76,6 +79,89 @@ impl MemoryBasicInformation {
 #[cfg(test)]
 use backend::page_key;
 
+/// Direct-mapped fast TLB: TLB[guest_page] = host_base + offset, single
+/// bounds check. Direct-mapped, 4096 entries, tag = guest_page. Fallback is
+/// the region/page walk. Invalidated on `bump_generation`.
+const FAST_TLB_SIZE: usize = 4096;
+const FAST_TLB_MASK: usize = FAST_TLB_SIZE - 1;
+const FAST_TLB_EMPTY: u64 = u64::MAX;
+
+#[derive(Clone, Copy)]
+struct FastTlbSlot {
+    page_key: u64,
+    host_u64: u64,
+    tlbg: u64,
+    allow_r: bool,
+    allow_w: bool,
+}
+
+impl Default for FastTlbSlot {
+    fn default() -> Self {
+        Self {
+            page_key: FAST_TLB_EMPTY,
+            host_u64: 0,
+            tlbg: 0,
+            allow_r: false,
+            allow_w: false,
+        }
+    }
+}
+
+struct FastTlb {
+    slots: Vec<FastTlbSlot>,
+}
+
+impl FastTlb {
+    fn new() -> Self {
+        Self {
+            slots: vec![FastTlbSlot::default(); FAST_TLB_SIZE],
+        }
+    }
+
+    #[inline]
+    fn idx(page_key: u64) -> usize {
+        (page_key as usize) & FAST_TLB_MASK
+    }
+
+    #[inline]
+    fn lookup(&self, page_key: u64, cur_gen: u64) -> Option<PageTlbEntry> {
+        let slot = &self.slots[Self::idx(page_key)];
+        if slot.page_key == page_key && slot.tlbg == cur_gen {
+            // Single bounds check: slot tag == page_key already validated.
+            let host = slot.host_u64 as *mut u8;
+            if host.is_null() {
+                return None;
+            }
+            Some(PageTlbEntry {
+                host,
+                allow_r: slot.allow_r,
+                allow_w: slot.allow_w,
+                generation: slot.tlbg,
+            })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, page_key: u64, entry: PageTlbEntry) {
+        let idx = Self::idx(page_key);
+        if let Some(slot) = self.slots.get_mut(idx) {
+            slot.page_key = page_key;
+            slot.host_u64 = entry.host as u64;
+            slot.tlbg = entry.generation;
+            slot.allow_r = entry.allow_r;
+            slot.allow_w = entry.allow_w;
+        }
+    }
+
+    fn invalidate(&mut self) {
+        for slot in &mut self.slots {
+            slot.page_key = FAST_TLB_EMPTY;
+        }
+    }
+}
+
 /// Guest memory: mmap arenas + region registry + software page map (SPC).
 ///
 /// Storage is always [`MmapArenaBackend`]. Permission enforcement lives here
@@ -90,6 +176,9 @@ pub struct GuestMemory {
     /// `AtomicU64` so concurrent readers can observe generation with
     /// acquire loads while structural writers bump under the process map lock.
     generation: AtomicU64,
+    /// Fast direct-mapped TLB: TLB[guest_page] = host_base, single array
+    /// lookup, fallback to region walk on miss. Invalidated on generation bump.
+    fast_tlb: RwLock<FastTlb>,
 }
 
 impl Default for GuestMemory {
@@ -111,6 +200,28 @@ impl std::fmt::Debug for GuestMemory {
 }
 
 impl GuestMemory {
+    /// Direct-mapped fast translate: TLB[guest_page] → host ptr + offset, single
+    /// bounds/tag check. Returns `None` on miss (caller falls back to region
+    /// walk). Stays behind `RwLock` for interior mutability from `&self`.
+    #[inline]
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn fast_translate(&self, va: u64, write: bool) -> Option<*mut u8> {
+        let page_key = va >> 12;
+        let cur_gen = self.generation.load(Ordering::Acquire);
+        let entry = self.fast_tlb.read().ok()?.lookup(page_key, cur_gen)?;
+        if write && !entry.allow_w {
+            return None;
+        }
+        if !write && !entry.allow_r {
+            return None;
+        }
+        let off = usize::try_from(va & 0xFFF).ok()?;
+        // SAFETY: host is page base, offset < PAGE_SIZE.
+        #[expect(unsafe_code)]
+        Some(unsafe { entry.host.add(off) })
+    }
+
     /// Create guest memory with the sole mmap-arena storage backend.
     #[must_use]
     pub(crate) fn new() -> Self {
@@ -120,6 +231,7 @@ impl GuestMemory {
             pages: PageMap::new(),
             vad: VadTable::new(),
             generation: AtomicU64::new(0),
+            fast_tlb: RwLock::new(FastTlb::new()),
         }
     }
 
@@ -147,6 +259,11 @@ impl GuestMemory {
             .try_update(Ordering::AcqRel, Ordering::Acquire, |g| {
                 Some(g.saturating_add(1))
             });
+        // Invalidate fast TLB array: generation tag will mismatch, but
+        // clearing tags eagerly avoids stale host pointers after unmap.
+        if let Ok(mut tlb) = self.fast_tlb.write() {
+            tlb.invalidate();
+        }
     }
 
     /// Full VAD allocation span when `addr` is an allocation base (`MEM_RELEASE`).

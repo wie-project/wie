@@ -386,6 +386,39 @@ impl PresentState {
         }
     }
 
+    /// Q9/C: hand the next pooled `WindowSurface` slice to the D3D9/wGL present
+    /// path as its render target. Ensures the surface and returns `&mut [u32]`
+    /// to the pooled `Vec<u32>` (the one `ensure_surface` will hand back via
+    /// Q2/D) so the caller can raster directly into it without an intermediate
+    /// `Vec<u32>` copy. If the frame size differs from the surface, the caller
+    /// must `stretch_nearest` directly into this slice (no temp alloc).
+    #[allow(dead_code)]
+    pub(crate) fn pooled_surface_mut(
+        &mut self,
+        hwnd: crate::handles::Hwnd,
+        width: u32,
+        height: u32,
+    ) -> Option<&mut [u32]> {
+        self.ensure_surface(hwnd, width, height);
+        self.surfaces
+            .get_mut(&hwnd)
+            .map(|s| s.pixels.as_mut_slice())
+    }
+
+    /// Q9/C: pooled target with dimensions — returns `(pixels, width, height, padded_width)`.
+    /// For the simple (non-padded) present, logical and padded are the same.
+    #[allow(dead_code)]
+    pub(crate) fn pooled_target_with_dims(
+        &mut self,
+        hwnd: crate::handles::Hwnd,
+        width: u32,
+        height: u32,
+    ) -> Option<(&mut [u32], u32, u32, u32)> {
+        self.ensure_surface(hwnd, width, height);
+        let s = self.surfaces.get_mut(&hwnd)?;
+        Some((s.pixels.as_mut_slice(), s.width, s.height, s.width))
+    }
+
     /// Record the 0RGB background color of `hwnd`'s surface — the owning
     /// window's class-brush color, resolved by the erase machinery.
     ///
@@ -576,7 +609,9 @@ impl PresentState {
     /// A frame sized exactly like the ensured surface copies row-major;
     /// anything else is nearest-neighbour stretched to the surface
     /// dimensions. No allocation: pixels go straight into the retained
-    /// surface buffer.
+    /// surface buffer (Q9/C: pooled WindowSurface slice as render target — no
+    /// intermediate `Vec<u32>` copy; stretch writes directly into the pooled
+    /// slice when sizes differ).
     pub(crate) fn blit_frame(
         &mut self,
         hwnd: crate::handles::Hwnd,

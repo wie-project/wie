@@ -17,6 +17,10 @@ use super::block::{self, BlockKind};
 // WARN; the tail logs at DEBUG so pathological guests don't spam the console.
 const REJECT_WARN_MAX: usize = 50;
 static REJECTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// First 5 M guest instructions run in boot mode: threshold = 1, no deferral
+/// doubling, and bounded inline on deferred (2 per 10 ms token bucket).
+pub(super) const BOOT_MODE_INSNS: u64 = 5_000_000;
 use super::config::{BG_QUEUE_CAP, JitConfig};
 use super::engine::JitEngine;
 use super::fast_api::FastApiKind;
@@ -330,6 +334,11 @@ pub struct JitShared {
     /// item). Backpressure signal: a deep queue raises the local promotion
     /// threshold instead of feeding a backlog guests will time out on.
     pub bg_queue_depth: AtomicU64,
+    /// Retired guest instructions (jit + iced) for boot-mode gating.
+    pub(super) guest_insns: AtomicU64,
+    /// Boot inline token bucket: `(window_start, used_in_window)` for the
+    /// 2-per-10ms bounded inline pool during boot (thrash guard).
+    pub(super) boot_inline_window: Mutex<(Instant, u32)>,
     /// Test-only latch forcing the background path on for this instance
     /// (env-independent, and per-`JitShared` so parallel unit tests cannot
     /// interfere with each other).
@@ -386,6 +395,8 @@ impl JitShared {
             bg_fast_api: Mutex::new(Arc::from(Vec::new())),
             bg_compile: BgCompileProfile::default(),
             bg_queue_depth: AtomicU64::new(0),
+            guest_insns: AtomicU64::new(0),
+            boot_inline_window: Mutex::new((Instant::now(), 0)),
             #[cfg(test)]
             bg_force: AtomicBool::new(false),
         }
@@ -413,6 +424,45 @@ impl JitShared {
     #[cfg(not(test))]
     fn bg_force_test(&self) -> bool {
         let _ = self;
+        false
+    }
+
+    /// Whether the guest is still in boot mode (first 5 M insns).
+    #[inline]
+    pub(super) fn is_boot_mode(&self) -> bool {
+        if cfg!(test) {
+            return false;
+        }
+        self.guest_insns.load(Ordering::Relaxed) < BOOT_MODE_INSNS
+    }
+
+    /// Record retired guest instructions (jit + iced) for boot gating.
+    #[inline]
+    pub(super) fn record_guest_insns(&self, n: u64) {
+        if n != 0 {
+            self.guest_insns.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Bounded inline token bucket during boot: 2 inline compiles per 10 ms.
+    ///
+    /// Guards against thrash when every deferred promotion would otherwise
+    /// inline-compile. Outside boot mode it always returns `false` (no extra
+    /// inline budget).
+    pub(super) fn try_acquire_boot_inline_token(&self) -> bool {
+        if !self.is_boot_mode() {
+            return false;
+        }
+        let now = Instant::now();
+        let mut guard = self.boot_inline_window.lock().unwrap();
+        if now.duration_since(guard.0) >= Duration::from_millis(10) {
+            *guard = (now, 1);
+            return true;
+        }
+        if guard.1 < 2 {
+            guard.1 += 1;
+            return true;
+        }
         false
     }
 

@@ -243,16 +243,31 @@ impl super::GuestMemory {
     }
 
     /// Resolve a committed page for JIT TLB install: host pointer + R/W flags + gen.
+    ///
+    /// Fast path: direct array lookup `TLB[guest_page] = host_base + offset`,
+    /// single bounds/tag check. On miss, falls back to region/page walk and
+    /// fills the TLB.
     #[must_use]
     pub(crate) fn page_tlb_entry(&self, page_key: u64) -> Option<PageTlbEntry> {
+        let cur_gen = self.generation();
+        // Fast array TLB: single tag check, no region walk.
+        if let Ok(tlb) = self.fast_tlb.read()
+            && let Some(entry) = tlb.lookup(page_key, cur_gen)
+        {
+            return Some(entry);
+        }
         let meta = self.page_protect_meta(page_key)?;
         let host = self.backend.page_data_ptr(page_key)?;
-        Some(PageTlbEntry {
+        let entry = PageTlbEntry {
             host,
             allow_r: meta.allow_r,
             allow_w: meta.allow_w,
-            generation: self.generation(),
-        })
+            generation: cur_gen,
+        };
+        if let Ok(mut tlb) = self.fast_tlb.write() {
+            tlb.insert(page_key, entry);
+        }
+        Some(entry)
     }
 
     /// Read-only walk variant of [`Self::page_tlb_entry`].

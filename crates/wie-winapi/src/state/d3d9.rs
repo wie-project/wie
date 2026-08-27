@@ -126,6 +126,16 @@ pub struct D3D9State {
     /// Vertex-shader boolean constant registers `b0..b15` (set via
     /// `SetVertexShaderConstantB` + `defb` at Create time).
     pub(crate) d3d9_vs_bool_constants: [bool; crate::d3d9_shader::VS_BOOL_CONST_COUNT],
+    // ── Q9/C pooled target + scratch ──────────────────────────────────────
+    /// Q9/C: per-device texture mip-chain pool — `tex handle → Vec<Vec<u32>>` chain
+    /// (level0 + mips) with capacity retained; CreateTexture reuses, Release returns.
+    pub(crate) d3d9_texture_pool: HashMap<u64, Vec<Vec<u32>>>,
+    /// Q9/C: per-Device9 tiled scratch for raster scanline/blended spans — one
+    /// reused `Vec<u32>` per device, not a per-draw `vec![]`.
+    pub(crate) d3d9_tile_scratch: Vec<u32>,
+    /// Q9/C: per-Device9 vertex/index scratch — reused `Vec<u8>` for
+    /// `Draw*UP` guest reads, not a per-draw `vec![0_u8; n]`.
+    pub(crate) d3d9_vertex_scratch: Vec<u8>,
 }
 
 impl Default for D3D9State {
@@ -175,6 +185,9 @@ impl Default for D3D9State {
             d3d9_vs_constants: [[0.0; 4]; crate::d3d9_shader::VS_CONST_COUNT],
             d3d9_vs_int_constants: [[0; 4]; crate::d3d9_shader::VS_INT_CONST_COUNT],
             d3d9_vs_bool_constants: [false; crate::d3d9_shader::VS_BOOL_CONST_COUNT],
+            d3d9_texture_pool: HashMap::with_capacity(16),
+            d3d9_tile_scratch: Vec::new(),
+            d3d9_vertex_scratch: Vec::new(),
         }
     }
 }

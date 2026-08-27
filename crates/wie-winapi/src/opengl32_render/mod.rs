@@ -1542,6 +1542,69 @@ pub(crate) fn gl_frame_0rgb(
     (ctx.width, ctx.height, frame)
 }
 
+/// Q9/C: raster directly into the pooled WindowSurface slice (the one
+/// `PresentState::ensure_surface` will hand back via spare-buffer pooling) — no intermediate
+/// `Vec<u32>` copy. If the GL framebuffer size differs from the surface,
+/// stretch_nearest writes directly into the pooled slice (no temp).
+pub(crate) fn gl_frame_into(
+    ctx: &mut GlCtx,
+    dst: &mut [u32],
+    logical_w: u32,
+    height: u32,
+    padded_w: u32,
+    surface_w: u32,
+    surface_h: u32,
+) -> bool {
+    if logical_w == 0 || height == 0 || padded_w == 0 {
+        return false;
+    }
+    gl_ensure_framebuffer(ctx, surface_w, surface_h);
+    let fw = ctx.width;
+    let fh = ctx.height;
+    if fw == 0 || fh == 0 {
+        return false;
+    }
+    if fw == logical_w && fh == height {
+        // Direct row-major copy with padded stride, no alloc.
+        let src_stride = fw as usize;
+        let dst_stride = padded_w as usize;
+        for y in 0..height as usize {
+            let src_start = y * src_stride;
+            let dst_start = y * dst_stride;
+            if src_start + logical_w as usize <= ctx.backbuffer.len()
+                && dst_start + logical_w as usize <= dst.len()
+            {
+                for x in 0..logical_w as usize {
+                    dst[dst_start + x] = ctx.backbuffer[src_start + x] & 0x00FF_FFFF;
+                }
+            }
+        }
+    } else {
+        // Nearest-neighbour stretch directly into pooled slice (no temp Vec).
+        let logical_w_us = logical_w as usize;
+        let padded_w_us = padded_w as usize;
+        let h_us = height as usize;
+        let fw_us = fw as usize;
+        let fh_us = fh as usize;
+        if logical_w_us > 0 && h_us > 0 && fw_us > 0 && fh_us > 0 {
+            for y in 0..h_us {
+                let src_y = (y * fh_us) / h_us;
+                let dst_row = y * padded_w_us;
+                let src_row = src_y * fw_us;
+                for x in 0..logical_w_us {
+                    let src_x = (x * fw_us) / logical_w_us;
+                    let src_idx = src_row + src_x;
+                    let dst_idx = dst_row + x;
+                    if src_idx < ctx.backbuffer.len() && dst_idx < dst.len() {
+                        dst[dst_idx] = ctx.backbuffer[src_idx] & 0x00FF_FFFF;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,

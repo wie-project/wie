@@ -11,6 +11,7 @@
 
 use super::ALL_DIRTY_BITS;
 use super::JitStats;
+use super::baseline;
 use super::block::{self, BlockKind, decode_pure_gpr_block, pure_is_self_loop};
 use super::config::{
     BG_QUEUE_CAP, COOLDOWN_THRESHOLD_CAP, JitConfig, WORK_THRESHOLD_CEILING, WORK_THRESHOLD_FLOOR,
@@ -425,7 +426,31 @@ impl JitCpu {
                             // promotion (doubled threshold) instead of feeding
                             // the backlog; the block re-promotes after it.
                             if self.bg_queue_too_deep() {
-                                self.defer_promotion(rip, thr);
+                                // Boot mode: bounded inline instead of doubling.
+                                if self.shared.is_boot_mode()
+                                    && self.shared.try_acquire_boot_inline_token()
+                                {
+                                    self.stats.bg.inline_fallbacks =
+                                        self.stats.bg.inline_fallbacks.saturating_add(1);
+                                    let kind = {
+                                        let mem = self.shared.mem.read().unwrap();
+                                        block::decode_pure_gpr_block(
+                                            &mem,
+                                            self.thread.hooks.as_ref(),
+                                            rip,
+                                        )
+                                    };
+                                    if let Some(compiled) =
+                                        self.try_compile_from_kind(rip, kind, inv_gen)
+                                    {
+                                        let meta = CompiledRunMeta::from(&compiled);
+                                        self.insert_ready(rip, compiled);
+                                        return Ok(self.finish_compiled(rip, meta));
+                                    }
+                                    self.mark_never(rip);
+                                } else {
+                                    self.defer_promotion(rip, thr);
+                                }
                             } else {
                                 let kind = {
                                     let mem = self.shared.mem.read().unwrap();
@@ -491,7 +516,7 @@ impl JitCpu {
                     BlockKind::Pure { insns, .. } => insns.len(),
                     BlockKind::NotPure => 0,
                 };
-                let (thr, eager) = select_hot_threshold(
+                let (mut thr, eager) = select_hot_threshold(
                     is_ucrt,
                     is_loop,
                     pure_insns,
@@ -500,6 +525,33 @@ impl JitCpu {
                     JitConfig::get().target_work(),
                     JitConfig::get().eager_block_insns(),
                 );
+                // Boot mode: first 5 M guest insns use threshold = 1 and bypass
+                // deferral doubling (inline token bucket handles thrash).
+                if self.shared.is_boot_mode() {
+                    thr = 1;
+                }
+                // Tier-0 baseline: during boot, attempt a fast inline baseline
+                // compile (0.2 ms) and enqueue tier-1 Cranelift bg for same RIP.
+                // On next execution the Ready entry will be patched to tier-1.
+                if self.shared.is_boot_mode()
+                    && matches!(kind, BlockKind::Pure { .. })
+                    && let Some(baseline) = baseline::try_compile_baseline(
+                        &self.shared,
+                        &self.fast_api,
+                        rip,
+                        kind.clone(),
+                        inv_gen,
+                    )
+                {
+                    // Enqueue tier-1 bg before installing baseline (otherwise
+                    // enqueue would see Ready and return `Ready`).
+                    drop(self.enqueue_bg(rip, &kind, inv_gen, false));
+                    let meta = CompiledRunMeta::from(&baseline);
+                    self.insert_ready(rip, baseline);
+                    self.stats.profile.eager_compiles =
+                        self.stats.profile.eager_compiles.saturating_add(1);
+                    return Ok(self.finish_compiled(rip, meta));
+                }
                 if eager {
                     // Eager compile: the entry is required NOW (there may be no
                     // revisit). Prefer the background worker and block briefly
@@ -508,9 +560,22 @@ impl JitCpu {
                     self.stats.profile.eager_compiles =
                         self.stats.profile.eager_compiles.saturating_add(1);
                     if self.bg_queue_too_deep() {
-                        // Backpressure: don't feed the backlog; re-promote soon
-                        // via the (doubled) visit threshold instead.
-                        self.defer_promotion(rip, thr);
+                        // Boot mode uses bounded inline instead of deferral.
+                        if self.shared.is_boot_mode() && self.shared.try_acquire_boot_inline_token()
+                        {
+                            self.stats.bg.inline_fallbacks =
+                                self.stats.bg.inline_fallbacks.saturating_add(1);
+                            if let Some(compiled) =
+                                self.try_compile_from_kind(rip, kind.clone(), inv_gen)
+                            {
+                                let meta = CompiledRunMeta::from(&compiled);
+                                self.insert_ready(rip, compiled);
+                                return Ok(self.finish_compiled(rip, meta));
+                            }
+                            self.mark_never(rip);
+                        } else {
+                            self.defer_promotion(rip, thr);
+                        }
                     } else {
                         self.thread.pending_promote_thr = thr;
                         // Urgent lane: the caller blocks on this job's cell
@@ -624,6 +689,7 @@ impl JitCpu {
         )?;
         if matches!(result, StepResult::Continue) {
             self.thread.iced_steps = self.thread.iced_steps.saturating_add(1);
+            self.shared.record_guest_insns(1);
         }
         self.drain_pending_code_writes();
         Ok((result, 1))
@@ -706,6 +772,16 @@ impl JitCpu {
             return None; // worker gone: caller handles inline fallback
         }
         if self.shared.bg_queue_depth.load(Ordering::Relaxed) >= BG_WAIT_SKIP_DEPTH {
+            // Boot mode: bounded inline on deep-queue (avoid thrash, no doubling).
+            if self.shared.is_boot_mode() && self.shared.try_acquire_boot_inline_token() {
+                self.stats.bg.inline_fallbacks = self.stats.bg.inline_fallbacks.saturating_add(1);
+                if let Some(compiled) = self.try_compile(rip) {
+                    self.insert_ready(rip, compiled);
+                    return Some(compiled);
+                }
+                self.mark_never(rip);
+                return None;
+            }
             self.stats.promo.deferred = self.stats.promo.deferred.saturating_add(1);
             self.arm_cooldown(rip, cell.threshold());
             return None;
@@ -777,7 +853,23 @@ impl JitCpu {
     /// interpreted and re-promotes only after the raised threshold. Only ever
     /// replaces Hot/Queued/absent entries — never Ready or Never.
     fn arm_cooldown(&mut self, rip: u64, prev_thr: u32) {
-        let thr = next_cooldown_thr(prev_thr);
+        // Boot mode uses bounded inline instead of cooldown hysteresis.
+        if self.shared.is_boot_mode() && self.shared.try_acquire_boot_inline_token() {
+            self.stats.bg.inline_fallbacks = self.stats.bg.inline_fallbacks.saturating_add(1);
+            if let Some(compiled) = self.try_compile(rip) {
+                self.insert_ready(rip, compiled);
+                // Caller will handle Ready via cache re-check; for wait
+                // path we return after install via wait_bg_ready inline.
+                return;
+            }
+            self.mark_never(rip);
+            return;
+        }
+        let thr = if self.shared.is_boot_mode() {
+            1
+        } else {
+            next_cooldown_thr(prev_thr)
+        };
         let inserted = {
             let cache = self.shared.cache.pin();
             match cache.get(&rip) {
@@ -803,7 +895,21 @@ impl JitCpu {
     /// promotion threshold (doubled) so the block re-promotes later instead of
     /// queueing behind a backlog guests would time out on anyway.
     fn defer_promotion(&mut self, rip: u64, prev_thr: u32) {
-        let thr = next_cooldown_thr(prev_thr);
+        // Boot mode: bounded inline instead of doubling.
+        if self.shared.is_boot_mode() && self.shared.try_acquire_boot_inline_token() {
+            self.stats.bg.inline_fallbacks = self.stats.bg.inline_fallbacks.saturating_add(1);
+            if let Some(compiled) = self.try_compile(rip) {
+                self.insert_ready(rip, compiled);
+                return;
+            }
+            self.mark_never(rip);
+            return;
+        }
+        let thr = if self.shared.is_boot_mode() {
+            1
+        } else {
+            next_cooldown_thr(prev_thr)
+        };
         {
             let cache = self.shared.cache.pin();
             match cache.get(&rip) {
@@ -948,6 +1054,7 @@ impl JitCpu {
                 .exec
                 .jit_insns
                 .saturating_add(u64::from(meta.insn_count));
+            self.shared.record_guest_insns(u64::from(meta.insn_count));
             (
                 StepResult::Continue,
                 usize::try_from(meta.insn_count).unwrap_or(1),

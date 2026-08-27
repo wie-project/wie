@@ -483,6 +483,15 @@ fn rasterize_vertex_stream(
         return;
     }
     let d3d = state.d3d9();
+    // Q9/C: per-Device9 tiled scratch — one reused Vec<u32> for scanline/
+    // blended spans, not a per-draw vec![].
+    d3d.d3d9_tile_scratch.clear();
+    // Growth-only: reserve a scanline's worth to avoid per-row realloc.
+    let scanline_cap = width as usize;
+    if d3d.d3d9_tile_scratch.capacity() < scanline_cap {
+        d3d.d3d9_tile_scratch
+            .reserve(scanline_cap - d3d.d3d9_tile_scratch.capacity());
+    }
     let world = d3d.d3d9_world_matrix;
     let view = d3d.d3d9_view_matrix;
     let projection = d3d.d3d9_projection_matrix;
@@ -773,43 +782,63 @@ pub(crate) fn draw_vertex_stream(
     let data_bytes = vertex_count
         .checked_mul(stride)
         .context("vertex stream size overflow")?;
-    let mut data = vec![0_u8; data_bytes];
-    if engine.mem_read(data_va, &mut data).is_err() {
-        // Unmapped guest memory: skip the draw rather than fault the guest.
-        return Ok(());
-    }
-
-    let indices = if index_count > 0 && index_va != 0 {
-        // D3DFMT_INDEX32 = 102 (4-byte indices); everything else — including
-        // D3DFMT_INDEX16 = 101 — is 16-bit. Unknown formats default lenient.
+    // Q9/C: per-Device9 tiled scratch + vertex scratch — reused allocations,
+    // not per-draw vec![].
+    let index_info = if index_count > 0 && index_va != 0 {
         let size = usize::try_from(if index_format == D3DFMT_INDEX32 { 4 } else { 2 })
             .context("index size does not fit usize")?;
         let index_bytes = index_count
             .checked_mul(size)
             .context("index buffer size overflow")?;
-        let mut index_data = vec![0_u8; index_bytes];
-        if engine.mem_read(index_va, &mut index_data).is_err() {
-            return Ok(());
-        }
-        Some((index_data, size))
+        Some((size, index_bytes))
     } else {
         None
     };
-
-    draw_vertex_stream_host(
+    let total_bytes = data_bytes + index_info.map_or(0, |(_, b)| b);
+    // Take the vertex scratch (capacity retained) for the guest reads.
+    let mut scratch = std::mem::take(&mut state.d3d9().d3d9_vertex_scratch);
+    scratch.resize(total_bytes, 0);
+    if engine
+        .mem_read(data_va, &mut scratch[..data_bytes])
+        .is_err()
+    {
+        // Unmapped guest memory: skip the draw rather than fault the guest.
+        state.d3d9().d3d9_vertex_scratch = scratch;
+        return Ok(());
+    }
+    let (data_slice, indices) = if let Some((size, index_bytes)) = index_info {
+        if engine
+            .mem_read(index_va, &mut scratch[data_bytes..data_bytes + index_bytes])
+            .is_err()
+        {
+            state.d3d9().d3d9_vertex_scratch = scratch;
+            return Ok(());
+        }
+        // Slices borrow from `scratch` (owned locally, not via `state`, so the
+        // later `draw_vertex_stream_host` borrow of `state` does not alias).
+        let data_slice: &[u8] = &scratch[..data_bytes];
+        let idx_slice: &[u8] = &scratch[data_bytes..data_bytes + index_bytes];
+        (data_slice, Some((idx_slice, size)))
+    } else {
+        let data_slice: &[u8] = &scratch[..data_bytes];
+        (data_slice, None)
+    };
+    // Call the host raster with slices borrowed from the reused scratch.
+    let res = draw_vertex_stream_host(
         state,
-        &data,
+        data_slice,
         layout,
         stride,
         vertex_count,
         primitive_type,
         primitive_count,
-        indices
-            .as_ref()
-            .map(|(bytes, size)| (bytes.as_slice(), *size)),
+        indices,
         0,
         0,
-    )
+    );
+    // Restore the scratch Vec with its capacity retained for the next draw.
+    state.d3d9().d3d9_vertex_scratch = scratch;
+    res
 }
 /// Rasterize a host-side vertex pool (+ optional host index data) — the
 /// buffer-form draw path (`DrawPrimitive`/`DrawIndexedPrimitive`).

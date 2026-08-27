@@ -38,7 +38,7 @@ flowchart LR
 
 **Seam 5 — drain + reconcile.** `drain_pending_publishes` publishes each deduplicated top-level once per idle boundary (one frame per repaint cycle, union dirty region). `reconcile_and_publish` then diffs `content_rev` vs `last_published_rev` and republishes stale top-levels — the pull half that guarantees a mutation-bumped window reaches the screen even if no paint deferred a publish.
 
-**Seam 6 — host present.** The publish fires a stored wake callback → `WieEvent::Frame` in the winit loop → `request_redraw` → `take_frame` reads the current published slot → wgpu uploads (dirty region when hinted; full frame on generation gaps). A budget-exhausted `NotDrawn` present schedules a throttled re-arm so a single-wake flow can't strand its frame.
+**Seam 6 — host present.** The publish fires a stored wake callback → `WieEvent::Frame` in the winit loop → `request_redraw` → `take_frame` reads the current published slot → wgpu uploads (dirty region when hinted; full frame on generation gaps). A budget-exhausted `NotDrawn` present schedules a throttled re-arm so a single-wake flow can't strand its frame. Wave3 defaults: per-HWND pooled `WindowSurface` (64 px padding → `row_bytes %256==0` zero-copy full-frame `write_texture`), host-reused `Vec<u8>` scratch for region uploads, and latest-wins coalescing (`pending_publishes` deduplicated per cycle + `retry_delay` throttling) — all default on, no env required; steady zero-alloc confirmed via `WIE_RUNTIME_PROFILE=1` `hand_back_unwrap` vs `clone` counters.
 
 ```mermaid
 sequenceDiagram

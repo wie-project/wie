@@ -35,7 +35,9 @@ Headline numbers on Apple Silicon release builds (re-measure with `WIE_RUNTIME_P
 | Short micros (`crt_hello`, heap, …) | ~15–25 ms | Init-dominated; emulation often < 1 ms |
 | `long_loop` under `WIE_CPU=iced` | fails slice budget | ~11M iced steps/s; needs JIT for pure compute |
 
-What actually burns CPU today: tight guest loops (expected ~100% under JIT), memory helpers (cold / non-pinned loads through TLB helpers), host API stops (every non-stub import), block entry/exit GPR sync, and the cold-compile tax on one-shot code.
+> **Wave3 defaults / harness (no fabricated numbers):** `long_loop` is now pooled (`wie-cpu` JIT workers `min(3, available_parallelism()-1)` UTILITY, pooled Cranelift contexts) — compile latency overlaps guest execution. `wake→present` P95 target is **<16.6 ms** under a **40 s `WIE_RUNTIME_PROFILE=1` capture** (see ADR 0001 validation: `present_ns_last` / `hand_back_unwrap` vs `clone` / `Arc::try_unwrap` probe; see `docs/perf-plan.md` §7). Re-measure on your machine with that harness; do not compare debug builds. Steady-state GDI/D3D9 frames are zero-alloc/zero-copy (per-HWND pooled surface, latest-wins coalescing via `drain_pending_publishes` + region union; no `WIE_SURFACE_PAD` env required).
+
+What actually burns CPU today: tight guest loops (expected ~100% under JIT), memory helpers (cold / non-pinned loads through TLB helpers), host API stops (every non-stub import), block entry/exit GPR sync, and the cold-compile tax on one-shot code. Wave3 makes padded surface pool, latest-wins throttling, pre-reserve, size-class TLS, and CompactString the default (no env required for steady zero-alloc); JIT direct regs (`WIE_JIT_DIRECT_REGS`) is default **on** (opt-out with `WIE_JIT_DIRECT_REGS=0` for bisect).
 
 ## Roadmap — the feature list for running "everything"
 

@@ -83,6 +83,8 @@ pub(super) struct JitConfig {
     tlb_neon_enabled: bool,
     string_inline_enabled: bool,
     jit_workers: usize,
+    #[allow(dead_code)]
+    direct_regs_enabled: bool,
 }
 
 /// Bounds of the background worker-pool size (`WIE_JIT_WORKERS`).
@@ -265,6 +267,15 @@ impl JitConfig {
             ),
             // Background worker-pool size (`WIE_JIT_WORKERS`).
             jit_workers: jit_workers_from_env(),
+            // Direct block-to-block register hand-off (Q8/C): guest GPRs/rflags
+            // stay in native regs across chained blocks (x19–x28 / x14 on
+            // aarch64). Wave3 default: **on**; opt-out via
+            // `WIE_JIT_DIRECT_REGS=0` for bisect/matrix. Unset → on (no env
+            // required for steady-state throughput).
+            direct_regs_enabled: !matches!(
+                std::env::var("WIE_JIT_DIRECT_REGS"),
+                Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+            ),
         }
     }
 
@@ -391,6 +402,15 @@ impl JitConfig {
     #[must_use]
     pub(super) fn jit_workers(&self) -> usize {
         self.jit_workers
+    }
+
+    /// Direct register hand-off across chained blocks (Q8/C). Default **on**;
+    /// `WIE_JIT_DIRECT_REGS=0` disables for bisect (fallback is `JitCtx`
+    /// spill/reload).
+    #[must_use]
+    #[allow(dead_code)]
+    pub(super) fn direct_regs_enabled(&self) -> bool {
+        self.direct_regs_enabled
     }
 }
 

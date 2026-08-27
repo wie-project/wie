@@ -16,6 +16,7 @@
     private_interfaces // JitShared/PerThreadJitState expose crate-private types
 )]
 
+mod baseline;
 mod block;
 mod config;
 mod cpu_engine;

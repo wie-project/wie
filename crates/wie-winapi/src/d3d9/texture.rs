@@ -238,20 +238,77 @@ pub fn handle_create_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
                 levels_raw_value
             };
             let levels = levels_requested.min(chain_len);
-            let mip_levels = (1..levels)
-                .map(|level| {
+            // Q9/C: pooled texture mip chains — reuse old chain Vecs (capacity
+            // retained) to avoid per-frame realloc. The pool is
+            // `HashMap<tex_id, Vec<Vec<u32>>>` per device.
+            let mut pooled_chain: Option<Vec<Vec<u32>>> = None;
+            if !state.d3d9().d3d9_texture_pool.is_empty()
+                && let Some(key) = state.d3d9().d3d9_texture_pool.keys().next().copied()
+            {
+                pooled_chain = state.d3d9().d3d9_texture_pool.remove(&key);
+            }
+            let (pixels, mip_levels) = if let Some(mut chain) = pooled_chain {
+                // chain[0] is level0, chain[1..] are mips — reuse capacity.
+                let texel_count =
+                    usize::try_from(width.checked_mul(height).unwrap_or(0)).unwrap_or(0);
+                let mut pixels = if !chain.is_empty() {
+                    let mut v = chain.remove(0);
+                    v.clear();
+                    v.resize(texel_count, 0);
+                    v
+                } else {
+                    vec![0; texel_count]
+                };
+                let mut mip_levels: Vec<MipLevel> =
+                    Vec::with_capacity((levels.saturating_sub(1)) as usize);
+                for level in 1..levels {
                     let level_w = (width >> level).max(1);
                     let level_h = (height >> level).max(1);
-                    let texel_count =
+                    let needed =
                         usize::try_from(level_w.checked_mul(level_h).unwrap_or(0)).unwrap_or(0);
-                    MipLevel {
+                    let vec = if !chain.is_empty() {
+                        let mut v = chain.remove(0);
+                        v.clear();
+                        v.resize(needed, 0);
+                        v
+                    } else {
+                        vec![0; needed]
+                    };
+                    mip_levels.push(MipLevel {
                         width: level_w,
                         height: level_h,
-                        pixels: vec![0; texel_count],
+                        pixels: vec,
+                    });
+                }
+                // Return any leftover Vecs to the pool (capacity retained) so
+                // we don't discard reusable allocations when chain lengths differ.
+                if !chain.is_empty() {
+                    let mut new_key = object.wrapping_add(1);
+                    while state.d3d9().d3d9_texture_pool.contains_key(&new_key) {
+                        new_key = new_key.wrapping_add(1);
                     }
-                })
-                .collect();
-            let texel_count = usize::try_from(width.checked_mul(height).unwrap_or(0)).unwrap_or(0);
+                    state.d3d9().d3d9_texture_pool.insert(new_key, chain);
+                }
+                let _ = &mut pixels;
+                (pixels, mip_levels)
+            } else {
+                let mip_levels = (1..levels)
+                    .map(|level| {
+                        let level_w = (width >> level).max(1);
+                        let level_h = (height >> level).max(1);
+                        let texel_count =
+                            usize::try_from(level_w.checked_mul(level_h).unwrap_or(0)).unwrap_or(0);
+                        MipLevel {
+                            width: level_w,
+                            height: level_h,
+                            pixels: vec![0; texel_count],
+                        }
+                    })
+                    .collect();
+                let texel_count =
+                    usize::try_from(width.checked_mul(height).unwrap_or(0)).unwrap_or(0);
+                (vec![0; texel_count], mip_levels)
+            };
             state.d3d9().d3d9_textures.insert(
                 object,
                 TextureRecord {
@@ -260,7 +317,7 @@ pub fn handle_create_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
                     height,
                     levels,
                     format,
-                    pixels: vec![0; texel_count],
+                    pixels,
                     mip_levels,
                     surface_vas: vec![0; usize::try_from(levels).unwrap_or(0)],
                     locked_va: 0,
@@ -998,16 +1055,13 @@ pub fn handle_texture_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let state = &mut *ctx.state;
     let this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DTexture9::Release")?;
 
-    let (surface_vas, locked_va) = state
-        .d3d9()
-        .d3d9_textures
-        .get(&this_pointer)
-        .map_or((Vec::new(), 0), |r| (r.surface_vas.clone(), r.locked_va));
-    let exists = !surface_vas.is_empty()
-        || locked_va != 0
-        || state.d3d9().d3d9_textures.contains_key(&this_pointer);
-
-    let return_value = if exists {
+    // Q9/C: pull the record so we can return its mip chain Vecs to the
+    // per-device pool (capacity retained, no per-frame realloc) instead of
+    // dropping them.
+    let record = state.d3d9().d3d9_textures.remove(&this_pointer);
+    let return_value = if let Some(record) = record {
+        let surface_vas = record.surface_vas.clone();
+        let locked_va = record.locked_va;
         // Unbind from every stage.
         for slot in &mut state.d3d9().d3d9_texture_bindings {
             if *slot == this_pointer {
@@ -1043,7 +1097,14 @@ pub fn handle_texture_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .free_coherent(engine, vtable);
-        state.d3d9().d3d9_textures.remove(&this_pointer);
+        // Q9/C: per-device pool `HashMap<tex_id, Vec<Vec<u32>>>` — retain
+        // capacities by moving the chain Vecs into the pool.
+        let mut chain: Vec<Vec<u32>> = Vec::with_capacity(record.levels as usize);
+        chain.push(record.pixels);
+        for mip in record.mip_levels {
+            chain.push(mip.pixels);
+        }
+        state.d3d9().d3d9_texture_pool.insert(this_pointer, chain);
         1
     } else {
         0

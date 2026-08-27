@@ -188,13 +188,51 @@ pub(crate) fn handle_wgl_swap_buffers(ctx: &mut HandlerContext<'_>) -> Result<Wi
             )
         }
     };
+    // Q9/C: in-place pooled target — the GL backbuffer is blitted directly
+    // into the pooled WindowSurface slice (the one `ensure_surface` will hand
+    // back via spare-buffer pooling) with no intermediate `Vec<u32>` copy. If
+    // the GL framebuffer size differs from the surface, stretch_nearest writes
+    // directly into the pooled slice (no temp).
     state.present().ensure_surface(hwnd, width, height);
-    // Snapshot the context's backbuffer (0RGB) — the frame the user sees.
-    let frame = with_current_gl(|gl_ctx| render::gl_frame_0rgb(gl_ctx, width, height));
-    if let Some((fw, fh, pixels)) = frame {
-        state.present().blit_frame(hwnd, &pixels, fw, fh);
-    } else {
+    // Take the pooled surface Vec out (pointer move, no copy), hand its
+    // mutable slice to the GL present as render target, then restore it.
+    let (logical_w, h, padded_w) = {
+        let s = state
+            .present()
+            .surfaces
+            .get(&hwnd)
+            .expect("surface ensured");
+        (s.width, s.height, s.width)
+    };
+    let mut pooled = std::mem::take(
+        &mut state
+            .present()
+            .surfaces
+            .get_mut(&hwnd)
+            .expect("surface ensured")
+            .pixels,
+    );
+    let did_blit = with_current_gl(|gl_ctx| {
+        render::gl_frame_into(gl_ctx, &mut pooled, logical_w, h, padded_w, width, height)
+    })
+    .unwrap_or(false);
+    // Restore the pooled allocation (capacity retained) for publish.
+    state
+        .present()
+        .surfaces
+        .get_mut(&hwnd)
+        .expect("surface ensured")
+        .pixels = pooled;
+    if did_blit {
         state.present().publish(hwnd);
+    } else {
+        // Fallback: no GL context — publish the (cleared) surface.
+        let frame = with_current_gl(|gl_ctx| render::gl_frame_0rgb(gl_ctx, width, height));
+        if let Some((fw, fh, pixels)) = frame {
+            state.present().blit_frame(hwnd, &pixels, fw, fh);
+        } else {
+            state.present().publish(hwnd);
+        }
     }
     tracing::trace!(target: "wiegui", hdc, width, height, "wglSwapBuffers published a rendered frame");
     ctx.finish(1)

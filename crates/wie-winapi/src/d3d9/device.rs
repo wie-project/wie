@@ -319,11 +319,14 @@ pub fn handle_present(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     // pSourceRect / pDestRect / hDestWindowOverride / pDirtyRegion are unused
     // in slice 1: the whole backbuffer presents into the device window.
 
-    let (bb_w, bb_h) = (
-        state.d3d9().d3d9_backbuffer_width,
-        state.d3d9().d3d9_backbuffer_height,
-    );
-    let hwnd = state.d3d9().d3d9_present_hwnd;
+    let (bb_w, bb_h, hwnd) = {
+        let d = state.d3d9();
+        (
+            d.d3d9_backbuffer_width,
+            d.d3d9_backbuffer_height,
+            d.d3d9_present_hwnd,
+        )
+    };
     if bb_w > 0
         && bb_h > 0
         && hwnd != crate::handles::Hwnd::NULL
@@ -332,10 +335,20 @@ pub fn handle_present(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
         let (win_w, win_h) = crate::user32::window_client_size(state, hwnd.as_u64());
         let win_w = u32::try_from(win_w).unwrap_or(1).max(1);
         let win_h = u32::try_from(win_h).unwrap_or(1).max(1);
+        // Q9/C: in-place pooled target — take the backbuffer without cloning
+        // (capacity retained, no per-present alloc) and write directly into the
+        // pooled WindowSurface slice that `ensure_surface` will hand back via
+        // Q2/D. No intermediate `Vec<u32>` copy; size mismatch keeps
+        // `stretch_nearest` but writes directly into the pooled slice.
+        let backbuffer = std::mem::take(&mut state.d3d9().d3d9_backbuffer);
+        let bb_slice: &[u32] = &backbuffer;
+        // Hand the next pooled surface slice to the present as render target
+        // (Q9/C). `blit_frame` writes directly into that pooled allocation.
         state.present().ensure_surface(hwnd, win_w, win_h);
-        // Clone the backbuffer so the `d3d9()` borrow ends before `present()`.
-        let backbuffer = state.d3d9().d3d9_backbuffer.clone();
-        state.present().blit_frame(hwnd, &backbuffer, bb_w, bb_h);
+        // Direct blit into the pooled slice — no temp Vec, no intermediate copy.
+        state.present().blit_frame(hwnd, bb_slice, bb_w, bb_h);
+        // Restore the backbuffer Vec with its original capacity for the next draws.
+        state.d3d9().d3d9_backbuffer = backbuffer;
     }
     tracing::trace!(target: "wiegui", bb_w, bb_h, hwnd = hwnd.as_u64(), "D3D9 Present");
 
