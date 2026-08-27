@@ -15,7 +15,7 @@ use crate::{CpuEngine, RwxPerms};
 use block::BlockKind;
 use config::JitConfig;
 use lower::{JitCtx, chain_table_insert};
-use pipeline::{next_cooldown_thr, ranges_overlap};
+use pipeline::ranges_overlap;
 use shared::{BgEnqueueOutcome, BgPool, BgWaitCell};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -532,8 +532,8 @@ fn hot_threshold_crossing_compiles_and_invalidates() {
 // --- Timeout → Cooldown (never inline while the worker lives) ---
 
 /// Simulated stalled worker: an alive `bg_alive` flag with nobody draining
-/// the queue. The wait must consume its budget, NOT compile inline, and
-/// re-arm the entry as a doubled-threshold cooldown.
+/// the queue. The wait must time out and then make progress via an inline
+/// compile on the guest thread instead of cooling down.
 #[test]
 fn bg_timeout_arms_cooldown_never_inline_compiles() {
     let mut cpu = JitCpu::open_x86_64();
@@ -558,42 +558,34 @@ fn bg_timeout_arms_cooldown_never_inline_compiles() {
     cpu.write_rip(base).expect("rip");
     let (result, retired) = cpu.step_one().expect("step");
     assert!(matches!(result, StepResult::Continue));
-    assert_eq!(retired, 1, "stalled wait must fall back to ONE iced insn");
+    // Timeout inline-compiles the block (2 insns) instead of running one iced step.
     assert!(
-        matches!(
-            cpu.shared.cache.pin().get(&base),
-            Some(CacheEntry::Hot {
-                visits: 0,
-                thr: 200
-            })
-        ),
-        "timeout must re-arm as Hot {{ visits: 0, thr: doubled }}"
+        retired >= 2,
+        "timeout must inline-compile, not run one iced insn"
     );
     assert!(
-        !cpu.has_ready_at(base),
-        "no inline compile while worker alive"
+        cpu.has_ready_at(base),
+        "timeout must install Ready via inline compile"
     );
     let s = cpu.stats();
-    assert_eq!(s.bg.inline_fallbacks, 0, "inline fallback must not fire");
+    assert_eq!(
+        s.bg.inline_fallbacks, 1,
+        "inline fallback must fire on timeout"
+    );
     assert_eq!(s.promo.timed_out, 1);
-    assert_eq!(s.promo.cooled_down, 1);
+    assert_eq!(s.promo.cooled_down, 0, "timeout must not arm cooldown");
     assert_eq!(s.promo.stalled_ok, 0);
 
-    // Invalidation leaves the Queued/Cooldown machinery untouched: a
-    // range invalidate over a still-Queued entry is a no-op (only Ready
-    // blocks are dropped) and must not panic or corrupt state.
+    // Invalidation drops the Ready block installed by the inline compile.
     cpu.invalidate_code_range(base, 8);
-    assert!(matches!(
-        cpu.shared.cache.pin().get(&base),
-        Some(CacheEntry::Hot {
-            visits: 0,
-            thr: 200
-        })
-    ));
+    assert!(
+        !cpu.has_ready_at(base),
+        "invalidation must drop the inline-installed Ready"
+    );
 }
 
-/// Successive timeouts double the cooldown threshold again and again;
-/// the cap holds.
+/// Timeout now makes progress via inline compile instead of cooldown
+/// hysteresis; successive timeouts each install a Ready block.
 #[test]
 fn bg_cooldown_hysteresis_doubles_then_quadruples() {
     let mut cpu = JitCpu::open_x86_64();
@@ -605,41 +597,43 @@ fn bg_cooldown_hysteresis_doubles_then_quadruples() {
         protect::PAGE_EXECUTE_READWRITE,
     )
     .expect("alloc");
+    cpu.mem_write(base, &[0xb8, 0x2a, 0x00, 0x00, 0x00, 0x90, 0x0f, 0x0b])
+        .expect("code");
     cpu.shared.bg_alive.store(true, Ordering::Relaxed);
-    let thr_sequence = [100_u32, 200, 400];
-    for (i, &thr) in thr_sequence.iter().enumerate() {
+    for (i, &thr) in [100_u32, 200, 400].iter().enumerate() {
         let cell = BgWaitCell::new(thr);
         cpu.shared
             .cache
             .pin()
             .insert(base, CacheEntry::Queued(Arc::clone(&cell)));
         let r = cpu.wait_bg_ready(base, &cell);
-        assert!(r.is_none(), "stalled worker never resolves (iter {i})");
-        let want = next_cooldown_thr(thr);
+        assert!(r.is_some(), "timeout must inline-compile Ready (iter {i})");
         assert!(
-            matches!(
-                cpu.shared.cache.pin().get(&base),
-                Some(CacheEntry::Hot { visits: 0, thr }) if *thr == want
-            ),
-            "timeout {i}: expected doubled threshold {want}"
+            cpu.has_ready_at(base),
+            "timeout {i}: Ready must be installed"
         );
+        // Clear for next iteration (invalidate drops Ready).
+        cpu.invalidate_code_range(base, 8);
+        assert!(!cpu.has_ready_at(base));
     }
     let s = cpu.stats();
     assert_eq!(s.promo.timed_out, 3);
-    assert_eq!(s.promo.cooled_down, 3);
-    // Cap respected end-to-end: doubling from ≥ cap/2 pins at the cap.
+    assert_eq!(s.promo.cooled_down, 0, "timeout must not arm cooldown");
+    assert_eq!(s.bg.inline_fallbacks, 3);
+    // NotPure block still marks Never instead of looping as Hot.
     let cell = BgWaitCell::new(30_000);
     cpu.shared
         .cache
         .pin()
         .insert(base, CacheEntry::Queued(Arc::clone(&cell)));
-    assert!(cpu.wait_bg_ready(base, &cell).is_none());
+    // Corrupt the code so the inline compile fails (NotPure due to ud2-only).
+    cpu.mem_write(base, &[0x0f, 0x0b, 0x0f, 0x0b])
+        .expect("bad code");
+    let r = cpu.wait_bg_ready(base, &cell);
+    assert!(r.is_none(), "NotPure inline must return None");
     assert!(matches!(
         cpu.shared.cache.pin().get(&base),
-        Some(CacheEntry::Hot {
-            visits: 0,
-            thr: 40_000
-        })
+        Some(CacheEntry::Never)
     ));
 }
 

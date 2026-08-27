@@ -382,11 +382,11 @@ impl JitCpu {
                     CacheEntry::Queued(notify) => {
                         // About to execute the entry the worker is compiling:
                         // block only for this entry, and only briefly. On
-                        // timeout the wait re-arms the entry as a doubled
-                        // threshold (`Hot`) — cooldown — so we keep
-                        // interpreting instead of inline-compiling the same
-                        // block the worker is already building. Inline is
-                        // reserved for a dead worker.
+                        // timeout the wait attempts an inline compile on the
+                        // guest thread (installing Ready on success or Never
+                        // on failure) — the queued Bg job still races but
+                        // last-writer-wins on the cache. Inline fallback here
+                        // is only for a dead worker that never timed out.
                         if let Some(compiled) = self.wait_bg_ready(rip, &notify) {
                             let meta = CompiledRunMeta::from(&compiled);
                             return Ok(self.finish_compiled(rip, meta));
@@ -401,9 +401,10 @@ impl JitCpu {
                             }
                             self.mark_never(rip);
                         }
-                        // Worker alive: cooldown was armed by the timed-out
-                        // wait (or another waiter resolved/re-decided it) —
-                        // fall through to iced this visit.
+                        // Worker alive: either inline compile succeeded and we
+                        // already returned, or it failed and we marked Never,
+                        // or the entry resolved/re-decided mid-wait — fall
+                        // through to iced this visit.
                     }
                     CacheEntry::Hot { visits, thr } => {
                         let next = visits.saturating_add(1);
@@ -502,9 +503,8 @@ impl JitCpu {
                 if eager {
                     // Eager compile: the entry is required NOW (there may be no
                     // revisit). Prefer the background worker and block briefly
-                    // on this entry only. On timeout the wait converts to a
-                    // cooldown re-arm — inline compilation stays reserved for a
-                    // dead/unavailable worker.
+                    // on this entry only. On timeout the wait attempts an inline
+                    // compile on the guest thread instead of cooling down.
                     self.stats.profile.eager_compiles =
                         self.stats.profile.eager_compiles.saturating_add(1);
                     if self.bg_queue_too_deep() {
@@ -535,9 +535,10 @@ impl JitCpu {
                                     }
                                     self.mark_never(rip);
                                 }
-                                // Worker alive: cooldown armed by the timed-out
-                                // wait (or the entry resolved/vanished mid-wait)
-                                // — fall through to iced this visit.
+                                // Worker alive: timeout already attempted an
+                                // inline compile (installed Ready/Never) or the
+                                // entry resolved/vanished mid-wait — fall
+                                // through to iced this visit if not Ready.
                             }
                             BgEnqueueOutcome::Ready => {
                                 // Worker beat us: the cache already holds Ready.
@@ -689,17 +690,20 @@ impl JitCpu {
     /// wait is per-entry (the one-shot token cell from the Queued entry, not
     /// the whole queue) and time-boxed by [`JitConfig::bg_wait_timeout`].
     ///
-    /// On budget exhaustion the entry is re-armed as **cooldown** —
-    /// `Hot { visits: 0, thr: doubled }` (hysteresis; each successive timeout
-    /// doubles further, capped) — and `None` is returned. A deep queue skips
-    /// the wait entirely and takes the same cooldown path. Callers must NOT
-    /// inline-compile while the worker is alive: the block is already in
-    /// flight on the queue. Inline fallback stays reserved for a dead worker.
+    /// On budget exhaustion the guest thread attempts an inline compile
+    /// instead of cooling down: if it succeeds the Ready block is installed
+    /// and returned, otherwise the entry is marked Never. This keeps hot
+    /// blocks from running interpreted for thousands of visits while the
+    /// worker catches up (last-writer-wins if the worker later installs
+    /// the same rip). A deep queue skips the wait entirely and takes the
+    /// cooldown hysteresis path instead. Callers must not inline-compile
+    /// separately while the worker is alive — the timeout path already
+    /// did so.
     ///
-    /// Returns the Ready block once installed.
+    /// Returns the Ready block once installed (by worker or inline fallback).
     pub(super) fn wait_bg_ready(&mut self, rip: u64, cell: &BgWaitCell) -> Option<CompiledBlock> {
         if !self.shared.bg_alive.load(Ordering::Relaxed) {
-            return None; // worker gone: inline fallback (no cooldown armed)
+            return None; // worker gone: caller handles inline fallback
         }
         if self.shared.bg_queue_depth.load(Ordering::Relaxed) >= BG_WAIT_SKIP_DEPTH {
             self.stats.promo.deferred = self.stats.promo.deferred.saturating_add(1);
@@ -745,9 +749,15 @@ impl JitCpu {
                 self.stats.profile.bg_wait_timeouts =
                     self.stats.profile.bg_wait_timeouts.saturating_add(1);
                 self.stats.promo.timed_out = self.stats.promo.timed_out.saturating_add(1);
-                // Cooldown, not inline compile: re-arm with a doubled threshold
-                // so this block keeps interpreting while the worker catches up.
-                self.arm_cooldown(rip, cell.threshold());
+                // Timeout while worker is alive: make progress on the guest
+                // thread instead of cooling down. The queued Bg job is still
+                // in flight — last-writer-wins on the cache insert.
+                self.stats.bg.inline_fallbacks = self.stats.bg.inline_fallbacks.saturating_add(1);
+                if let Some(compiled) = self.try_compile(rip) {
+                    self.insert_ready(rip, compiled);
+                    return Some(compiled);
+                }
+                self.mark_never(rip);
                 return None;
             }
             // One-shot token wait: block in recv_timeout for the remaining
