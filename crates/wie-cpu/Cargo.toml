@@ -12,6 +12,8 @@ ahash.workspace = true
 papaya.workspace = true
 tracing.workspace = true
 libc = "0.2"
+# Persistent JIT code-cache ledger (bincode v2 native encode/derive, no serde).
+bincode = { version = "2", default-features = false, features = ["std", "derive"] }
 # Slim iced: decoder + Register helpers; drop encoder/formatters.
 # no_xop / no_d3now: unused on PE64 MSVC paths (saves a little table RAM).
 # Keep VEX/EVEX — CRT and many PE64s need them at decode time.

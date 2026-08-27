@@ -157,7 +157,10 @@ impl JitCpu {
         // like the inline path (same `call_fast` → same emitted code). The Arc
         // hands the worker a shared immutable table (no per-job Vec clone).
         *self.shared.bg_fast_api.lock().unwrap() = Arc::from(pairs);
-        self.clear_compiled();
+        // Init-time clear: keep the persistent ledger — this runs before any
+        // guest execution, so loaded ledger facts stay valid (probes are
+        // hash-validated anyway).
+        self.clear_compiled_keep_ledger();
         self.invalidate_chain_and_shadow();
     }
 
@@ -166,8 +169,11 @@ impl JitCpu {
     }
 
     /// Mark `rip` as `Never` (cold / non-pure) and count it for diagnostics.
+    /// Also records a negative ledger entry (`WIE_JIT_CACHE`) so warm boots
+    /// skip re-decoding blocks that structurally cannot compile.
     fn mark_never(&mut self, rip: u64) {
         self.shared.cache.pin().insert(rip, CacheEntry::Never);
+        self.shared.persist_record_never(rip);
         self.stats.profile.never_marks = self.stats.profile.never_marks.saturating_add(1);
     }
 
@@ -180,10 +186,30 @@ impl JitCpu {
     /// `configure_fast_path`, `install_runtime_hooks`, the
     /// `FlushInstructionCache` size==0 flush, and the
     /// `drain_pending_code_writes` overflow flush.
+    ///
+    /// Guest-triggered full flushes also purge the persistent disk ledger
+    /// (full rewrite at next flush): guest-written code means cached facts
+    /// about those bytes are stale by definition.
     pub(super) fn clear_compiled(&mut self) {
+        self.clear_compiled_inner(true);
+    }
+
+    /// Same as [`Self::clear_compiled`] but preserves the persistent ledger:
+    /// used for init-time clears that run BEFORE any guest execution
+    /// (`configure_fast_path`, `install_runtime_hooks`). Every ledger
+    /// consumption is hash-validated against current guest bytes, so loaded
+    /// facts cannot go stale unnoticed.
+    pub(super) fn clear_compiled_keep_ledger(&mut self) {
+        self.clear_compiled_inner(false);
+    }
+
+    fn clear_compiled_inner(&mut self, purge_ledger: bool) {
         self.shared.cache.pin().clear();
         self.shared.chain_ids.pin().clear();
         self.shared.code_pages.lock().unwrap().clear();
+        if purge_ledger {
+            self.shared.persist_clear(true);
+        }
         // Release: pairs with the dispatcher's Acquire load (see below).
         self.shared.invalidate_gen.fetch_add(1, Ordering::Release);
     }
@@ -231,6 +257,9 @@ impl JitCpu {
         // Release: pairs with the dispatcher's Acquire load — a thread that
         // observes this bump must also observe every drop made before it.
         self.shared.invalidate_gen.fetch_add(1, Ordering::Release);
+        // Persistent-ledger tombstones for the invalidated byte range (drops
+        // in-memory entries + marks the file for rewrite).
+        self.shared.persist_invalidate_range(addr, write_end);
         self.stats.exec.code_invs = self.stats.exec.code_invs.saturating_add(1);
         self.invalidate_chain_and_shadow();
         if JitConfig::get().chain_enabled() {
@@ -510,6 +539,22 @@ impl JitCpu {
                     let mem = self.shared.mem.read().unwrap();
                     block::decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip)
                 };
+                // Warm-boot fast path (`WIE_JIT_CACHE`): a byte-validated
+                // known-good ledger hit skips the Hot visit-threshold warmup
+                // entirely — the block goes straight to compilation. (`Never`
+                // negatives never reach here; attach-time seeding covers them.)
+                let mut persist_eager = false;
+                if self.shared.persist_active() {
+                    let probe = {
+                        let mem = self.shared.mem.read().unwrap();
+                        self.shared.persist_probe(&mem, rip)
+                    };
+                    if probe.is_some() {
+                        persist_eager = true;
+                        self.stats.profile.warm_ledger_hits =
+                            self.stats.profile.warm_ledger_hits.saturating_add(1);
+                    }
+                }
                 let is_ucrt = block_kind_ends_in_fast_ucrt(&self.shared, &self.fast_api, &kind);
                 let is_loop = pure_is_self_loop(&kind, rip);
                 let pure_insns = match &kind {
@@ -533,7 +578,10 @@ impl JitCpu {
                 // Tier-0 baseline: during boot, attempt a fast inline baseline
                 // compile (0.2 ms) and enqueue tier-1 Cranelift bg for same RIP.
                 // On next execution the Ready entry will be patched to tier-1.
+                // Ledger-known-good blocks skip it: they get one direct
+                // compile, not tier-0 + tier-1 double work.
                 if self.shared.is_boot_mode()
+                    && !persist_eager
                     && matches!(kind, BlockKind::Pure { .. })
                     && let Some(baseline) = baseline::try_compile_baseline(
                         &self.shared,
@@ -552,7 +600,7 @@ impl JitCpu {
                         self.stats.profile.eager_compiles.saturating_add(1);
                     return Ok(self.finish_compiled(rip, meta));
                 }
-                if eager {
+                if eager || persist_eager {
                     // Eager compile: the entry is required NOW (there may be no
                     // revisit). Prefer the background worker and block briefly
                     // on this entry only. On timeout the wait attempts an inline

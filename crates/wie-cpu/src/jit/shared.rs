@@ -12,6 +12,7 @@
 
 use super::CacheEntry;
 use super::block::{self, BlockKind};
+use super::cache_persist::{LedgerProbe, PersistentJitCache, jit_cache_pe_hash};
 
 // [verifier-rejection warn rate-limit] First REJECT_WARN_MAX rejections log at
 // WARN; the tail logs at DEBUG so pathological guests don't spam the console.
@@ -339,6 +340,11 @@ pub struct JitShared {
     /// Boot inline token bucket: `(window_start, used_in_window)` for the
     /// 2-per-10ms bounded inline pool during boot (thrash guard).
     pub(super) boot_inline_window: Mutex<(Instant, u32)>,
+    /// Persistent disk code-cache ledger (`WIE_JIT_CACHE`). Always present;
+    /// inert when disabled (`=0`, or default-off under `cfg(test)`). See
+    /// [`super::cache_persist`] for why this stores metadata rather than
+    /// machine-code bytes.
+    pub(super) persist: Arc<PersistentJitCache>,
     /// Test-only latch forcing the background path on for this instance
     /// (env-independent, and per-`JitShared` so parallel unit tests cannot
     /// interfere with each other).
@@ -397,6 +403,7 @@ impl JitShared {
             bg_queue_depth: AtomicU64::new(0),
             guest_insns: AtomicU64::new(0),
             boot_inline_window: Mutex::new((Instant::now(), 0)),
+            persist: Arc::new(PersistentJitCache::new()),
             #[cfg(test)]
             bg_force: AtomicBool::new(false),
         }
@@ -406,6 +413,76 @@ impl JitShared {
     /// (on for real runs, off under `cfg(test)`) or the test latch.
     pub(super) fn bg_enabled_here(&self) -> bool {
         JitConfig::get().bg_enabled() || self.bg_force_test()
+    }
+
+    // -- persistent disk-cache ledger (WIE_JIT_CACHE) -----------------------
+
+    /// Attach (and bulk-load) the persistent JIT ledger for `pe_hash`,
+    /// computed by the caller over the PE image file bytes via
+    /// [`crate::jit_cache_pe_hash`]. Call once at session init, before guest
+    /// execution. Seeds `Never` records straight into the live cache so warm
+    /// boots skip re-decoding known-bad blocks immediately. No-op when the
+    /// cache is disabled (`WIE_JIT_CACHE=0`).
+    pub fn attach_pe_cache(&self, pe_hash: u64) {
+        self.persist.attach(pe_hash);
+        let cache = self.cache.pin();
+        for va in self.persist.never_vas() {
+            // Only from absence: a live Ready/Hot/Queued decision outranks it.
+            if cache.get(&va).is_none() {
+                cache.insert(va, CacheEntry::Never);
+            }
+        }
+    }
+
+    /// Hash of a PE image for [`Self::attach_pe_cache`] (re-exported at the
+    /// crate root as [`crate::jit_cache_pe_hash`]).
+    #[must_use]
+    pub fn pe_cache_hash(pe_file_bytes: &[u8]) -> u64 {
+        jit_cache_pe_hash(pe_file_bytes)
+    }
+
+    /// Byte-validated warm-boot probe against the active PE's ledger.
+    pub(super) fn persist_probe(&self, mem: &GuestMemory, va: u64) -> Option<LedgerProbe> {
+        self.persist.probe(mem, va)
+    }
+
+    /// Record one Ready install (`inline` and worker paths) into the ledger.
+    pub(super) fn persist_record_ready(&self, compiled: &CompiledBlock) {
+        let mem = self.mem.read().unwrap();
+        self.persist.record_ready(
+            &mem,
+            compiled.guest_start,
+            compiled.guest_end,
+            compiled.insn_count,
+            compiled.inv_gen,
+        );
+    }
+
+    /// Record a `Never` verdict into the ledger (fixed-window hash).
+    pub(super) fn persist_record_never(&self, va: u64) {
+        if !self.persist_active() {
+            return;
+        }
+        let mem = self.mem.read().unwrap();
+        self.persist.record_never(&mem, va);
+    }
+
+    /// Ledger invalidation over `[addr, addr+len)` (SMC / X-loss / writes).
+    pub(super) fn persist_invalidate_range(&self, addr: u64, end: u64) {
+        let len = usize::try_from(end.saturating_sub(addr)).unwrap_or(usize::MAX);
+        self.persist.invalidate_range(addr, len);
+    }
+
+    /// Ledger clear: `full = true` purges everything (guest-triggered full
+    /// flushes); `full = false` keeps loaded/learned entries valid (session
+    /// init clears before execution — probes stay hash-validated regardless).
+    pub(super) fn persist_clear(&self, full: bool) {
+        self.persist.clear_all(full);
+    }
+
+    /// Whether persistence is both enabled AND attached to a PE.
+    pub(super) fn persist_active(&self) -> bool {
+        self.persist.active_pe() != 0
     }
 
     /// Whether `rip` is currently `Queued` in the cache — a background
@@ -495,6 +572,7 @@ impl JitShared {
         }
         self.code_pages_add_range(compiled.guest_start, compiled.guest_end);
         self.cache.pin().insert(rip, CacheEntry::Ready(compiled));
+        self.persist_record_ready(&compiled);
     }
 
     /// Clone of the live pool handle (`None` before spawn / after a failed
@@ -792,6 +870,7 @@ impl JitShared {
         // thread that observes the new epoch is guaranteed to find the VA in
         // its drain (install-order lock discipline).
         self.recent_installs.lock().unwrap().push(rip);
+        self.persist_record_ready(&compiled);
         self.cache_epoch.fetch_add(1, Ordering::Relaxed);
         self.chain_epoch_bumps.fetch_add(1, Ordering::Relaxed);
         self.bg_compiles.fetch_add(1, Ordering::Relaxed);
@@ -808,6 +887,8 @@ impl JitShared {
             match cache.remove(&rip).cloned() {
                 Some(CacheEntry::Queued(n)) => {
                     cache.insert(rip, CacheEntry::Never);
+                    // Negative ledger entry: warm boots probe as KnownNever.
+                    self.persist_record_never(rip);
                     Some(n)
                 }
                 _ => None,

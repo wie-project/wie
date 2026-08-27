@@ -108,6 +108,9 @@ pub struct JitProfile {
     pub iced_fallbacks: u64,
     /// Blocks marked `Never` (cold / non-pure).
     pub never_marks: u64,
+    /// Persistent-ledger warm hits (`WIE_JIT_CACHE`): known-good blocks that
+    /// skipped the Hot visit-threshold warmup and compiled immediately.
+    pub warm_ledger_hits: u64,
 }
 
 /// Lock-free accumulator for background-compile timing. The worker thread

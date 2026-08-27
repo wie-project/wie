@@ -219,7 +219,9 @@ impl CpuEngine for JitCpu {
         hook_end: u64,
         stop_bitmap: std::sync::Arc<[u8]>,
     ) -> Result<(), CpuError> {
-        self.clear_compiled();
+        // Init-time clear before guest execution: preserve the persistent
+        // ledger (see `clear_compiled_keep_ledger`).
+        self.clear_compiled_keep_ledger();
         self.invalidate_tlb();
         self.invalidate_chain_and_shadow();
         let range_len = hook_end.saturating_sub(hook_begin).saturating_add(1);
@@ -259,6 +261,8 @@ impl CpuEngine for JitCpu {
                 .cache
                 .pin()
                 .get_or_insert(address, CacheEntry::Never);
+            // Mirror mark_never's negative-ledger recording.
+            self.shared.persist_record_never(address);
         }
     }
 

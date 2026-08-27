@@ -33,7 +33,7 @@ pub use jit::{
     BgCompileProfile, BgCompileStats, ChainStats, CompileStats, ExecStats, FastApiKind, JitCpu,
     JitFastPathConfig, JitHeapLayout, JitProfile, JitShared, JitStats, MemPathStats,
     PROFILE_BUCKETS, PerThreadJitState, PromoLedger, TimeBuckets, dump_mem_path_stats,
-    jit_profile_report_lines,
+    jit_cache_pe_hash, jit_profile_report_lines,
 };
 /// Windows `PAGE_*` constants and software access checks.
 pub use mem::protect;

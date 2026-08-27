@@ -18,6 +18,7 @@
 
 mod baseline;
 mod block;
+mod cache_persist;
 mod config;
 mod cpu_engine;
 mod diag;
@@ -30,6 +31,7 @@ mod profile;
 mod shared;
 mod trampolines;
 
+pub use cache_persist::jit_cache_pe_hash;
 /// Dump mem-path histogram / profile report lines (`WIE_JIT_MEM_TRACE=1` …).
 pub use diag::{dump_mem_path_stats, jit_profile_report_lines};
 pub(crate) use engine::JitEngine;

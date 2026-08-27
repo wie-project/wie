@@ -442,6 +442,13 @@ impl super::RuntimeSession {
         };
         t_phase = phase("backend-open", t_phase);
 
+        // Persistent JIT code-cache (`WIE_JIT_CACHE`): attach the ledger for
+        // this image before any guest execution so warm boots skip threshold
+        // warmup for blocks known-good from a previous run.
+        if let Some(shared) = &shared_jit {
+            shared.attach_pe_cache(wie_cpu::jit_cache_pe_hash(&pe_bytes));
+        }
+
         // One MEM_IMAGE arena, temporary RWX — headers/sections/IAT are written
         // directly into guest memory (no intermediate Vec<u8> buffer).
         engine
