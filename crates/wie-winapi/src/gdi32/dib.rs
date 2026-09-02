@@ -326,10 +326,18 @@ fn read_bmi_geometry(
 /// (buffer row 0 is the image's bottom row, so image row 0 maps to the last
 /// buffer row). Sampling clips to the surface; out-of-bounds source pixels are
 /// skipped, so an over-large destination simply crops.
+///
+/// `surface_stride` is the destination row pitch (the 64-padded surface
+/// stride, NOT the logical width — rows index `row * surface_stride + x`).
+///
+/// Zero-copy fast path (Wave 1d): when the whole DIB buffer is contiguous in
+/// one arena, `host_slice` borrows every row directly from guest memory — no
+/// per-row `mem_read`, no per-call scratch allocation. Non-contiguous buffers
+/// fall back to the chunked per-row read.
 #[allow(clippy::too_many_arguments)]
 fn blit_dib_region(
     engine: &mut dyn wie_cpu::CpuEngine,
-    surface_w: u32,
+    surface_stride: u32,
     surface_h: u32,
     dest: &mut [u32],
     src_va: u64,
@@ -349,9 +357,13 @@ fn blit_dib_region(
     if dst_cx <= 0 || dst_cy <= 0 || src_cx <= 0 || src_cy <= 0 {
         return;
     }
-    let sw = i32::try_from(surface_w).unwrap_or(0).max(1);
+    let sw = i32::try_from(surface_stride).unwrap_or(0).max(1);
     let sh = i32::try_from(surface_h).unwrap_or(0).max(1);
     // Clip the dest rect to the surface; the source origin shifts with it.
+    // The clip width is bounded by the LOGICAL width of the surface, which
+    // callers track separately — here `sw` bounds only row indexing, so the
+    // caller must pass a dest rect already clipped to the logical width (it
+    // does: `dst_cx` comes from the guest call's dest extents).
     let clip_left = surface_x.max(0);
     let clip_top = surface_y.max(0);
     let clip_right = surface_x.saturating_add(dst_cx).min(sw);
@@ -364,33 +376,34 @@ fn blit_dib_region(
     let stride = ((usize::try_from(image_w).unwrap_or(0)).saturating_mul(bpp_bytes) + 3) & !3;
     let src_w_i = i32::try_from(image_w).unwrap_or(0).max(1);
     let src_h_i = i32::try_from(image_h).unwrap_or(0).max(1);
-    let surf_w_us = usize::try_from(surface_w).unwrap_or(0);
+    let surf_stride_us = usize::try_from(surface_stride).unwrap_or(0);
+    // The 1:1 32-bpp game-frame case converts whole rows with the SIMD
+    // format pass instead of per-pixel math.
+    let fast_1to1 = bpp == 32 && dst_cx == src_cx && dst_cy == src_cy;
+    let fast_src_start = usize::try_from(src_x.max(0)).unwrap_or(0).saturating_mul(4);
+    let fast_copy_w = usize::try_from(clip_right - clip_left).unwrap_or(0);
+    let fast_left_us = usize::try_from(clip_left).unwrap_or(0);
 
-    let mut row = vec![0_u8; stride];
-    for dy in clip_top..clip_bottom {
-        // Nearest-neighbour source row for this dest row (downsampling safe).
-        let in_row = dy - surface_y;
-        let sy = if dst_cy == src_cy {
-            src_y.saturating_add(in_row)
-        } else {
-            src_y.saturating_add(in_row.saturating_mul(src_cy) / dst_cy)
-        };
-        if sy < 0 || sy >= src_h_i {
-            continue;
+    // Row→dest writer shared by the zero-copy and fallback loops: samples the
+    // source row (nearest neighbour) and writes the clipped dest columns.
+    let write_row = |row_bytes: &[u8], dy: i32, dest: &mut [u32]| {
+        let dst_row_base = usize::try_from(dy)
+            .unwrap_or(0)
+            .saturating_mul(surf_stride_us);
+        if fast_1to1 {
+            let src_row = row_bytes
+                .get(fast_src_start..fast_src_start.saturating_add(fast_copy_w.saturating_mul(4)));
+            let dst_row = dest.get_mut(
+                dst_row_base.saturating_add(fast_left_us)
+                    ..dst_row_base
+                        .saturating_add(fast_left_us)
+                        .saturating_add(fast_copy_w),
+            );
+            if let (Some(src_row), Some(dst_row)) = (src_row, dst_row) {
+                wie_cpu::mask_bgra_to_0rgb(dst_row, src_row);
+                return;
+            }
         }
-        // Buffer row index: bottom-up stores the image flipped.
-        let buf_row = if bottom_up {
-            src_h_i.saturating_sub(1).saturating_sub(sy)
-        } else {
-            sy
-        };
-        let row_va = src_va.saturating_add(
-            u64::try_from(buf_row.saturating_mul(i32::try_from(stride).unwrap_or(0))).unwrap_or(0),
-        );
-        if engine.mem_read(row_va, &mut row).is_err() {
-            continue;
-        }
-        let dst_row_base = usize::try_from(dy).unwrap_or(0).saturating_mul(surf_w_us);
         for dx in clip_left..clip_right {
             let in_col = dx - surface_x;
             let sx = if dst_cx == src_cx {
@@ -402,7 +415,7 @@ fn blit_dib_region(
                 continue;
             }
             let byte = usize::try_from(sx).unwrap_or(0).saturating_mul(bpp_bytes);
-            let Some(src_slice) = row.get(byte..byte.saturating_add(bpp_bytes)) else {
+            let Some(src_slice) = row_bytes.get(byte..byte.saturating_add(bpp_bytes)) else {
                 continue;
             };
             // 0x00RRGGBB for the present surface (mask_bgra, or manual for 24bpp).
@@ -417,7 +430,79 @@ fn blit_dib_region(
                 *slot = px;
             }
         }
+    };
+
+    // Zero-copy path (Wave 1d): the whole DIB is contiguous in one arena —
+    // one `host_slice` borrow covers every row; no per-row `mem_read`, no
+    // per-call scratch allocation.
+    let total_bytes = stride.saturating_mul(usize::try_from(image_h).unwrap_or(0));
+    if let Some(host) = engine
+        .host_slice(src_va, total_bytes)
+        .filter(|h| h.len() >= total_bytes)
+    {
+        for dy in clip_top..clip_bottom {
+            let Some(buf_row) =
+                dib_row_offset(src_h_i, bottom_up, dy, surface_y, src_y, src_cy, dst_cy)
+            else {
+                continue;
+            };
+            let row_off = buf_row.saturating_mul(stride);
+            let Some(row_bytes) = host
+                .get(row_off..row_off.saturating_add(stride))
+                .filter(|r| !r.is_empty())
+            else {
+                continue;
+            };
+            write_row(row_bytes, dy, dest);
+        }
+        return;
     }
+    // Fallback: non-contiguous buffer — one-row scratch, read per row.
+    let mut row = vec![0_u8; stride.max(1)];
+    for dy in clip_top..clip_bottom {
+        let Some(buf_row) =
+            dib_row_offset(src_h_i, bottom_up, dy, surface_y, src_y, src_cy, dst_cy)
+        else {
+            continue;
+        };
+        let row_off = buf_row.saturating_mul(stride);
+        let row_va = src_va.saturating_add(u64::try_from(row_off).unwrap_or(0));
+        if engine.mem_read(row_va, &mut row).is_err() {
+            continue;
+        }
+        write_row(&row, dy, dest);
+    }
+}
+
+/// The buffer row index (in rows, NOT bytes) of the guest DIB row that dest
+/// row `dy` samples (nearest neighbour + bottom-up flip). `None` when
+/// off-image. Callers scale by the image's byte stride.
+#[allow(clippy::too_many_arguments)]
+fn dib_row_offset(
+    src_h_i: i32,
+    bottom_up: bool,
+    dy: i32,
+    surface_y: i32,
+    src_y: i32,
+    src_cy: i32,
+    dst_cy: i32,
+) -> Option<usize> {
+    let in_row = dy - surface_y;
+    let sy = if dst_cy == src_cy {
+        src_y.saturating_add(in_row)
+    } else {
+        src_y.saturating_add(in_row.saturating_mul(src_cy) / dst_cy)
+    };
+    if sy < 0 || sy >= src_h_i {
+        return None;
+    }
+    // Buffer row index: bottom-up stores the image flipped.
+    let buf_row = if bottom_up {
+        src_h_i.saturating_sub(1).saturating_sub(sy)
+    } else {
+        sy
+    };
+    usize::try_from(buf_row).ok()
 }
 
 /// Wire a device-DIB blit (`SetDIBitsToDevice` / `StretchDIBits`) into the
@@ -457,17 +542,17 @@ fn publish_device_dib_blit(
     let surface_x = dest_x.saturating_add(info.offset_x);
     let surface_y = dest_y.saturating_add(info.offset_y);
     {
-        let Some(dest) = state
+        let Some((dest, surface_stride)) = state
             .present()
             .surfaces
             .get_mut(&info.hwnd)
-            .map(|s| &mut s.pixels[..])
+            .map(|s| (&mut s.pixels[..], s.stride))
         else {
             return Ok(false);
         };
         blit_dib_region(
             engine,
-            info.width,
+            surface_stride,
             info.height,
             dest,
             bits_va,

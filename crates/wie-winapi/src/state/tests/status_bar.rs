@@ -484,7 +484,7 @@ fn test_status_bar_paint_draws_parts_with_client_edge_and_text() {
         .clone();
     assert_eq!((frame.width, frame.height), (200, 100));
     let px = |col: i32, row: i32| -> u32 {
-        let idx = (usize::try_from(row).unwrap_or(0) * usize::try_from(frame.width).unwrap_or(0))
+        let idx = (usize::try_from(row).unwrap_or(0) * usize::try_from(frame.stride).unwrap_or(0))
             .saturating_add(usize::try_from(col).unwrap_or(0));
         frame.pixels.get(idx).copied().unwrap_or(0)
     };
@@ -548,7 +548,7 @@ fn test_status_bar_paint_draws_part_separator_grooves() {
         .expect("published frame")
         .clone();
     let px = |col: i32, row: i32| -> u32 {
-        let idx = (usize::try_from(row).unwrap_or(0) * usize::try_from(frame.width).unwrap_or(0))
+        let idx = (usize::try_from(row).unwrap_or(0) * usize::try_from(frame.stride).unwrap_or(0))
             .saturating_add(usize::try_from(col).unwrap_or(0));
         frame.pixels.get(idx).copied().unwrap_or(0)
     };
@@ -722,7 +722,7 @@ fn test_status_bar_hide_paint_show_paint_round_trip() {
     };
     assert_eq!(
         frame_before.pixels[(usize::try_from(77).unwrap_or(0)
-            * usize::try_from(frame_before.width).unwrap_or(0))
+            * usize::try_from(frame_before.stride).unwrap_or(0))
             + usize::try_from(10).unwrap_or(0)],
         0x00F0_F0F0,
         "the visible bar paints its BTNFACE strip"
@@ -798,7 +798,7 @@ fn test_status_bar_hide_paint_show_paint_round_trip() {
         .clone();
     assert_eq!(
         frame_after_show.pixels[(usize::try_from(77).unwrap_or(0)
-            * usize::try_from(frame_after_show.width).unwrap_or(0))
+            * usize::try_from(frame_after_show.stride).unwrap_or(0))
             + usize::try_from(10).unwrap_or(0)],
         0x00F0_F0F0,
         "the re-shown bar repaints its BTNFACE strip"
@@ -891,7 +891,7 @@ fn test_status_bar_no_font_fixed_cell_fits_full_part_text() {
         for col in range {
             for row in 78..98 {
                 let idx = (usize::try_from(row).unwrap_or(0)
-                    * usize::try_from(frame.width).unwrap_or(0))
+                    * usize::try_from(frame.stride).unwrap_or(0))
                 .saturating_add(usize::try_from(col).unwrap_or(0));
                 if frame.pixels.get(idx).copied().unwrap_or(0) != 0x00F0_F0F0 {
                     count = count.saturating_add(1);

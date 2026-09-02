@@ -73,7 +73,7 @@ fn gui_d3d9_renders_clear_and_triangle() {
                 frame.height
             );
             let idx = |x: u32, y: u32| {
-                usize::try_from(y).unwrap_or(0) * frame.width as usize
+                usize::try_from(y).unwrap_or(0) * frame.stride as usize
                     + usize::try_from(x).unwrap_or(0)
             };
             // Clear red outside the triangles (top-left corner region).
@@ -504,7 +504,7 @@ fn gui_dialog_modal_loop_and_end_dialog() {
         {
             let (x, y) = DIALOG_OK_BUTTON_SAMPLE;
             if x < frame.width && y < frame.height {
-                let idx = usize::try_from(y).unwrap_or(0) * frame.width as usize
+                let idx = usize::try_from(y).unwrap_or(0) * frame.stride as usize
                     + usize::try_from(x).unwrap_or(0);
                 if frame.pixels.get(idx).copied() == Some(BTNFACE_0RGB) {
                     saw_dialog_face = true;
@@ -559,11 +559,19 @@ fn gui_dialog_shift_tab_moves_focus() {
     session
         .set_guest_env("WIE_SELFTEST", "1")
         .expect("inject WIE_SELFTEST");
+    // Host-driven close: disable the exe's timer auto-close so its VK_RETURN
+    // cannot race the focus transitions (ENTER landing on the Cancel button
+    // mid-transition clicks IDCANCEL → exit 172). This test posts its own
+    // VK_RETURN once focus is verified back on the first tab stop.
+    session
+        .set_guest_env("WIE_DIALOG_HOSTDRIVEN", "1")
+        .expect("inject WIE_DIALOG_HOSTDRIVEN");
 
     // Win32 constants for the host-posted input (gui_dialog has two tab stop
     // buttons: OK then Cancel).
     const VK_SHIFT: u16 = 0x10;
     const VK_TAB: u16 = 0x09;
+    const VK_RETURN: u16 = 0x0D;
     const WM_KEYDOWN: u32 = 0x0100;
 
     let handle = session.guest_handle();
@@ -610,6 +618,19 @@ fn gui_dialog_shift_tab_moves_focus() {
                         }
                     }
                     2 if handle.focus_window() == Some(first_focus) => {
+                        // Focus wrapped back to the first tab stop (OK).
+                        // Close deterministically NOW: post ENTER to the
+                        // dialog (owner's first child #32770) so
+                        // IsDialogMessage turns it into WM_COMMAND(IDOK) →
+                        // EndDialog(1).
+                        let owner_now = session.first_guest_window_handle().unwrap_or(0);
+                        let dialog = session
+                            .guest_windows_snapshot()
+                            .iter()
+                            .find(|(_, cls, ..)| cls == "#32770")
+                            .map(|(h, ..)| *h)
+                            .unwrap_or(owner_now);
+                        handle.post_message(dialog, WM_KEYDOWN, u64::from(VK_RETURN), 0);
                         stage = 3;
                     }
                     _ => {}
@@ -723,7 +744,7 @@ fn gui_demo_dialog_opens_on_click() {
         {
             let (x, y) = DIALOG_FACE_SAMPLE;
             if x < frame.width && y < frame.height {
-                let idx = usize::try_from(y).unwrap_or(0) * frame.width as usize
+                let idx = usize::try_from(y).unwrap_or(0) * frame.stride as usize
                     + usize::try_from(x).unwrap_or(0);
                 if frame.pixels.get(idx).copied() == Some(BTNFACE_0RGB) {
                     saw_dialog_face = true;
@@ -860,7 +881,7 @@ fn gui_demo_dialog_ok_click_closes_dialog() {
                 && let Some(owner) = session.first_guest_window_handle()
                 && let Some(frame) = session.take_frame(owner)
             {
-                let idx = 150_usize * frame.width as usize + 490_usize;
+                let idx = 150_usize * frame.stride as usize + 490_usize;
                 if frame.pixels.get(idx).copied() != Some(BTNFACE_0RGB) {
                     saw_face_gone = true;
                 }

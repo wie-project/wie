@@ -81,7 +81,7 @@ suites for trend visibility; whole-program timing stays with
 
 The README keeps the shortlist; the complete set lives here.
 
-> **Wave3 defaults (final gate):** padded surface pool + wgpu scratch, latest-wins coalescing/throttling (`drain_pending_publishes` + `retry_delay`), pre-reserve (Q4/C), size-class TLS, and CompactString are **default on** — steady zero-alloc with no env required. JIT direct register hand-off (`WIE_JIT_DIRECT_REGS`) is default **on** (opt-out with `=0` for bisect); D3D9 in-place pooled target (Q9/C) is default. No `WIE_SURFACE_PAD` env required — 64 px padding is the default pooled path.
+> **Wave3 defaults (final gate):** padded surface pool + wgpu scratch, latest-wins coalescing/throttling (`drain_pending_publishes` + `retry_delay`), pre-reserve (Q4/C), size-class TLS, and CompactString are **default on** — steady zero-alloc with no env required. JIT direct register hand-off (`WIE_JIT_DIRECT_REGS`) is **still unbuilt** despite the "default on" wording in ADR-0002 (implementation status note added 2026-09-02 — zero call sites; see `docs/implementation-plan.md` Wave 3); D3D9 in-place pooled target (Q9/C) is default. 64 px pitch padding is implemented (ADR-0001 status note, 2026-09-02) — `WIE_SURFACE_PAD=0` opts out.
 
 | Variable | Effect |
 | --- | --- |
@@ -126,7 +126,8 @@ The README keeps the shortlist; the complete set lives here.
 
 | Variable | Default | Opt-out | Lane |
 | --- | --- | --- | --- |
-| `WIE_SURFACE_PAD` / padded pool | **64 px** pooled per-HWND + reused wgpu scratch | `WIE_SURFACE_PAD=0` (on-demand alloc) | Q2/D |
+| `WIE_SURFACE_PAD` / padded pool | **64 px** row pitch (`padded_stride`, ADR-0001, implemented 2026-09) + reused wgpu scratch | `WIE_SURFACE_PAD=0` (unpadded, on-demand pack) | Q2/D |
+| present channel | **on** (`PresentChannel` latest-wins slot; `take_frame` is lock-free on the presenter side, ADR-0003) | none — always on | Wave 1a |
 | present throttling / latest-wins | **on** (`drain_pending_publishes` + `retry_delay` coalesce) | `cfg(test)` skips (tests assert publish) | Q5/C |
 | pre-reserve / scratch reuse | **on** (capacity-retained `Vec`s, pooled `WgpuPresenter` scratch) | none — always on | Q4/C |
 | CompactString | **on** (inline small strings; see `compact_string` crate in `wie-winapi` where string-heavy) | `WIE_COMPACT_STRING=0` if gated | Q6/C |

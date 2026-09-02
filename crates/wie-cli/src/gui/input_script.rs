@@ -251,8 +251,14 @@ fn execute_real_steps(handle: &GuestHandle, hwnd: u64, steps: &[ScriptStep]) {
                 };
                 let file = std::fs::File::create(path).expect("snapshot file");
                 let mut writer = std::io::BufWriter::new(file);
-                crate::bmp::write_bmp(&mut writer, frame.width, frame.height, &frame.pixels)
-                    .expect("snapshot bmp");
+                crate::bmp::write_bmp(
+                    &mut writer,
+                    frame.width,
+                    frame.height,
+                    frame.stride,
+                    &frame.pixels,
+                )
+                .expect("snapshot bmp");
                 tracing::info!(target: "wiegui", "snapshot written to {path}");
             }
         }

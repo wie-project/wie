@@ -378,7 +378,7 @@ fn goto_cancel_click_closes_dialog_on_first_click() {
         let mut n = 0_u32;
         for py in dlg_y..(dlg_y + GOTO_DLG_CY) {
             for px in dlg_x..(dlg_x + GOTO_DLG_CX) {
-                let idx = py as usize * frame.width as usize + px as usize;
+                let idx = py as usize * frame.stride as usize + px as usize;
                 if frame
                     .pixels
                     .get(idx)
@@ -880,7 +880,7 @@ fn goto_line_deep_keeps_rows_below_visible() {
         for y in (0..frame.height).step_by(19) {
             let mut ink = 0_u32;
             for x in 4..frame.width {
-                let idx = usize::try_from(y).unwrap_or(0) * frame.width as usize
+                let idx = usize::try_from(y).unwrap_or(0) * frame.stride as usize
                     + usize::try_from(x).unwrap_or(0);
                 if frame.pixels.get(idx).copied() != Some(0x00FF_FFFF) {
                     ink += 1;

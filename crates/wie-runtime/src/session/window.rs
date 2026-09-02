@@ -15,6 +15,12 @@ use wie_winapi::{WindowFlags, handles::Hmenu, handles::Hwnd};
 pub struct GuestHandle {
     pub(super) state: std::sync::Arc<std::sync::Mutex<wie_winapi::WinApiState>>,
     pub(super) queue: std::sync::Arc<std::sync::Mutex<wie_winapi::present::MessageQueue>>,
+    /// The host-presenter frame channel (ADR-0003): latest-wins frame slot,
+    /// spare pool, z/window revision mirrors, presenter timing. Per-frame
+    /// reads/writes (`take_frame`, `store_spare_buffer`, `windows_rev`,
+    /// `z_snapshot`, `record_present_time`) lock ONLY this — never the big
+    /// `WinApiState` mutex the guest thread holds during paint handlers.
+    pub(super) present_channel: Arc<wie_winapi::present::PresentChannel>,
     /// Cached menu-bar tree, keyed by the menu handle it was built for.
     ///
     /// `window_menu_items` rebuilds only when `WindowState.menu_dirty` flips
@@ -76,23 +82,27 @@ impl GuestHandle {
     }
 
     /// Take the latest published frame for `hwnd`, if any.
+    ///
+    /// Channel-only: never touches the big `WinApiState` mutex, so a guest
+    /// paint handler or D3D9 draw holding that lock cannot stall the
+    /// presenter (and the macOS UI thread) — the whole point of the channel.
     #[must_use]
     pub fn take_frame(&self, hwnd: u64) -> Option<wie_winapi::present::SurfaceFrame> {
-        let state = self.lock_state()?;
-        state
-            .try_present()?
-            .published
-            .get(&wie_winapi::handles::Hwnd::from(hwnd))
-            .cloned()
+        self.present_channel
+            .take_frame(wie_winapi::handles::Hwnd::from(hwnd))
+    }
+
+    /// Frames published but not yet taken — the presenter re-arms its redraw
+    /// when this is nonzero after a take (closing the publish gate's one
+    /// race). Lock-free.
+    #[must_use]
+    pub fn pending_frames(&self) -> u64 {
+        self.present_channel.pending_frames()
     }
 
     pub fn store_spare_buffer(&self, hwnd: u64, buffer: Vec<u32>) {
-        if let Some(mut state) = self.lock_state() {
-            state
-                .present()
-                .spare_buffers
-                .insert(wie_winapi::handles::Hwnd::from(hwnd), buffer);
-        }
+        self.present_channel
+            .store_spare(wie_winapi::handles::Hwnd::from(hwnd), buffer);
     }
 
     /// The EDIT control's caret/selection for `hwnd`: `(caret, sel_start,
@@ -132,15 +142,14 @@ impl GuestHandle {
         wie_winapi::present::frame_timing_enabled()
     }
 
-    /// Record one host present (softbuffer copy + upload) wall time (ns).
-    /// The internal gate makes this a no-op (no lock) when timing is disabled.
+    /// Record one host present (upload + present) wall time (ns).
+    /// Channel-only (the internal gate makes this a no-op when timing is
+    /// disabled) — never the big lock.
     pub fn record_present_time(&self, ns: u128) {
         if !wie_winapi::present::frame_timing_enabled() {
             return;
         }
-        if let Some(mut state) = self.lock_state() {
-            state.present().record_present(ns);
-        }
+        self.present_channel.record_present(ns);
     }
 
     /// Publish duration of the most recent frame (ns; 0 when timing disabled).
@@ -251,10 +260,7 @@ impl GuestHandle {
     /// an unchanged window set skips the enumerate+diff entirely.
     #[must_use]
     pub fn windows_rev(&self) -> u64 {
-        let Some(state) = self.lock_state() else {
-            return 0;
-        };
-        state.try_present().map_or(0, |p| p.windows_rev)
+        self.present_channel.windows_rev()
     }
 
     /// The guest's top-level z-order revision — bumped by every top-level
@@ -264,10 +270,7 @@ impl GuestHandle {
     /// The Frame handler re-orders its NSWindows only when this changes.
     #[must_use]
     pub fn z_rev(&self) -> u64 {
-        let Some(state) = self.lock_state() else {
-            return 0;
-        };
-        state.try_present().map_or(0, |p| p.z_rev)
+        self.present_channel.z_rev()
     }
 
     /// Atomic snapshot of the guest top-level z-order: the revision AND the
@@ -279,16 +282,7 @@ impl GuestHandle {
     /// revision it compared actually describes.
     #[must_use]
     pub fn z_snapshot(&self) -> (u64, Vec<u64>) {
-        let Some(state) = self.lock_state() else {
-            return (0, Vec::new());
-        };
-        let Some(present) = state.try_present() else {
-            return (0, Vec::new());
-        };
-        (
-            present.z_rev,
-            present.z_order.iter().map(|hwnd| hwnd.as_u64()).collect(),
-        )
+        self.present_channel.z_snapshot()
     }
 
     /// The top-level (parentless) ancestor of the focused window.
@@ -715,8 +709,16 @@ mod tests {
                 ..Default::default()
             });
         }
+        let __state_arc = Arc::new(Mutex::new(winapi_state));
+        let __present_channel = {
+            let mut __guard = __state_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            __guard.present().channel_arc()
+        };
         let handle = GuestHandle {
-            state: Arc::new(Mutex::new(winapi_state)),
+            state: Arc::clone(&__state_arc),
+            present_channel: Arc::clone(&__present_channel),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
@@ -797,8 +799,16 @@ mod tests {
                 ..Default::default()
             });
         }
+        let __state_arc = Arc::new(Mutex::new(winapi_state));
+        let __present_channel = {
+            let mut __guard = __state_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            __guard.present().channel_arc()
+        };
         let handle = GuestHandle {
-            state: Arc::new(Mutex::new(winapi_state)),
+            state: Arc::clone(&__state_arc),
+            present_channel: Arc::clone(&__present_channel),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
@@ -922,8 +932,16 @@ mod tests {
                 ..Default::default()
             });
         }
+        let __state_arc = Arc::new(Mutex::new(winapi_state));
+        let __present_channel = {
+            let mut __guard = __state_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            __guard.present().channel_arc()
+        };
         let handle = GuestHandle {
-            state: Arc::new(Mutex::new(winapi_state)),
+            state: Arc::clone(&__state_arc),
+            present_channel: Arc::clone(&__present_channel),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
@@ -994,8 +1012,16 @@ mod tests {
             ws.host_geometry_request = Some((20, 30, 200, 100));
             ws.host_geometry_hwnd = Some(0x200);
         }
+        let __state_arc = Arc::new(Mutex::new(winapi_state));
+        let __present_channel = {
+            let mut __guard = __state_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            __guard.present().channel_arc()
+        };
         let handle = GuestHandle {
-            state: Arc::new(Mutex::new(winapi_state)),
+            state: Arc::clone(&__state_arc),
+            present_channel: Arc::clone(&__present_channel),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
@@ -1071,8 +1097,16 @@ mod tests {
                 ..Default::default()
             });
         }
+        let __state_arc = Arc::new(Mutex::new(winapi_state));
+        let __present_channel = {
+            let mut __guard = __state_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            __guard.present().channel_arc()
+        };
         let handle = GuestHandle {
-            state: Arc::new(Mutex::new(winapi_state)),
+            state: Arc::clone(&__state_arc),
+            present_channel: Arc::clone(&__present_channel),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
@@ -1133,8 +1167,16 @@ mod tests {
             });
             ws.focus_window_handle = wie_winapi::handles::Hwnd::from(0x201);
         }
+        let __state_arc = Arc::new(Mutex::new(winapi_state));
+        let __present_channel = {
+            let mut __guard = __state_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            __guard.present().channel_arc()
+        };
         let handle = GuestHandle {
-            state: Arc::new(Mutex::new(winapi_state)),
+            state: Arc::clone(&__state_arc),
+            present_channel: Arc::clone(&__present_channel),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
@@ -1193,8 +1235,16 @@ mod tests {
                 ..Default::default()
             });
         }
+        let __state_arc = Arc::new(Mutex::new(winapi_state));
+        let __present_channel = {
+            let mut __guard = __state_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            __guard.present().channel_arc()
+        };
         let handle = GuestHandle {
-            state: Arc::new(Mutex::new(winapi_state)),
+            state: Arc::clone(&__state_arc),
+            present_channel: Arc::clone(&__present_channel),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
@@ -1266,8 +1316,16 @@ mod tests {
                 ..Default::default()
             });
         }
+        let __state_arc = Arc::new(Mutex::new(winapi_state));
+        let __present_channel = {
+            let mut __guard = __state_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            __guard.present().channel_arc()
+        };
         let handle = GuestHandle {
-            state: Arc::new(Mutex::new(winapi_state)),
+            state: Arc::clone(&__state_arc),
+            present_channel: Arc::clone(&__present_channel),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
@@ -1333,8 +1391,16 @@ mod tests {
             bottle_root: Some(PathBuf::from("/tmp/bottle")),
             drive_d_root: Some(PathBuf::from("/Users/me/data")),
         };
+        let __state_arc = Arc::new(Mutex::new(winapi_state));
+        let __present_channel = {
+            let mut __guard = __state_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            __guard.present().channel_arc()
+        };
         let handle = GuestHandle {
-            state: Arc::new(Mutex::new(winapi_state)),
+            state: Arc::clone(&__state_arc),
+            present_channel: Arc::clone(&__present_channel),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
@@ -1385,8 +1451,16 @@ mod tests {
             bottle_root: Some(PathBuf::from("/tmp/bottle")),
             drive_d_root: Some(PathBuf::from("/Users/me/data")),
         };
+        let __state_arc = Arc::new(Mutex::new(winapi_state));
+        let __present_channel = {
+            let mut __guard = __state_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            __guard.present().channel_arc()
+        };
         let handle = GuestHandle {
-            state: Arc::new(Mutex::new(winapi_state)),
+            state: Arc::clone(&__state_arc),
+            present_channel: Arc::clone(&__present_channel),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
@@ -1432,8 +1506,16 @@ mod tests {
             // HWND_TOP: 0x100 to the front → back-to-front [0x200, 0x300, 0x100].
             present.z_order_to_top(wie_winapi::handles::Hwnd::from(0x100));
         }
+        let __state_arc = Arc::new(Mutex::new(winapi_state));
+        let __present_channel = {
+            let mut __guard = __state_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            __guard.present().channel_arc()
+        };
         let handle = GuestHandle {
-            state: Arc::new(Mutex::new(winapi_state)),
+            state: Arc::clone(&__state_arc),
+            present_channel: Arc::clone(&__present_channel),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
@@ -1471,8 +1553,16 @@ mod tests {
             crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
                 .expect("winapi state");
         let stats = Arc::new(crate::mt_runtime::LockWaitStats::new());
+        let __state_arc = Arc::new(Mutex::new(winapi_state));
+        let __present_channel = {
+            let mut __guard = __state_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            __guard.present().channel_arc()
+        };
         let handle = GuestHandle {
-            state: Arc::new(Mutex::new(winapi_state)),
+            state: Arc::clone(&__state_arc),
+            present_channel: Arc::clone(&__present_channel),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::clone(&stats),
@@ -1480,10 +1570,11 @@ mod tests {
         (handle, stats)
     }
 
-    /// `take_frame` (the presenter's per-frame read path) times its wait on
-    /// `shared_winapi` while profiling is enabled: with the guest holding
-    /// the lock, the blocked acquisition lands in the presenter-side stats
-    /// (total + max) and never in the guest side.
+    /// `take_frame` (the presenter's per-frame read path) reads the present
+    /// channel WITHOUT the big WinApiState lock: even while the guest holds
+    /// `shared_winapi` for 10 ms, the presenter's take returns immediately
+    /// and never lands in the presenter-side lock stats (the Wave 1a
+    /// contract — rendering no longer serializes behind guest WinAPI work).
     #[test]
     fn take_frame_times_presenter_wait_when_enabled() {
         let (handle, stats) = handle_with_stats();
@@ -1496,23 +1587,24 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         });
         let _ = rx.recv();
+        let t0 = std::time::Instant::now();
         let frame = handle.take_frame(0x100);
+        let elapsed = t0.elapsed();
         assert!(frame.is_none(), "no published frame yet");
+        assert!(
+            elapsed < std::time::Duration::from_millis(10),
+            "take_frame must not wait out the guest-held big lock (took {elapsed:?})"
+        );
         let _ = holder.join();
         let snap = stats.snapshot();
-        assert!(
-            snap.presenter_total_ns >= 5_000_000,
-            "the 10 ms held lock must be observed on the presenter side (got {} ns)",
-            snap.presenter_total_ns
+        assert_eq!(
+            snap.presenter_total_ns, 0,
+            "the channel read is lock-free — no presenter-side wait is recorded"
         );
-        assert!(
-            snap.presenter_max_ns >= 5_000_000,
-            "the presenter max must capture the same wait (got {} ns)",
-            snap.presenter_max_ns
-        );
+        assert_eq!(snap.presenter_max_ns, 0);
         assert_eq!(
             snap.guest_total_ns, 0,
-            "presenter waits never mix with guest"
+            "presenter reads never mix with guest"
         );
         assert_eq!(snap.guest_max_ns, 0);
     }

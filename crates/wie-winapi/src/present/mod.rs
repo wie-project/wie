@@ -5,7 +5,8 @@
 
 use ahash::HashMapExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 mod queue;
@@ -36,14 +37,45 @@ pub fn frame_timing_enabled() -> bool {
 /// color — notepad's client and the common case.
 const DEFAULT_BACKGROUND_COLOR: u32 = 0x00FF_FFFF;
 
+/// Surface pitch padding gate (ADR-0001 reversibility): `WIE_SURFACE_PAD=0`
+/// allocates surfaces at the logical width (stride == width); any other
+/// value or unset keeps the default 64-pixel pitch padding so a full-frame
+/// host upload is always zero-copy (`stride * 4` is a multiple of 256).
+fn surface_padding_enabled() -> bool {
+    static PAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PAD.get_or_init(|| !std::env::var("WIE_SURFACE_PAD").is_ok_and(|v| v == "0"))
+}
+
+/// The row pitch (in pixels) for a surface of logical `width`: padded up to a
+/// multiple of 64 so `stride * 4` bytes satisfies wgpu's 256-byte
+/// `bytes_per_row` alignment and the presenter can borrow the pixel buffer
+/// zero-copy. `WIE_SURFACE_PAD=0` restores the unpitched layout for bisect.
+#[must_use]
+pub fn padded_stride(width: u32) -> u32 {
+    if width == 0 {
+        return 0;
+    }
+    if surface_padding_enabled() {
+        width.div_ceil(64).saturating_mul(64)
+    } else {
+        width
+    }
+}
+
 /// A frame of 0RGB pixels ready for display.
 #[derive(Clone)]
 pub struct SurfaceFrame {
-    /// Pixel width of the frame.
+    /// Logical pixel width (the guest-visible width; column count).
     pub width: u32,
-    /// Pixel height of the frame.
+    /// Row pitch of `pixels` in pixels. `stride >= width`; the tail of every
+    /// row (`stride - width` pixels) is padding that carries no content.
+    /// Equal to `width` for unpitched frames (tests, `WIE_SURFACE_PAD=0`).
+    /// The host presenter uses it as the source `bytes_per_row` for
+    /// `write_texture`, which keeps the full-frame upload zero-copy.
+    pub stride: u32,
+    /// Pixel height.
     pub height: u32,
-    /// 0RGB pixel data, top-down.
+    /// 0RGB pixel data, top-down, `stride * height` words (padding included).
     pub pixels: Arc<Vec<u32>>,
     /// 0RGB background color of the owning window, recorded by the erase
     /// machinery (the class-brush color; `COLOR_WINDOW`-white by default).
@@ -54,8 +86,9 @@ pub struct SurfaceFrame {
     /// as the window background instead of the presenter's default black.
     pub background_color: u32,
     /// The region of `pixels` that changed since the previous publish, in
-    /// surface coordinates. `None` = the whole surface changed (the presenter
-    /// must upload the full frame); `Some(rect)` = only that rect changed.
+    /// LOGICAL surface coordinates. `None` = the whole surface changed (the
+    /// presenter must upload the full frame); `Some(rect)` = only that rect
+    /// changed.
     ///
     /// This is a GPU-side HINT: the pixel bytes always carry the FULL frame,
     /// so headless readers (tests, the record slot) are unaffected. A
@@ -65,14 +98,36 @@ pub struct SurfaceFrame {
     pub region: Option<IRect>,
 }
 
+impl SurfaceFrame {
+    /// The logical pixel at `(x, y)` — the stride-aware read every frame
+    /// consumer (BMP encoder, test helpers, probes) must use instead of
+    /// indexing `pixels` with `y * width + x`.
+    #[must_use]
+    pub fn pixel(&self, x: u32, y: u32) -> Option<u32> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let stride = usize::try_from(self.stride).unwrap_or(0);
+        let idx = usize::try_from(y)
+            .unwrap_or(0)
+            .saturating_mul(stride)
+            .saturating_add(usize::try_from(x).unwrap_or(0));
+        self.pixels.get(idx).copied()
+    }
+}
+
 /// Per-window surface: pixel buffer + dimensions.
 #[derive(Debug, Clone)]
 pub struct WindowSurface {
-    /// Pixel width.
+    /// Logical pixel width (column count).
     pub width: u32,
+    /// Row pitch of `pixels` in pixels (`>= width`, 64-aligned by default).
+    /// Every row-major write must index `row * stride + x` — the padding tail
+    /// of each row carries no content and the next row starts after it.
+    pub stride: u32,
     /// Pixel height.
     pub height: u32,
-    /// 0RGB pixel buffer (top-down, length = width * height). The blit paints
+    /// 0RGB pixel buffer (top-down, length = stride * height). The blit paints
     /// into this buffer; `publish` moves it into the published Arc and the next
     /// paint hands the published buffer back (see [`PresentState::ensure_surface`]),
     /// so the composite always accumulates across publishes.
@@ -122,6 +177,210 @@ pub struct WindowRevisions {
     pub last_published_rev: ahash::HashMap<crate::handles::Hwnd, ContentRev>,
 }
 
+/// The host-presenter side of the publish pipeline, behind its OWN lock.
+///
+/// This is the Wave-1 extraction (ADR-0003): everything the host presenter
+/// touches per frame — the latest published frame slot, the spare-buffer
+/// pool, the z-order/window-set revision mirrors, and the presenter-side
+/// timing counters — lives here behind a dedicated tiny mutex, so
+/// `take_frame` / `store_spare_buffer` / `windows_rev` / `z_snapshot` /
+/// `record_present_time` never acquire the big `WinApiState` mutex. Before
+/// this channel, one window's paint or a D3D9 `DrawPrimitive` holding the big
+/// lock stalled the presenter (and the whole macOS UI thread) for its whole
+/// duration; now the presenter waits at most for one map insert/clone.
+///
+/// Lock ordering: guest threads take big-`WinApiState` → channel (inside
+/// paint handlers and `publish`); the presenter takes channel ONLY. Nobody
+/// takes channel → big, so no deadlock is possible.
+///
+/// Wake gating: `published_seq` counts publishes (guest side), `taken_seq`
+/// counts host takes. A publish fires the wake callback only when every
+/// frame published before it has already been taken (`prev == taken`) — the
+/// host is idle, so without a wake it would never look again. When frames are
+/// still pending the host already has a redraw in flight whose take drains
+/// the latest slot (latest-wins), so skipping the wake caps the Frame-event
+/// rate at the host's drain rate instead of the guest's publish rate. The
+/// one race (a publish landing between the host's take and the end of its
+/// redraw pass) is closed host-side by re-requesting a redraw when
+/// [`Self::pending_frames`] is nonzero after a take.
+pub struct PresentChannel {
+    inner: Mutex<ChannelInner>,
+    published_seq: AtomicU64,
+    taken_seq: AtomicU64,
+}
+
+struct ChannelInner {
+    /// The latest published frame per HWND (latest-wins slot; the host takes
+    /// a cheap `Arc` clone of the pixels).
+    latest: ahash::HashMap<crate::handles::Hwnd, SurfaceFrame>,
+    /// Spare buffers recycled by the presenter after a frame is superseded,
+    /// handed back to the guest paint side so `ensure_surface` reuses the
+    /// allocation instead of cloning/memset (ADR-0001's zero-alloc loop).
+    spare_buffers: ahash::HashMap<crate::handles::Hwnd, Vec<u32>>,
+    /// Mirror of `PresentState::z_order` (read side for the host reorder).
+    z_order: Vec<crate::handles::Hwnd>,
+    /// Mirror of `PresentState::z_rev`.
+    z_rev: u64,
+    /// Mirror of `PresentState::windows_rev`.
+    windows_rev: u64,
+    /// Presenter-side present wall-time accumulators (written by the host
+    /// presenter, read by the profile dump).
+    present_ns: u128,
+    present_ns_last: u128,
+}
+
+impl PresentChannel {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(ChannelInner {
+                latest: ahash::HashMap::new(),
+                spare_buffers: ahash::HashMap::new(),
+                z_order: Vec::new(),
+                z_rev: 0,
+                windows_rev: 0,
+                present_ns: 0,
+                present_ns_last: 0,
+            }),
+            published_seq: AtomicU64::new(0),
+            taken_seq: AtomicU64::new(0),
+        }
+    }
+
+    /// Publish `frame` into the latest-wins slot. Returns the displaced
+    /// previous slot frame (the guest side may reclaim its buffer as a spare)
+    /// and whether the host must be woken (the gate: every earlier publish
+    /// was already taken).
+    pub(crate) fn publish_frame(
+        &self,
+        hwnd: crate::handles::Hwnd,
+        frame: SurfaceFrame,
+    ) -> (Option<SurfaceFrame>, bool) {
+        let prev = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.latest.insert(hwnd, frame)
+        };
+        let prev_seq = self.published_seq.fetch_add(1, Ordering::Relaxed);
+        let taken = self.taken_seq.load(Ordering::Relaxed);
+        (prev, prev_seq == taken)
+    }
+
+    /// Take the latest frame for `hwnd`, if any — the presenter's per-frame
+    /// read path. Bumps the take counter so the publish gate sees the drain.
+    #[must_use]
+    pub fn take_frame(&self, hwnd: crate::handles::Hwnd) -> Option<SurfaceFrame> {
+        let frame = {
+            let inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.latest.get(&hwnd).cloned()
+        };
+        if frame.is_some() {
+            self.taken_seq.fetch_add(1, Ordering::Relaxed);
+        }
+        frame
+    }
+
+    /// Frames published but not yet taken (saturating). The host presenter
+    /// re-requests a redraw when this is nonzero after a take — closing the
+    /// publish-between-take-and-redraw race the wake gate opens.
+    #[must_use]
+    pub fn pending_frames(&self) -> u64 {
+        self.published_seq
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.taken_seq.load(Ordering::Relaxed))
+    }
+
+    /// Recycle a superseded presented buffer into the spare pool (host side).
+    pub fn store_spare(&self, hwnd: crate::handles::Hwnd, buffer: Vec<u32>) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.spare_buffers.insert(hwnd, buffer);
+    }
+
+    /// Take a recycled spare buffer for `hwnd` (guest paint side).
+    pub(crate) fn take_spare(&self, hwnd: crate::handles::Hwnd) -> Option<Vec<u32>> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.spare_buffers.remove(&hwnd)
+    }
+
+    /// Mirror the guest-side z-order + revisions into the host read slot.
+    /// Called under the big `WinApiState` lock after every z/window-set
+    /// mutation; the channel lock section is a Vec clone.
+    pub(crate) fn sync_z(&self, z_rev: u64, z_order: &[crate::handles::Hwnd], windows_rev: u64) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.z_rev = z_rev;
+        inner.z_order.clear();
+        inner.z_order.extend_from_slice(z_order);
+        inner.windows_rev = windows_rev;
+    }
+
+    /// The mirrored `(z_rev, z_order)` pair — one lock, consistent snapshot.
+    #[must_use]
+    pub fn z_snapshot(&self) -> (u64, Vec<u64>) {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            inner.z_rev,
+            inner.z_order.iter().map(|h| h.as_u64()).collect(),
+        )
+    }
+
+    /// The mirrored window-set revision.
+    #[must_use]
+    pub fn windows_rev(&self) -> u64 {
+        self.inner.lock().map_or(0, |inner| inner.windows_rev)
+    }
+
+    /// The mirrored z-order revision.
+    #[must_use]
+    pub fn z_rev(&self) -> u64 {
+        self.inner.lock().map_or(0, |inner| inner.z_rev)
+    }
+
+    /// Record one host-present duration (ns) — presenter side, channel lock.
+    pub fn record_present(&self, ns: u128) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.present_ns = inner.present_ns.saturating_add(ns);
+        inner.present_ns_last = ns;
+    }
+
+    /// The most recent host-present duration (ns), for the profile dump.
+    #[must_use]
+    pub fn present_ns_last(&self) -> u128 {
+        self.inner.lock().map_or(0, |inner| inner.present_ns_last)
+    }
+
+    /// Accumulated host-present wall time (ns), for the profile dump.
+    #[must_use]
+    pub fn present_ns(&self) -> u128 {
+        self.inner.lock().map_or(0, |inner| inner.present_ns)
+    }
+}
+
+impl Default for PresentChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Manages per-window compositing surfaces and frame publishing.
 pub struct PresentState {
     /// Persistent composite surface per HWND (scratch buffer for accumulating blits).
@@ -129,10 +388,19 @@ pub struct PresentState {
     /// `pub(crate)`: the host reads published frames (`published`) and wake
     /// hooks; the scratch surfaces are internal to the blit pipeline.
     pub(crate) surfaces: ahash::HashMap<crate::handles::Hwnd, WindowSurface>,
-    /// Last published snapshot per HWND.
+    /// Last published snapshot per HWND — the guest-side hand-back source.
+    ///
+    /// The HOST presenter never reads this map: its per-frame view is the
+    /// [`PresentChannel`] (`channel`), which `publish` mirrors into. This map
+    /// exists for the zero-copy hand-back protocol (`ensure_surface` reclaims
+    /// the buffer when the surface is empty) and tests.
     pub published: ahash::HashMap<crate::handles::Hwnd, SurfaceFrame>,
     /// Monotonically increasing generation counter.
     pub generation: u64,
+    /// The host-presenter channel: latest-wins frame slot, spare pool, z/window
+    /// revision mirrors, presenter timing — behind its own tiny mutex so the
+    /// presenter never locks `WinApiState` per frame (ADR-0003).
+    pub(crate) channel: Arc<PresentChannel>,
     /// Optional wake callback for the host presenter.
     pub wake: Option<Box<dyn Fn() + Send>>,
     /// 0RGB background color per published HWND — the owning window's
@@ -169,14 +437,9 @@ pub struct PresentState {
     pub blit_copy_ns: u128,
     /// B9: duration of the most recent mask copy (ns).
     pub blit_copy_ns_last: u128,
-    /// B9: accumulated host present (frame upload + present) wall time (ns).
-    pub present_ns: u128,
-    /// B9: duration of the most recent host present (ns).
-    pub present_ns_last: u128,
-    /// Spare buffers reclaimed from previously published frames that the host
-    /// has released. Used to avoid cloning 8MB on hand_back_clone fallback
-    /// (see ensure_surface). One spare per HWND is enough for steady-state.
-    pub spare_buffers: ahash::HashMap<crate::handles::Hwnd, Vec<u32>>,
+    /// Spare buffers moved here from the docs: the pool lives in the
+    /// [`PresentChannel`] now (the presenter recycles into it without the big
+    /// lock); the guest side consumes it in [`Self::ensure_surface`].
     /// B3.6: HWNDs with deferred (coalesced) publishes pending since the last
     /// drain. Handlers call [`Self::publish_deferred`] instead of
     /// [`Self::publish`]; the runtime drains the set once per repaint cycle at
@@ -238,8 +501,6 @@ impl std::fmt::Debug for PresentState {
             .field("publish_ns_last", &self.publish_ns_last)
             .field("blit_copy_ns", &self.blit_copy_ns)
             .field("blit_copy_ns_last", &self.blit_copy_ns_last)
-            .field("present_ns", &self.present_ns)
-            .field("present_ns_last", &self.present_ns_last)
             .field("pending_publishes", &self.pending_publishes.len())
             .field("windows_rev", &self.windows_rev)
             .field("z_order_count", &self.z_order.len())
@@ -254,13 +515,14 @@ impl std::fmt::Debug for PresentState {
 }
 
 impl PresentState {
-    /// Create a new, empty `PresentState`.
+    /// Create a new, empty `PresentState` with its own [`PresentChannel`].
     #[must_use]
     pub fn new() -> Self {
         Self {
             surfaces: ahash::HashMap::new(),
             published: ahash::HashMap::new(),
             generation: 0,
+            channel: Arc::new(PresentChannel::new()),
             wake: None,
             background_colors: ahash::HashMap::new(),
             message_box_bridge: None,
@@ -272,9 +534,6 @@ impl PresentState {
             publish_ns_last: 0,
             blit_copy_ns: 0,
             blit_copy_ns_last: 0,
-            present_ns: 0,
-            present_ns_last: 0,
-            spare_buffers: ahash::HashMap::new(),
             pending_publishes: std::collections::HashSet::new(),
             windows_rev: 0,
             z_order: Vec::new(),
@@ -286,10 +545,36 @@ impl PresentState {
         }
     }
 
+    /// The host-presenter channel Arc — `RuntimeSession::guest_handle` clones
+    /// this once so presenter-side frame reads bypass the big lock entirely.
+    #[must_use]
+    pub fn channel_arc(&self) -> Arc<PresentChannel> {
+        Arc::clone(&self.channel)
+    }
+
+    /// Accumulated host-present wall time (ns) — lives in the channel (the
+    /// winit thread writes it without the big lock).
+    #[must_use]
+    pub fn channel_present_ns(&self) -> u128 {
+        self.channel.present_ns()
+    }
+
+    /// The most recent host-present duration (ns), from the channel.
+    #[must_use]
+    pub fn channel_present_ns_last(&self) -> u128 {
+        self.channel.present_ns_last()
+    }
+
     /// Ensure a surface exists for `hwnd` with the given dimensions.
     /// Resizes or reallocates if dimensions changed; never shrinks.
+    ///
+    /// The buffer is pitch-padded: `stride = padded_stride(width)` (a
+    /// multiple of 64 unless `WIE_SURFACE_PAD=0`), so `stride * 4` satisfies
+    /// wgpu's 256-byte row alignment and the presenter's full-frame upload is
+    /// zero-copy. Every row-major writer must index `row * stride + x`.
     pub fn ensure_surface(&mut self, hwnd: crate::handles::Hwnd, width: u32, height: u32) {
-        let needed = usize::try_from(width.checked_mul(height).unwrap_or(0)).unwrap_or(0);
+        let stride = padded_stride(width);
+        let needed = usize::try_from(stride.checked_mul(height).unwrap_or(0)).unwrap_or(0);
         // B1 double-buffer hand-back: a prior publish moved the painted buffer
         // into the published Arc, leaving the surface empty. Hand the buffer
         // back as the next paint base so the composite keeps accumulating
@@ -333,9 +618,17 @@ impl PresentState {
                     pixels
                 }
                 Err(shared) => {
-                    if let Some(mut spare) = self.spare_buffers.remove(&hwnd) {
-                        if spare.len() != needed {
-                            spare.resize(needed, 0);
+                    // The paint base must carry the JUST-published frame's
+                    // pixels. A recycled spare's CONTENT is one publish stale
+                    // (it is the channel slot displaced by this publish), so
+                    // the spare is only the DESTINATION allocation — the
+                    // current frame is copied into it (zero-alloc, one copy).
+                    // No spare → count a real clone.
+                    if let Some(mut spare) = self.channel.take_spare(hwnd) {
+                        spare.resize(needed, 0);
+                        let src = &shared[..];
+                        if let Some(dst) = spare.get_mut(0..src.len().min(needed)) {
+                            dst.copy_from_slice(&src[..dst.len()]);
                         }
                         spare
                     } else {
@@ -351,6 +644,7 @@ impl PresentState {
         }
         let entry = self.surfaces.entry(hwnd).or_insert_with(|| WindowSurface {
             width,
+            stride,
             height,
             // Zero-initialized: the only safe way to size a fresh Vec, and a
             // new surface has no previous frame to hand back. The F2
@@ -363,7 +657,7 @@ impl PresentState {
         // If dimensions changed, reallocate; grow when the buffer is too small
         // (matches the pre-B1 semantics — the recycled buffer may carry the
         // previous frame's size after a resize).
-        if entry.width != width || entry.height != height {
+        if entry.width != width || entry.height != height || entry.stride != stride {
             // The surface size changed — the old row-major buffer no longer
             // maps onto the new dimensions, but REUSING it (resize in place,
             // zeroing only the new tail) is safe: the F2 erase-before-clear
@@ -374,6 +668,7 @@ impl PresentState {
             // wasted work, and the no-black invariant was never protected by it
             // (both zeroed and stale heads are garbage that the erase covers).
             entry.width = width;
+            entry.stride = stride;
             entry.height = height;
             entry.pixels.resize(needed, 0);
             // Content is unknown at the new mapping — full upload.
@@ -398,15 +693,14 @@ impl PresentState {
         hwnd: crate::handles::Hwnd,
         width: u32,
         height: u32,
-    ) -> Option<&mut [u32]> {
+    ) -> Option<(&mut [u32], u32)> {
         self.ensure_surface(hwnd, width, height);
         self.surfaces
             .get_mut(&hwnd)
-            .map(|s| s.pixels.as_mut_slice())
+            .map(|s| (s.pixels.as_mut_slice(), s.stride))
     }
 
-    /// Q9/C: pooled target with dimensions — returns `(pixels, width, height, padded_width)`.
-    /// For the simple (non-padded) present, logical and padded are the same.
+    /// Q9/C: pooled target with dimensions — returns `(pixels, width, height, stride)`.
     #[allow(dead_code)]
     pub(crate) fn pooled_target_with_dims(
         &mut self,
@@ -416,7 +710,7 @@ impl PresentState {
     ) -> Option<(&mut [u32], u32, u32, u32)> {
         self.ensure_surface(hwnd, width, height);
         let s = self.surfaces.get_mut(&hwnd)?;
-        Some((s.pixels.as_mut_slice(), s.width, s.height, s.width))
+        Some((s.pixels.as_mut_slice(), s.width, s.height, s.stride))
     }
 
     /// Record the 0RGB background color of `hwnd`'s surface — the owning
@@ -490,13 +784,13 @@ impl PresentState {
             .get(&hwnd)
             .copied()
             .unwrap_or(DEFAULT_BACKGROUND_COLOR);
-        let (width, height, pixels) = {
+        let (width, stride, height, pixels) = {
             // B1: publish WITHOUT a pixel clone — a pointer move of the painted
             // buffer into the Arc (no 4 MB copy under the WinAPI mutex). The
             // buffer returns to the surface on the next paint via
             // `ensure_surface`'s hand-back, preserving accumulation.
             let pixels: Arc<Vec<u32>> = Arc::from(std::mem::take(&mut surface.pixels));
-            (surface.width, surface.height, pixels)
+            (surface.width, surface.stride, surface.height, pixels)
         };
         // Snapshot the dirty accumulator as the frame's region hint, then
         // reset it for the next cycle. A degenerate (empty) rect means
@@ -537,10 +831,11 @@ impl PresentState {
         // bottom-right) of the published frame.
         if self.generation.is_multiple_of(32) {
             let w = usize::try_from(width).unwrap_or(1).max(1);
+            let stride_us = usize::try_from(stride).unwrap_or(w).max(w);
             let h = usize::try_from(height).unwrap_or(1).max(1);
             let px = |x: usize, y: usize| -> u32 {
                 pixels
-                    .get(y.wrapping_mul(w).wrapping_add(x))
+                    .get(y.wrapping_mul(stride_us).wrapping_add(x))
                     .copied()
                     .unwrap_or(0xDEAD_BEEF)
             };
@@ -564,6 +859,14 @@ impl PresentState {
             },
             "frame published"
         );
+        let frame = SurfaceFrame {
+            width,
+            stride,
+            height,
+            pixels,
+            background_color,
+            region,
+        };
         if let Some(record) = self.record.as_mut() {
             // The record slot holds the most recent frame only and is
             // overwritten on every publish; it is never mutated or read by the
@@ -572,33 +875,33 @@ impl PresentState {
             // `ensure_surface` hand-back below will see the shared Arc and
             // clone once for the next paint base — one copy per cycle either
             // way, but no extra allocation + memcpy here.
-            **record = SurfaceFrame {
-                width,
-                height,
-                pixels: Arc::clone(&pixels),
-                background_color,
-                region,
-            };
+            **record = frame.clone();
         }
-        let old = self.published.insert(
-            hwnd,
-            SurfaceFrame {
-                width,
-                height,
-                pixels,
-                background_color,
-                region,
-            },
-        );
-        // Reclaim the previous published buffer if host has released it.
-        // This provides a spare for next ensure_surface to reuse without
-        // cloning 8MB when the current published frame is still held.
+        // The channel mirror shares the pixels Arc (a refcount bump, never a
+        // pixel copy): the host takes from the channel without the big lock.
+        let channel_frame = frame.clone();
+        let old = self.published.insert(hwnd, frame);
+        // Reclaim the previous published buffer if the host has released it —
+        // a spare for the next `ensure_surface` so the hand-back never clones.
         if let Some(old_frame) = old
             && let Ok(vec) = Arc::try_unwrap(old_frame.pixels)
         {
-            self.spare_buffers.insert(hwnd, vec);
+            self.channel.store_spare(hwnd, vec);
         }
-        if let Some(wake) = &self.wake {
+        // Mirror the frame into the host channel (latest-wins slot) and decide
+        // the wake. The gate fires only when the host has drained every
+        // earlier publish (the presenter's in-flight redraw drains the latest
+        // slot anyway); the displaced channel slot's buffer is reclaimed as a
+        // spare when nothing holds it. The published insert above happens
+        // BEFORE this wake — a presenter taking on the wake always sees the
+        // fresh frame.
+        let (old_slot, should_wake) = self.channel.publish_frame(hwnd, channel_frame);
+        if let Some(old_slot) = old_slot
+            && let Ok(vec) = Arc::try_unwrap(old_slot.pixels)
+        {
+            self.channel.store_spare(hwnd, vec);
+        }
+        if should_wake && let Some(wake) = &self.wake {
             wake();
         }
     }
@@ -606,12 +909,14 @@ impl PresentState {
     /// Blit a whole 0RGB frame into `hwnd`'s surface and publish it — the
     /// shared tail of the D3D9 `Present` and `wglSwapBuffers` frame paths.
     ///
-    /// A frame sized exactly like the ensured surface copies row-major;
-    /// anything else is nearest-neighbour stretched to the surface
-    /// dimensions. No allocation: pixels go straight into the retained
-    /// surface buffer (Q9/C: pooled WindowSurface slice as render target — no
-    /// intermediate `Vec<u32>` copy; stretch writes directly into the pooled
-    /// slice when sizes differ).
+    /// A frame sized exactly like the ensured surface copies row-major (one
+    /// `copy_from_slice` when the pitch matches, per-row otherwise — the
+    /// surface pitch is 64-padded, the source frame is not); anything else is
+    /// nearest-neighbour stretched to the surface dimensions. No allocation:
+    /// pixels go straight into the retained surface buffer (Q9/C: pooled
+    /// WindowSurface slice as render target — no intermediate `Vec<u32>`
+    /// copy; stretch writes directly into the pooled slice when sizes
+    /// differ).
     pub(crate) fn blit_frame(
         &mut self,
         hwnd: crate::handles::Hwnd,
@@ -621,13 +926,34 @@ impl PresentState {
     ) {
         if let Some(surface) = self.surfaces.get_mut(&hwnd) {
             if frame_width == surface.width && frame_height == surface.height {
-                let n = surface.pixels.len().min(frame.len());
-                if let (Some(dst), Some(src)) = (surface.pixels.get_mut(..n), frame.get(..n)) {
-                    dst.copy_from_slice(src);
+                if surface.stride == surface.width {
+                    let n = surface.pixels.len().min(frame.len());
+                    if let (Some(dst), Some(src)) = (surface.pixels.get_mut(..n), frame.get(..n)) {
+                        dst.copy_from_slice(src);
+                    }
+                } else {
+                    // Pitched surface: copy each logical row at its stride.
+                    let stride = usize::try_from(surface.stride).unwrap_or(0);
+                    let width = usize::try_from(surface.width).unwrap_or(0);
+                    let height = usize::try_from(surface.height).unwrap_or(0);
+                    for row in 0..height {
+                        let src_start = row.saturating_mul(width);
+                        let dst_start = row.saturating_mul(stride);
+                        let (Some(src), Some(dst)) = (
+                            frame.get(src_start..src_start.saturating_add(width)),
+                            surface
+                                .pixels
+                                .get_mut(dst_start..dst_start.saturating_add(width)),
+                        ) else {
+                            break;
+                        };
+                        dst.copy_from_slice(src);
+                    }
                 }
             } else {
-                wie_cpu::stretch_nearest(
+                wie_cpu::stretch_nearest_strided(
                     &mut surface.pixels,
+                    surface.stride,
                     frame,
                     frame_width,
                     frame_height,
@@ -685,6 +1011,14 @@ impl PresentState {
         }
     }
 
+    /// Sync the z-order / revision mirrors into the host channel. Call after
+    /// every mutation of `z_order`, `z_rev`, or `windows_rev` — the channel
+    /// clone is what the presenter actually reads.
+    fn sync_channel_z(&self) {
+        self.channel
+            .sync_z(self.z_rev, &self.z_order, self.windows_rev);
+    }
+
     /// Register a newly created top-level window at the TOP of the z-order.
     ///
     /// Bumps BOTH revisions: the window-set revision (the presenter
@@ -697,6 +1031,7 @@ impl PresentState {
         self.z_order.push(hwnd);
         self.z_rev = self.z_rev.wrapping_add(1);
         self.windows_rev = self.windows_rev.wrapping_add(1);
+        self.sync_channel_z();
     }
 
     /// Unregister a destroyed top-level window.
@@ -717,6 +1052,7 @@ impl PresentState {
         // surface) or leak its entries.
         self.revisions.content_rev.remove(&hwnd);
         self.revisions.last_published_rev.remove(&hwnd);
+        self.sync_channel_z();
     }
 
     /// Move `hwnd` to the TOP of the z-order (`SetWindowPos` HWND_TOP).
@@ -734,6 +1070,7 @@ impl PresentState {
         self.z_order.remove(pos);
         self.z_order.push(hwnd);
         self.z_rev = self.z_rev.wrapping_add(1);
+        self.sync_channel_z();
         true
     }
 
@@ -750,6 +1087,7 @@ impl PresentState {
         self.z_order.remove(pos);
         self.z_order.insert(0, hwnd);
         self.z_rev = self.z_rev.wrapping_add(1);
+        self.sync_channel_z();
         true
     }
 
@@ -759,10 +1097,11 @@ impl PresentState {
         self.blit_copy_ns_last = ns;
     }
 
-    /// B9: record one host present (softbuffer copy + upload) duration (ns).
+    /// B9: record one host present (upload + present) duration (ns).
+    ///
+    /// Written by the host presenter through the channel — no big lock.
     pub fn record_present(&mut self, ns: u128) {
-        self.present_ns = self.present_ns.saturating_add(ns);
-        self.present_ns_last = ns;
+        self.channel.record_present(ns);
     }
 
     /// B3.6: defer a publish for `hwnd` to the next
@@ -1068,6 +1407,7 @@ mod tests {
     fn empty_frame() -> SurfaceFrame {
         SurfaceFrame {
             width: 0,
+            stride: 0,
             height: 0,
             pixels: Arc::new(Vec::new()),
             background_color: DEFAULT_BACKGROUND_COLOR,
@@ -1207,10 +1547,11 @@ mod tests {
             }),
             "the frame region is the union of the cycle's writes"
         );
+        assert_eq!(frame.stride, 256, "the row pitch is 64-padded (ADR-0001)");
         assert_eq!(
             frame.pixels.len(),
-            usize::try_from(200 * 100).unwrap_or(0),
-            "the pixel bytes still carry the FULL frame (region is a hint)"
+            usize::try_from(frame.stride * frame.height).unwrap_or(0),
+            "the pixel bytes still carry the FULL padded frame (region is a hint)"
         );
     }
 
@@ -1317,18 +1658,22 @@ mod tests {
         );
     }
 
-    /// The B1 hand-back MOVES the published buffer back into the scratch
-    /// surface (zero-copy) when the host holds no extra Arc reference: the
-    /// published frame's allocation reappears as the surface's buffer, and the
-    /// composite keeps accumulating (the painted pixels survive the
-    /// round-trip).
+    /// The hand-back keeps the composite accumulating across publishes, and
+    /// in the steady state it is zero-ALLOC, not zero-copy: the presenter
+    /// channel pins a clone of every published frame (the host takes it
+    /// without the big lock, at any time), so the published Arc can no longer
+    /// be unwrapped on the next paint. The recycled allocation is the
+    /// DISPLACED channel slot: publishing frame N+1 frees the channel's
+    /// frame-N clone, which lands in the spare pool and comes back as the
+    /// next paint base — the very first cycle still pays one clone.
     #[test]
     fn hand_back_moves_the_published_buffer_zero_copy() {
         let mut state = PresentState::new();
         let hwnd = Hwnd::from(30);
         state.ensure_surface(hwnd, 64, 32);
         // Paint a recognizable pattern, then publish: the buffer leaves the
-        // surface and lands in the published Arc as the only reference.
+        // surface and lands in the published Arc plus the channel's slot
+        // clone (a refcount bump, not a copy).
         if let Some(surf) = state.surfaces.get_mut(&hwnd) {
             for (i, px) in surf.pixels.iter_mut().enumerate() {
                 *px = u32::try_from(i % 7 + 1).unwrap_or(0);
@@ -1342,19 +1687,16 @@ mod tests {
             .pixels
             .as_ptr();
 
-        // Next paint cycle: the scratch buffer is empty and a published frame
-        // exists, so ensure_surface reclaims it. `try_unwrap` succeeds (no
-        // record slot, no presenter take, no keep-alive) and the Vec moves
-        // back — the surface buffer IS the published allocation.
+        // First paint cycle: the channel pins its clone, so `try_unwrap`
+        // fails and no spare exists yet — the fallback CLONES (one alloc,
+        // first cycle only). The composite still accumulates.
         state.ensure_surface(hwnd, 64, 32);
-        assert_eq!(state.hand_back_unwrap, 1);
-        assert_eq!(state.hand_back_clone, 0);
-        let surface = state.surfaces.get(&hwnd).expect("surface");
+        assert_eq!(state.hand_back_unwrap, 0, "the channel pins every frame");
         assert_eq!(
-            surface.pixels.as_ptr(),
-            published_ptr,
-            "the zero-copy hand-back reuses the published allocation"
+            state.hand_back_clone, 1,
+            "no spare yet: one first-cycle clone"
         );
+        let surface = state.surfaces.get(&hwnd).expect("surface");
         assert!(
             surface.pixels.iter().any(|&px| px != 0),
             "the reclaimed buffer carries the previously painted content"
@@ -1367,14 +1709,35 @@ mod tests {
             "the reclaimed entry is gone until the repaint republishes"
         );
 
-        // Republish: the same Vec flows through again (a move, never a copy or
-        // a realloc), so the frame still points at the original allocation.
+        // Republish: the clone flows through a fresh Arc, and the channel's
+        // displaced slot (the FIRST frame, still holding the original
+        // allocation) lands in the spare pool.
         state.publish(hwnd);
         let republished = state.published.get(&hwnd).expect("republished frame");
-        assert_eq!(
+        assert_ne!(
             republished.pixels.as_ptr(),
             published_ptr,
-            "the republish moves the reclaimed buffer back into a fresh Arc"
+            "the republish wraps the cloned buffer in a new Arc"
+        );
+
+        // Second paint cycle: `try_unwrap` fails again (the channel pins the
+        // new frame), but the displaced first-frame buffer is now a spare —
+        // the hand-back takes it with NO clone and NO allocation, and the
+        // original published allocation comes back as the paint base.
+        state.ensure_surface(hwnd, 64, 32);
+        assert_eq!(
+            state.hand_back_clone, 1,
+            "steady-state hand-backs recycle spares"
+        );
+        let surface = state.surfaces.get(&hwnd).expect("surface");
+        assert_eq!(
+            surface.pixels.as_ptr(),
+            published_ptr,
+            "the displaced channel slot's allocation returns as the paint base"
+        );
+        assert!(
+            surface.pixels.iter().any(|&px| px != 0),
+            "the spare carries the painted content (the composite keeps accumulating)"
         );
     }
 

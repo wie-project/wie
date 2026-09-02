@@ -28,6 +28,7 @@ static int      g_dlg_open;
 static int g_init_sentinel;
 static int g_timer_count;
 static int g_selftest;
+static int g_host_driven;
 static HDC      g_dc;
 static HBITMAP  g_dib;
 static void    *g_bits;
@@ -48,9 +49,20 @@ static int eq_str(const char *a, const char *b) {
 // the dialog with a posted VK_RETURN after TIMER_TICKS. Interactive runs keep
 // the dialog open; the user closes it with Enter/Esc/OK/Cancel through the
 // normal IsDialogMessage path.
+// WIE_DIALOG_HOSTDRIVEN=1 additionally DISABLES the timer auto-close: the
+// host test drives Shift+Tab/Tab focus transitions and posts its own
+// VK_RETURN once focus is verified back on the first tab stop. Without this
+// the auto-close ENTER can land while focus sits on Cancel (mid-transition),
+// clicking IDCANCEL instead of IDOK — a race, not a focus bug.
 static int selftest_enabled(void) {
     char buf[16];
     DWORD n = GetEnvironmentVariableA("WIE_SELFTEST", buf, sizeof(buf));
+    return n == 1 && buf[0] == '1';
+}
+
+static int host_driven_enabled(void) {
+    char buf[16];
+    DWORD n = GetEnvironmentVariableA("WIE_DIALOG_HOSTDRIVEN", buf, sizeof(buf));
     return n == 1 && buf[0] == '1';
 }
 
@@ -129,7 +141,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_TIMER:
         g_timer_count++;
         InvalidateRect(hwnd, NULL, FALSE);
-        if (g_selftest && g_dlg_open && g_dlg && g_timer_count >= TIMER_TICKS) {
+        if (g_selftest && !g_host_driven && g_dlg_open && g_dlg && g_timer_count >= TIMER_TICKS) {
             // The modal loop is running inside DialogBoxParam below: drive
             // the dialog headlessly. Posting VK_RETURN exercises IsDialogMessage
             // (Enter → WM_COMMAND(IDOK) → EndDialog(1)) in the in-guest stub
@@ -175,6 +187,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 void entry(void) {
     HINSTANCE inst = GetModuleHandleA(NULL);
     g_selftest = selftest_enabled();
+    g_host_driven = host_driven_enabled();
 
     WNDCLASSEXA wc;
     wc.cbSize        = sizeof(WNDCLASSEXA);
@@ -245,7 +258,9 @@ void entry(void) {
 
     // The timer drove the close inside the modal loop; it must have fired.
     // Interactive runs may close the dialog (Enter/Esc) before any ticks.
-    if (g_selftest && g_timer_count < TIMER_TICKS) {
+    // Host-driven runs close on the HOST's VK_RETURN (no auto-close timer),
+    // so the tick count carries no signal.
+    if (g_selftest && !g_host_driven && g_timer_count < TIMER_TICKS) {
         ExitProcess(152);
     }
 

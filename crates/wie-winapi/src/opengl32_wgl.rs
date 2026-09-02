@@ -202,7 +202,7 @@ pub(crate) fn handle_wgl_swap_buffers(ctx: &mut HandlerContext<'_>) -> Result<Wi
             .surfaces
             .get(&hwnd)
             .expect("surface ensured");
-        (s.width, s.height, s.width)
+        (s.width, s.height, s.stride)
     };
     let mut pooled = std::mem::take(
         &mut state

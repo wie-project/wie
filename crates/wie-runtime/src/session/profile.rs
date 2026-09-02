@@ -530,6 +530,13 @@ impl super::RuntimeSession {
         // the profile snapshot. Runs before the present-state read so the
         // sync also applies to non-GUI sessions (no present state).
         self.sync_lock_wait_stats();
+        // Presenter-side present timing lives in the host channel (it is
+        // written by the winit thread) — read it without the big lock.
+        let (channel_present_ns, channel_present_ns_last) = self.process.with_winapi_ref(|st| {
+            st.try_present()
+                .map(|p| (p.channel_present_ns(), p.channel_present_ns_last()))
+                .unwrap_or((0, 0))
+        });
         let present = self.process.with_winapi_ref(|st| {
             st.try_present().map(|p| {
                 (
@@ -538,8 +545,6 @@ impl super::RuntimeSession {
                     p.publish_ns_last,
                     p.blit_copy_ns,
                     p.blit_copy_ns_last,
-                    p.present_ns,
-                    p.present_ns_last,
                     p.hand_back_unwrap,
                     p.hand_back_clone,
                     p.generation,
@@ -552,8 +557,6 @@ impl super::RuntimeSession {
             publish_ns_last,
             blit_copy_ns,
             blit_copy_ns_last,
-            present_ns,
-            present_ns_last,
             hand_back_unwrap,
             hand_back_clone,
             generation,
@@ -566,8 +569,8 @@ impl super::RuntimeSession {
         self.profile.publish_ns_last = publish_ns_last;
         self.profile.blit_copy_ns = blit_copy_ns;
         self.profile.blit_copy_ns_last = blit_copy_ns_last;
-        self.profile.present_ns = present_ns;
-        self.profile.present_ns_last = present_ns_last;
+        self.profile.present_ns = channel_present_ns;
+        self.profile.present_ns_last = channel_present_ns_last;
         self.profile.hand_back_unwrap = hand_back_unwrap;
         self.profile.hand_back_clone = hand_back_clone;
 

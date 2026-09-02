@@ -7,12 +7,15 @@ use std::io::{self, Write};
 
 /// Write a 0RGB surface (top-down, row-major `u32`) as a bottom-up 32-bpp BMP.
 ///
-/// The `bitmap_file_header` + `bitmap_info_header` + pixel data are written
-/// directly to `writer`.
+/// `src_stride` is the input's row pitch in PIXELS (a present frame's row
+/// pitch is 64-padded, so it may exceed `width`); rows are read at that
+/// pitch and written packed. The `bitmap_file_header` + `bitmap_info_header`
+/// + pixel data are written directly to `writer`.
 pub fn write_bmp<W: Write>(
     mut writer: W,
     width: u32,
     height: u32,
+    src_stride: u32,
     pixels: &[u32],
 ) -> io::Result<()> {
     let row_bytes = width.checked_mul(4).unwrap_or(0);
@@ -37,9 +40,13 @@ pub fn write_bmp<W: Write>(
 
     // Pixel data: write rows bottom-up (BMP format).
     // The input is top-down 0RGB u32; BMP expects bottom-up BGRA.
+    let pitch = usize::try_from(src_stride.max(width)).unwrap_or(0);
     for y in (0..height).rev() {
-        let row_start = (y * width) as usize;
-        for &pixel in &pixels[row_start..row_start + width as usize] {
+        let row_start = usize::try_from(y).unwrap_or(0).saturating_mul(pitch);
+        for &pixel in pixels
+            .get(row_start..row_start.saturating_add(usize::try_from(width).unwrap_or(0)))
+            .unwrap_or(&[])
+        {
             // Convert 0RGB to BGRA: R@16, G@8, B@0, A=255.
             let b = (pixel & 0x0000_00FF) as u8;
             let g = ((pixel >> 8) & 0xFF) as u8;

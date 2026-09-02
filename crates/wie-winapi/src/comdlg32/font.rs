@@ -904,7 +904,7 @@ mod tests {
         let owner = Hwnd::from(owner_hwnd);
         let sample = |state: &mut WinApiState| -> Option<u32> {
             let frame = state.present().published.get(&owner)?.clone();
-            let idx = 190_usize * frame.width as usize + 235_usize;
+            let idx = 190_usize * frame.stride as usize + 235_usize;
             frame.pixels.get(idx).copied()
         };
         // The dialog face (BTNFACE) must be present in the owner frame.

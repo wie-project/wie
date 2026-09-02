@@ -55,10 +55,12 @@ enum TextTarget<'a> {
         height: u32,
         top_down: bool,
     },
-    /// Window present surface (0RGB pixels, top-down).
+    /// Window present surface (0RGB pixels, top-down). `stride` is the row
+    /// pitch (64-padded, ADR-0001) — rows index `row * stride + x`.
     Surface {
         pixels: &'a mut [u32],
         width: u32,
+        stride: u32,
         height: u32,
     },
     /// A print job's active page canvas (0RGB white pixels, top-down). Same
@@ -132,10 +134,21 @@ impl TextTarget<'_> {
             }
             Self::Surface {
                 pixels: surf,
-                width,
-                height: _,
+                stride,
+                ..
+            } => {
+                let row_w = usize::try_from(*stride).unwrap_or(0);
+                let start = usize::try_from(visual_row)
+                    .unwrap_or(0)
+                    .saturating_mul(row_w)
+                    .saturating_add(usize::try_from(x0).unwrap_or(0));
+                let len = usize::try_from(x1.saturating_sub(x0)).unwrap_or(0);
+                let Some(dst) = surf.get_mut(start..start.saturating_add(len)) else {
+                    return Ok(());
+                };
+                blend_row_surface(dst, fg, alphas);
             }
-            | Self::Page {
+            Self::Page {
                 pixels: surf,
                 width,
                 height: _,
@@ -329,6 +342,7 @@ fn resolve_text_target(state: &mut WinApiState, dc_handle: u64) -> Option<Resolv
                 target: TextTarget::Surface {
                     pixels: &mut surface.pixels[..],
                     width: surface.width,
+                    stride: surface.stride,
                     height: surface.height,
                 },
                 surface_hwnd: Some(hwnd),
@@ -800,6 +814,7 @@ pub(crate) fn render_text_into_surface(
     font_engine: &mut FontEngine,
     pixels: &mut [u32],
     width: u32,
+    stride: u32,
     height: u32,
     x: i32,
     y: i32,
@@ -821,6 +836,7 @@ pub(crate) fn render_text_into_surface(
     let mut target = TextTarget::Surface {
         pixels,
         width,
+        stride,
         height,
     };
     render_run(

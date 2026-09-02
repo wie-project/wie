@@ -91,7 +91,7 @@ fn test_edit_caret_blink_repaints_only_the_caret_row() {
         for x in 0..after.width {
             let idx = usize::try_from(y)
                 .unwrap_or(0)
-                .saturating_mul(after.width as usize)
+                .saturating_mul(after.stride as usize)
                 .saturating_add(usize::try_from(x).unwrap_or(0));
             if before.pixels.get(idx) != after.pixels.get(idx) {
                 assert!(
@@ -303,7 +303,7 @@ fn test_edit_partial_repaint_preserves_unpainted_rows() {
         for x in 10_i32..130_i32 {
             let idx = usize::try_from(y)
                 .unwrap_or(0)
-                .saturating_mul(after.width as usize)
+                .saturating_mul(after.stride as usize)
                 .saturating_add(usize::try_from(x).unwrap_or(0));
             let before_px = before.pixels.get(idx).copied();
             let after_px = after.pixels.get(idx).copied();
@@ -470,7 +470,7 @@ fn test_edit_paint_empty_text_draws_caret_at_start() {
     // at offset_x + 2 = 12. The caret is the 1 px black bar at column 12;
     // column 13 must stay the COLOR_WINDOW fill — no glyphs.
     let px = |col: i32, row: i32| {
-        let idx = (usize::try_from(row).unwrap_or(0) * frame.width as usize)
+        let idx = (usize::try_from(row).unwrap_or(0) * frame.stride as usize)
             .saturating_add(usize::try_from(col).unwrap_or(0));
         frame.pixels[idx]
     };
@@ -561,7 +561,7 @@ fn test_edit_multiline_first_paint_renders_rows_from_the_top() {
     // Text rows = black glyph ink on the white COLOR_WINDOW fill (the paint
     // erases the edit rect white before rendering). Scan the edit interior —
     // clear of the 1 px black border — for rows that hold ink.
-    let frame_width = usize::try_from(frame.width).unwrap_or(0);
+    let frame_width = usize::try_from(frame.stride).unwrap_or(0);
     let mut ink_rows: Vec<i32> = Vec::new();
     for y in 12_i32..68_i32 {
         let mut ink = 0_u32;
@@ -851,7 +851,7 @@ fn test_edit_scrollbar_chrome_painted_in_gutter() {
         .get(&crate::handles::Hwnd::from(top))
         .expect("published frame")
         .clone();
-    let frame_width = usize::try_from(frame.width).unwrap_or(0);
+    let frame_width = usize::try_from(frame.stride).unwrap_or(0);
     let px = |col: i32, row: i32| {
         let idx = (usize::try_from(row).unwrap_or(0))
             .saturating_mul(frame_width)
@@ -912,7 +912,7 @@ fn test_edit_scrollbar_chrome_painted_in_gutter() {
         .get(&crate::handles::Hwnd::from(top))
         .expect("published frame")
         .clone();
-    let frame_width = usize::try_from(frame.width).unwrap_or(0);
+    let frame_width = usize::try_from(frame.stride).unwrap_or(0);
     let px = |col: i32, row: i32| {
         let idx = (usize::try_from(row).unwrap_or(0))
             .saturating_mul(frame_width)
@@ -1109,7 +1109,7 @@ fn test_edit_es_center_first_paint_centers_text() {
         .get(&crate::handles::Hwnd::from(top))
         .expect("published frame")
         .clone();
-    let frame_width = usize::try_from(frame.width).unwrap_or(0);
+    let frame_width = usize::try_from(frame.stride).unwrap_or(0);
     // The ink of the centered "ab" must start well right of the 2 px left
     // margin (a left-aligned paint would put it at x ≈ 12).
     let mut min_ink_x = None;

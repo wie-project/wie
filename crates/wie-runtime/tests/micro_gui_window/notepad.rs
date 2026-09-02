@@ -402,7 +402,7 @@ fn count_status_bar_face(frame: &wie_winapi::present::SurfaceFrame, rows: u32) -
     let h = frame.height;
     for y in h.saturating_sub(rows)..h {
         for x in 0..frame.width {
-            let idx = usize::try_from(y).unwrap_or(0) * frame.width as usize
+            let idx = usize::try_from(y).unwrap_or(0) * frame.stride as usize
                 + usize::try_from(x).unwrap_or(0);
             if frame.pixels.get(idx).copied() == Some(0x00F0_F0F0) {
                 face += 1;
@@ -595,7 +595,7 @@ fn time_date_replace_all_clears_rows_below_the_date() {
         let mut ink = 0_u32;
         for y in 60..frame.height.saturating_sub(40) {
             for x in 4..frame.width.saturating_sub(620) {
-                let idx = usize::try_from(y).unwrap_or(0) * frame.width as usize
+                let idx = usize::try_from(y).unwrap_or(0) * frame.stride as usize
                     + usize::try_from(x).unwrap_or(0);
                 if frame.pixels.get(idx).copied() != Some(0x00FF_FFFF) {
                     ink += 1;

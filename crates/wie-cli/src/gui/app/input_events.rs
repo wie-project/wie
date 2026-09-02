@@ -203,6 +203,14 @@ impl WieApp {
                     return;
                 };
                 let frame = handle.take_frame(rt.hwnd.as_u64());
+                // The wake gate fires only when the host had drained every
+                // earlier publish — a publish landing while frames were still
+                // pending (this in-flight redraw) suppresses its wake. This
+                // take drained the gate, so re-check and re-arm the redraw
+                // loop; winit coalesces the extra request.
+                if handle.pending_frames() > 0 {
+                    rt.window.request_redraw();
+                }
                 if let Some(frame) = frame {
                     let (dst_w, dst_h) = {
                         let s = rt.window.inner_size();

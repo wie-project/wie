@@ -331,25 +331,38 @@ impl RuntimeSession {
     }
 
     /// Return a cloneable handle for cross-thread WinAPI access.
+    ///
+    /// Eagerly initializes the Present state slot so the handle carries the
+    /// frame channel from birth — the presenter's per-frame reads never go
+    /// through the big `WinApiState` mutex (ADR-0003).
     #[must_use]
     pub fn guest_handle(&self) -> GuestHandle {
+        let winapi = self.process.winapi_arc();
+        let mut state = winapi
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let present_channel = state.present().channel_arc();
+        drop(state);
         GuestHandle {
-            state: self.process.winapi_arc(),
+            state: winapi,
             queue: self.process.message_queue_arc(),
+            present_channel,
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::clone(&self.process.lock_wait_stats),
         }
     }
 
-    /// Take the latest published frame for `hwnd`, if any.
+    /// Take the latest published frame for `hwnd`, if any (channel read).
     #[must_use]
     pub fn take_frame(&self, hwnd: u64) -> Option<wie_winapi::present::SurfaceFrame> {
         self.process.with_winapi_ref(|state| {
             state
-                .try_present()?
-                .published
-                .get(&wie_winapi::handles::Hwnd::from(hwnd))
-                .cloned()
+                .try_present()
+                .map(|p| {
+                    p.channel_arc()
+                        .take_frame(wie_winapi::handles::Hwnd::from(hwnd))
+                })
+                .unwrap_or(None)
         })
     }
 
@@ -766,8 +779,10 @@ mod tests {
             crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
                 .expect("winapi state");
         winapi_state.window_state().windows = windows;
+        let present_channel = winapi_state.present().channel_arc();
         GuestHandle {
             state: Arc::new(Mutex::new(winapi_state)),
+            present_channel,
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
@@ -883,8 +898,16 @@ mod tests {
         // windows: enter the host-visible window set (bumps `windows_rev`, the
         // Frame handler's reconcile latch).
         state.present().register_top_level(Hwnd::from(hwnd));
+        let __state_arc = Arc::new(Mutex::new(state));
+        let __present_channel = {
+            let mut __guard = __state_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            __guard.present().channel_arc()
+        };
         let handle = GuestHandle {
-            state: Arc::new(Mutex::new(state)),
+            state: Arc::clone(&__state_arc),
+            present_channel: Arc::clone(&__present_channel),
             queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),

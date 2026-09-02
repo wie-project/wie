@@ -80,6 +80,7 @@ pub fn run_screenshot(
                     .with_context(|| format!("create {}", out_path.display()))?,
                 w,
                 h,
+                frame.stride,
                 &frame.pixels,
             )?;
             tracing::info!("wrote screenshot {} ({}x{})", out_path.display(), w, h);

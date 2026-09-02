@@ -1039,6 +1039,7 @@ mod tests {
     fn empty_record() -> present::SurfaceFrame {
         present::SurfaceFrame {
             width: 0,
+            stride: 0,
             height: 0,
             pixels: Arc::new(Vec::new()),
             background_color: 0x00FF_FFFF,
@@ -1139,8 +1140,13 @@ mod tests {
         // (COLOR_WINDOW white) so the DIB still never publishes black.
         let frame = published_frame(&mut state, hwnd);
         assert_eq!(frame.background_color, 0x00FF_FFFF);
+        // Scan only the LOGICAL pixels: the 64-padded row pitch (ADR-0001)
+        // keeps the padding tail zeroed, and those padding slots are not
+        // frame content.
+        let no_black = (0..frame.height)
+            .all(|y| (0..frame.width).all(|x| frame.pixel(x, y) != Some(0x0000_0000)));
         assert!(
-            !frame.pixels.contains(&0x0000_0000),
+            no_black,
             "brush-less windows still erase to the system background"
         );
     }

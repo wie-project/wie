@@ -46,7 +46,10 @@ pub use mem::{
 };
 pub use regs::{RegFile, Rflags, ThreadContext};
 /// SIMD pixel helpers for the GUI present path (NEON on aarch64).
-pub use simd::{blend_0rgb_4x, fill_0rgb_4x, mask_bgra_to_0rgb, mul_0rgb_4x, stretch_nearest};
+pub use simd::{
+    blend_0rgb_4x, fill_0rgb_4x, mask_bgra_to_0rgb, mul_0rgb_4x, stretch_nearest,
+    stretch_nearest_strided,
+};
 /// Per-thread TEB ownership, allocation, and initialization.
 pub use teb::{PerThreadTeb, TebInit, TebPool};
 

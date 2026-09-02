@@ -136,6 +136,11 @@ pub struct D3D9State {
     /// Q9/C: per-Device9 vertex/index scratch — reused `Vec<u8>` for
     /// `Draw*UP` guest reads, not a per-draw `vec![0_u8; n]`.
     pub(crate) d3d9_vertex_scratch: Vec<u8>,
+    /// Opt-in present pacing (`WIE_PRESENT_PACING_HZ`): the last Present
+    /// instant, so the next Present can sleep out the remainder of the
+    /// target frame interval. Diagnostic only — the sleep runs under the
+    /// WinAPI lock.
+    pub(crate) d3d9_last_present: Option<std::time::Instant>,
 }
 
 impl Default for D3D9State {
@@ -188,6 +193,7 @@ impl Default for D3D9State {
             d3d9_texture_pool: HashMap::with_capacity(16),
             d3d9_tile_scratch: Vec::new(),
             d3d9_vertex_scratch: Vec::new(),
+            d3d9_last_present: None,
         }
     }
 }

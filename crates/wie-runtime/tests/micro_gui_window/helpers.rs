@@ -109,7 +109,7 @@ pub(crate) fn frame_hash(frame: &wie_winapi::present::SurfaceFrame, top: u32, bo
         for pixel in frame
             .pixels
             .iter()
-            .skip(usize::try_from(row).unwrap_or(0) * frame.width as usize)
+            .skip(usize::try_from(row).unwrap_or(0) * frame.stride as usize)
             .take(usize::try_from(frame.width).unwrap_or(0))
         {
             for byte in pixel.to_le_bytes() {
@@ -209,7 +209,7 @@ pub(crate) fn assert_frame_renders_gradient_text_and_controls(
         "gui_blit frame must be at least 1280x800, got {w}x{h}"
     );
     let idx = |x: u32, y: u32| {
-        usize::try_from(y).unwrap_or(0) * frame.width as usize + usize::try_from(x).unwrap_or(0)
+        usize::try_from(y).unwrap_or(0) * frame.stride as usize + usize::try_from(x).unwrap_or(0)
     };
 
     // Gradient intact at a point clear of text and children.
@@ -327,7 +327,7 @@ pub(crate) fn count_edit_ink(session: &wie_runtime::RuntimeSession, owner: u64) 
     for y in 2..40_u32 {
         for x in 8..400_u32 {
             if x < frame.width && y < frame.height {
-                let idx = usize::try_from(y).unwrap_or(0) * frame.width as usize
+                let idx = usize::try_from(y).unwrap_or(0) * frame.stride as usize
                     + usize::try_from(x).unwrap_or(0);
                 if frame.pixels.get(idx).copied() != Some(0x00FF_FFFF) {
                     ink += 1;

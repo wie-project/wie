@@ -1,0 +1,386 @@
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|              ooO             |
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|               ooO            |
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                ooO           |
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                 ooO          |
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                  ooO         |
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                   ooO        |
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                    ooO       |
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                     ooO      |
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                      ooO     |
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                       ooO    |
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                        ooO   |
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                         ooO  |
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                          ooO |
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                           ooO|
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HScore: 0   (WASD/arrows to move, q to quit)
++------------------------------+
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                           ooO|
+|     *                        |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
+|                              |
++------------------------------+
+[2J[HGame over! Final score: 0
+Press any key to exit...[2m2026-08-27T06:00:58.565378Z[0m [33m WARN[0m [2mwie_exit[0m[2m:[0m ExitProcess [3mcode[0m[2m=[0m0 [3mcaller_rip[0m[2m=[0m0x14000140d
+=== WIE_RUNTIME_PROFILE ===
+mem_backend=mmap
+idle_policy=park
+host_stops=198 noisy=15 charged=84
+winapi_lock_wait: guest_ms=0.009 guest_max_ms=0.000 presenter_ms=0.000 presenter_max_ms=0.000
+wall_ms=2032.39  cpu_user_ms=30.54  cpu_sys_ms=4.84  cpu%≈1.7
+emu_ms=22.26 (1.1%)  handler_ms=2001.99 (98.9%)  resolve_ms=0.01 (0.0%)  total_accounted_ms=2024.26  init_ms=7.61
+jit: insns=8372 iced=12679 compiles=1 skip=2 bg_compiles=37 bg_stalls=19 bg_stall_us=18193 bg_fallback=0 cache_hits=2506 load=12 store=2
+jit_profile: compile_us=44379 eager=12 hot=9 bg_enq=40 bg_hit=14 bg_to=5 inline=1 iced_fb=12679 never=2
+top exports by handler time:
+       15   2001.21 ms  kernel32.dll!sleep
+       15      0.30 ms  api-ms-win-crt-stdio-l1-1-0.dll!fputs
+       15      0.13 ms  api-ms-win-crt-stdio-l1-1-0.dll!_kbhit
+        1      0.10 ms  api-ms-win-crt-runtime-l1-1-0.dll!exit
+       15      0.09 ms  api-ms-win-crt-stdio-l1-1-0.dll!__stdio_common_vsprintf
+        1      0.04 ms  api-ms-win-crt-time-l1-1-0.dll!_time64
+        1      0.04 ms  api-ms-win-crt-conio-l1-1-0.dll!_getch
+       14      0.03 ms  api-ms-win-crt-private-l1-1-0.dll!memmove
+       16      0.03 ms  api-ms-win-crt-runtime-l1-1-0.dll!system
+        1      0.01 ms  kernel32.dll!setunhandledexceptionfilter
+        1      0.01 ms  api-ms-win-crt-utility-l1-1-0.dll!srand
+        2      0.01 ms  api-ms-win-crt-stdio-l1-1-0.dll!__stdio_common_vfprintf
+        2      0.00 ms  api-ms-win-crt-utility-l1-1-0.dll!rand
+top exports by count:
+       16      0.03 ms  api-ms-win-crt-runtime-l1-1-0.dll!system
+       15      0.09 ms  api-ms-win-crt-stdio-l1-1-0.dll!__stdio_common_vsprintf
+       15      0.30 ms  api-ms-win-crt-stdio-l1-1-0.dll!fputs
+       15      0.13 ms  api-ms-win-crt-stdio-l1-1-0.dll!_kbhit
+       15   2001.21 ms  kernel32.dll!sleep
+       14      0.03 ms  api-ms-win-crt-private-l1-1-0.dll!memmove
+        2      0.01 ms  api-ms-win-crt-stdio-l1-1-0.dll!__stdio_common_vfprintf
+        2      0.00 ms  api-ms-win-crt-utility-l1-1-0.dll!rand
+        1      0.01 ms  kernel32.dll!setunhandledexceptionfilter
+        1      0.01 ms  api-ms-win-crt-utility-l1-1-0.dll!srand
+        1      0.04 ms  api-ms-win-crt-time-l1-1-0.dll!_time64
+        1      0.10 ms  api-ms-win-crt-runtime-l1-1-0.dll!exit
+        1      0.04 ms  api-ms-win-crt-conio-l1-1-0.dll!_getch
+[wie] jit_bg_ledger: workers=4 hit_ready=0 stalled_ok=14 timed_out=5 cooled_down=5 deferred=0 (total=24)
+[wie] jit_chain: epoch_bumps=37 resyncs=21 avg_width=1 inline_inserts=1 code_invs=0

@@ -34,7 +34,7 @@ use crate::fake_va::D3d9Iface;
 use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_memory::{write_u32 as write_guest_u32, write_u64 as write_guest_u64};
 use crate::kernel32::low_u32;
-use crate::{HandlerContext, WinApiHandlerResult};
+use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 /// Handles `IDirect3DDevice9::SetFVF`.
 pub fn handle_set_fvf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -312,12 +312,22 @@ pub fn handle_direct3d9_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 /// surface when the sizes differ. Slice 1 (B7): Present returns immediately;
 /// vsync frame pacing is deferred to P4 and the gating requirement is
 /// trivially satisfied by never blocking.
+///
+/// Opt-in pacing: `WIE_PRESENT_PACING_HZ=<n>` sleeps the Present handler so
+/// the guest renders at ~n FPS (a diagnostic knob for FPS measurements — a
+/// guest at thousands of FPS floods the publish path and the profile stops
+/// saying anything about steady-state frame cost). Default is off
+/// (unpaced). The sleep runs inside the handler under the WinAPI lock, so it
+/// pauses guest dispatch on this thread by construction — do not enable it
+/// for throughput runs.
 pub fn handle_present(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
     let _this_pointer = read_arg(engine, ArgReg::Rcx, "IDirect3DDevice9::Present")?;
     // pSourceRect / pDestRect / hDestWindowOverride / pDirtyRegion are unused
     // in slice 1: the whole backbuffer presents into the device window.
+
+    present_pacing_wait(state);
 
     let (bb_w, bb_h, hwnd) = {
         let d = state.d3d9();
@@ -353,6 +363,39 @@ pub fn handle_present(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     tracing::trace!(target: "wiegui", bb_w, bb_h, hwnd = hwnd.as_u64(), "D3D9 Present");
 
     ctx.finish(D3D_OK)
+}
+
+/// The resolved `WIE_PRESENT_PACING_HZ` target frame interval (`None` = off).
+fn present_pacing_period() -> Option<std::time::Duration> {
+    static PERIOD: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *PERIOD.get_or_init(|| {
+        let hz = std::env::var("WIE_PRESENT_PACING_HZ")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|hz| *hz > 0.0)?;
+        Some(std::time::Duration::from_secs_f64(1.0 / hz))
+    })
+}
+
+/// Sleep out the remainder of the paced frame interval before a Present (see
+/// the `WIE_PRESENT_PACING_HZ` doc on [`handle_present`]).
+fn present_pacing_wait(state: &mut WinApiState) {
+    let Some(period) = present_pacing_period() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let wait = match state.d3d9().d3d9_last_present {
+        Some(last) => {
+            let elapsed = now.saturating_duration_since(last);
+            period.saturating_sub(elapsed)
+        }
+        None => std::time::Duration::ZERO,
+    };
+    state.d3d9().d3d9_last_present = Some(now);
+    // Skip sleeps too short to be worth the wake-up cost (sub-millisecond).
+    if wait > std::time::Duration::from_millis(1) {
+        std::thread::sleep(wait);
+    }
 }
 
 /// Handles `IDirect3DDevice9::Clear` (vtable slot 43).

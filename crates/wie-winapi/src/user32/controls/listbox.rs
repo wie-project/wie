@@ -121,6 +121,7 @@ pub(super) fn render_control_text(
         font.engine,
         &mut surface.pixels,
         surface.width,
+        surface.stride,
         surface.height,
         rect.left,
         rect.top,

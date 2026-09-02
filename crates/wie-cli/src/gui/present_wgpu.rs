@@ -133,6 +133,11 @@ pub(crate) struct WgpuPresenter {
     /// region-delta contract). Set by any present that did not draw; cleared
     /// once a full upload (or a same-frame upload skip) completes.
     force_full: bool,
+    /// Reused pack buffer for region / unaligned uploads (ADR-0001): capacity
+    /// grows to the largest packed upload and is never freed, so a steady
+    /// state of region uploads allocates nothing. Full frames on a 64-padded
+    /// surface never touch it (zero-copy borrow path).
+    upload_scratch: Vec<u8>,
 }
 
 impl WgpuPresenter {
@@ -299,6 +304,7 @@ impl WgpuPresenter {
             staging: None,
             last_uploaded: None,
             force_full: false,
+            upload_scratch: Vec::new(),
         })
     }
 
@@ -376,6 +382,7 @@ impl WgpuPresenter {
         // `Arc::try_unwrap` the published buffer zero-copy instead of cloning.
         let SurfaceFrame {
             width: frame_w_raw,
+            stride: frame_stride,
             height: frame_h_raw,
             pixels,
             background_color,
@@ -412,7 +419,14 @@ impl WgpuPresenter {
             // A generation gap forces the whole frame; otherwise upload only
             // the published region (None region = full frame).
             let upload_region = if self.force_full { None } else { region };
-            let upload = upload_source(&pixels, frame_w, frame_h, upload_region);
+            let upload = upload_source(
+                &pixels,
+                frame_stride,
+                frame_w,
+                frame_h,
+                upload_region,
+                &mut self.upload_scratch,
+            );
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &staging.texture,
@@ -577,12 +591,13 @@ const COPY_BYTES_PER_ROW_ALIGNMENT: usize = 256;
 
 /// The source bytes + copy layout for one `write_texture` call.
 struct UploadSource<'a> {
-    /// Source bytes. `Cow::Borrowed` for a full frame whose natural pitch is
-    /// already 256-aligned (zero-copy); `Cow::Owned` for a padded row pack
-    /// otherwise (region uploads and unaligned full frames).
+    /// Source bytes. Borrowed directly from the frame's pixel buffer when the
+    /// copy is zero-copy (full frame, 256-aligned pitch — always true with
+    /// ADR-0001 pitch padding); borrowed from the presenter's REUSED scratch
+    /// otherwise (region uploads and `WIE_SURFACE_PAD=0` unaligned frames).
     bytes: Cow<'a, [u8]>,
-    /// Row stride in `bytes` — padded to wgpu's `COPY_BYTES_PER_ROW_ALIGNMENT`
-    /// (256), which `write_texture` requires.
+    /// Row stride in `bytes` — the frame's pitch padded to wgpu's 256-byte
+    /// `COPY_BYTES_PER_ROW_ALIGNMENT`, which `write_texture` requires.
     bytes_per_row: u32,
     /// Number of rows in `bytes`.
     rows: u32,
@@ -591,24 +606,35 @@ struct UploadSource<'a> {
     origin_y: u32,
     width: u32,
     height: u32,
+    /// Whether `bytes` aliases the frame's pixel buffer (zero-copy). Test
+    /// seam: the ADR-0001 invariant is "steady-state full frames never pack".
+    #[cfg_attr(not(test), allow(dead_code))]
+    zero_copy: bool,
 }
 
 /// Build the source buffer for a `write_texture` of `region` (None = full
-/// frame) out of the frame's `pixels` (0RGB u32, top-down).
+/// frame) out of the frame's `pixels` (0RGB u32, top-down, row pitch
+/// `stride`).
 ///
-/// Rows are packed into a buffer with the pitch padded to wgpu's 256-byte
-/// alignment — a region narrower than the full frame (e.g. a caret blink)
-/// must not stride by the full frame width, and the pitch must be aligned.
-/// The full-frame case with an already-aligned pitch is zero-copy (the `Cow`
-/// borrows the pixels buffer directly).
+/// The staging texture is LOGICAL-width; `write_texture`'s `bytes_per_row` is
+/// the SOURCE pitch, so a 64-pixel-padded frame uploads zero-copy with
+/// `bytes_per_row = stride * 4` (a multiple of 256) — the padding columns are
+/// never copied into the texture because the copy extent is the logical
+/// width. Region uploads pack their rows into `scratch` (capacity retained
+/// across frames — no per-frame allocation); the pack reads the source at its
+/// padded stride.
 #[must_use]
 fn upload_source<'a>(
     pixels: &'a [u32],
+    stride: u32,
     frame_w: u32,
     frame_h: u32,
     region: Option<IRect>,
+    scratch: &'a mut Vec<u8>,
 ) -> UploadSource<'a> {
-    let frame_w_u = usize::try_from(frame_w).unwrap_or(0);
+    let stride_u = usize::try_from(stride)
+        .unwrap_or(0)
+        .max(usize::try_from(frame_w).unwrap_or(0));
     let frame_w_i = i32::try_from(frame_w).unwrap_or(0);
     let frame_h_i = i32::try_from(frame_h).unwrap_or(0);
     let (left, top, right, bottom) = match region {
@@ -637,18 +663,31 @@ fn upload_source<'a>(
             origin_y: 0,
             width: 0,
             height: 0,
+            zero_copy: false,
         };
     }
-    let row_bytes = width_us.saturating_mul(4);
-    // wgpu requires `bytes_per_row` to be a multiple of 256 (the
-    // COPY_BYTES_PER_ROW_ALIGNMENT validation in wgpu-core).
-    let padded = row_bytes
-        .div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT)
-        .saturating_mul(COPY_BYTES_PER_ROW_ALIGNMENT);
-    if region.is_none() && row_bytes == padded {
-        // Full frame with a naturally aligned pitch: zero-copy u32 → u8 view
-        // of the 0RGB buffer (LE on all supported hosts). `bytemuck::cast_slice`
-        // is safe: u32 → u8 is any-bit-pattern.
+    // Source pitch in bytes: the frame's (padded) stride. wgpu requires a
+    // multiple of 256 (COPY_BYTES_PER_ROW_ALIGNMENT).
+    let src_row_bytes = stride_u.saturating_mul(4);
+    let padded = if region.is_none() {
+        src_row_bytes
+            .div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT)
+            .saturating_mul(COPY_BYTES_PER_ROW_ALIGNMENT)
+    } else {
+        // A region copy packs at the COPY width, not the source pitch: the
+        // pack loop re-indexes rows at the source stride, so the staged
+        // buffer only needs the region's rows 256-aligned. A padded surface
+        // stride would copy the surface's padding tail on every narrow
+        // region upload.
+        (width_us.saturating_mul(4))
+            .div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT)
+            .saturating_mul(COPY_BYTES_PER_ROW_ALIGNMENT)
+    };
+    if region.is_none() && src_row_bytes == padded {
+        // Full frame with an aligned pitch: zero-copy u32 → u8 view of the
+        // 0RGB buffer (LE on all supported hosts). `bytemuck::cast_slice` is
+        // safe: u32 → u8 is any-bit-pattern. The copy extent stays logical —
+        // the padding tail of each source row is never read as pixels.
         return UploadSource {
             bytes: Cow::Borrowed(bytemuck::cast_slice(pixels)),
             bytes_per_row: u32::try_from(padded).unwrap_or(0),
@@ -657,22 +696,21 @@ fn upload_source<'a>(
             origin_y: 0,
             width: u32::try_from(width).unwrap_or(0),
             height: u32::try_from(height).unwrap_or(0),
+            zero_copy: true,
         };
     }
-    // Pack the region rows into a padded buffer (region copies and unaligned
-    // full frames). The inner copy is a per-row u32 memcpy: on the little-
-    // endian hosts this emulator targets, the u32 LE bytes ARE the 0RGB pixel
-    // (the zero-copy full-frame path above already relies on this identity),
-    // so a slice copy lowers to the platform SIMD memcpy instead of the old
-    // per-pixel 4-byte stores. `padded` is a multiple of 256, so the u32 view
-    // of the pack buffer is exact, and `vec![0_u8; …]` is allocator-aligned.
-    let mut buf = vec![0_u8; height_us.saturating_mul(padded)];
-    let buf_u32: &mut [u32] = bytemuck::cast_slice_mut(&mut buf);
+    // Pack the region rows into the REUSED scratch (region copies and
+    // unaligned full frames — the latter only under `WIE_SURFACE_PAD=0`).
+    // The inner copy is a per-row u32 memcpy at the source's padded stride.
+    scratch.clear();
+    scratch.resize(height_us.saturating_mul(padded), 0);
+    let buf: &mut [u8] = scratch.as_mut_slice();
+    let buf_u32: &mut [u32] = bytemuck::cast_slice_mut(buf);
     let row_words = padded / 4;
     for row in 0..height_us {
         let src_start = top_us
             .saturating_add(row)
-            .saturating_mul(frame_w_u)
+            .saturating_mul(stride_u)
             .saturating_add(left_us);
         let Some(src) = pixels.get(src_start..src_start.saturating_add(width_us)) else {
             continue;
@@ -684,13 +722,14 @@ fn upload_source<'a>(
         }
     }
     UploadSource {
-        bytes: Cow::Owned(buf),
+        bytes: Cow::Borrowed(scratch.as_slice()),
         bytes_per_row: u32::try_from(padded).unwrap_or(0),
         rows: u32::try_from(height_us).unwrap_or(0),
         origin_x: u32::try_from(left).unwrap_or(0),
         origin_y: u32::try_from(top).unwrap_or(0),
         width: u32::try_from(width).unwrap_or(0),
         height: u32::try_from(height).unwrap_or(0),
+        zero_copy: false,
     }
 }
 
@@ -705,13 +744,23 @@ fn color_channel(background_color: u32, shift: u32) -> f64 {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::upload_source;
-    use std::borrow::Cow;
     use wie_winapi::gdi32::IRect;
 
     /// A `w × h` frame filled with one color.
     fn frame(w: u32, h: u32, fill: u32) -> Vec<u32> {
         vec![fill; usize::try_from(w.saturating_mul(h)).unwrap_or(0)]
+    }
+
+    /// `upload_source` with an unpitched frame (stride == width) and a fresh
+    /// scratch — the pre-padding call shape.
+    fn src<'a>(
+        pixels: &'a [u32],
+        w: u32,
+        h: u32,
+        region: Option<IRect>,
+        scratch: &'a mut Vec<u8>,
+    ) -> super::UploadSource<'a> {
+        super::upload_source(pixels, w, w, h, region, scratch)
     }
 
     /// The region pixel at frame coordinates (col, row) inside a packed
@@ -731,9 +780,10 @@ mod tests {
     #[test]
     fn full_aligned_pitch_is_zero_copy() {
         let pixels = frame(640, 480, 0x00FF_FFFF);
-        let src = upload_source(&pixels, 640, 480, None);
+        let mut scratch = Vec::new();
+        let src = src(&pixels, 640, 480, None, &mut scratch);
         assert!(
-            matches!(src.bytes, Cow::Borrowed(_)),
+            src.zero_copy,
             "an aligned full frame must borrow the pixels, not pack them"
         );
         assert_eq!(src.bytes_per_row, 2560);
@@ -761,11 +811,9 @@ mod tests {
             right: 40,
             bottom: 15,
         };
-        let src = upload_source(&pixels, 100, 50, Some(region));
-        assert!(
-            matches!(src.bytes, Cow::Owned(_)),
-            "a region-limited upload must pack rows"
-        );
+        let mut scratch = Vec::new();
+        let src = src(&pixels, 100, 50, Some(region), &mut scratch);
+        assert!(!src.zero_copy, "a region-limited upload must pack rows");
         // 20 cols × 4 B = 80 B → padded to the 256-byte alignment.
         assert_eq!(src.bytes_per_row, 256);
         assert_eq!(src.rows, 10);
@@ -789,9 +837,10 @@ mod tests {
     #[test]
     fn unaligned_full_frame_is_padded() {
         let pixels = frame(90, 40, 0x00AB_CDEF);
-        let src = upload_source(&pixels, 90, 40, None);
+        let mut scratch = Vec::new();
+        let src = src(&pixels, 90, 40, None, &mut scratch);
         assert!(
-            matches!(src.bytes, Cow::Owned(_)),
+            !src.zero_copy,
             "an unaligned pitch must be packed, not zero-copy"
         );
         assert_eq!(src.bytes_per_row, 512, "90 × 4 = 360 → padded to 512");
@@ -810,7 +859,8 @@ mod tests {
     #[test]
     fn degenerate_region_produces_no_copy() {
         let pixels = frame(100, 100, 0);
-        let src = upload_source(&pixels, 100, 100, Some(IRect::empty()));
+        let mut scratch = Vec::new();
+        let src = src(&pixels, 100, 100, Some(IRect::empty()), &mut scratch);
         assert_eq!((src.width, src.height), (0, 0));
         assert_eq!(src.bytes.as_ref().len(), 0);
     }
@@ -819,7 +869,8 @@ mod tests {
     #[test]
     fn region_is_clipped_to_the_frame() {
         let pixels = frame(50, 50, 0);
-        let src = upload_source(
+        let mut scratch = Vec::new();
+        let src = src(
             &pixels,
             50,
             50,
@@ -829,6 +880,7 @@ mod tests {
                 right: 200,
                 bottom: 200,
             }),
+            &mut scratch,
         );
         assert_eq!(
             (src.origin_x, src.origin_y, src.width, src.height),
@@ -849,7 +901,8 @@ mod tests {
             right: 38,
             bottom: 8,
         };
-        let src = upload_source(&pixels, 80, 20, Some(region));
+        let mut scratch = Vec::new();
+        let src = src(&pixels, 80, 20, Some(region), &mut scratch);
         assert_eq!(src.rows, 5);
         assert_eq!(src.bytes_per_row, 256);
         let bytes = src.bytes.as_ref();

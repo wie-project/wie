@@ -730,7 +730,7 @@ fn test_button_caption_change_paints_only_the_caption_rect() {
         for x in 0..after.width {
             let idx = usize::try_from(y)
                 .unwrap_or(0)
-                .saturating_mul(after.width as usize)
+                .saturating_mul(after.stride as usize)
                 .saturating_add(usize::try_from(x).unwrap_or(0));
             if before.pixels.get(idx) != after.pixels.get(idx) {
                 assert!(
@@ -894,7 +894,7 @@ fn test_static_caption_change_paints_only_the_caption_rect() {
         for x in 0..after.width {
             let idx = usize::try_from(y)
                 .unwrap_or(0)
-                .saturating_mul(after.width as usize)
+                .saturating_mul(after.stride as usize)
                 .saturating_add(usize::try_from(x).unwrap_or(0));
             if before.pixels.get(idx) != after.pixels.get(idx) {
                 assert!(

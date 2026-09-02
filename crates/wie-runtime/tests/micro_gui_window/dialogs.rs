@@ -168,7 +168,7 @@ fn notepad_font_dialog_survives_control_click() {
     let face_px_at = |frame: &wie_winapi::present::SurfaceFrame| {
         let x = usize::try_from(dx + 5).unwrap_or(0);
         let y = usize::try_from(dy + 5).unwrap_or(0);
-        frame.pixels.get(y * frame.width as usize + x).copied()
+        frame.pixels.get(y * frame.stride as usize + x).copied()
     };
 
     handle.post_message(main, WM_COMMAND, u64::from(font_id), 0);
@@ -255,7 +255,7 @@ fn notepad_font_dialog_survives_control_click() {
                 // (the selection followed the click through the repaint).
                 let highlight = (dy + 8..dy + 8 + 140).fold(0_u32, |acc, y| {
                     acc + (dx + 72..dx + 72 + 168).fold(0_u32, |acc, x| {
-                        let idx = usize::try_from(y).unwrap_or(0) * frame.width as usize
+                        let idx = usize::try_from(y).unwrap_or(0) * frame.stride as usize
                             + usize::try_from(x).unwrap_or(0);
                         acc + u32::from(frame.pixels.get(idx).copied() == Some(0x0000_78D7))
                     })
@@ -462,7 +462,7 @@ fn notepad_file_dialog_paints_into_the_owner_surface() {
                 u32::try_from(dy.saturating_add(33)).unwrap_or(0),
             );
             if sx < frame.width && sy < frame.height {
-                let idx = usize::try_from(sy).unwrap_or(0) * frame.width as usize
+                let idx = usize::try_from(sy).unwrap_or(0) * frame.stride as usize
                     + usize::try_from(sx).unwrap_or(0);
                 if frame.pixels.get(idx).copied() == Some(BTNFACE_0RGB) {
                     saw_dialog_face_in_owner = true;

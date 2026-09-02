@@ -395,7 +395,7 @@ fn blit_row(
     src_h: i32,
     top_down: bool,
     dest: &mut [u32],
-    dest_w: u32,
+    dest_stride: u32,
     dest_x: i32,
     dest_y: i32,
     width: i32,
@@ -415,7 +415,7 @@ fn blit_row(
     let src_x_us = usize::try_from(src_x).unwrap_or(0);
     let src_y_us = usize::try_from(src_y).unwrap_or(0);
     let src_h_us = usize::try_from(src_h).unwrap_or(0);
-    let dest_w_us = usize::try_from(dest_w).unwrap_or(0);
+    let dest_stride_us = usize::try_from(dest_stride).unwrap_or(0);
     let dest_x_us = usize::try_from(dest_x).unwrap_or(0);
     let dest_y_us = usize::try_from(dest_y).unwrap_or(0);
     let width_us = usize::try_from(width).unwrap_or(0);
@@ -450,7 +450,9 @@ fn blit_row(
                 return;
             };
             let dst_row = dest_y_us.saturating_add(row);
-            let dst_offset = dst_row.saturating_mul(dest_w_us).saturating_add(dest_x_us);
+            let dst_offset = dst_row
+                .saturating_mul(dest_stride_us)
+                .saturating_add(dest_x_us);
             let dst_end = dst_offset.saturating_add(width_us).min(dest.len());
             let Some(dst_slice) = dest.get_mut(dst_offset..dst_end) else {
                 return;
@@ -497,7 +499,9 @@ fn blit_row(
                     return;
                 };
                 let dst_row = dest_y_us.saturating_add(row);
-                let dst_offset = dst_row.saturating_mul(dest_w_us).saturating_add(dest_x_us);
+                let dst_offset = dst_row
+                    .saturating_mul(dest_stride_us)
+                    .saturating_add(dest_x_us);
                 let dst_end = dst_offset.saturating_add(width_us).min(dest.len());
                 let Some(dst_slice) = dest.get_mut(dst_offset..dst_end) else {
                     failed = true;
@@ -537,14 +541,18 @@ pub(crate) fn fill_rect_surface(
 ) {
     state.present().ensure_surface(hwnd, dest_w, dest_h);
     if let Some(surf) = state.present().surfaces.get_mut(&hwnd) {
-        let dest_w_u = usize::try_from(surf.width).unwrap_or(0);
+        // Row pitch vs logical width: the surface buffer is pitch-padded
+        // (ADR-0001), so rows start at `row * stride`; the written-rect clip
+        // below stays in LOGICAL coordinates.
+        let pitch = usize::try_from(surf.stride).unwrap_or(0);
+        let logical_w = usize::try_from(surf.width).unwrap_or(0);
         let row_bytes = usize::try_from(cx.max(0)).unwrap_or(0);
         let dest_y_s = usize::try_from(y.max(0)).unwrap_or(0);
         let dest_x_s = usize::try_from(x.max(0)).unwrap_or(0);
         let h = usize::try_from(cy.max(0)).unwrap_or(0);
         let surf_height = usize::try_from(surf.height).unwrap_or(0);
         for row in dest_y_s..dest_y_s.saturating_add(h).min(surf_height) {
-            let start = row.saturating_mul(dest_w_u).saturating_add(dest_x_s);
+            let start = row.saturating_mul(pitch).saturating_add(dest_x_s);
             let end = start.saturating_add(row_bytes).min(surf.pixels.len());
             if let Some(pixels) = surf.pixels.get_mut(start..end) {
                 for px in pixels {
@@ -553,11 +561,11 @@ pub(crate) fn fill_rect_surface(
             }
         }
         // The effective written rect — the loop above clips x to the row end
-        // and y to the surface height, so mirror that clip here.
+        // and y to the surface height, so mirror that clip here (logical).
         let x1 = dest_x_s
             .saturating_add(row_bytes)
             .min(surf.pixels.len())
-            .min(dest_w_u);
+            .min(logical_w);
         let y1 = dest_y_s.saturating_add(h).min(surf_height);
         if x1 > dest_x_s && y1 > dest_y_s {
             let written = IRect {
@@ -726,14 +734,17 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
 
     // Blit rows: scope the dest borrow so we can re-borrow state for publish.
     {
-        let dest = state
+        // The dest pitch is the surface stride (64-padded); `info.width` is
+        // the LOGICAL width and must not be used to index rows.
+        let (dest, dest_stride) = state
             .present()
             .surfaces
             .get_mut(&info.hwnd)
-            .map(|s| &mut s.pixels[..]);
-        let Some(dest) = dest else {
+            .map(|s| (&mut s.pixels[..], s.stride))
+            .unwrap_or((&mut [][..], 0));
+        if dest.is_empty() {
             return ctx.finish(1);
-        };
+        }
         for rect in &rects {
             let rect_w = rect.width();
             let rect_h = rect.height();
@@ -755,7 +766,7 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
                 src_h,
                 top_down,
                 dest,
-                info.width,
+                dest_stride,
                 surface_x,
                 surface_y,
                 rect_w,

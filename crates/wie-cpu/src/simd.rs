@@ -102,28 +102,76 @@ pub fn stretch_nearest(
     dst_w: u32,
     dst_h: u32,
 ) {
+    stretch_nearest_strided(buf, dst_w, src, src_w, src_h, dst_w, dst_h);
+}
+
+/// [`stretch_nearest`] with an explicit destination row pitch: `buf` holds
+/// `dst_stride * dst_h` words and row `y` starts at `y * dst_stride`, so a
+/// pitch-padded present surface (ADR-0001: 64-pixel stride for zero-copy GPU
+/// uploads) can be the destination directly. The `dst_stride - dst_w` tail of
+/// each row is left untouched (padding carries no content).
+///
+/// # Panics
+/// Never panics; out-of-range rows/columns are skipped (same degradation as
+/// the checked variant).
+pub fn stretch_nearest_strided(
+    buf: &mut [u32],
+    dst_stride: u32,
+    src: &[u32],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) {
     let (src_w, src_h, dst_w, dst_h) = (
         usize::try_from(src_w).unwrap_or(0),
         usize::try_from(src_h).unwrap_or(0),
         usize::try_from(dst_w).unwrap_or(0),
         usize::try_from(dst_h).unwrap_or(0),
     );
+    let dst_stride = usize::try_from(dst_stride).unwrap_or(0).max(dst_w);
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return;
     }
     let sy: Vec<usize> = (0..dst_h).map(|y| (y * src_h) / dst_h).collect();
     let sx: Vec<usize> = (0..dst_w).map(|x| (x * src_w) / dst_w).collect();
-    // SAFETY: `sy[y] < src_h` and `sx[x] < src_w` by construction, so every
-    // read is within `src`; `dst` is fully covered by the y/x loops.  Callers
-    // must pass buffers of exactly `dst_w * dst_h` and `src_w * src_h`.
-    #[expect(unsafe_code)]
-    unsafe {
-        for y in 0..dst_h {
-            let src_row = *sy.get_unchecked(y) * src_w;
-            let dst_row = y * dst_w;
-            for x in 0..dst_w {
-                *buf.get_unchecked_mut(dst_row + x) =
-                    *src.get_unchecked(src_row + *sx.get_unchecked(x));
+    // Fast path: when both buffers provably hold their full pitched extent,
+    // every index below is in range by construction (`sy[y] < src_h`,
+    // `sx[x] < src_w`, rows < dst_h) and the bounds checks would only cost
+    // time. Otherwise fall back to the checked row loop.
+    let src_full = src_w.checked_mul(src_h).is_some_and(|n| src.len() >= n);
+    let dst_full = dst_stride
+        .checked_mul(dst_h)
+        .is_some_and(|n| buf.len() >= n);
+    if src_full && dst_full {
+        // SAFETY: `sy[y] < src_h` and `sx[x] < src_w` by construction, so every
+        // read is within `src`; `dst` is fully covered by the y/x loops and
+        // `dst_stride >= dst_w` keeps row starts in range.
+        #[expect(unsafe_code)]
+        unsafe {
+            for y in 0..dst_h {
+                let src_row = *sy.get_unchecked(y) * src_w;
+                let dst_row = y * dst_stride;
+                for x in 0..dst_w {
+                    *buf.get_unchecked_mut(dst_row + x) =
+                        *src.get_unchecked(src_row + *sx.get_unchecked(x));
+                }
+            }
+        }
+        return;
+    }
+    for (y, &sy_y) in sy.iter().enumerate().take(dst_h) {
+        let src_row = sy_y.wrapping_mul(src_w);
+        let dst_row = y.wrapping_mul(dst_stride);
+        let (Some(src_row_slice), Some(dst_row_slice)) = (
+            src.get(src_row..src_row.saturating_add(src_w)),
+            buf.get_mut(dst_row..dst_row.saturating_add(dst_w)),
+        ) else {
+            continue;
+        };
+        for (dst_px, &sx_x) in dst_row_slice.iter_mut().zip(sx.iter()) {
+            if let Some(&src_px) = src_row_slice.get(sx_x) {
+                *dst_px = src_px;
             }
         }
     }

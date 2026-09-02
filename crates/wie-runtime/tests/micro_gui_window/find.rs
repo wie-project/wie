@@ -224,7 +224,7 @@ fn cancel_removes_dialog_pixels_from_owner_frame() {
             for px in dx..(dx + FIND_DLG_CX) {
                 if frame
                     .pixels
-                    .get(py as usize * frame.width as usize + px as usize)
+                    .get(py as usize * frame.stride as usize + px as usize)
                     .is_some_and(|&p| p & 0x00FF_FFFF == 0x00F0_F0F0)
                 {
                     n = n.saturating_add(1);
@@ -339,7 +339,7 @@ fn replace_cancel_closes_dialog_in_one_click() {
             for px in dx..(dx + FIND_DLG_CX) {
                 if frame
                     .pixels
-                    .get(py as usize * frame.width as usize + px as usize)
+                    .get(py as usize * frame.stride as usize + px as usize)
                     .is_some_and(|&p| p & 0x00FF_FFFF == 0x00F0_F0F0)
                 {
                     n = n.saturating_add(1);
@@ -653,7 +653,7 @@ fn count_dialog_rows(
         for px in dx.max(0)..(dx + FIND_DLG_CX) {
             if frame
                 .pixels
-                .get(py as usize * frame.width as usize + px as usize)
+                .get(py as usize * frame.stride as usize + px as usize)
                 .is_some_and(|&p| p == color)
             {
                 n = n.saturating_add(1);
