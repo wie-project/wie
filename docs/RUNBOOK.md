@@ -128,13 +128,14 @@ The README keeps the shortlist; the complete set lives here.
 | --- | --- | --- | --- |
 | `WIE_SURFACE_PAD` / padded pool | **64 px** row pitch (`padded_stride`, ADR-0001, implemented 2026-09) + reused wgpu scratch | `WIE_SURFACE_PAD=0` (unpadded, on-demand pack) | Q2/D |
 | present channel | **on** (`PresentChannel` latest-wins slot; `take_frame` is lock-free on the presenter side, ADR-0003) | none — always on | Wave 1a |
+| `WIE_PRESENT_COMMIT` | **on in GUI sessions** (Wave 2 slice 1, 2026-09: `IDirect3DDevice9::Present` hands the finished backbuffer to the `wie-present-commit` render thread — stretch + publish run off the big lock; headless/micro-suite keep the legacy in-handler path) | `WIE_PRESENT_COMMIT=0` (legacy in-handler present) | Wave 2 |
 | present throttling / latest-wins | **on** (`drain_pending_publishes` + `retry_delay` coalesce) | `cfg(test)` skips (tests assert publish) | Q5/C |
 | pre-reserve / scratch reuse | **on** (capacity-retained `Vec`s, pooled `WgpuPresenter` scratch) | none — always on | Q4/C |
 | CompactString | **on** (inline small strings; see `compact_string` crate in `wie-winapi` where string-heavy) | `WIE_COMPACT_STRING=0` if gated | Q6/C |
 | size-class TLS | **on** (24 classes, TLS-pooled) | none — always on | TLS lane |
 | mimalloc | **feature** `mimalloc` (if enabled, host allocator) | default allocator if feature off | Q7/C |
 | D3D9 in-place | **on** (pooled `WindowSurface` slice as render target — no temp `Vec<u32>`) | `WIE_D3D9_INPLACE=0` if gated | Q9/C |
-| `WIE_JIT_DIRECT_REGS` | **on** (direct GPR/rflags hand-off) | `WIE_JIT_DIRECT_REGS=0`/`false`/`off` | Q8/C |
+| `WIE_JIT_DIRECT_REGS` | **NOT implemented** (ADR-0002 status note, 2026-09-02: zero call sites — tracked as Wave 3 in `docs/implementation-plan.md`; the variable does nothing) | — | Q8/C |
 
 > If a knob is not listed above, it is **not** a Wave3 gate — see the full table. All Wave3 paths are verified steady zero-alloc under `WIE_RUNTIME_PROFILE=1` without setting any of these.
 

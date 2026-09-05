@@ -967,6 +967,26 @@ pub fn run_gui_windowed(
                         crate::gui::print::enable_interactive_page_setup_dialogs(&mut session);
                         let handle = session.guest_handle();
 
+                        // Wave 2 (Option A1): D3D9 Present commits leave the
+                        // emu thread — the present-committer render thread
+                        // stretches + publishes the committed backbuffer off
+                        // the big lock, then fires the same Frame-event wake
+                        // the guest publish path uses. `WIE_PRESENT_COMMIT=0`
+                        // or a failed spawn keeps the legacy in-handler path
+                        // (the CI hash gates exercise that path headless).
+                        // The handle lives to the end of this closure — its
+                        // Drop stops + joins the render thread at teardown.
+                        let _present_committer = {
+                            let commit_proxy = proxy.clone();
+                            let commit_pending = pending_frame_guest.clone();
+                            handle.enable_present_commit(Box::new(move || {
+                                commit_pending.store(true, std::sync::atomic::Ordering::SeqCst);
+                                let _ = commit_proxy.send_event(WieEvent::Frame {
+                                    published_at: Instant::now(),
+                                });
+                            }))
+                        };
+
                         // Register wake callback.
                         {
                             let proxy = proxy.clone();

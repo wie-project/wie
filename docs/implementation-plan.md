@@ -29,14 +29,14 @@ Conventions that apply to every wave: workspace lints deny
 | 1c. D3D9 wake coalescing + `WIE_PRESENT_PACING_HZ` pacing knob | ✅ — wake gate in the channel; pacing sleep in `d3d9/device.rs::present_pacing_wait` |
 | 1d. GDI DIB host_slice zero-copy fast path | ✅ — whole-DIB borrow + one-row fallback (`gdi32/dib.rs`); note: `dib_row_offset` returns a ROW index — callers scale by the byte stride |
 
-## Wave 2 — command capture + render thread (next)
+## Wave 2 — command capture + render thread (in progress)
 
 | Item | Status |
 | --- | --- |
-| Capture GDI/D3D9 draw calls into a command stream instead of rasterizing inside WinAPI handlers | ⬜ |
-| Dedicated render thread consumes the stream; emu thread never rasterizes | ⬜ |
-| Kill the remaining big-lock reads from the host (z-order, window list already mirrored; audit leftovers) | ⬜ |
-| Acceptance: 40 s profile shows guest >90% CPU while a paint-heavy app renders | ⬜ |
+| Capture GDI/D3D9 draw calls into a command stream instead of rasterizing inside WinAPI handlers | ⬜ — D3D9 draw-state surface (render targets, depth, textures, shaders) makes per-draw capture a slice of its own; sequenced after the commit thread (see the A1 skeleton note on the next row) |
+| Dedicated render thread consumes the stream; emu thread never rasterizes | 🟡 **slice 1 landed 2026-09-05** — the A1 skeleton: `present/commit.rs` commit slot + `wie-present-commit` render thread; `IDirect3DDevice9::Present` hands the finished backbuffer to the committer (pointer move, spare-pool recycled) and the stretch + publish run off the big lock (GUI sessions only; `WIE_PRESENT_COMMIT=0` opts out; headless keeps the legacy path — CI hashes unchanged). Hash-equivalence proof: `micro_gui_window::commit` runs gui_d3d9 under commit mode and pins `D3D9_RESTING_FRAME_HASH`. Profile: `commit_frames/commit_ms` counters. GDI stays inline (post-Wave-1 it is memcpy-level); wgl publishes inline too |
+| Kill the remaining big-lock reads from the host (z-order, window list already mirrored; audit leftovers) | ⬜ — audited list in the exploration: `edit_selection`, `control_text`, `status_bar_part_text`, `window_at`, `capture_target`, `focused_top_level`, `mouse_tracking`, `set_key_state`, `window_menu_items` rebuild, `resize_window` settle (input-event frequency, not frame frequency) |
+| Acceptance: 40 s profile shows guest >90% CPU while a paint-heavy app renders | ⬜ measure with the FPS harness on the D3D9 loop micro (`commit_ms` now separates the render-thread share from guest time) |
 
 ## Wave 3 — JIT throughput (ADR-0002, the accepted-but-unbuilt fix)
 

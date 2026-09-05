@@ -345,20 +345,40 @@ pub fn handle_present(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
         let (win_w, win_h) = crate::user32::window_client_size(state, hwnd.as_u64());
         let win_w = u32::try_from(win_w).unwrap_or(1).max(1);
         let win_h = u32::try_from(win_h).unwrap_or(1).max(1);
-        // Q9/C: in-place pooled target — take the backbuffer without cloning
-        // (capacity retained, no per-present alloc) and write directly into the
-        // pooled WindowSurface slice that `ensure_surface` will hand back via
-        // Q2/D. No intermediate `Vec<u32>` copy; size mismatch keeps
-        // `stretch_nearest` but writes directly into the pooled slice.
-        let backbuffer = std::mem::take(&mut state.d3d9().d3d9_backbuffer);
-        let bb_slice: &[u32] = &backbuffer;
-        // Hand the next pooled surface slice to the present as render target
-        // (Q9/C). `blit_frame` writes directly into that pooled allocation.
-        state.present().ensure_surface(hwnd, win_w, win_h);
-        // Direct blit into the pooled slice — no temp Vec, no intermediate copy.
-        state.present().blit_frame(hwnd, bb_slice, bb_w, bb_h);
-        // Restore the backbuffer Vec with its original capacity for the next draws.
-        state.d3d9().d3d9_backbuffer = backbuffer;
+        if state.present().channel.commit_enabled() {
+            // Wave 2 (Option A1): commit mode — hand the finished backbuffer
+            // to the render thread (a pointer move, no copy) and draw the
+            // next frame into a recycled buffer. The stretch + publish happen
+            // off the big lock.
+            let backbuffer = std::mem::take(&mut state.d3d9().d3d9_backbuffer);
+            let recycled = state
+                .present()
+                .enqueue_present_commit(hwnd, bb_w, bb_h, win_w, win_h, backbuffer);
+            // Keep the "backbuffer.len() == w * h" invariant: a recycled
+            // spare is already the right size; a cold pool allocates once.
+            state.d3d9().d3d9_backbuffer = if recycled.len()
+                == usize::try_from(bb_w.checked_mul(bb_h).unwrap_or(0)).unwrap_or(0)
+            {
+                recycled
+            } else {
+                vec![0_u32; usize::try_from(bb_w.checked_mul(bb_h).unwrap_or(0)).unwrap_or(0)]
+            };
+        } else {
+            // Q9/C: in-place pooled target — take the backbuffer without cloning
+            // (capacity retained, no per-present alloc) and write directly into the
+            // pooled WindowSurface slice that `ensure_surface` will hand back via
+            // Q2/D. No intermediate `Vec<u32>` copy; size mismatch keeps
+            // `stretch_nearest` but writes directly into the pooled slice.
+            let backbuffer = std::mem::take(&mut state.d3d9().d3d9_backbuffer);
+            let bb_slice: &[u32] = &backbuffer;
+            // Hand the next pooled surface slice to the present as render target
+            // (Q9/C). `blit_frame` writes directly into that pooled allocation.
+            state.present().ensure_surface(hwnd, win_w, win_h);
+            // Direct blit into the pooled slice — no temp Vec, no intermediate copy.
+            state.present().blit_frame(hwnd, bb_slice, bb_w, bb_h);
+            // Restore the backbuffer Vec with its original capacity for the next draws.
+            state.d3d9().d3d9_backbuffer = backbuffer;
+        }
     }
     tracing::trace!(target: "wiegui", bb_w, bb_h, hwnd = hwnd.as_u64(), "D3D9 Present");
 

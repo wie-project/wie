@@ -42,6 +42,11 @@ pub struct RuntimeProfile {
     blit_copy_ns_last: u128,
     present_ns: u128,
     present_ns_last: u128,
+    /// Wave 2: Present-commit render-thread counters (0 when commit mode is
+    /// off or frame timing is disabled).
+    commit_frames: u64,
+    commit_ns: u128,
+    commit_ns_last: u128,
     last_frame_host_stops: u64,
     last_frame_iced_insns: u64,
     last_frame_jit_insns: u64,
@@ -186,6 +191,22 @@ impl RuntimeProfile {
     #[must_use]
     pub fn present_ns_last(&self) -> u128 {
         self.present_ns_last
+    }
+    /// Number of Present-commit frames published by the render thread (ns
+    /// gated; 0 when commit mode is off).
+    #[must_use]
+    pub fn commit_frames(&self) -> u64 {
+        self.commit_frames
+    }
+    /// Accumulated render-thread commit (stretch + publish) wall time (ns).
+    #[must_use]
+    pub fn commit_ns(&self) -> u128 {
+        self.commit_ns
+    }
+    /// Duration of the most recent render-thread commit (ns).
+    #[must_use]
+    pub fn commit_ns_last(&self) -> u128 {
+        self.commit_ns_last
     }
     /// Host stops between the last two published frames.
     #[must_use]
@@ -397,7 +418,8 @@ impl RuntimeProfile {
             lines.push(format!(
                 "frames_published={} publish_ms={:.3} publish_ms_last={:.3} \
                  blit_copy_ms={:.3} blit_copy_ms_last={:.3} \
-                 present_ms={:.3} present_ms_last={:.3}",
+                 present_ms={:.3} present_ms_last={:.3} \
+                 commit_frames={} commit_ms={:.3} commit_ms_last={:.3}",
                 self.frames_published(),
                 self.publish_ns() as f64 / 1e6,
                 self.publish_ns_last() as f64 / 1e6,
@@ -405,6 +427,9 @@ impl RuntimeProfile {
                 self.blit_copy_ns_last() as f64 / 1e6,
                 self.present_ns() as f64 / 1e6,
                 self.present_ns_last() as f64 / 1e6,
+                self.commit_frames(),
+                self.commit_ns() as f64 / 1e6,
+                self.commit_ns_last() as f64 / 1e6,
             ));
             lines.push(format!("hand_back_unwrap={}", self.hand_back_unwrap()));
             lines.push(format!("hand_back_clone={}", self.hand_back_clone()));
@@ -532,11 +557,21 @@ impl super::RuntimeSession {
         self.sync_lock_wait_stats();
         // Presenter-side present timing lives in the host channel (it is
         // written by the winit thread) — read it without the big lock.
-        let (channel_present_ns, channel_present_ns_last) = self.process.with_winapi_ref(|st| {
-            st.try_present()
-                .map(|p| (p.channel_present_ns(), p.channel_present_ns_last()))
-                .unwrap_or((0, 0))
-        });
+        let (channel_present_ns, channel_present_ns_last, commit_frames, commit_ns, commit_ns_last) =
+            self.process.with_winapi_ref(|st| {
+                st.try_present()
+                    .map(|p| {
+                        let channel = p.channel_arc();
+                        (
+                            channel.present_ns(),
+                            channel.present_ns_last(),
+                            channel.commit_frames(),
+                            u128::from(channel.commit_ns()),
+                            u128::from(channel.commit_ns_last()),
+                        )
+                    })
+                    .unwrap_or((0, 0, 0, 0, 0))
+            });
         let present = self.process.with_winapi_ref(|st| {
             st.try_present().map(|p| {
                 (
@@ -571,6 +606,9 @@ impl super::RuntimeSession {
         self.profile.blit_copy_ns_last = blit_copy_ns_last;
         self.profile.present_ns = channel_present_ns;
         self.profile.present_ns_last = channel_present_ns_last;
+        self.profile.commit_frames = commit_frames;
+        self.profile.commit_ns = commit_ns;
+        self.profile.commit_ns_last = commit_ns_last;
         self.profile.hand_back_unwrap = hand_back_unwrap;
         self.profile.hand_back_clone = hand_back_clone;
 
