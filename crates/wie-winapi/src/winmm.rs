@@ -71,6 +71,10 @@ pub struct WinmmState {
     timers: Vec<WinmmTimerRecord>,
     /// Open wave-out devices, keyed by handle.
     wave_outs: Vec<WaveOutRecord>,
+    /// The `timeBeginPeriod`-requested minimum timer period (ms; 0 = none).
+    /// The pump uses it (and the due-timer wheel) to bound its park waits, so
+    /// guest timer cadence does not depend on being mid-pump.
+    min_period_ms: u32,
     /// PCM bytes submitted through `waveOutWrite` (the playback sink). Bounded:
     /// past [`PLAYBACK_SINK_CAP`] new bytes are dropped (the cadence, not the
     /// content, drives the guest).
@@ -313,6 +317,31 @@ impl WinmmState {
     pub fn reset_wave_out(&mut self, handle: u64) {
         self.timers
             .retain(|r| !(r.kind == DueTimerKind::WaveOutDone && r.handle == handle));
+    }
+
+    /// The `timeBeginPeriod` minimum period (ms; 0 = never requested).
+    #[must_use]
+    pub fn timer_period_ms(&self) -> u32 {
+        self.min_period_ms
+    }
+
+    /// Milliseconds until the next timer/WOM_DONE entry is due, for the
+    /// pump's timed parks. `None` when nothing is queued.
+    #[must_use]
+    pub fn next_due_in_ms(&self, now_tick: u32) -> Option<u32> {
+        self.timers
+            .iter()
+            .map(|r| r.due_tick_ms.wrapping_sub(now_tick))
+            .filter(|delta| *delta < 0x8000_0000)
+            .min()
+    }
+
+    /// Whether any timer/WOM_DONE entry is due right now.
+    #[must_use]
+    pub fn peek_due(&self, now_tick: u32) -> bool {
+        self.timers
+            .iter()
+            .any(|r| is_due_tick(now_tick, r.due_tick_ms))
     }
 
     /// Append submitted PCM to the playback sink (bounded — see
@@ -879,9 +908,20 @@ pub fn handle_wave_in_get_num_devs(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     ctx.finish(0)
 }
 
-/// Handles `WINMM.dll!timeBeginPeriod` / `timeEndPeriod` — accepted no-ops
-/// returning `TIMERR_NOERROR` (host timers are not quantum-constrained).
+/// Handles `WINMM.dll!timeBeginPeriod` / `timeEndPeriod`.
+///
+/// The requested minimum period is recorded on the WINMM state: the runtime
+/// pump bounds its park waits by the next due guest timer (clamped to the
+/// period when one was requested), so a guest's timer cadence no longer
+/// depends on being mid-pump. Returns `TIMERR_NOERROR`.
 pub fn handle_time_begin_end_period(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let _period = ctx.engine.read_rcx()?;
+    let state = &mut *ctx.state;
+    let period = ctx.engine.read_rcx()?;
+    let period = u32::try_from(period & u64::from(u32::MAX)).unwrap_or(0);
+    if period > 0 {
+        state.winmm().min_period_ms = period;
+    } else {
+        state.winmm().min_period_ms = 0;
+    }
     ctx.finish(TIMERR_NOERROR)
 }

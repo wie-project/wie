@@ -645,6 +645,15 @@ impl WinApiState {
         self.winmm().pop_due_timers(now_tick)
     }
 
+    /// Read-only WINMM state (timer wheel + period), `None` before the DLL
+    /// state is initialized. The pump's park loops use this to bound their
+    /// waits by the next due guest timer without taking `&mut`.
+    #[must_use]
+    pub fn winmm_ref(&self) -> Option<&crate::winmm::WinmmState> {
+        self.dll_states
+            .get::<crate::winmm::WinmmState>(crate::DllId::Winmm)
+    }
+
     /// Pop the next due WINMM timer for `now_tick`, if any.
     ///
     /// The pump uses this to dispatch at most one timer per boundary while a

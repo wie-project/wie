@@ -65,7 +65,7 @@ Conventions that apply to every wave: workspace lints deny
 | winmm/waveOut ring buffer with a real audio callback thread | 🟡 **slice 1 landed 2026-09-05** — `waveOutOpen` parses the guest `WAVEFORMATEX` + fdwOpen/dwInstance; `waveOutWrite` sinks the PCM (bounded 8 MiB `playback_sink`, the seam a future host audio backend consumes), marks `WHDR_DONE` (polling-guest contract) and queues a timed `WOM_DONE` at `now + buffer_ms` through the shared timer table — `DueTimerKind::WaveOutDone` dispatches with the `waveOutProc` ABI (`rcx=hwo, rdx=WOM_DONE, r8=dwInstance`) via the existing pump boundary. `waveOutReset`/`Close` drop pending completions. Callback guests get real-time playback cadence; window/event callback kinds still degrade to NULL (next slice) |
 | DirectInput/RawInput pass-through; winit event → guest queue without big lock | ⬜ |
 | Multi-queue message pump per thread (`user32/message` today is single-queue) | ⬜ |
-| Timer resolution independent of the message pump | ⬜ |
+| Timer resolution independent of the message pump | 🟡 **slice 1 landed 2026-09-05** — `timeBeginPeriod`/`timeEndPeriod` record the requested minimum period on the WINMM state; the pump's WaitObject INFINITE park now bounds its waits by the next due WINMM timer (clamped by the period, 50 ms liveness cap): when one is due the park leaves WITHOUT writing a wait result (the fake API stop re-executes — the CS-park idempotent re-entry), the quantum boundary dispatches the timer callback, and the wait re-parks. Guest timer cadence no longer stalls behind a guest parked in `WaitForSingleObject(INFINITE)` |
 
 ## Wave 6 — GPU offload (only if Wave 2+3 leave headroom on the table)
 

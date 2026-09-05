@@ -1428,6 +1428,12 @@ impl super::RuntimeSession {
                             // re-checks the object state. The 50 ms cap only
                             // bounds `process_dying` / spawn-drain latency.
                             let t0 = Instant::now();
+                            // Set when the park was cut short by a due WINMM
+                            // timer: the wait result must NOT be written (the
+                            // fake API stop re-executes — the same idempotent
+                            // re-entry the CS park uses) and the quantum
+                            // boundary dispatches the timer.
+                            let mut timer_wake = false;
                             let result = match target {
                                 Some(target) => {
                                     if timeout_ms == wie_winapi::INFINITE {
@@ -1445,10 +1451,50 @@ impl super::RuntimeSession {
                                             if dying {
                                                 break;
                                             }
-                                            inbox.wait_bounded(
+                                            // Timer-resolution lane: bound the
+                                            // wait by the next due WINMM
+                                            // timer (clamped by any
+                                            // timeBeginPeriod request, max
+                                            // 50 ms liveness). When one is
+                                            // due, leave the park WITHOUT
+                                            // writing a wait result — the API
+                                            // stop re-executes, the quantum
+                                            // boundary dispatches the timer,
+                                            // and the handler re-parks.
+                                            let now = u32::try_from(
+                                                wie_winapi::kernel32::clock::tick_count_32()
+                                                    & u64::from(u32::MAX),
+                                            )
+                                            .unwrap_or(0);
+                                            let bound = {
+                                                let next = self.process.with_winapi_ref(|st| {
+                                                    st.winmm_ref()
+                                                        .and_then(|w| w.next_due_in_ms(now))
+                                                });
+                                                let period = self.process.with_winapi_ref(|st| {
+                                                    st.winmm_ref()
+                                                        .map_or(0, |w| w.timer_period_ms())
+                                                });
+                                                let base = next.unwrap_or(50);
+                                                base.min(if period > 0 { period } else { 50 })
+                                                    .max(1)
+                                            };
+                                            let _ = inbox.wait_bounded(
                                                 None,
-                                                std::time::Duration::from_millis(50),
+                                                std::time::Duration::from_millis(u64::from(bound)),
                                             );
+                                            let due = self.process.with_winapi_ref(|st| {
+                                                let now2 = u32::try_from(
+                                                    wie_winapi::kernel32::clock::tick_count_32()
+                                                        & u64::from(u32::MAX),
+                                                )
+                                                .unwrap_or(0);
+                                                st.winmm_ref().is_some_and(|w| w.peek_due(now2))
+                                            });
+                                            if due {
+                                                timer_wake = true;
+                                                break;
+                                            }
                                         }
                                         target.exit_wait(&inbox);
                                         result
@@ -1460,13 +1506,18 @@ impl super::RuntimeSession {
                             };
                             park_residency_ns =
                                 park_residency_ns.saturating_add(t0.elapsed().as_nanos());
-                            self.process.with_mut(|eng, st| {
-                                st.kernel.threads.activate(primary_tid);
-                                let _ = eng.return_from_win64_api(u64::from(result)).map_err(|e| {
-                                    tracing::error!("guest stack corrupted on wait park: {e}")
+                            if !timer_wake {
+                                self.process.with_mut(|eng, st| {
+                                    st.kernel.threads.activate(primary_tid);
+                                    let _ =
+                                        eng.return_from_win64_api(u64::from(result)).map_err(|e| {
+                                            tracing::error!(
+                                                "guest stack corrupted on wait park: {e}"
+                                            )
+                                        });
                                 });
-                            });
-                            hooks.charged_api = hooks.charged_api.saturating_add(1);
+                                hooks.charged_api = hooks.charged_api.saturating_add(1);
+                            }
                         }
                         HostParkReason::PthreadWait => {
                             // Drain any pending CreateThread/pthread_create

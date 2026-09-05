@@ -422,3 +422,39 @@ fn test_wave_out_reset_drops_pending_completions() {
         "waveOutReset must drop the pending WOM_DONE"
     );
 }
+
+/// Wave 5 slice 2: `timeBeginPeriod` records the requested minimum period
+/// (the pump clamps its park waits by it), `timeEndPeriod`/a zero period
+/// clears it, and the timer wheel exposes `next_due_in_ms`/`peek_due` for
+/// the pump's timed parks.
+#[test]
+fn test_time_begin_period_records_and_timer_wheel_probes() {
+    let mut state = default_winapi_state();
+    assert_eq!(state.winmm().timer_period_ms(), 0, "no period requested");
+    assert_eq!(state.winmm().next_due_in_ms(0), None, "empty wheel");
+    assert!(!state.winmm().peek_due(0), "empty wheel has nothing due");
+
+    // timeBeginPeriod(2) through the dispatch table.
+    let mut engine = test_engine();
+    write_regs(&mut engine, 2, 0, 0, 0, 0);
+    assert_eq!(
+        dispatch_winmm(&mut engine, &mut state, "timeBeginPeriod"),
+        0
+    );
+    assert_eq!(state.winmm().timer_period_ms(), 2, "the period is recorded");
+
+    // Queue a completion 40 ms out (now = 1_000): the wheel sees it.
+    state.winmm().queue_wave_out_done(0x5500_0101, 40, 1_000);
+    assert_eq!(
+        state.winmm().next_due_in_ms(1_000),
+        Some(40),
+        "the wheel reports the ms delta to the next entry"
+    );
+    assert!(!state.winmm().peek_due(1_010), "not due at +10 ms");
+    assert!(state.winmm().peek_due(1_040), "due at +40 ms");
+
+    // timeEndPeriod / a zero period clears the record.
+    write_regs(&mut engine, 0, 0, 0, 0, 0);
+    assert_eq!(dispatch_winmm(&mut engine, &mut state, "timeEndPeriod"), 0);
+    assert_eq!(state.winmm().timer_period_ms(), 0, "cleared");
+}
