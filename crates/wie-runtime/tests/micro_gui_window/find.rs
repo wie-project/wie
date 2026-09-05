@@ -82,7 +82,7 @@ fn replace_repaints_the_selection_without_a_second_input() {
     for _ in 0..30 {
         let summary = session.run_until_stop(1_000_000).expect("run");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
     assert!(
@@ -119,7 +119,7 @@ fn replace_repaints_the_selection_without_a_second_input() {
             }
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert_ne!(dialog, 0, "replace dialog opens");
@@ -172,7 +172,7 @@ fn replace_repaints_the_selection_without_a_second_input() {
             }
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
     assert!(
@@ -253,7 +253,7 @@ fn cancel_removes_dialog_pixels_from_owner_frame() {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert_ne!(dialog, 0, "find dialog opens");
@@ -286,7 +286,7 @@ fn cancel_removes_dialog_pixels_from_owner_frame() {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert!(closed, "ONE click on Cancel closes the find dialog");
@@ -368,7 +368,7 @@ fn replace_cancel_closes_dialog_in_one_click() {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert_ne!(dialog, 0, "replace dialog opens");
@@ -385,7 +385,7 @@ fn replace_cancel_closes_dialog_in_one_click() {
     for _ in 0..30 {
         let summary = session.run_until_stop(1_000_000).expect("run");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -416,7 +416,7 @@ fn replace_cancel_closes_dialog_in_one_click() {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert!(closed, "ONE click on Cancel closes the replace dialog");
@@ -476,7 +476,7 @@ fn find_next_selects_the_match_under_the_guest_registered_message_id() {
     for _ in 0..30 {
         let summary = session.run_until_stop(1_000_000).expect("run");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
     assert!(
@@ -501,7 +501,7 @@ fn find_next_selects_the_match_under_the_guest_registered_message_id() {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert_ne!(dialog, 0, "find dialog opens");
@@ -540,7 +540,7 @@ fn find_next_selects_the_match_under_the_guest_registered_message_id() {
             }
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
     assert!(
@@ -594,7 +594,7 @@ fn find_dialog_reopens_after_cancel_close() {
                 return hwnd;
             }
             if let EntryTraceTermination::WaitingForMessage = summary.termination {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
         0
@@ -625,7 +625,7 @@ fn find_dialog_reopens_after_cancel_close() {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert!(closed, "Cancel closes the Find dialog");
@@ -707,7 +707,7 @@ fn face_session_new(cy: i32) -> Option<FaceSession> {
     for _ in 0..30 {
         let summary = session.run_until_stop(1_000_000).expect("run");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -758,7 +758,7 @@ fn face_dialog_open(
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert_ne!(dialog, 0, "find dialog opens");
@@ -769,7 +769,7 @@ fn face_dialog_open(
     for _ in 0..10 {
         let summary = session.run_until_stop(1_000_000).expect("run");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
     dialog
@@ -815,7 +815,7 @@ fn click_dialog_button(
     for _ in 0..15 {
         let summary = session.run_until_stop(1_000_000).expect("run");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 }
@@ -857,7 +857,7 @@ fn find_dialog_face_stays_gray_through_find_next_click() {
         for _ in 0..6 {
             let summary = session.run_until_stop(1_000_000).expect("run");
             if let EntryTraceTermination::WaitingForMessage = summary.termination {
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
 
@@ -950,7 +950,7 @@ fn replace_dialog_face_stays_gray_through_replace_click() {
     for _ in 0..10 {
         let summary = session.run_until_stop(1_000_000).expect("run");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -1035,7 +1035,7 @@ fn find_dialog_face_survives_selection_in_its_row_range() {
     for _ in 0..10 {
         let summary = session.run_until_stop(1_000_000).expect("run");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -1115,7 +1115,7 @@ fn whole_word_probe(whole_word: bool) -> Option<u32> {
     for _ in 0..30 {
         let summary = session.run_until_stop(1_000_000).expect("run");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
     assert!(
@@ -1140,7 +1140,7 @@ fn whole_word_probe(whole_word: bool) -> Option<u32> {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert_ne!(dialog, 0, "find dialog opens");
@@ -1219,7 +1219,7 @@ fn whole_word_probe(whole_word: bool) -> Option<u32> {
                 return Some(left);
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     Some(u32::MAX)
 }

@@ -89,7 +89,7 @@ fn goto_dialog_resolves_edit_and_moves_the_caret() {
     for _ in 0..30 {
         let summary = session.run_until_stop(1_000_000).expect("run after typing");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -139,7 +139,7 @@ fn goto_dialog_resolves_edit_and_moves_the_caret() {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert_ne!(
@@ -185,7 +185,7 @@ fn goto_dialog_resolves_edit_and_moves_the_caret() {
         let _ = session
             .run_until_stop(1_000_000)
             .expect("run after typing line");
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     let typed = handle.control_text(edit_hwnd).unwrap_or_default();
     assert_eq!(
@@ -223,7 +223,7 @@ fn goto_dialog_resolves_edit_and_moves_the_caret() {
             caret_on_line_two = true;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         if closed && caret_on_line_two {
             break;
@@ -306,7 +306,7 @@ fn goto_cancel_click_closes_dialog_on_first_click() {
     for _ in 0..10 {
         let summary = session.run_until_stop(1_000_000).expect("run after typing");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -334,7 +334,7 @@ fn goto_cancel_click_closes_dialog_on_first_click() {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert_ne!(dialog_hwnd, 0, "CMD_GOTO must open a Dialog window");
@@ -447,13 +447,13 @@ fn goto_cancel_click_closes_dialog_on_first_click() {
             // region and repaint its controls before the frame is judged.
             for _ in 0..10 {
                 let _ = session.run_until_stop(1_000_000).expect("settle run");
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
             frame_face = frame_face_count(&session);
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert!(
@@ -493,7 +493,7 @@ fn goto_cancel_click_closes_dialog_on_first_click() {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert_ne!(dialog_hwnd, 0, "second CMD_GOTO must open a Dialog window");
@@ -555,7 +555,7 @@ fn goto_cancel_click_closes_dialog_on_first_click() {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert!(
@@ -631,7 +631,7 @@ fn goto_prefill_caret_is_at_end_and_typing_appends() {
     for _ in 0..30 {
         let summary = session.run_until_stop(1_000_000).expect("run after typing");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -662,7 +662,7 @@ fn goto_prefill_caret_is_at_end_and_typing_appends() {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert_ne!(dialog_hwnd, 0, "CMD_GOTO must open a Dialog window");
@@ -690,7 +690,7 @@ fn goto_prefill_caret_is_at_end_and_typing_appends() {
     handle.post_message(edit_hwnd, WM_CHAR, u64::from('5' as u32), 0);
     for _ in 0..20 {
         let _ = session.run_until_stop(1_000_000).expect("run after typing");
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert_eq!(
         handle.control_text(edit_hwnd).unwrap_or_default(),
@@ -760,7 +760,7 @@ fn run_goto_flow(
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     assert_ne!(dialog_hwnd, 0, "CMD_GOTO must open a Dialog window");
@@ -776,7 +776,7 @@ fn run_goto_flow(
         let _ = session
             .run_until_stop(1_000_000)
             .expect("run after typing line");
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     let ok_hwnd = session
         .guest_windows_snapshot()
@@ -789,6 +789,7 @@ fn run_goto_flow(
 
     // Pump until the dialog closes; settle a few cycles so the frame paints.
     let mut frame = None;
+    let mut closed = false;
     for _ in 0..150 {
         let summary = session.run_until_stop(1_000_000).expect("run after OK");
         if matches!(
@@ -797,11 +798,23 @@ fn run_goto_flow(
         ) {
             break;
         }
+        if !session
+            .guest_windows_snapshot()
+            .iter()
+            .any(|(_, cls, ..)| cls == "Dialog")
+        {
+            closed = true;
+        }
         if let Some(f) = session.take_frame(main) {
             frame = Some(f);
         }
+        // Done as soon as the dialog is gone AND the post-close frame landed
+        // (this loop used to run its full 150 sleep quanta unconditionally).
+        if closed && frame.is_some() {
+            break;
+        }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     frame.expect("a frame must be published after the Go To flow")
@@ -869,7 +882,7 @@ fn goto_line_deep_keeps_rows_below_visible() {
     for _ in 0..30 {
         let summary = session.run_until_stop(1_000_000).expect("run after typing");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -902,7 +915,7 @@ fn goto_line_deep_keeps_rows_below_visible() {
     for _ in 0..10 {
         let summary = session.run_until_stop(1_000_000).expect("run after VK_END");
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
     let after = run_goto_flow(&mut session, &handle, main, goto_id, "20");
@@ -969,7 +982,7 @@ fn goto_ignores_unknown_command_id() {
             panic!("notepad exited on an unknown command id");
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 }

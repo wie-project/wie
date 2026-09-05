@@ -87,7 +87,7 @@ pub(crate) fn drive_gui_session(path: &Path, iterations_budget: usize) -> Option
             EntryTraceTermination::ExitProcess { code } => return Some(code),
             EntryTraceTermination::WaitingForMessage => {
                 // Sleep a quantum so timers advance, then re-enter GetMessage.
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
             other => {
                 panic!("GUI session stopped unexpectedly: {other:?}");
@@ -274,7 +274,7 @@ pub(crate) fn pump_until_windows_ready(session: &mut wie_runtime::RuntimeSession
                 panic!("notepad exited (code {code}) before its window was ready");
             }
             EntryTraceTermination::WaitingForMessage => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
             other => panic!("notepad stopped unexpectedly: {other:?}"),
         }
@@ -304,7 +304,7 @@ pub(crate) fn wait_for_window_class(
             return true;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let _ = handle;
     }
