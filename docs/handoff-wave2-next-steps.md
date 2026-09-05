@@ -199,3 +199,39 @@ check removal) and re-run the hash suite; then Step 2.
   `docs/baselines/wave2-acceptance.txt`. The human step that remains:
   run it on an idle machine with a release build and commit the
   baseline.
+
+## Remaining-lane continuation notes (2026-09-05, post slice 4 + Wave 3/4/5 slice 1)
+
+Progress this session: Wave 2 closed (slices 3-4 + capture default-on +
+acceptance harness), Wave 3 slice 1 (tail-call chain hops
+`WIE_JIT_TAILCHAIN`, ADR-0002 feasibility pass), Wave 4 slice 1
+(degrade-not-die fallback + `degraded_insns` metric), Wave 5 slice 1
+(waveOut playback sink + timed `WOM_DONE`).
+
+**Wave 3 slice 2 (next big JIT step)** — the design the feasibility pass
+settled on:
+- Do NOT attempt x19–x28 via Cranelift signatures: 17 results don't fit
+  the aarch64 C-ABI result window and there is no custom call-conv hook.
+- SSA rflags first (independent of the ABI): replace the packed `rflags:
+  Value` plumbing with `FlagState { zf, sf, cf, of, pf: Option<Value> }`
+  threaded through `emit_body_and_term`; `PendingFlags` (insn.rs:48-88)
+  produces i1 booleans; `flag_cond` (lower/mod.rs:1295) consumes them
+  directly; materialize to the packed u64 only at block boundaries
+  (dispatcher exit / non-tail hops) and decompose only when
+  `block_needs_flags` (analysis.rs:185). Gate: `WIE_JIT_SSA_FLAGS=0`
+  opt-out; oracle = the existing B4 dual-path harness pattern
+  (tests/mod.rs:752) extended to GPR/flags programs.
+- Prologue-stub ABI after that: hand-written per-block stub (the
+  trampolines.rs pattern) shuffling x19–x28/x14 against the C-ABI frame;
+  chaining links the post-prologue body label.
+- Measurement: `long_loop` micro-exe is the canonical metric
+  (0.25 s → ≤0.10 s target); `cargo bench -p wie-cpu` +
+  `scripts/capture-baseline.sh micro-exes/out/long_loop.exe`.
+
+**Wave 4 next**: x87 subset (fld/fstp/fadd/fmul/fsub/fdiv/fcom on an
+8-deep f64 stack in RegFile — additive field, JitCtx untouched; JIT bails
+to the interpreter for these, which now degrades instead of stopping) and
+packed integer SSE widening. **Wave 5 next**: CALLBACK_WINDOW/CALLBACK_EVENT
+waveOut kinds (GuestCallbackRequest window-message shape already exists),
+RawInput, multi-queue pump. **Wave 6** stays gated behind the FPS harness
+decision gate.
