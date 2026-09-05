@@ -38,6 +38,23 @@ pub(super) fn handle_draw_up_common(
                     let layout_stride = usize::try_from(layout.stride).unwrap_or(usize::MAX);
                     if stride < layout_stride || (index_count > 0 && index_va == 0) {
                         D3DERR_INVALIDCALL
+                    } else if super::capture::capture_enabled(state) {
+                        // Wave 2: record the op (guest bytes read at record
+                        // time) — the capture render thread rasterizes.
+                        super::capture::record_draw_up(
+                            engine,
+                            state,
+                            layout,
+                            stride,
+                            vertex_count,
+                            primitive_type,
+                            primitive_count,
+                            data_va,
+                            index_va,
+                            index_format,
+                            index_count,
+                        );
+                        D3D_OK
                     } else {
                         draw_vertex_stream(
                             engine,
@@ -152,6 +169,24 @@ pub(super) fn draw_buffer_form_common(
         }
         None => (None, 0, 0, 0),
     };
+
+    if super::capture::capture_enabled(state) {
+        // Wave 2: move the cloned stream/index bytes into the op — the
+        // capture render thread rasterizes into its own targets.
+        super::capture::record_draw_buffer(
+            state,
+            data,
+            layout,
+            stride,
+            primitive_type,
+            primitive_count,
+            index_data,
+            index_size,
+            index_offset,
+            vertex_base,
+        );
+        return Ok(D3D_OK);
+    }
 
     draw_vertex_stream_host(
         state,

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
+use std::sync::Arc;
 
-use super::{D3DFMT_INDEX32, DepthStencilRecord, TextureRecord};
+use super::{D3DFMT_INDEX32, TextureRecord};
 use crate::WinApiState;
 use crate::d3d9_render::{
     ClipVertex, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST, D3DPT_TRIANGLEFAN,
@@ -117,7 +118,7 @@ pub(crate) enum PrimitiveGroups {
 
 impl PrimitiveGroups {
     /// Whether the draw produced no primitives (the caller skips it).
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         match self {
             Self::Points(v) => v.is_empty(),
             Self::Lines(v) => v.is_empty(),
@@ -126,7 +127,10 @@ impl PrimitiveGroups {
     }
 }
 
-fn primitive_groups(primitive_type: u64, primitive_count: u64) -> Result<PrimitiveGroups> {
+pub(crate) fn primitive_groups(
+    primitive_type: u64,
+    primitive_count: u64,
+) -> Result<PrimitiveGroups> {
     let count = usize::try_from(primitive_count & u64::from(u32::MAX))
         .context("primitive count does not fit usize")?;
     match u32::try_from(primitive_type & u64::from(u32::MAX)).unwrap_or(u32::MAX) {
@@ -208,22 +212,14 @@ fn indexed_vertex(
 /// Build the per-draw blend + depth fragment state from the typed device
 /// render state.
 ///
-/// Borrows the depth buffer (when bound) through a field-level mutable borrow
-/// so the caller can hold the backbuffer mutably at the same time. `scissor`
-/// is the `SetScissorRect` rect (a device-level state, not a `D3DRS_*`).
-fn build_fragment_state<'a>(
+/// `depth` is the bound depth buffer's texels (when one is bound and its
+/// record exists — the caller resolves the slice). `scissor` is the
+/// `SetScissorRect` rect (a device-level state, not a `D3DRS_*`).
+pub(crate) fn build_fragment_state<'a>(
     render_state: &RenderState,
-    depth_stencil: u64,
-    depth_surfaces: &'a mut ahash::HashMap<u64, DepthStencilRecord>,
+    depth: Option<&'a mut [f32]>,
     scissor: Option<IRect>,
 ) -> FragmentState<'a> {
-    let depth = if depth_stencil != 0 {
-        depth_surfaces
-            .get_mut(&depth_stencil)
-            .map(|record| record.depth.as_mut_slice())
-    } else {
-        None
-    };
     FragmentState {
         depth,
         z_enable: render_state.z_enable.as_u32(),
@@ -437,7 +433,270 @@ fn clip_to_screen_vertex(cv: &ClipVertex, viewport: &Viewport) -> Option<ScreenV
     screen_from_clip(cv, viewport)
 }
 
-/// Rasterize a batched vertex stream into the backbuffer.
+/// Everything one draw's rasterization needs, fully resolved: the color
+/// output + dims, the transform stack, the fragment/sampler/shader state, and
+/// the vertex stream.
+///
+/// Borrowed end-to-end so both producers can build it without copies: the
+/// emu-thread path borrows field-by-field out of `D3D9State`, the capture
+/// replay path (Wave 2, `d3d9/capture.rs`) borrows out of the captured draw
+/// op it owns. `dirty` is the accumulated dirty region in (carried in, and
+/// the union written back out).
+pub(crate) struct RasterFrame<'a> {
+    /// Color output (0RGB, top-down) — the implicit backbuffer or a bound
+    /// render target's texels.
+    pub output: &'a mut [u32],
+    /// Output dimensions.
+    pub width: u32,
+    pub height: u32,
+    /// Composed world × view × projection matrix (the FFP transform; ignored
+    /// when a vertex shader is bound).
+    pub matrix: Mat4,
+    /// Viewport (`D3DVIEWPORT9` fields).
+    pub viewport: Viewport,
+    /// FVF `XYZRHW` (pre-transformed) flag.
+    pub pre_transformed: bool,
+    /// `D3DRS_POINTSIZE` (a float; default 1.0).
+    pub point_size: f32,
+    /// Stage-0 sampler state for the FFP path (`None` = untextured).
+    pub tex: Option<TextureStage<'a>>,
+    /// Bound pixel-shader program (`None` = the FFP fragment stage runs).
+    pub ps: Option<PsProgram<'a>>,
+    /// Bound vertex-shader program (`None` = the FFP transform runs).
+    pub vs: Option<VsProgram<'a>>,
+    /// Blend + depth + scissor + alpha/fog state.
+    pub frag: FragmentState<'a>,
+    /// Vertex pool bytes.
+    pub data: &'a [u8],
+    /// FVF decode layout.
+    pub layout: &'a FvfLayout,
+    /// Stream stride in bytes.
+    pub stride: usize,
+    /// Per-primitive vertex-index groups.
+    pub groups: &'a PrimitiveGroups,
+    /// Index buffer (`bytes`, index size, `StartIndex` offset).
+    pub indices: Option<(&'a [u8], usize, usize)>,
+    /// `BaseVertexIndex` added to every resolved index.
+    pub vertex_base: i64,
+    /// Accumulated dirty region since the last Present (in = the device's
+    /// current accumulator, out = the union including this draw).
+    pub dirty: Option<IRect>,
+}
+
+/// Rasterize one fully-resolved draw frame into its output buffer.
+///
+/// The shared core of the emu-thread raster path and the Wave 2 capture
+/// replay: [`rasterize_vertex_stream`] resolves `D3D9State` into a
+/// [`RasterFrame`] and calls this; `d3d9/capture.rs` builds the same frame
+/// from a captured draw op. The vertex stage runs the bound VS (or the FFP
+/// matrix transform), triangles/segments straddling the near plane are
+/// clipped (Sutherland–Hodgman), and the fragment stage (texturing / PS /
+/// alpha test / fog / blend / depth) writes `output` while unioning the
+/// covered region into `dirty`.
+pub(crate) fn rasterize_frame(frame: &mut RasterFrame<'_>) {
+    let RasterFrame {
+        output,
+        width,
+        height,
+        matrix,
+        viewport,
+        pre_transformed,
+        point_size,
+        tex,
+        ps,
+        vs,
+        frag,
+        data,
+        layout,
+        stride,
+        groups,
+        indices,
+        vertex_base,
+        dirty,
+    } = frame;
+    let mut dirty_acc = std::mem::take(dirty);
+    let transform = |v: GuestVertex| -> TransformedVertex {
+        transform_vertex(&v, *pre_transformed, matrix, viewport, vs.as_ref(), layout)
+    };
+    match &**groups {
+        PrimitiveGroups::Points(points) => {
+            for &i0 in points {
+                let Some(v0) = indexed_vertex(data, layout, *stride, *indices, *vertex_base, i0)
+                else {
+                    continue;
+                };
+                match transform(v0) {
+                    TransformedVertex::Screen(sv) => rasterize_point(
+                        output,
+                        *width,
+                        *height,
+                        sv,
+                        *point_size,
+                        tex.as_ref(),
+                        ps.as_ref(),
+                        frag,
+                        &mut dirty_acc,
+                    ),
+                    // A point is either fully in front (draw) or behind
+                    // (skip) — clipping a point would only drop it.
+                    TransformedVertex::Clip(cv) => {
+                        if let Some(sv) = clip_to_screen_vertex(&cv, viewport) {
+                            rasterize_point(
+                                output,
+                                *width,
+                                *height,
+                                sv,
+                                *point_size,
+                                tex.as_ref(),
+                                ps.as_ref(),
+                                frag,
+                                &mut dirty_acc,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        PrimitiveGroups::Lines(lines) => {
+            for &(i0, i1) in lines {
+                let (Some(v0), Some(v1)) = (
+                    indexed_vertex(data, layout, *stride, *indices, *vertex_base, i0),
+                    indexed_vertex(data, layout, *stride, *indices, *vertex_base, i1),
+                ) else {
+                    continue;
+                };
+                match (transform(v0), transform(v1)) {
+                    (TransformedVertex::Screen(a), TransformedVertex::Screen(b)) => {
+                        rasterize_line(
+                            output,
+                            *width,
+                            *height,
+                            a,
+                            b,
+                            tex.as_ref(),
+                            ps.as_ref(),
+                            frag,
+                            &mut dirty_acc,
+                        );
+                    }
+                    (TransformedVertex::Clip(a), TransformedVertex::Clip(b)) => {
+                        // Near-clip the segment: 0 (fully behind), 1
+                        // (touches the plane), or 2 (straddles) vertices.
+                        let clipped = clip_polygon_near(&[a, b]);
+                        if clipped.len() == 2 {
+                            let (Some(a), Some(b)) = (
+                                clip_to_screen_vertex(&clipped[0], viewport),
+                                clip_to_screen_vertex(&clipped[1], viewport),
+                            ) else {
+                                continue;
+                            };
+                            rasterize_line(
+                                output,
+                                *width,
+                                *height,
+                                a,
+                                b,
+                                tex.as_ref(),
+                                ps.as_ref(),
+                                frag,
+                                &mut dirty_acc,
+                            );
+                        }
+                    }
+                    // Mixed screen/clip forms are impossible (the transform
+                    // is uniform per draw) — skip defensively.
+                    _ => {}
+                }
+            }
+        }
+        PrimitiveGroups::Triangles(triples) => {
+            for &(i0, i1, i2) in triples {
+                let (Some(v0), Some(v1), Some(v2)) = (
+                    indexed_vertex(data, layout, *stride, *indices, *vertex_base, i0),
+                    indexed_vertex(data, layout, *stride, *indices, *vertex_base, i1),
+                    indexed_vertex(data, layout, *stride, *indices, *vertex_base, i2),
+                ) else {
+                    continue;
+                };
+                match (transform(v0), transform(v1), transform(v2)) {
+                    (
+                        TransformedVertex::Screen(a),
+                        TransformedVertex::Screen(b),
+                        TransformedVertex::Screen(c),
+                    ) => {
+                        rasterize_triangle(
+                            output,
+                            *width,
+                            *height,
+                            a,
+                            b,
+                            c,
+                            tex.as_ref(),
+                            ps.as_ref(),
+                            frag,
+                            &mut dirty_acc,
+                        );
+                    }
+                    (
+                        TransformedVertex::Clip(a),
+                        TransformedVertex::Clip(b),
+                        TransformedVertex::Clip(c),
+                    ) => {
+                        // Near-clip the triangle (Sutherland–Hodgman): a
+                        // straddling triangle fans into 3..4 screen triangles.
+                        let clipped = clip_polygon_near(&[a, b, c]);
+                        if let Some(first) = clipped.first() {
+                            for pair in clipped.get(1..).unwrap_or(&[]).windows(2) {
+                                let (Some(a), Some(b), Some(c)) = (
+                                    clip_to_screen_vertex(first, viewport),
+                                    clip_to_screen_vertex(&pair[0], viewport),
+                                    clip_to_screen_vertex(&pair[1], viewport),
+                                ) else {
+                                    continue;
+                                };
+                                rasterize_triangle(
+                                    output,
+                                    *width,
+                                    *height,
+                                    a,
+                                    b,
+                                    c,
+                                    tex.as_ref(),
+                                    ps.as_ref(),
+                                    frag,
+                                    &mut dirty_acc,
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    *dirty = dirty_acc;
+}
+
+/// Resolve the bound depth buffer slice for a draw (the device's
+/// `d3d9_depth_stencil` binding), making the storage uniquely owned for the
+/// fragment stage's depth writes. `None` when no depth surface is bound or
+/// the binding is stale (the draw runs depth-less — the same skip the legacy
+/// map lookup produced).
+fn resolve_depth_slice(
+    depth_stencil: u64,
+    depth_surfaces: &mut ahash::HashMap<u64, super::DepthStencilRecord>,
+) -> Option<&mut [f32]> {
+    if depth_stencil == 0 {
+        return None;
+    }
+    depth_surfaces
+        .get_mut(&depth_stencil)
+        .map(|record| Arc::make_mut(&mut record.depth).as_mut_slice())
+}
+
+/// Rasterize a batched vertex stream into the backbuffer — the emu-thread
+/// legacy path. Resolves everything the draw needs off `D3D9State` into a
+/// [`RasterFrame`] and runs [`rasterize_frame`].
 ///
 /// `data` is the full vertex pool; `groups` names each primitive; `indices`
 /// (when present) resolves primitive corners through an index buffer (`bytes`,
@@ -449,7 +708,7 @@ fn clip_to_screen_vertex(cv: &ClipVertex, viewport: &Viewport) -> Option<ScreenV
 /// (Sutherland–Hodgman) instead of rejected; points behind it are skipped.
 /// Accumulates the dirty region, and the fragment stage samples a bound
 /// stage-0 texture.
-fn rasterize_vertex_stream(
+pub(crate) fn rasterize_vertex_stream(
     state: &mut WinApiState,
     data: &[u8],
     layout: &FvfLayout,
@@ -497,7 +756,7 @@ fn rasterize_vertex_stream(
     let projection = d3d.d3d9_projection_matrix;
     let (vp_x, vp_y, vp_w, vp_h, vp_min_z, vp_max_z) = d3d.d3d9_viewport;
     let pre_transformed = layout.pre_transformed;
-    let mut dirty = d3d.d3d9_dirty;
+    let dirty_in = d3d.d3d9_dirty;
     let matrix = mat4_mul(&world, &mat4_mul(&view, &projection));
     let viewport = Viewport {
         x: vp_x,
@@ -562,191 +821,50 @@ fn rasterize_vertex_stream(
     );
     // Resolve the blend + depth fragment state (mutably borrows the bound
     // depth buffer — a different field than the backbuffer).
-    let mut frag = build_fragment_state(
+    let frag = build_fragment_state(
         &d3d.d3d9_render_state,
-        d3d.d3d9_depth_stencil,
-        &mut d3d.d3d9_depth_surfaces,
+        resolve_depth_slice(d3d.d3d9_depth_stencil, &mut d3d.d3d9_depth_surfaces),
         d3d.d3d9_scissor_rect,
     );
-    let transform = |v: GuestVertex| -> TransformedVertex {
-        transform_vertex(
-            &v,
-            pre_transformed,
-            &matrix,
-            &viewport,
-            vs_program.as_ref(),
-            layout,
-        )
-    };
     // L6: resolve the color output buffer once — the bound render target's
     // texels when one is set, else the implicit backbuffer. Field-level
     // borrows keep `frag` (depth surfaces) and the output disjoint.
     let output: &mut [u32] = if rt == 0 {
         &mut d3d.d3d9_backbuffer
     } else {
-        &mut d3d
+        match d3d
             .d3d9_render_targets
             .get_mut(&rt)
-            .expect("RT presence checked above")
-            .pixels
+            .map(|record| Arc::make_mut(&mut record.pixels))
+        {
+            Some(pixels) => pixels.as_mut_slice(),
+            // The presence check above passed but the entry vanished — draw
+            // nothing rather than panic (the stale-binding skip).
+            None => return,
+        }
     };
-    match groups {
-        PrimitiveGroups::Points(points) => {
-            for &i0 in points {
-                let Some(v0) = indexed_vertex(data, layout, stride, indices, vertex_base, i0)
-                else {
-                    continue;
-                };
-                match transform(v0) {
-                    TransformedVertex::Screen(sv) => rasterize_point(
-                        output,
-                        width,
-                        height,
-                        sv,
-                        point_size,
-                        tex.as_ref(),
-                        ps.as_ref(),
-                        &mut frag,
-                        &mut dirty,
-                    ),
-                    // A point is either fully in front (draw) or behind
-                    // (skip) — clipping a point would only drop it.
-                    TransformedVertex::Clip(cv) => {
-                        if let Some(sv) = clip_to_screen_vertex(&cv, &viewport) {
-                            rasterize_point(
-                                output,
-                                width,
-                                height,
-                                sv,
-                                point_size,
-                                tex.as_ref(),
-                                ps.as_ref(),
-                                &mut frag,
-                                &mut dirty,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        PrimitiveGroups::Lines(lines) => {
-            for &(i0, i1) in lines {
-                let (Some(v0), Some(v1)) = (
-                    indexed_vertex(data, layout, stride, indices, vertex_base, i0),
-                    indexed_vertex(data, layout, stride, indices, vertex_base, i1),
-                ) else {
-                    continue;
-                };
-                match (transform(v0), transform(v1)) {
-                    (TransformedVertex::Screen(a), TransformedVertex::Screen(b)) => {
-                        rasterize_line(
-                            output,
-                            width,
-                            height,
-                            a,
-                            b,
-                            tex.as_ref(),
-                            ps.as_ref(),
-                            &mut frag,
-                            &mut dirty,
-                        );
-                    }
-                    (TransformedVertex::Clip(a), TransformedVertex::Clip(b)) => {
-                        // Near-clip the segment: 0 (fully behind), 1
-                        // (touches the plane), or 2 (straddles) vertices.
-                        let clipped = clip_polygon_near(&[a, b]);
-                        if clipped.len() == 2 {
-                            let (Some(a), Some(b)) = (
-                                clip_to_screen_vertex(&clipped[0], &viewport),
-                                clip_to_screen_vertex(&clipped[1], &viewport),
-                            ) else {
-                                continue;
-                            };
-                            rasterize_line(
-                                output,
-                                width,
-                                height,
-                                a,
-                                b,
-                                tex.as_ref(),
-                                ps.as_ref(),
-                                &mut frag,
-                                &mut dirty,
-                            );
-                        }
-                    }
-                    // Mixed screen/clip forms are impossible (the transform
-                    // is uniform per draw) — skip defensively.
-                    _ => {}
-                }
-            }
-        }
-        PrimitiveGroups::Triangles(triples) => {
-            for &(i0, i1, i2) in triples {
-                let (Some(v0), Some(v1), Some(v2)) = (
-                    indexed_vertex(data, layout, stride, indices, vertex_base, i0),
-                    indexed_vertex(data, layout, stride, indices, vertex_base, i1),
-                    indexed_vertex(data, layout, stride, indices, vertex_base, i2),
-                ) else {
-                    continue;
-                };
-                match (transform(v0), transform(v1), transform(v2)) {
-                    (
-                        TransformedVertex::Screen(a),
-                        TransformedVertex::Screen(b),
-                        TransformedVertex::Screen(c),
-                    ) => {
-                        rasterize_triangle(
-                            output,
-                            width,
-                            height,
-                            a,
-                            b,
-                            c,
-                            tex.as_ref(),
-                            ps.as_ref(),
-                            &mut frag,
-                            &mut dirty,
-                        );
-                    }
-                    (
-                        TransformedVertex::Clip(a),
-                        TransformedVertex::Clip(b),
-                        TransformedVertex::Clip(c),
-                    ) => {
-                        // Near-clip the triangle (Sutherland–Hodgman): a
-                        // straddling triangle fans into 3..4 screen triangles.
-                        let clipped = clip_polygon_near(&[a, b, c]);
-                        if let Some(first) = clipped.first() {
-                            for pair in clipped.get(1..).unwrap_or(&[]).windows(2) {
-                                let (Some(a), Some(b), Some(c)) = (
-                                    clip_to_screen_vertex(first, &viewport),
-                                    clip_to_screen_vertex(&pair[0], &viewport),
-                                    clip_to_screen_vertex(&pair[1], &viewport),
-                                ) else {
-                                    continue;
-                                };
-                                rasterize_triangle(
-                                    output,
-                                    width,
-                                    height,
-                                    a,
-                                    b,
-                                    c,
-                                    tex.as_ref(),
-                                    ps.as_ref(),
-                                    &mut frag,
-                                    &mut dirty,
-                                );
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    d3d.d3d9_dirty = dirty;
+    let mut frame = RasterFrame {
+        output,
+        width,
+        height,
+        matrix,
+        viewport,
+        pre_transformed,
+        point_size,
+        tex,
+        ps,
+        vs: vs_program,
+        frag,
+        data,
+        layout,
+        stride,
+        groups,
+        indices,
+        vertex_base,
+        dirty: dirty_in,
+    };
+    rasterize_frame(&mut frame);
+    d3d.d3d9_dirty = frame.dirty;
 }
 
 /// Batched-memory-read a guest vertex pool (+ optional guest index buffer)

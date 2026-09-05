@@ -260,6 +260,13 @@ pub fn handle_device_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             state.d3d9().d3d9_stream_stride = 0;
             state.d3d9().d3d9_stream_offset = 0;
             state.d3d9().d3d9_index_buffer_va = 0;
+            // Wave 2: drop the capture bookkeeping with the device — an
+            // unflushed stream and the seen/dirty sets reference VAs that
+            // teardown just invalidated.
+            state.d3d9().d3d9_capture_stream.clear();
+            state.d3d9().d3d9_capture_emu_dirty_rt.clear();
+            state.d3d9().d3d9_capture_rt_seen.clear();
+            state.d3d9().d3d9_capture_depth_seen.clear();
         }
 
         u64::from(remaining_references)
@@ -337,7 +344,18 @@ pub fn handle_present(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
             d.d3d9_present_hwnd,
         )
     };
-    if bb_w > 0
+    if state.present().channel.capture_enabled() {
+        // Wave 2 slice 2: the capture path — flush the recorded op stream to
+        // the capture render thread (which replays it into its own backbuffer
+        // and publishes). The emu thread's backbuffer is not involved: the
+        // render thread owns the implicit backbuffer outright.
+        if bb_w > 0 && bb_h > 0 && hwnd != crate::handles::Hwnd::NULL {
+            let (win_w, win_h) = crate::user32::window_client_size(state, hwnd.as_u64());
+            let win_w = u32::try_from(win_w).unwrap_or(1).max(1);
+            let win_h = u32::try_from(win_h).unwrap_or(1).max(1);
+            super::capture::flush_present(state, win_w, win_h);
+        }
+    } else if bb_w > 0
         && bb_h > 0
         && hwnd != crate::handles::Hwnd::NULL
         && !state.d3d9().d3d9_backbuffer.is_empty()
@@ -444,7 +462,7 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
         // bound → a no-op (documented), matching D3D9's behavior.
         let depth_stencil = state.d3d9().d3d9_depth_stencil;
         if let Some(record) = state.d3d9().d3d9_depth_surfaces.get_mut(&depth_stencil) {
-            for slot in &mut record.depth {
+            for slot in std::sync::Arc::make_mut(&mut record.depth) {
                 *slot = z_value;
             }
         } else {
@@ -455,6 +473,48 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
         .context("Clear rect count does not fit usize")?;
     let color = low_u32(color_raw, "Clear color")?;
     let color_0rgb = color & D3DCOLOR_RGB_MASK;
+
+    if super::capture::capture_enabled(state) {
+        // Wave 2: record the clear as a self-contained op — the capture
+        // render thread performs the fills into its own target copies.
+        let mut rects: Vec<crate::gdi32::IRect> = Vec::new();
+        if clear_target && rects_va != 0 && rect_count > 0 {
+            let mut rect_bytes = vec![0_u8; rect_count.saturating_mul(16)];
+            if engine.mem_read(rects_va, &mut rect_bytes).is_ok() {
+                for chunk in rect_bytes.chunks(16).take(rect_count) {
+                    let i32_at = |offset: usize| {
+                        i32::from_le_bytes(
+                            chunk
+                                .get(offset..offset.saturating_add(4))
+                                .and_then(|s| s.try_into().ok())
+                                .unwrap_or([0; 4]),
+                        )
+                    };
+                    rects.push(crate::gdi32::IRect {
+                        left: i32_at(0),
+                        top: i32_at(4),
+                        right: i32_at(8),
+                        bottom: i32_at(12),
+                    });
+                }
+            }
+        }
+        let (rt, depth_stencil) = {
+            let d3d = state.d3d9();
+            (d3d.d3d9_render_target, d3d.d3d9_depth_stencil)
+        };
+        super::capture::record_clear(
+            state,
+            rt,
+            depth_stencil,
+            clear_target,
+            clear_depth,
+            color_0rgb,
+            z_value,
+            rects,
+        );
+        return ctx.finish(D3D_OK);
+    }
 
     if clear_target {
         // L6: Clear targets the bound render target when one is set, else
@@ -481,7 +541,7 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
             } else if let Some(record) = state.d3d9().d3d9_render_targets.get_mut(&rt)
                 && record.pixels.len() != needed
             {
-                record.pixels = vec![color_0rgb; needed];
+                record.pixels = std::sync::Arc::new(vec![color_0rgb; needed]);
             }
             if rects_va != 0 && rect_count > 0 {
                 let mut rect_bytes = vec![0_u8; rect_count.saturating_mul(16)];
@@ -514,11 +574,12 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
                         let output: &mut [u32] = if rt == 0 {
                             &mut state.d3d9().d3d9_backbuffer
                         } else {
-                            state
-                                .d3d9()
-                                .d3d9_render_targets
-                                .get_mut(&rt)
-                                .map_or(&mut [], |record| record.pixels.as_mut_slice())
+                            state.d3d9().d3d9_render_targets.get_mut(&rt).map_or(
+                                &mut [][..],
+                                |record| {
+                                    std::sync::Arc::make_mut(&mut record.pixels).as_mut_slice()
+                                },
+                            )
                         };
                         fill_backbuffer_rect(
                             output, width, height, left, top, right, bottom, color_0rgb,
@@ -530,7 +591,7 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
                     *pixel = color_0rgb;
                 }
             } else if let Some(record) = state.d3d9().d3d9_render_targets.get_mut(&rt) {
-                for pixel in &mut record.pixels {
+                for pixel in std::sync::Arc::make_mut(&mut record.pixels) {
                     *pixel = color_0rgb;
                 }
             }
@@ -1195,7 +1256,7 @@ pub fn handle_create_render_target(ctx: &mut HandlerContext<'_>) -> Result<WinAp
                     width,
                     height,
                     format,
-                    pixels: vec![0; texel_count],
+                    pixels: std::sync::Arc::new(vec![0; texel_count]),
                     locked_va: 0,
                     locked_rect: None,
                 },

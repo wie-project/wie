@@ -141,6 +141,21 @@ pub struct D3D9State {
     /// target frame interval. Diagnostic only — the sleep runs under the
     /// WinAPI lock.
     pub(crate) d3d9_last_present: Option<std::time::Instant>,
+    // ── Wave 2 capture stream (d3d9/capture.rs; only filled when the capture
+    //    pipeline is enabled — `PresentChannel::capture_enabled`) ──────────
+    /// The ordered op stream drained at each `Present` flush. Ops are
+    /// self-contained (`CaptureOp`) — the emu thread never rasterizes on the
+    /// capture path.
+    pub(crate) d3d9_capture_stream: Vec<crate::d3d9::capture::CaptureOp>,
+    /// Render targets the emu thread mutated since the last flush (the
+    /// `UnlockRect` copy-back) — their current texels must be sent to the
+    /// render thread as authoritative inputs at the next flush.
+    pub(crate) d3d9_capture_emu_dirty_rt: ahash::HashSet<u64>,
+    /// Render targets the render thread holds a copy of (its input protocol:
+    /// send a target's texels when never-sent or emu-dirty).
+    pub(crate) d3d9_capture_rt_seen: ahash::HashSet<u64>,
+    /// Depth-stencil surfaces the render thread holds a copy of.
+    pub(crate) d3d9_capture_depth_seen: ahash::HashSet<u64>,
 }
 
 impl Default for D3D9State {
@@ -194,6 +209,10 @@ impl Default for D3D9State {
             d3d9_tile_scratch: Vec::new(),
             d3d9_vertex_scratch: Vec::new(),
             d3d9_last_present: None,
+            d3d9_capture_stream: Vec::new(),
+            d3d9_capture_emu_dirty_rt: ahash::HashSet::default(),
+            d3d9_capture_rt_seen: ahash::HashSet::default(),
+            d3d9_capture_depth_seen: ahash::HashSet::default(),
         }
     }
 }

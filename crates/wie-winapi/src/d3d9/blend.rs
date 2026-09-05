@@ -87,7 +87,7 @@ pub fn handle_create_depth_stencil_surface(
                     width,
                     height,
                     format,
-                    depth: vec![1.0; depth_count],
+                    depth: std::sync::Arc::new(vec![1.0; depth_count]),
                 },
             );
             write_guest_u64(engine, pp_surface, object)

@@ -556,6 +556,38 @@ impl GuestHandle {
         Some(committer)
     }
 
+    /// Enable the D3D9 command-capture pipeline (implementation-plan Wave 2
+    /// slice 2): spawns the capture render thread on this session's channel
+    /// and flips the capture gate, so `Draw*`/`Clear` handlers record ops
+    /// instead of rasterizing inline and `Present` flushes the stream to the
+    /// render thread (see `wie_winapi::d3d9::capture` for the op model and
+    /// the render-target/depth round-trip protocol).
+    ///
+    /// The caller decides the opt-in policy: the GUI host only calls this
+    /// when `WIE_CAPTURE_STREAM=1` (default off during bring-up — flip to
+    /// default-on after the hash-equivalence gate passes). Headless runs and
+    /// the other micro-suite tests never call it, so the CI hashes exercise
+    /// the legacy in-handler raster path unchanged (the dedicated capture
+    /// test spawns it explicitly).
+    ///
+    /// `wake` is the frame-arrival callback the render thread fires after a
+    /// publish that passes the channel wake gate — the same closure shape
+    /// [`Self::set_wake`] and [`Self::enable_present_commit`] register.
+    ///
+    /// Keep the returned handle alive for the session's lifetime: dropping
+    /// it stops and joins the render thread (its `Drop`). `None` = the
+    /// thread could not spawn — the legacy path stays active.
+    pub fn enable_capture_stream(
+        &self,
+        wake: Box<dyn Fn() + Send + 'static>,
+    ) -> Option<wie_winapi::present::CaptureStreamerHandle> {
+        let streamer =
+            wie_winapi::present::spawn_capture_streamer(Arc::clone(&self.present_channel), wake)?;
+        // Flip the gate only after the consumer exists.
+        self.present_channel.set_capture_enabled(true);
+        Some(streamer)
+    }
+
     /// Set the host MessageBox bridge — called by the `MessageBoxA/W`
     /// handlers with `(caption, text, mb_type)`; the returned Win32 id
     /// (IDOK/IDCANCEL/IDYES/IDNO) is returned to the guest.

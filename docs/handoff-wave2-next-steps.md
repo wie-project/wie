@@ -4,6 +4,10 @@ Context: `docs/implementation-plan.md` is the live plan. Wave 1 done, Wave 2
 slice 1 (D3D9 Present-commit render thread, `present/commit.rs`) landed in
 `3cb2370`. Branch: `feat/dll-coverage`.
 
+**Status update (2026-09-05, after slice 1):** Step 1 (D3D9 draw-command
+capture) is implemented, awaiting the user's gates — see the checklist at
+the bottom. Steps 2/3 unchanged.
+
 **Rule: do NOT run tests yourself.** Implement, then tell the user which
 commands to run and stop. The user runs the gates and reports results.
 
@@ -86,3 +90,44 @@ cargo nextest run -p wie-runtime -E 'test(gui_d3d9) or test(commit_thread)'
 ```
 
 Report all failures verbatim to the agent; do not fix or rerun silently.
+
+## Step 1 implementation notes (2026-09-05)
+
+Landed, unresolved design decisions resolved as follows:
+
+- **Op model**: only two op kinds — `Clear` (self-contained) and `Draw`
+  (full device-state snapshot: matrices, viewport, typed render state +
+  POINTSIZE + scissor, 8 stage states, texture-texel clones, parsed
+  shader programs + constant files, target bindings, stream bytes). The
+  `Set*` handlers record NOTHING: each draw's snapshot is exactly the
+  state its stream prefix produced, so the single ordered `Vec`
+  (clear-then-draws) preserves order semantics by construction — the
+  handoff's "record SetState ops" requirement is met by folding.
+- **Textures/shaders**: v1 record-time copies (as the doc allows); the
+  follow-up is `Arc`-wrapping `TextureRecord`/`ShaderRecord` storage.
+- **RT/depth round-trip**: RT/depth texel storage migrated to `Arc`
+  (`RenderTargetRecord.pixels`, `DepthStencilRecord.depth` — legacy
+  mutators use `Arc::make_mut`, free while unshared). The render thread
+  keeps its own copies; the emu thread sends a target's `Arc` at flush
+  when never-sent (`d3d9_capture_rt_seen`/`_depth_seen`) or emu-mutated
+  (`d3d9_capture_emu_dirty_rt`, set by the RT `UnlockRect` copy-back).
+  The render thread hands its post-frame RT buffers back; the emu thread
+  installs the handback at each flush AND at RT lock/unlock (sync point
+  — guest writes always layer on the render thread's latest state; reads
+  at most one frame stale while a replay is in flight). Backbuffer and
+  depth never hand back (no guest read path). VA-reuse handled by
+  clearing the seen/dirty sets on surface release + device release.
+- **Rasterizer**: `raster.rs` split into `RasterFrame` + `rasterize_frame`
+  (shared core) and `rasterize_vertex_stream` (emu-side resolver) — the
+  replay builds the same frame from the captured op, so both paths are
+  identical by construction.
+- **Gate**: `WIE_CAPTURE_STREAM=1` — the GUI host (app.rs) spawns
+  `spawn_capture_streamer` via `GuestHandle::enable_capture_stream` only
+  under that env; headless/CI never spawn, so zero behavior change when
+  off. Test: `micro_gui_window::capture` (spawns explicitly).
+- **Known v1 limitation** (documented in `d3d9/capture.rs`): per-draw
+  texture/program clones and one RT texel copy per frame on the render
+  thread's handback — bring-up correctness first, optimization next.
+
+Remaining after the gates pass: flip capture to default-on (app.rs env
+check removal) and re-run the hash suite; then Step 2.

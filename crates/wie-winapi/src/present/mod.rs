@@ -11,8 +11,10 @@ use std::time::Instant;
 
 mod commit;
 mod queue;
+mod stream;
 pub use commit::{CommitterHandle, spawn_present_committer};
 pub use queue::{MessageQueue, MessageSignal};
+pub use stream::{CaptureStreamerHandle, spawn_capture_streamer};
 
 use crate::WinApiState;
 use crate::gdi32::{IRect, union_rect};
@@ -37,7 +39,7 @@ pub fn frame_timing_enabled() -> bool {
 /// The default frame background: `COLOR_WINDOW`-white (0RGB). Used when the
 /// erase machinery has not yet recorded the owning window's class-brush
 /// color — notepad's client and the common case.
-const DEFAULT_BACKGROUND_COLOR: u32 = 0x00FF_FFFF;
+pub(crate) const DEFAULT_BACKGROUND_COLOR: u32 = 0x00FF_FFFF;
 
 /// Surface pitch padding gate (ADR-0001 reversibility): `WIE_SURFACE_PAD=0`
 /// allocates surfaces at the logical width (stride == width); any other
@@ -213,6 +215,10 @@ pub struct PresentChannel {
     /// commit slot, backbuffer spare pool, committer counters. Own mutex
     /// inside, so an enqueue never contends the frame-slot lock.
     pub(crate) commit: commit::PresentCommit,
+    /// Wave 2 slice 2: the D3D9 command-capture pipeline — latest-wins flush
+    /// slot, handback slot, replay counters. Own mutex inside (the same
+    /// isolation argument as `commit`).
+    pub(crate) capture: stream::CapturePipeline,
 }
 
 struct ChannelInner {
@@ -251,6 +257,7 @@ impl PresentChannel {
             published_seq: AtomicU64::new(0),
             taken_seq: AtomicU64::new(0),
             commit: commit::PresentCommit::new(),
+            capture: stream::CapturePipeline::new(),
         }
     }
 
@@ -285,6 +292,51 @@ impl PresentChannel {
     #[must_use]
     pub fn commit_frames(&self) -> u64 {
         self.commit.commit_frames()
+    }
+
+    /// Enable/disable the D3D9 command-capture pipeline (Wave 2 slice 2).
+    /// Only call after the capture render thread spawned
+    /// (`spawn_capture_streamer`), so every enqueued flush has a live
+    /// consumer.
+    pub fn set_capture_enabled(&self, enabled: bool) {
+        self.capture.set_enabled(enabled);
+    }
+
+    /// Whether the D3D9 handlers record draw/clear ops and flush at `Present`
+    /// (the capture render thread replays + publishes) instead of
+    /// rasterizing inline under the big lock.
+    #[must_use]
+    pub fn capture_enabled(&self) -> bool {
+        self.capture.enabled()
+    }
+
+    /// Enqueue a capture flush (the Present handler's stream hand-off).
+    pub(crate) fn enqueue_capture_flush(&self, flush: crate::d3d9::capture::CaptureFlush) {
+        self.capture.enqueue(flush);
+    }
+
+    /// Take the capture render thread's latest handback (post-frame target
+    /// buffers), if any.
+    pub(crate) fn take_capture_handback(&self) -> Option<crate::d3d9::capture::CaptureHandback> {
+        self.capture.take_handback()
+    }
+
+    /// Replayed (capture-thread published) frame count.
+    #[must_use]
+    pub fn capture_frames(&self) -> u64 {
+        self.capture.frames()
+    }
+
+    /// Accumulated capture replay+publish wall time (ns).
+    #[must_use]
+    pub fn capture_ns(&self) -> u64 {
+        self.capture.ns()
+    }
+
+    /// Most recent capture replay+publish wall time (ns).
+    #[must_use]
+    pub fn capture_ns_last(&self) -> u64 {
+        self.capture.ns_last()
     }
 
     /// Publish `frame` into the latest-wins slot. Returns the displaced
@@ -719,38 +771,6 @@ impl PresentState {
             entry.pixels.resize(needed, 0);
             entry.dirty = None;
         }
-    }
-
-    /// Q9/C: hand the next pooled `WindowSurface` slice to the D3D9/wGL present
-    /// path as its render target. Ensures the surface and returns `&mut [u32]`
-    /// to the pooled `Vec<u32>` (the one `ensure_surface` will hand back via
-    /// Q2/D) so the caller can raster directly into it without an intermediate
-    /// `Vec<u32>` copy. If the frame size differs from the surface, the caller
-    /// must `stretch_nearest` directly into this slice (no temp alloc).
-    #[allow(dead_code)]
-    pub(crate) fn pooled_surface_mut(
-        &mut self,
-        hwnd: crate::handles::Hwnd,
-        width: u32,
-        height: u32,
-    ) -> Option<(&mut [u32], u32)> {
-        self.ensure_surface(hwnd, width, height);
-        self.surfaces
-            .get_mut(&hwnd)
-            .map(|s| (s.pixels.as_mut_slice(), s.stride))
-    }
-
-    /// Q9/C: pooled target with dimensions — returns `(pixels, width, height, stride)`.
-    #[allow(dead_code)]
-    pub(crate) fn pooled_target_with_dims(
-        &mut self,
-        hwnd: crate::handles::Hwnd,
-        width: u32,
-        height: u32,
-    ) -> Option<(&mut [u32], u32, u32, u32)> {
-        self.ensure_surface(hwnd, width, height);
-        let s = self.surfaces.get_mut(&hwnd)?;
-        Some((s.pixels.as_mut_slice(), s.width, s.height, s.stride))
     }
 
     /// Record the 0RGB background color of `hwnd`'s surface — the owning

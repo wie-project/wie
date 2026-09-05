@@ -987,6 +987,29 @@ pub fn run_gui_windowed(
                             }))
                         };
 
+                        // Wave 2 slice 2: with `WIE_CAPTURE_STREAM=1` the
+                        // D3D9 Draw*/Clear handlers record ops and Present
+                        // flushes the stream to the capture render thread
+                        // (which replays + publishes off the big lock).
+                        // Opt-in during bring-up; the handle's Drop stops +
+                        // joins the thread at teardown. When capture is on
+                        // it supersedes the commit path (the Present handler
+                        // checks the capture gate first).
+                        let _capture_streamer = if std::env::var("WIE_CAPTURE_STREAM")
+                            .is_ok_and(|v| v == "1")
+                        {
+                            let capture_proxy = proxy.clone();
+                            let capture_pending = pending_frame_guest.clone();
+                            handle.enable_capture_stream(Box::new(move || {
+                                capture_pending.store(true, std::sync::atomic::Ordering::SeqCst);
+                                let _ = capture_proxy.send_event(WieEvent::Frame {
+                                    published_at: Instant::now(),
+                                });
+                            }))
+                        } else {
+                            None
+                        };
+
                         // Register wake callback.
                         {
                             let proxy = proxy.clone();

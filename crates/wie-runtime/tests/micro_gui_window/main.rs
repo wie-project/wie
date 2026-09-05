@@ -8,6 +8,7 @@
 //! font/confirm/save dialog flows (`dialogs`), and the Edit → Go To
 //! line-jump flow (`goto`).
 
+mod capture;
 mod commit;
 mod controls;
 mod demo;

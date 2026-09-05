@@ -963,7 +963,7 @@ fn test_d3d9_depth_surface_create_bind_and_clear() {
     assert_eq!(record.height, 2);
     assert_eq!(record.format, 80);
     assert_eq!(
-        record.depth,
+        *record.depth,
         vec![0.25; 4],
         "Clear(ZBUFFER) must fill the depth"
     );

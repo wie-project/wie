@@ -6,7 +6,9 @@
 //! draws, streams, index/vertex buffers) live in [`device`]; shader objects
 //! live in [`shader`], software rasterization in [`raster`], texture/surface
 //! lifecycle in [`texture`], vertex/index-buffer COM objects in [`buffer`],
-//! and blend/depth state in [`blend`].
+//! blend/depth state in [`blend`], and the Wave 2 command-capture stream
+//! (ops recorded instead of inline rasterization, replayed by the capture
+//! render thread in `present/stream.rs`) in [`capture`].
 
 use crate::gdi32::{ArgReg, read_arg};
 use anyhow::{Context, Result};
@@ -22,6 +24,7 @@ use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
 mod blend;
 mod buffer;
+pub(crate) mod capture;
 mod device;
 mod draw;
 mod raster;

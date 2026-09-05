@@ -40,6 +40,13 @@ pub struct MipLevel {
 /// Owns its own host texel buffer, so `SetRenderTarget` redirects Clear and
 /// draw output here instead of the implicit backbuffer. Texels are stored in
 /// `0xAARRGGBB` order (the same convention as [`TextureRecord`]).
+///
+/// The texel storage is an `Arc` (Wave 2 capture): the capture stream hands
+/// the render thread `Arc` clones of the current texels at each flush and
+/// installs the render thread's post-frame copy back through the handback
+/// slot, so every cross-thread transfer is a refcount bump. Mutators take the
+/// buffer exclusively with `Arc::make_mut` (a free clone when the refcount is
+/// 1 — the legacy in-handler path).
 #[derive(Debug, Clone)]
 pub struct RenderTargetRecord {
     /// The surface object's guest VA (also the `IDirect3DSurface9` pointer).
@@ -51,7 +58,7 @@ pub struct RenderTargetRecord {
     /// `D3DFMT_*` format (only A8R8G8B8 / X8R8G8B8 are accepted).
     pub format: u32,
     /// Texels in `0xAARRGGBB` order, row-major, top row first.
-    pub pixels: Vec<u32>,
+    pub pixels: std::sync::Arc<Vec<u32>>,
     /// Guest block VA handed out by the active `LockRect` (0 = not locked).
     pub locked_va: u64,
     /// Locked region (None = whole surface) in surface coordinates.
@@ -97,6 +104,9 @@ pub struct TextureRecord {
 /// Depth values are `f32` in `0.0 = near` .. `1.0 = far` (D3D9's cleared
 /// default). `D3DFMT_D24S8` stores depth only — the stencil bits are unused
 /// (documented; stencil operations are not modeled).
+///
+/// The storage is an `Arc` for the same Wave 2 capture round-trip as
+/// [`RenderTargetRecord::pixels`] (see that doc).
 #[derive(Debug, Clone)]
 pub struct DepthStencilRecord {
     /// The surface object's guest VA (also the `IDirect3DSurface9` pointer).
@@ -108,7 +118,7 @@ pub struct DepthStencilRecord {
     /// `D3DFMT_*` format (only D16 / D24S8 are accepted).
     pub format: u32,
     /// Depth texels, row-major (0.0 = near, 1.0 = far initial value).
-    pub depth: Vec<f32>,
+    pub depth: std::sync::Arc<Vec<f32>>,
 }
 
 // ── P4b texture handlers ────────────────────────────────────────────────
@@ -533,6 +543,11 @@ fn lock_rect_render_target(
     p_locked_rect: u64,
     p_rect: u64,
 ) -> Result<u64> {
+    // Wave 2 capture sync point: install a pending render-thread handback
+    // FIRST so the exposed current texels include the latest replay output.
+    if super::capture::capture_enabled(state) {
+        super::capture::drain_handback(state);
+    }
     let Some(record) = state.d3d9().d3d9_render_targets.get(&rt_va) else {
         return Ok(D3DERR_INVALIDCALL);
     };
@@ -634,6 +649,11 @@ fn unlock_rect_render_target(
     state: &mut WinApiState,
     rt_va: u64,
 ) -> u64 {
+    // Wave 2 capture sync point: install a pending handback before the guest
+    // writes land, so they layer on top of the render thread's latest state.
+    if super::capture::capture_enabled(state) {
+        super::capture::drain_handback(state);
+    }
     let Some(record) = state.d3d9().d3d9_render_targets.get(&rt_va) else {
         return D3DERR_INVALIDCALL;
     };
@@ -677,11 +697,12 @@ fn unlock_rect_render_target(
                 .unwrap_or(0)
                 .saturating_mul(usize::try_from(width).unwrap_or(0));
             if let Some(record) = state.d3d9().d3d9_render_targets.get_mut(&rt_va) {
+                let pixels = std::sync::Arc::make_mut(&mut record.pixels);
                 for (col, texel) in texels.into_iter().enumerate() {
                     let index = row_start
                         .saturating_add(usize::try_from(left).unwrap_or(0))
                         .saturating_add(col);
-                    if let Some(slot) = record.pixels.get_mut(index) {
+                    if let Some(slot) = pixels.get_mut(index) {
                         *slot = texel;
                     }
                 }
@@ -697,6 +718,12 @@ fn unlock_rect_render_target(
     if let Some(record) = state.d3d9().d3d9_render_targets.get_mut(&rt_va) {
         record.locked_va = 0;
         record.locked_rect = None;
+    }
+    // Wave 2 capture: the copy-back made the emu thread's texels the
+    // authority for this target — mark it so the next flush sends them to
+    // the render thread as an input.
+    if super::capture::capture_enabled(state) {
+        state.d3d9().d3d9_capture_emu_dirty_rt.insert(rt_va);
     }
     D3D_OK
 }
@@ -1155,6 +1182,9 @@ pub fn handle_surface_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
             if state.d3d9().d3d9_depth_stencil == this_pointer {
                 state.d3d9().d3d9_depth_stencil = 0;
             }
+            // Wave 2 capture: the render thread's copy of this VA must be
+            // invalidated (a future surface can reuse the VA with new dims).
+            state.d3d9().d3d9_capture_depth_seen.remove(&this_pointer);
             let vtable = this_pointer.saturating_sub(IDIRECT3DSURFACE9_OBJECT_OFFSET);
             let _ = state
                 .heap_state
@@ -1174,6 +1204,10 @@ pub fn handle_surface_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
             if state.d3d9().d3d9_render_target == this_pointer {
                 state.d3d9().d3d9_render_target = 0;
             }
+            // Wave 2 capture: invalidate the render thread's copy bookkeeping
+            // for this VA (a future surface can reuse the VA with new dims).
+            state.d3d9().d3d9_capture_rt_seen.remove(&this_pointer);
+            state.d3d9().d3d9_capture_emu_dirty_rt.remove(&this_pointer);
             let vtable = this_pointer.saturating_sub(IDIRECT3DSURFACE9_OBJECT_OFFSET);
             let _ = state
                 .heap_state
