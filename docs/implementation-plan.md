@@ -62,7 +62,7 @@ Conventions that apply to every wave: workspace lints deny
 
 | Item | Status |
 | --- | --- |
-| winmm/waveOut ring buffer with a real audio callback thread | ⬜ |
+| winmm/waveOut ring buffer with a real audio callback thread | 🟡 **slice 1 landed 2026-09-05** — `waveOutOpen` parses the guest `WAVEFORMATEX` + fdwOpen/dwInstance; `waveOutWrite` sinks the PCM (bounded 8 MiB `playback_sink`, the seam a future host audio backend consumes), marks `WHDR_DONE` (polling-guest contract) and queues a timed `WOM_DONE` at `now + buffer_ms` through the shared timer table — `DueTimerKind::WaveOutDone` dispatches with the `waveOutProc` ABI (`rcx=hwo, rdx=WOM_DONE, r8=dwInstance`) via the existing pump boundary. `waveOutReset`/`Close` drop pending completions. Callback guests get real-time playback cadence; window/event callback kinds still degrade to NULL (next slice) |
 | DirectInput/RawInput pass-through; winit event → guest queue without big lock | ⬜ |
 | Multi-queue message pump per thread (`user32/message` today is single-queue) | ⬜ |
 | Timer resolution independent of the message pump | ⬜ |

@@ -27,14 +27,37 @@ const TIME_PERIODIC: u32 = 0x0001;
 ///
 /// Returned by [`WinmmState::pop_due_timers`]; the pump turns each into a
 /// [`crate::GuestCallbackRequest`] for the guest `LPTIMECALLBACK`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DueTimerKind {
+    /// A `timeSetEvent` timer (`LPTIMECALLBACK`, uMsg = 0).
+    TimeEvent,
+    /// A completed `waveOutWrite` buffer (`waveOutProc`, uMsg = `WOM_DONE`).
+    WaveOutDone,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueTimer {
-    /// Timer handle (`uTimerID`).
+    /// Timer handle (`uTimerID`) or the wave-out handle for [`DueTimerKind::WaveOutDone`].
     pub handle: u64,
-    /// Guest callback VA (`fptc`).
+    /// Guest callback VA (`fptc` / `dwCallback`).
     pub callback_va: u64,
-    /// User data (`dwUser`).
+    /// User data (`dwUser` / `dwInstance`).
     pub user_data: u64,
+    /// Which guest-callback ABI to dispatch with.
+    pub kind: DueTimerKind,
+}
+
+impl DueTimer {
+    /// A plain `timeSetEvent` due timer.
+    #[must_use]
+    pub fn time_event(handle: u64, callback_va: u64, user_data: u64) -> Self {
+        Self {
+            handle,
+            callback_va,
+            user_data,
+            kind: DueTimerKind::TimeEvent,
+        }
+    }
 }
 
 /// WINMM timer/audio handle tables (`timeSetEvent`, `waveOut*`), owned by
@@ -46,6 +69,12 @@ pub struct WinmmState {
     next_timer_handle: u64,
     /// Live multimedia timers, keyed by their handle.
     timers: Vec<WinmmTimerRecord>,
+    /// Open wave-out devices, keyed by handle.
+    wave_outs: Vec<WaveOutRecord>,
+    /// PCM bytes submitted through `waveOutWrite` (the playback sink). Bounded:
+    /// past [`PLAYBACK_SINK_CAP`] new bytes are dropped (the cadence, not the
+    /// content, drives the guest).
+    playback_sink: Vec<u8>,
 }
 
 /// One live `timeSetEvent` registration.
@@ -70,6 +99,7 @@ struct WinmmTimerRecord {
     user_data: u64,
     due_tick_ms: u32,
     periodic: bool,
+    kind: DueTimerKind,
 }
 
 impl WinmmState {
@@ -97,10 +127,15 @@ impl WinmmState {
                 let handle = self.timers.get(index).map_or(0, |r| r.handle);
                 let callback_va = self.timers.get(index).map_or(0, |r| r.callback_va);
                 let user_data = self.timers.get(index).map_or(0, |r| r.user_data);
+                let kind = self
+                    .timers
+                    .get(index)
+                    .map_or(DueTimerKind::TimeEvent, |r| r.kind);
                 due.push(DueTimer {
                     handle,
                     callback_va,
                     user_data,
+                    kind,
                 });
                 if periodic {
                     if let Some(rec) = self.timers.get_mut(index) {
@@ -139,6 +174,7 @@ impl WinmmState {
             handle: rec.handle,
             callback_va: rec.callback_va,
             user_data: rec.user_data,
+            kind: rec.kind,
         };
         if rec.periodic {
             if let Some(slot) = self.timers.get_mut(idx) {
@@ -160,6 +196,7 @@ impl Clone for WinmmTimerRecord {
             user_data: self.user_data,
             due_tick_ms: self.due_tick_ms,
             periodic: self.periodic,
+            kind: self.kind,
         }
     }
 }
@@ -170,6 +207,128 @@ impl Clone for WinmmTimerRecord {
 /// time is considered reached when `now - due < 0x8000_0000`.
 fn is_due_tick(now: u32, due: u32) -> bool {
     now.wrapping_sub(due) < 0x8000_0000
+}
+
+/// `WOM_DONE` — "the wave-out buffer returned to the guest".
+pub const WOM_DONE: u32 = 0x3BD;
+/// `WHDR_DONE` — the WAVEHDR flag marking a buffer as played out.
+pub const WHDR_DONE: u32 = 0x0000_0001;
+/// `WHDR_INQUEUE` — the WAVEHDR flag while the buffer is queued for playback.
+pub const WHDR_INQUEUE: u32 = 0x0000_0010;
+/// `CALLBACK_TYPEMASK` — the fdwOpen callback-kind selector.
+const CALLBACK_TYPEMASK: u64 = 0x0007_0000;
+/// `CALLBACK_FUNCTION` — dwCallback is a guest function pointer.
+const CALLBACK_FUNCTION: u64 = 0x0003_0000;
+/// Playback sink cap: 8 MiB of submitted PCM (see `WinmmState::playback_sink`).
+const PLAYBACK_SINK_CAP: usize = 8 * 1024 * 1024;
+
+/// The `WAVEFORMATEX` a wave-out was opened with (the fields the playback
+/// cadence math needs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaveFormat {
+    pub channels: u16,
+    pub samples_per_sec: u32,
+    pub block_align: u16,
+    pub bits_per_sample: u16,
+}
+
+/// One open wave-out device (the fake `WAVE_OUT_HANDLE`).
+#[derive(Debug, Clone)]
+struct WaveOutRecord {
+    handle: u64,
+    format: WaveFormat,
+    /// `dwCallback` (a guest function VA under `CALLBACK_FUNCTION`).
+    callback_va: u64,
+    /// `dwInstance` (passed back as `dwInstance` in `waveOutProc`).
+    user_data: u64,
+    /// The fdwOpen callback kind (v1 dispatches only `CALLBACK_FUNCTION`).
+    callback_kind: u64,
+}
+
+impl WinmmState {
+    /// Register an opened wave-out device (upsert by handle).
+    pub fn register_wave_out(
+        &mut self,
+        handle: u64,
+        format: WaveFormat,
+        callback_va: u64,
+        user_data: u64,
+        callback_kind: u64,
+    ) {
+        let record = WaveOutRecord {
+            handle,
+            format,
+            callback_va,
+            user_data,
+            callback_kind,
+        };
+        match self.wave_outs.iter_mut().find(|r| r.handle == handle) {
+            Some(slot) => *slot = record,
+            None => self.wave_outs.push(record),
+        }
+    }
+
+    /// The wave-out's format, if the handle is open.
+    #[must_use]
+    pub fn wave_out_format(&self, handle: u64) -> Option<WaveFormat> {
+        self.wave_outs
+            .iter()
+            .find(|r| r.handle == handle)
+            .map(|r| r.format)
+    }
+
+    /// A read-only view of an open wave-out's record fields:
+    /// `(format, callback_va, user_data, callback_kind)`.
+    #[must_use]
+    pub fn wave_out_record(&self, handle: u64) -> Option<(WaveFormat, u64, u64, u64)> {
+        self.wave_outs
+            .iter()
+            .find(|r| r.handle == handle)
+            .map(|r| (r.format, r.callback_va, r.user_data, r.callback_kind))
+    }
+
+    /// Queue a `WOM_DONE` completion for `handle` at `now + delay_ms`.
+    ///
+    /// Reuses the timer table: the pump polls the same queue at safe
+    /// boundaries, and the `DueTimerKind::WaveOutDone` kind selects the
+    /// `waveOutProc` ABI (`rcx=hwo, rdx=WOM_DONE, r8=dwInstance`).
+    pub fn queue_wave_out_done(&mut self, handle: u64, delay_ms: u32, now_tick: u32) {
+        let Some(record) = self.wave_outs.iter().find(|r| r.handle == handle) else {
+            return;
+        };
+        let entry = WinmmTimerRecord {
+            handle,
+            delay_ms: 0,
+            callback_va: record.callback_va,
+            user_data: record.user_data,
+            due_tick_ms: now_tick.wrapping_add(delay_ms),
+            periodic: false,
+            kind: DueTimerKind::WaveOutDone,
+        };
+        self.timers.push(entry);
+    }
+
+    /// Drop all pending `WOM_DONE` completions for `handle`
+    /// (`waveOutReset` / `waveOutClose` semantics).
+    pub fn reset_wave_out(&mut self, handle: u64) {
+        self.timers
+            .retain(|r| !(r.kind == DueTimerKind::WaveOutDone && r.handle == handle));
+    }
+
+    /// Append submitted PCM to the playback sink (bounded — see
+    /// [`PLAYBACK_SINK_CAP`]).
+    pub fn push_playback_bytes(&mut self, bytes: &[u8]) {
+        if self.playback_sink.len().saturating_add(bytes.len()) > PLAYBACK_SINK_CAP {
+            return;
+        }
+        self.playback_sink.extend_from_slice(bytes);
+    }
+
+    /// The submitted PCM bytes so far (test/verification accessor).
+    #[must_use]
+    pub fn playback_sink(&self) -> &[u8] {
+        &self.playback_sink
+    }
 }
 
 #[cfg(test)]
@@ -299,6 +458,7 @@ pub fn handle_time_set_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         user_data,
         due_tick_ms,
         periodic,
+        kind: DueTimerKind::TimeEvent,
     });
 
     ctx.finish(handle)
@@ -338,26 +498,83 @@ pub fn handle_time_kill_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 /// `MMSYSERR_NOERROR`, or `MMSYSERR_INVALPARAM` for a NULL `phwo`.
 pub fn handle_wave_out_open(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let phwo = engine
         .read_rcx()
         .context("failed to read RCX for waveOutOpen")?;
     let _device_id = engine
         .read_rdx()
         .context("failed to read RDX for waveOutOpen")?;
-    let _format_va = engine
+    let format_va = engine
         .read_r8()
         .context("failed to read R8 for waveOutOpen")?;
-    let _callback = engine
+    let callback = engine
         .read_r9()
         .context("failed to read R9 for waveOutOpen")?;
+    // fdwOpen (5th) and dwInstance (6th) are stack arguments; a missing or
+    // unreadable slot degrades to CALLBACK_NULL / instance 0.
+    let fdw_open = read_stack_arg(engine, 0x28).unwrap_or(0);
+    let dw_instance = read_stack_arg(engine, 0x30).unwrap_or(0);
 
     if phwo == 0 {
         return ctx.finish(MMSYSERR_INVALPARAM);
     }
 
+    // Parse the guest's WAVEFORMATEX (18 bytes): wFormatTag, nChannels,
+    // nSamplesPerSec, nAvgBytesPerSec, nBlockAlign, wBitsPerSample, cbSize.
+    // A missing/short format degrades to the CD-quality default so the
+    // playback cadence stays sane.
+    let format = read_wave_format(engine, format_va).unwrap_or(WaveFormat {
+        channels: 2,
+        samples_per_sec: 44_100,
+        block_align: 4,
+        bits_per_sample: 16,
+    });
+    state.winmm().register_wave_out(
+        WAVE_OUT_HANDLE,
+        format,
+        callback,
+        dw_instance,
+        fdw_open & CALLBACK_TYPEMASK,
+    );
+
     write_guest_u64(engine, phwo, WAVE_OUT_HANDLE).context("failed to write wave-out handle")?;
 
     ctx.finish(MMSYSERR_NOERROR)
+}
+
+/// Read the 5th (stack) argument of a Win64 call: `[rsp + 0x28]` at handler
+/// entry. `None` when the slot cannot be read (the caller degrades).
+fn read_stack_arg(engine: &mut dyn wie_cpu::CpuEngine, offset: u64) -> Option<u64> {
+    let rsp = engine.read_rsp().ok()?;
+    let mut bytes = [0_u8; 8];
+    engine
+        .mem_read(rsp.saturating_add(offset), &mut bytes)
+        .ok()?;
+    Some(u64::from_le_bytes(bytes))
+}
+
+/// Parse a guest `WAVEFORMATEX` (18 bytes). `None` when the pointer is NULL
+/// or the bytes cannot be read.
+fn read_wave_format(engine: &mut dyn wie_cpu::CpuEngine, format_va: u64) -> Option<WaveFormat> {
+    if format_va == 0 {
+        return None;
+    }
+    let mut bytes = [0_u8; 18];
+    engine.mem_read(format_va, &mut bytes).ok()?;
+    let channels = u16::from_le_bytes([bytes[2], bytes[3]]);
+    let samples_per_sec = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let block_align = u16::from_le_bytes([bytes[12], bytes[13]]);
+    let bits_per_sample = u16::from_le_bytes([bytes[14], bytes[15]]);
+    if channels == 0 || samples_per_sec == 0 {
+        return None;
+    }
+    Some(WaveFormat {
+        channels,
+        samples_per_sec,
+        block_align,
+        bits_per_sample,
+    })
 }
 
 /// Acknowledge a wave-out call whose `n_args` register arguments are all
@@ -382,7 +599,10 @@ fn ack_no_error(ctx: &mut HandlerContext<'_>, n_args: u32) -> Result<WinApiHandl
 ///
 /// The fake device needs no teardown; always `MMSYSERR_NOERROR`.
 pub fn handle_wave_out_close(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    ack_no_error(ctx, 1)
+    let state = &mut *ctx.state;
+    let hwo = ctx.engine.read_rcx()?;
+    state.winmm().reset_wave_out(hwo);
+    ctx.finish(MMSYSERR_NOERROR)
 }
 
 /// Handles `WINMM.dll!waveOutPrepareHeader`.
@@ -421,10 +641,93 @@ pub fn handle_wave_out_unprepare_header(
 
 /// Handles `WINMM.dll!waveOutWrite`.
 ///
-/// Documented no-op: the fake device plays nothing, but the buffer is
-/// acknowledged so the guest's playback pipeline proceeds.
+/// Wave 5 slice 1: the buffer's PCM bytes land in the playback sink, the
+/// header is marked `WHDR_DONE` immediately (polling guests see completion
+/// right away — the documented v1 approximation), and a `WOM_DONE`
+/// completion is queued at `now + buffer_duration_ms` so CALLBACK_FUNCTION
+/// guests get a real-time playback cadence (the pump dispatches it through
+/// the same boundary machinery as `timeSetEvent`).
 pub fn handle_wave_out_write(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    ack_no_error(ctx, 3)
+    const WAVEHDR_LDATA: u64 = 0;
+    const WAVEHDR_DWBUFFERLENGTH: u64 = 8;
+    const WAVEHDR_DWFLAGS: u64 = 24;
+
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let hwo = engine
+        .read_rcx()
+        .context("failed to read RCX for waveOutWrite")?;
+    let header_va = engine
+        .read_rdx()
+        .context("failed to read RDX for waveOutWrite")?;
+
+    if header_va == 0 {
+        return ctx.finish(MMSYSERR_INVALPARAM);
+    }
+    let mut len_bytes = [0_u8; 4];
+    engine
+        .mem_read(
+            header_va.saturating_add(WAVEHDR_DWBUFFERLENGTH),
+            &mut len_bytes,
+        )
+        .context("failed to read WAVEHDR.dwBufferLength")?;
+    let buffer_length = u32::from_le_bytes(len_bytes);
+    if buffer_length == 0 {
+        return ctx.finish(MMSYSERR_NOERROR);
+    }
+    let mut lp_bytes = [0_u8; 8];
+    engine
+        .mem_read(header_va.saturating_add(WAVEHDR_LDATA), &mut lp_bytes)
+        .context("failed to read WAVEHDR.lpData")?;
+    let data_va = u64::from_le_bytes(lp_bytes);
+
+    // Sink the PCM (bounded) for verification / a future host audio backend.
+    let mut pcm = vec![0_u8; usize::try_from(u64::from(buffer_length)).unwrap_or(0)];
+    if data_va != 0 {
+        engine
+            .mem_read(data_va, &mut pcm)
+            .context("failed to read WAVEHDR.lpData contents")?;
+    }
+    state.winmm().push_playback_bytes(&pcm);
+
+    // Mark the header DONE (and not INQUEUE) — the polling-guest contract.
+    let mut flags_bytes = [0_u8; 4];
+    if engine
+        .mem_read(header_va.saturating_add(WAVEHDR_DWFLAGS), &mut flags_bytes)
+        .is_ok()
+    {
+        let flags = u32::from_le_bytes(flags_bytes) & !WHDR_INQUEUE | WHDR_DONE;
+        engine
+            .mem_write(
+                header_va.saturating_add(WAVEHDR_DWFLAGS),
+                &flags.to_le_bytes(),
+            )
+            .context("failed to update WAVEHDR.dwFlags")?;
+    }
+
+    // Timed WOM_DONE for function callbacks: duration = frames / rate.
+    if state
+        .winmm()
+        .wave_out_record(hwo)
+        .is_some_and(|(_, _, _, callback_kind)| callback_kind == CALLBACK_FUNCTION)
+    {
+        let format = state.winmm().wave_out_format(hwo).unwrap_or(WaveFormat {
+            channels: 2,
+            samples_per_sec: 44_100,
+            block_align: 4,
+            bits_per_sample: 16,
+        });
+        let block_align = u64::from(format.block_align.max(1));
+        let frames = u64::from(buffer_length) / block_align;
+        let duration_ms =
+            u32::try_from(frames.saturating_mul(1000) / u64::from(format.samples_per_sec.max(1)))
+                .unwrap_or(0);
+        let now = u32::try_from(crate::kernel32::clock::tick_count_32() & u64::from(u32::MAX))
+            .unwrap_or(0);
+        state.winmm().queue_wave_out_done(hwo, duration_ms, now);
+    }
+
+    ctx.finish(MMSYSERR_NOERROR)
 }
 
 /// Handles `WINMM.dll!waveOutGetNumDevs`.
@@ -565,7 +868,9 @@ pub fn handle_midi_out_get_error_text_a(
 /// Handles `WINMM.dll!waveOutReset` — the fake device plays nothing, so the
 /// reset is a no-op like `waveOutWrite`.
 pub fn handle_wave_out_reset(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let _hwo = ctx.engine.read_rcx()?;
+    let state = &mut *ctx.state;
+    let hwo = ctx.engine.read_rcx()?;
+    state.winmm().reset_wave_out(hwo);
     ctx.finish(MMSYSERR_NOERROR)
 }
 

@@ -301,3 +301,124 @@ fn test_pop_next_due_timer_singular() {
     assert_eq!(one.as_ref().map(|d| d.handle), Some(handle));
     assert_eq!(state.pop_next_due_timer(due), None);
 }
+
+/// Wave 5 slice 1: `waveOutWrite` with a CALLBACK_FUNCTION device sinks the
+/// buffer's PCM, marks the header `WHDR_DONE` (polling contract), and queues
+/// a `WOM_DONE` completion due at `now + buffer_duration_ms` through the
+/// shared timer table.
+#[test]
+fn test_wave_out_write_sinks_pcm_and_queues_wom_done() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    // waveOutOpen(phwo=0x5000, format @ 0x2000, callback @ 0xBEEF_0000,
+    // fdwOpen = CALLBACK_FUNCTION (0x30000), dwInstance = 0x7A).
+    let phwo = 0x5000_u64;
+    let format_va = 0x2000_u64;
+    let callback_va = 0xBEEF_0000_u64;
+    // WAVEFORMATEX: PCM, stereo, 22050 Hz, 4 bytes/frame, 16-bit.
+    let mut fmt = [0_u8; 18];
+    fmt[0..2].copy_from_slice(&1_u16.to_le_bytes()); // wFormatTag = PCM
+    fmt[2..4].copy_from_slice(&2_u16.to_le_bytes()); // nChannels
+    fmt[4..8].copy_from_slice(&22_050_u32.to_le_bytes()); // nSamplesPerSec
+    fmt[8..12].copy_from_slice(&88_200_u32.to_le_bytes()); // nAvgBytesPerSec
+    fmt[12..14].copy_from_slice(&4_u16.to_le_bytes()); // nBlockAlign
+    fmt[14..16].copy_from_slice(&16_u16.to_le_bytes()); // wBitsPerSample
+    engine.mem_write(format_va, &fmt).expect("write format");
+    let flags = 0x0003_0000_u64; // CALLBACK_FUNCTION
+    engine
+        .mem_write(STACK_TOP - 0x28, &flags.to_le_bytes())
+        .expect("write fdwOpen slot");
+    engine
+        .mem_write(STACK_TOP - 0x30, &0x7A_u64.to_le_bytes())
+        .expect("write dwInstance slot");
+    write_regs(&mut engine, phwo, 0, format_va, callback_va, 0);
+    assert_eq!(dispatch_winmm(&mut engine, &mut state, "waveOutOpen"), 0);
+
+    // WAVEHDR @ 0x2100: lpData=0x3000, dwBufferLength=8820 (200ms at
+    // 22050 Hz stereo 16-bit), dwFlags=WHDR_PREPARED|WHDR_INQUEUE.
+    let header_va = 0x2100_u64;
+    let data_va = 0x3000_u64;
+    let pcm: Vec<u8> = (0..8820).map(|i| (i & 0xFF) as u8).collect();
+    engine.mem_write(data_va, &pcm).expect("write pcm");
+    let mut hdr = [0_u8; 48];
+    hdr[0..8].copy_from_slice(&data_va.to_le_bytes());
+    hdr[8..12].copy_from_slice(&8820_u32.to_le_bytes());
+    hdr[24..28].copy_from_slice(&0x12_u32.to_le_bytes()); // PREPARED|INQUEUE
+    engine.mem_write(header_va, &hdr).expect("write header");
+
+    write_regs(&mut engine, 0x5500_0101, header_va, 0, 0, 0);
+    assert_eq!(dispatch_winmm(&mut engine, &mut state, "waveOutWrite"), 0);
+
+    // 1. The PCM landed in the playback sink.
+    assert_eq!(
+        state.winmm().playback_sink(),
+        pcm.as_slice(),
+        "the submitted buffer must reach the playback sink"
+    );
+    // 2. The header is DONE and no longer INQUEUE.
+    let mut flags_out = [0_u8; 4];
+    engine
+        .mem_read(header_va + 24, &mut flags_out)
+        .expect("read dwFlags");
+    let out_flags = u32::from_le_bytes(flags_out);
+    assert_ne!(out_flags & 0x1, 0, "WHDR_DONE must be set");
+    assert_eq!(
+        out_flags & 0x10,
+        0,
+        "WHDR_INQUEUE must be cleared after write"
+    );
+    // 3. A WOM_DONE completion is queued (~200 ms out) for the function
+    // callback, carrying the wave-out handle.
+    let now =
+        u32::try_from(crate::kernel32::clock::tick_count_32() & u64::from(u32::MAX)).unwrap_or(0);
+    // The completion is NOT due yet: the buffer is ~200 ms of audio
+    // (allow slack for clock sampling between the write and this read).
+    assert!(
+        state.pop_next_due_timer(now).is_none(),
+        "a ~200 ms buffer must not complete immediately"
+    );
+    // Advancing the guest clock past the buffer's duration delivers it.
+    let later = now.wrapping_add(300);
+    let due = state
+        .pop_next_due_timer(later)
+        .expect("the WOM_DONE completion must fire ~200 ms out");
+    assert_eq!(due.handle, 0x5500_0101, "the completion names the device");
+    assert_eq!(
+        due.kind,
+        crate::winmm::DueTimerKind::WaveOutDone,
+        "the pump dispatches it with the waveOutProc ABI"
+    );
+    assert_eq!(due.callback_va, callback_va, "the guest function VA");
+    assert_eq!(due.user_data, 0x7A, "dwInstance round-trips");
+}
+
+/// `waveOutReset` / `waveOutClose` drop pending `WOM_DONE` completions.
+#[test]
+fn test_wave_out_reset_drops_pending_completions() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let phwo = 0x5000_u64;
+    engine
+        .mem_write(STACK_TOP - 0x28, &0x0003_0000_u64.to_le_bytes())
+        .expect("write fdwOpen");
+    write_regs(&mut engine, phwo, 0, 0, 0xBEEF_0000, 0);
+    assert_eq!(dispatch_winmm(&mut engine, &mut state, "waveOutOpen"), 0);
+
+    // Queue a completion directly (no PCM needed for the reset semantics),
+    // scheduled 60 s out so it is not due during the test.
+    let now =
+        u32::try_from(crate::kernel32::clock::tick_count_32() & u64::from(u32::MAX)).unwrap_or(0);
+    state.winmm().queue_wave_out_done(0x5500_0101, 60_000, now);
+    assert!(
+        state.pop_next_due_timer(now).is_none(),
+        "the completion is due 60 s out"
+    );
+    // reset_wave_out through waveOutReset drops it even when due.
+    write_regs(&mut engine, 0x5500_0101, 0, 0, 0, 0);
+    assert_eq!(dispatch_winmm(&mut engine, &mut state, "waveOutReset"), 0);
+    assert!(
+        state.pop_next_due_timer(now.wrapping_add(60_001)).is_none(),
+        "waveOutReset must drop the pending WOM_DONE"
+    );
+}

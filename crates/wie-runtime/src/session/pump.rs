@@ -627,11 +627,23 @@ impl QuantumHooks for SessionPumpHooks<'_> {
             };
             let due = guard.pop_next_due_timer(now);
             if let Some(due) = due {
-                let request = wie_winapi::GuestCallbackRequest::timer(
-                    due.handle,
-                    due.callback_va,
-                    due.user_data,
-                );
+                let request = match due.kind {
+                    wie_winapi::winmm::DueTimerKind::TimeEvent => {
+                        wie_winapi::GuestCallbackRequest::timer(
+                            due.handle,
+                            due.callback_va,
+                            due.user_data,
+                        )
+                    }
+                    wie_winapi::winmm::DueTimerKind::WaveOutDone => {
+                        wie_winapi::GuestCallbackRequest::wave_out_done(
+                            due.handle,
+                            due.callback_va,
+                            due.user_data,
+                            wie_winapi::winmm::WOM_DONE,
+                        )
+                    }
+                };
                 self.charged_api = self.charged_api.saturating_add(1);
                 let outer_library = self.intern_outer_api_name(resolved.library.clone());
                 let outer_name = self.intern_outer_api_name(resolved.name.clone());

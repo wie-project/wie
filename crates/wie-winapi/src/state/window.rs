@@ -1107,6 +1107,23 @@ impl GuestCallbackRequest {
             outer_return: OuterReturn::Passthrough,
         }
     }
+
+    /// Construct a WINMM `waveOutProc` completion request (`WOM_DONE`).
+    ///
+    /// Win64 ABI: `rcx = hwo`, `rdx = uMsg (WOM_DONE)`, `r8 = dwInstance`,
+    /// `r9 = 0 (dwParam1)`, `[rsp+0x28] = 0 (dwParam2)`.
+    #[must_use]
+    pub fn wave_out_done(hwo: u64, callback_va: u64, user_data: u64, msg: u32) -> Self {
+        Self {
+            callback_address: callback_va,
+            window_handle: hwo,
+            message: msg,
+            word_parameter: user_data,
+            long_parameter: 0,
+            unicode: false,
+            outer_return: OuterReturn::Passthrough,
+        }
+    }
 }
 
 /// A queued fake USER32 message.
