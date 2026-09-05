@@ -27,6 +27,7 @@ mod teb;
 pub type ConcurrentHashMap<K, V> = papaya::HashMap<K, V>;
 
 /// Dump residual iced-interpreter mnemonic histogram (`WIE_EXEC_TRACE=1`).
+pub use exec::degraded_insn_count;
 pub use exec::dump_iced_counters;
 pub use iced_cpu::IcedCpu;
 pub use jit::{

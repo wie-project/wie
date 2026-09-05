@@ -456,6 +456,9 @@ impl RuntimeProfile {
                 self.capture_ns() as f64 / 1e6,
                 self.capture_ns_last() as f64 / 1e6,
             ));
+            // Wave 4 coverage metric: instructions the interpreter executed
+            // as partial no-ops (unimplemented mnemonics, degrade-not-die).
+            lines.push(format!("degraded_insns={}", wie_cpu::degraded_insn_count()));
             lines.push(format!("hand_back_unwrap={}", self.hand_back_unwrap()));
             lines.push(format!("hand_back_clone={}", self.hand_back_clone()));
             let frame_total = self

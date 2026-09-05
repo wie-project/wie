@@ -20,7 +20,9 @@ use crate::consts::{DWORD_BYTES, QWORD_BITS, SHIFT_MASK_32, SHIFT_MASK_64, XMM_B
 use crate::mem::GuestMemory;
 use crate::regs::{self, RegFile, Rflags};
 use iced_x86::{Instruction, MemorySize, Mnemonic, OpKind, Register};
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use cache::{ICED_COUNTERS, ICED_TRACE_ENABLED, decode_at};
 use gpr::{
@@ -95,12 +97,53 @@ pub(crate) enum StepResult {
     InvalidMemory(InvalidMem),
 }
 
+// ── Wave 4: degrade-not-die fallback ─────────────────────────────────────
+//
+// An unimplemented mnemonic no longer stops the session. The fallback
+// executes the instruction PARTIALLY: RIP advances past it and register /
+// memory state is left untouched (the documented approximation — a guest
+// sees a no-op where real silicon would have produced a value). The first
+// occurrence of each mnemonic is traced once, every occurrence is counted
+// (the Wave 4 coverage metric surfaces it in the profile report), and
+// `WIE_DEGRADE=0` restores the hard stop for bisect.
+
 /// Decode + execute one instruction at `regs.rip`.
 ///
 /// Lightweight tracer: the first time each non-JIT mnemonic is interpreted,
 /// it is logged once at `info` level (opt-in: `WIE_EXEC_TRACE=1`).  Run with
 /// `WIE_EXEC_TRACE=1 7za …` to discover which instructions keep code in the
 /// interpreter rather than the JIT.
+/// Degrade-not-die gate (default on; `WIE_DEGRADE=0`/`false`/`off` disables).
+static DEGRADE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    !matches!(
+        std::env::var("WIE_DEGRADE"),
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+    )
+});
+
+/// Total fallback-executed instructions (the Wave 4 coverage metric).
+static DEGRADED_INSNS: AtomicU64 = AtomicU64::new(0);
+/// Mnemonic debug names already traced (first occurrence per mnemonic).
+static DEGRADED_SEEN: LazyLock<Mutex<ahash::HashSet<u32>>> = LazyLock::new(|| {
+    use ahash::HashSetExt;
+    Mutex::new(ahash::HashSet::new())
+});
+
+/// Total degrade-fallback executions, for the runtime profile report.
+#[must_use]
+pub fn degraded_insn_count() -> u64 {
+    DEGRADED_INSNS.load(Ordering::Relaxed)
+}
+
+type DegradedSeen = ahash::HashSet<u32>;
+
+fn degrade_locked_seen() -> MutexGuard<'static, DegradedSeen> {
+    match DEGRADED_SEEN.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 pub(crate) fn step(
     mem: &GuestMemory,
     regs: &mut RegFile,
@@ -652,10 +695,31 @@ fn execute_one(
             Ok(())
         }
 
-        other => Err(StepExecError::Cpu(CpuError::Message(format!(
-            "unimplemented mnemonic {other:?} at {:#x}",
-            instr.ip()
-        )))),
+        other => {
+            // Degrade-not-die (Wave 4): trace once per mnemonic, count the
+            // execution, and continue with partial state (RIP already
+            // advanced, no register/memory effects) instead of stopping the
+            // session.
+            if *DEGRADE_ENABLED {
+                DEGRADED_INSNS.fetch_add(1, Ordering::Relaxed);
+                let mut seen = degrade_locked_seen();
+                if seen.insert(other as u32) {
+                    tracing::warn!(
+                        target: "wiecpu",
+                        ip = format_args!("{:#x}", instr.ip()),
+                        mnemonic = format!("{other:?}"),
+                        "unimplemented mnemonic — executing as partial no-op \
+                         (degrade-not-die; WIE_DEGRADE=0 restores the stop)"
+                    );
+                }
+                Ok(())
+            } else {
+                Err(StepExecError::Cpu(CpuError::Message(format!(
+                    "unimplemented mnemonic {other:?} at {:#x}",
+                    instr.ip()
+                ))))
+            }
+        }
     }
 }
 

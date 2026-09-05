@@ -2214,3 +2214,41 @@ fn foreign_invalidation_forces_full_rebuild_and_unlinks_dropped_va() {
         "rebuild width is the post-drop cache (one block), not a delta of zero"
     );
 }
+
+/// Wave 4 degrade-not-die: an unimplemented mnemonic (x87 `f2xm1`) must NOT
+/// stop the interpreter — the fallback advances RIP past the instruction,
+/// leaves register state untouched, and counts the execution in the
+/// `degraded_insn_count` coverage metric. The counter is a global; the test
+/// only asserts a strict increase to stay robust against parallel tests.
+#[test]
+fn unimplemented_mnemonic_degrades_instead_of_stopping() {
+    crate::exec::iced_decode_cache_flush();
+    let mut iced = IcedCpu::open_x86_64();
+    iced.virtual_alloc(
+        SIMD_BASE,
+        0x2000,
+        MEM_RESERVE | MEM_COMMIT,
+        protect::PAGE_EXECUTE_READWRITE,
+    )
+    .expect("iced alloc");
+    // D9 F0 = f2xm1: an x87 transcendental op with no interpreter
+    // implementation (and no x87 register file at all) — the pre-Wave-4
+    // behavior was a session stop.
+    let code = [0xD9_u8, 0xF0_u8];
+    iced.mem_write(SIMD_BASE, &code).expect("iced code");
+    iced.write_rip(SIMD_BASE).expect("iced rip");
+
+    let before = crate::degraded_insn_count();
+    iced.step_once()
+        .expect("degrade fallback must not stop the session");
+    let after = crate::degraded_insn_count();
+    assert!(
+        after > before,
+        "the fallback must count the degraded execution (before={before})"
+    );
+    assert_eq!(
+        iced.regs().rip,
+        SIMD_BASE + u64::from(code.len() as u32),
+        "RIP must advance past the degraded instruction"
+    );
+}
