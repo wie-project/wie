@@ -17,7 +17,7 @@ Conventions that apply to every wave: workspace lints deny
 | --- | --- |
 | Docs-vs-code drift audit (every ADR claim → grep-verified) | ✅ done 2026-09-02 — ADR-0001 partially unbuilt (padding, scratch), ADR-0002 entirely unbuilt (dead gate); status notes appended to both ADRs; `docs/status.md` + `docs/RUNBOOK.md` claims corrected |
 | ADR-0003 for the present channel | ✅ written (`docs/adr/0003-present-channel.md`) |
-| End-to-end FPS harness (release build, headless windowed run, frames/s + present/jit counters, saved under `docs/baselines/`) | ⬜ pending — wire into `.github/workflows/nightly-bench.yml` |
+| End-to-end FPS harness (release build, headless windowed run, frames/s + present/jit counters, saved under `docs/baselines/`) | ⬜ pending — `scripts/fps-harness.sh` exists; wire into the local capture-baseline protocol (`WIE_RUNTIME_PROFILE` 40 s capture + `docs/baselines/`); the nightly-bench CI job was dropped in `2e97b0c` and replaced by a manual-dispatch `.github/workflows/bench.yml` (benchmarks are developer-local gates, not nightly CI) |
 | Full workspace + micro suite green after each wave | ⬜ re-verify per wave |
 
 ## Wave 1 — present-domain decoupling (done 2026-09-02)
