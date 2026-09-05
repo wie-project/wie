@@ -42,8 +42,8 @@ Conventions that apply to every wave: workspace lints deny
 
 | Item | Status |
 | --- | --- |
-| Feasibility pass: map x19–x28 = rax…r15 fixed order, `x14` rflags carrier; enumerate spill sites in `jit/lower/*` + `engine.rs` trampoline | ⬜ |
-| Direct block→block chaining (`b`/`br`, regs live) with dispatcher fallback (miss/SMC/fake-VA) | ⬜ |
+| Feasibility pass: map x19–x28 = rax…r15 fixed order, `x14` rflags carrier; enumerate spill sites in `jit/lower/*` + `engine.rs` trampoline | 🟡 **done 2026-09-05** — spill sites enumerated: dispatcher entry mass-copy (`pipeline.rs run_compiled`), block-entry live-GPR/rflags loads (`lower/mod.rs compile_block`), **per-chain-edge `writeback_gprs` + successor reload (`lower/emit.rs emit_chain_or_exit` — the hot tax)**, block-exit stores, dispatcher exit writeback; Rust-side trampoline twins (`mark_dirty`/`chain_tail`). ABI constraint: literal x19–x28 residency is inexpressible via Cranelift under the aarch64 C ABI (17 results > register window, no custom call-conv) → staged plan: tail-call chaining → hand-written prologue stub (trampolines.rs pattern) for the reg map → SSA rflags (details in ADR-0002 status) |
+| Direct block→block chaining (`b`/`br`, regs live) with dispatcher fallback (miss/SMC/fake-VA) | 🟡 **slice 1 landed 2026-09-05** — tail-call chain hops: `return_call`/`return_call_indirect` in `emit_chain_or_exit` (successor reuses the caller frame; no prologue/epilogue/ret per hop), `WIE_JIT_TAILCHAIN=0` restores the nested-call hop. `MAX_CHAIN_DEPTH` deliberately kept as the periodic dispatcher bounce (stop/Ctrl+C/hook checks run only in the Rust pump). regs-live hand-off still awaits the prologue-stub ABI (row above); dispatcher fallback/IC/chain-table untouched |
 | SSA rflags (`zf/sf/cf/of` per ALU) so `test; je` consumes ZF without pack/unpack | ⬜ |
 | Opt-out `WIE_JIT_DIRECT_REGS=0` restores the `JitCtx` path; oracle diff vs `WIE_CPU=iced` | ⬜ |
 | Multi-module compile (split the single `JitShared::engine` Mutex) | ⬜ after direct regs |

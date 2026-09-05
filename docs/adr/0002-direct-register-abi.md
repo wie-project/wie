@@ -34,13 +34,33 @@ Fixed native ABI for chained execution:
 Default **on**; opt-out via `WIE_JIT_DIRECT_REGS=0`/`false`/`off` restores existing `JitCtx` spill path. Wave3 flipped the gate (was opt-in).
 
 
-## Implementation status (2026-09-02 audit)
+## Implementation status (2026-09-05 feasibility pass)
 
-**NOT implemented.** The "default on" claim above was drift: `WIE_JIT_DIRECT_REGS`
-is parsed (`direct_regs_enabled()`) but has **zero call sites**; no x19–x28
-guest-register mapping exists in `jit/lower/*`, and every block boundary and
-chain hop still pays the full `JitCtx` GPR/XMM round trip. This remains the
-top JIT throughput lever (Wave 3 of the architecture-review roadmap); the
-feasibility assessment (trampoline/prologue shape, SSA rflags lowering order,
-oracle diffing vs `WIE_CPU=iced`) is tracked in
-`docs/implementation-plan.md`.
+**Feasibility pass complete; staged implementation begun.** Findings:
+
+- **Spill-site enumeration** (the per-edge cost this ADR removes):
+  dispatcher entry mass-copy (`pipeline.rs run_compiled`), block-entry
+  live-GPR/rflags loads (`lower/mod.rs compile_block`), the per-chain-edge
+  `writeback_gprs` + successor reload (`lower/emit.rs emit_chain_or_exit` —
+  executed on every block edge, the 750k-transitions tax), block-exit
+  stores, and dispatcher exit writeback. Full list in
+  `docs/implementation-plan.md` Wave 3 row 1.
+- **Direct chaining (landed)**: chain hops are now tail calls
+  (`return_call`/`return_call_indirect`, `WIE_JIT_TAILCHAIN`, default on) —
+  the successor reuses the caller frame (no prologue/epilogue/ret per hop).
+  The `MAX_CHAIN_DEPTH` counter is deliberately KEPT as the periodic
+  dispatcher bounce: stop requests / Ctrl+C / hook checks only run when
+  control re-enters the Rust pump, so an unbounded tail chain must never
+  remove the bounce cadence. `WIE_JIT_TAILCHAIN=0` restores the nested-call
+  hop for bisect.
+- **ABI constraint (the load-bearing finding)**: literal x19–x28 residency
+  cannot be expressed through Cranelift under the standard aarch64 C ABI —
+  a 17-result block signature does not fit the result register window, and
+  no custom call-convention hook is available. The viable staged path is:
+  (1) tail-call chaining (done), (2) a hand-written per-block prologue
+  stub (the `trampolines.rs` pattern) that shuffles x19–x28/x14 against the
+  C-ABI frame with chaining linking the post-prologue body label, (3) SSA
+  rflags layered onto that stub boundary. `WIE_JIT_DIRECT_REGS` remains
+  reserved for step 2; the SSA-rflags design (pack/unpack deletion,
+  `PendingFlags` → i1 booleans, `flag_cond` consuming ZF/SF/CF/OF directly)
+  is unchanged and ordered after the stub.

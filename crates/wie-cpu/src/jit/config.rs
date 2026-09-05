@@ -83,6 +83,9 @@ pub(super) struct JitConfig {
     tlb_neon_enabled: bool,
     string_inline_enabled: bool,
     jit_workers: usize,
+    /// Tail-call block chaining: chain hops are `return_call`s (no host-stack
+    /// growth, no depth guard, no per-hop ret) instead of nested `call`s.
+    tail_chain_enabled: bool,
     #[allow(dead_code)]
     direct_regs_enabled: bool,
 }
@@ -204,6 +207,12 @@ impl JitConfig {
             // Late-bound + direct block chaining (`WIE_JIT_CHAIN=0` disables).
             chain_enabled: !matches!(
                 std::env::var("WIE_JIT_CHAIN"),
+                Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+            ),
+            // Tail-call chain hops (`WIE_JIT_TAILCHAIN=0` disables — falls
+            // back to the nested-call + depth-guard hop).
+            tail_chain_enabled: !matches!(
+                std::env::var("WIE_JIT_TAILCHAIN"),
                 Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             ),
             // Background compiler worker. Default: on for real runs, off under
@@ -411,6 +420,14 @@ impl JitConfig {
     #[allow(dead_code)]
     pub(super) fn direct_regs_enabled(&self) -> bool {
         self.direct_regs_enabled
+    }
+
+    /// Tail-call chain hops (no host-stack growth / depth guard). Default
+    /// **on**; `WIE_JIT_TAILCHAIN=0` disables for bisect (fallback is the
+    /// nested-`call` + `MAX_CHAIN_DEPTH` guard hop).
+    #[must_use]
+    pub(super) fn tail_chain_enabled(&self) -> bool {
+        self.tail_chain_enabled
     }
 }
 

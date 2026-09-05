@@ -196,11 +196,18 @@ fn emit_inv_gen_check(
     cont_blk
 }
 
-/// Writeback + set RIP + call successor (direct or late-bound), then return.
+/// Writeback + set RIP + chain to the successor (direct or late-bound).
 ///
-/// Uses host C ABI `call`/`call_indirect` (not Tail/`return_call`) so blocks stay
-/// callable from Rust as `extern "C"`. Nesting is capped by [`MAX_CHAIN_DEPTH`]:
-/// past the limit we return to the Rust dispatcher with RIP already advanced.
+/// Two hop shapes, selected by `WIE_JIT_TAILCHAIN` (default on):
+/// - **Tail hop**: `return_call`/`return_call_indirect` — the successor
+///   reuses this frame (no prologue/epilogue, no per-hop ret). The
+///   `MAX_CHAIN_DEPTH` counter stays as the periodic dispatcher bounce
+///   (every <=48 hops) the pump's stop/interrupt checks rely on.
+/// - **Nested hop** (`=0`): host C ABI `call`/`call_indirect` — blocks stay
+///   callable from Rust as plain `extern "C"`; past [`MAX_CHAIN_DEPTH`] we
+///   return to the Rust dispatcher with RIP already advanced.
+///
+/// Both shapes keep the inv-gen guard (the SMC safety net) on every edge.
 // The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_chain_or_exit(
@@ -241,6 +248,94 @@ pub(super) fn emit_chain_or_exit(
         // machinery: RIP (= exit_rip) + GPRs are already flushed above, so a
         // mismatch just returns to the dispatcher for purge + re-decode.
         let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, |_| {});
+    }
+
+    // Tail-call chaining (`WIE_JIT_TAILCHAIN`, default on): the hop is a
+    // `return_call`/`return_call_indirect` — the caller's frame is reused, so
+    // there is no prologue/epilogue or per-hop ret. The `MAX_CHAIN_DEPTH`
+    // guard is KEPT: it is the periodic dispatcher bounce (every <=48 hops)
+    // the pump relies on for stop requests / Ctrl+C / hook checks — without
+    // it a tight chained loop would never re-enter Rust. Each hop costs one
+    // load + compare + counter bump instead of a full nested C frame.
+    // `WIE_JIT_TAILCHAIN=0` restores the nested-call hop.
+    if super::super::config::JitConfig::get().tail_chain_enabled() {
+        // Host-stack guard repurposed as the dispatcher-bounce cadence: cap
+        // and re-enter from Rust (RIP + GPRs are already flushed).
+        let depth_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_CHAIN_DEPTH));
+        let depth = bcx.ins().load(types::I64, flags, depth_ptr, 0);
+        let max_d = iconst_u64(bcx, MAX_CHAIN_DEPTH);
+        let too_deep = bcx
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, depth, max_d);
+        let deep_blk = bcx.create_block();
+        let chain_blk = bcx.create_block();
+        bcx.ins().brif(too_deep, deep_blk, &[], chain_blk, &[]);
+
+        bcx.switch_to_block(deep_blk);
+        bcx.seal_block(deep_blk);
+        // RIP + GPRs already written; pop back to the dispatcher.
+        bcx.ins().return_(&[]);
+
+        bcx.switch_to_block(chain_blk);
+        bcx.seal_block(chain_blk);
+        let depth1 = bcx.ins().iadd_imm(depth, 1);
+        bcx.ins().store(flags, depth1, depth_ptr, 0);
+
+        if let Some(f) = href {
+            bcx.ins().return_call(f, &[ctx_ptr]);
+            return;
+        }
+        // Monomorphic edge IC (data plane) before the full chain-table
+        // helper, identical probe to the nested-call path below.
+        let mut ic_ok = bcx.ins().iconst(types::I8, 0);
+        let zero = iconst_u64(bcx, 0);
+        let mut ic_fn = zero;
+        for slot in 0..EDGE_IC_SLOTS {
+            let off_va =
+                i64::from(OFF_EDGE_IC_VA) + i64::try_from(slot.saturating_mul(8)).unwrap_or(0);
+            let off_fn =
+                i64::from(OFF_EDGE_IC_FN) + i64::try_from(slot.saturating_mul(8)).unwrap_or(0);
+            let va_p = bcx.ins().iadd_imm(ctx_ptr, off_va);
+            let fn_p = bcx.ins().iadd_imm(ctx_ptr, off_fn);
+            let slot_va = bcx.ins().load(types::I64, flags, va_p, 0);
+            let slot_fn = bcx.ins().load(types::I64, flags, fn_p, 0);
+            let va_ok = bcx.ins().icmp(IntCC::Equal, slot_va, exit_rip);
+            let fn_nz = bcx.ins().icmp_imm(IntCC::NotEqual, slot_fn, 0);
+            let hit_i = bcx.ins().band(va_ok, fn_nz);
+            let first = bcx.ins().icmp_imm(IntCC::Equal, ic_ok, 0);
+            let take = bcx.ins().band(hit_i, first);
+            ic_fn = bcx.ins().select(take, slot_fn, ic_fn);
+            ic_ok = bcx.ins().bor(ic_ok, hit_i);
+        }
+        let ic_hit_blk = bcx.create_block();
+        let ic_miss_blk = bcx.create_block();
+        bcx.ins().brif(ic_ok, ic_hit_blk, &[], ic_miss_blk, &[]);
+
+        bcx.switch_to_block(ic_hit_blk);
+        bcx.seal_block(ic_hit_blk);
+        bcx.ins()
+            .return_call_indirect(block_sig_ref, ic_fn, &[ctx_ptr]);
+
+        bcx.switch_to_block(ic_miss_blk);
+        bcx.seal_block(ic_miss_blk);
+        // Late-bound: open-addressing chain table (successors compiled after
+        // us); a miss falls back to the ordinary dispatcher exit.
+        let call = bcx.ins().call(lookup_ref, &[ctx_ptr, exit_rip]);
+        let fn_ptr = bcx.inst_results(call)[0];
+        let hit = bcx.ins().icmp_imm(IntCC::NotEqual, fn_ptr, 0);
+        let hit_blk = bcx.create_block();
+        let miss_blk = bcx.create_block();
+        bcx.ins().brif(hit, hit_blk, &[], miss_blk, &[]);
+        bcx.switch_to_block(hit_blk);
+        bcx.seal_block(hit_blk);
+        bcx.ins()
+            .return_call_indirect(block_sig_ref, fn_ptr, &[ctx_ptr]);
+        bcx.switch_to_block(miss_blk);
+        bcx.seal_block(miss_blk);
+        // No tail call — restore the hop counter before the exit path.
+        bcx.ins().store(flags, depth, depth_ptr, 0);
+        jump_exit(bcx, exit, gpr, rflags);
+        return;
     }
 
     // Host-stack guard: each hop nests a C frame. Cap and re-enter from Rust.
