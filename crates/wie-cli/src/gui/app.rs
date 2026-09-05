@@ -987,17 +987,21 @@ pub fn run_gui_windowed(
                             }))
                         };
 
-                        // Wave 2 slice 2: with `WIE_CAPTURE_STREAM=1` the
-                        // D3D9 Draw*/Clear handlers record ops and Present
-                        // flushes the stream to the capture render thread
-                        // (which replays + publishes off the big lock).
-                        // Opt-in during bring-up; the handle's Drop stops +
-                        // joins the thread at teardown. When capture is on
-                        // it supersedes the commit path (the Present handler
-                        // checks the capture gate first).
+                        // Wave 2: the D3D9 Draw*/Clear handlers record ops
+                        // and Present flushes the stream to the capture
+                        // render thread (which replays + publishes off the
+                        // big lock). Default-on for GUI sessions now that
+                        // the hash-equivalence + RT read-back gates pass;
+                        // `WIE_CAPTURE_STREAM=0` opts back out to the
+                        // legacy in-handler raster path. The handle's Drop
+                        // stops + joins the thread at teardown. When capture
+                        // is on it supersedes the commit path (the Present
+                        // handler checks the capture gate first).
                         let _capture_streamer = if std::env::var("WIE_CAPTURE_STREAM")
-                            .is_ok_and(|v| v == "1")
+                            .is_ok_and(|v| v == "0")
                         {
+                            None
+                        } else {
                             let capture_proxy = proxy.clone();
                             let capture_pending = pending_frame_guest.clone();
                             handle.enable_capture_stream(Box::new(move || {
@@ -1006,8 +1010,6 @@ pub fn run_gui_windowed(
                                     published_at: Instant::now(),
                                 });
                             }))
-                        } else {
-                            None
                         };
 
                         // Register wake callback.

@@ -175,3 +175,27 @@ Landed, unresolved design decisions resolved as follows:
 
 Remaining after the gates pass: flip capture to default-on (app.rs env
 check removal) and re-run the hash suite; then Step 2.
+
+## Slice 4 + Wave 2 close notes (2026-09-05)
+
+- **RT read-back rendezvous (fix for the capture test's exit 217)**: a
+  guest that renders into an offscreen RT and `LockRect`s it BEFORE any
+  `Present` (gui_d3d9's L6 self-test) read pre-raster zeros — the replay
+  only ran at Present-flush boundaries. `CapturePipeline` now sequences
+  flushes (`enqueue` assigns a seq, the handback carries it) and
+  `wait_for_handback` blocks on that barrier; RT `LockRect` with a
+  non-empty stream calls `capture::sync_flush_for_target_read` (flush
+  with zero publish dims → replay + handback, no frame published) and
+  the read-back sees the rasterized texels. Rare path: costs nothing
+  when the stream is empty.
+- **Capture flipped default-on** for GUI sessions (`WIE_CAPTURE_STREAM=0`
+  opts out); headless/CI never spawn the streamer, so the hash gates
+  still exercise the legacy path byte-for-byte.
+- **Acceptance harness** (Step 3): `scripts/acceptance-wave2.sh` runs a
+  40 s SIGINT capture on gui_d3d9's new continuous-present mode
+  (`WIE_SELFTEST=2`, injected headlessly via the `WIE_GUEST_ENV` hook in
+  `memory.rs`) and checks emu ≤1 ms/frame, render-thread counters
+  present, cpu%≥90; `WAVE2_BASELINE=1` appends to
+  `docs/baselines/wave2-acceptance.txt`. The human step that remains:
+  run it on an idle machine with a release build and commit the
+  baseline.

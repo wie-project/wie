@@ -499,6 +499,41 @@ pub const PROCESS_HEAP_BASE: u64 = DEFAULT_LAYOUT.process_heap.base;
 /// Fake process heap size.
 pub const PROCESS_HEAP_SIZE: usize = DEFAULT_LAYOUT.process_heap.size;
 
+/// Host-side measurement hook: `WIE_GUEST_ENV="NAME=VALUE;NAME2=VALUE2"` pairs
+/// injected into every new session's guest environment (upsert, case-
+/// insensitive names like Windows). This is how headless CLI runs reach the
+/// micro-exes' self-test modes (`WIE_GUEST_ENV=WIE_SELFTEST=2`) without a
+/// dedicated CLI flag — the tests' `set_guest_env` path stays authoritative
+/// and this is unset there, so CI is unaffected. A pair without `=` is
+/// dropped with a warning.
+fn apply_host_guest_env_overrides(environment: &mut Vec<(String, String)>) {
+    let Some(raw) = std::env::var_os("WIE_GUEST_ENV") else {
+        return;
+    };
+    let Some(raw) = raw.to_str() else {
+        return;
+    };
+    for pair in raw.split(';') {
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = pair.split_once('=') else {
+            tracing::warn!("WIE_GUEST_ENV: ignoring pair without '=': {pair:?}");
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        match environment
+            .iter_mut()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        {
+            Some(slot) => slot.1 = value.to_string(),
+            None => environment.push((name.to_string(), value.to_string())),
+        }
+    }
+}
+
 pub(crate) fn default_winapi_state(
     layout: &RuntimeMemoryLayout,
     executable_file_bytes: std::sync::Arc<Vec<u8>>,
@@ -538,8 +573,14 @@ pub(crate) fn default_winapi_state(
             error_mode: 0,
             suspended_threads: ahash::HashMap::new(),
             // SDL2 guests: disable the DirectInput joystick driver (see
-            // `SDL_DIRECTINPUT_ENV_PAIR`).
-            environment: vec![(directinput_var.to_string(), directinput_value.to_string())],
+            // `SDL_DIRECTINPUT_ENV_PAIR`), then apply the host-side
+            // `WIE_GUEST_ENV` measurement overrides on top.
+            environment: {
+                let mut environment =
+                    vec![(directinput_var.to_string(), directinput_value.to_string())];
+                apply_host_guest_env_overrides(&mut environment);
+                environment
+            },
             // The main module's RT_DIALOG/RT_MENU/RT_STRING/RT_ACCELERATOR
             // resources are parsed in session init (the section map is not
             // available here).

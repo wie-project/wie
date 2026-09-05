@@ -128,7 +128,15 @@ static const DWORD g_vs_bytecode[] = {
 static int selftest_enabled(void) {
     char buf[16];
     DWORD n = GetEnvironmentVariableA("WIE_SELFTEST", buf, sizeof(buf));
-    return n == 1 && buf[0] == '1';
+    // Mode 1 = scripted self-test (auto-quits after TIMER_TICKS_MIN ticks).
+    // Mode 2 = continuous-present mode for the Wave 2 acceptance capture:
+    // every check still runs, but the WM_TIMER loop never quits, so the
+    // session presents frames until the host's SIGINT profile watchdog ends
+    // it (see scripts/acceptance-wave2.sh).
+    if (n == 1 && buf[0] >= '1' && buf[0] <= '2') {
+        return buf[0] - '0';
+    }
+    return 0;
 }
 
 // Create the 2x2 checkerboard texture (red/green/blue/white) and bind it to
@@ -1047,9 +1055,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_timer_count++;
         // Repaint → re-render → re-present (exercises repeated presents).
         InvalidateRect(hwnd, NULL, FALSE);
-        if (g_timer_count >= TIMER_TICKS_MIN) {
-            PostQuitMessage(0);
+        if (g_selftest == 1 && g_timer_count >= TIMER_TICKS_MIN) {
+            PostQuitMessage(0);   // mode 1: scripted self-test auto-quits
         }
+        // Mode 2 never quits — the continuous-present acceptance capture.
         return 0;
 
     case WM_CHAR:
