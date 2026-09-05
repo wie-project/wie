@@ -378,8 +378,16 @@ impl PresentChannel {
     }
 
     /// Enqueue a capture flush (the Present handler's stream hand-off).
-    pub(crate) fn enqueue_capture_flush(&self, flush: crate::d3d9::capture::CaptureFlush) {
-        self.capture.enqueue(flush);
+    /// Returns the flush's sequence number — the rendezvous wait barrier.
+    pub(crate) fn enqueue_capture_flush(&self, flush: crate::d3d9::capture::CaptureFlush) -> u64 {
+        self.capture.enqueue(flush)
+    }
+
+    /// Block until the capture render thread posts the handback for flush
+    /// `seq` (or newer), or `timeout` elapses (the render-target LockRect
+    /// rendezvous).
+    pub(crate) fn capture_wait_for_handback(&self, seq: u64, timeout: std::time::Duration) {
+        let _reached = self.capture.wait_for_handback(seq, timeout);
     }
 
     /// Take the capture render thread's latest handback (post-frame target

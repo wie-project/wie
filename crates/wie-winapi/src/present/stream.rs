@@ -40,6 +40,13 @@ pub(crate) struct CapturePipeline {
     signal: std::sync::Condvar,
     /// The most recent handback (`None` once the emu thread installs it).
     handback: std::sync::Mutex<Option<CaptureHandback>>,
+    /// Wakes the emu thread when a handback is posted (the render-target
+    /// LockRect rendezvous waits on this).
+    handback_signal: std::sync::Condvar,
+    /// Seq of the most recently posted handback (the flush that produced it).
+    handback_seq: AtomicU64,
+    /// Monotonic flush sequence number (assigned at enqueue).
+    next_seq: AtomicU64,
     /// Replayed (stretched + published) frame count.
     frames: AtomicU64,
     /// Accumulated replay+publish wall time (ns, saturating).
@@ -56,6 +63,9 @@ impl CapturePipeline {
             slot: std::sync::Mutex::new(None),
             signal: std::sync::Condvar::new(),
             handback: std::sync::Mutex::new(None),
+            handback_signal: std::sync::Condvar::new(),
+            handback_seq: AtomicU64::new(0),
+            next_seq: AtomicU64::new(1),
             frames: AtomicU64::new(0),
             ns: AtomicU64::new(0),
             ns_last: AtomicU64::new(0),
@@ -75,8 +85,12 @@ impl CapturePipeline {
     }
 
     /// Enqueue a flush (latest-wins: a superseded flush is dropped whole —
-    /// its ops were never applied).
-    pub(crate) fn enqueue(&self, flush: CaptureFlush) {
+    /// its ops were never applied). Returns the flush's sequence number; the
+    /// handback produced by replaying it carries the same number (the
+    /// rendezvous wait's barrier).
+    pub(crate) fn enqueue(&self, mut flush: CaptureFlush) -> u64 {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        flush.seq = seq;
         self.slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -84,16 +98,49 @@ impl CapturePipeline {
         // Wake AFTER the slot is filled (the same ordering argument the
         // commit slot makes: a woken consumer takes whatever is latest).
         self.signal.notify_one();
+        seq
     }
 
     /// Install the render thread's handback (post-frame target buffers) for
     /// the emu thread to pick up. Replaces any not-yet-installed handback —
     /// the newest replay state wins.
-    pub(crate) fn post_handback(&self, handback: CaptureHandback) {
+    pub(crate) fn post_handback(&self, handback: CaptureHandback, seq: u64) {
         self.handback
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .replace(handback);
+        self.handback_seq.store(seq, Ordering::Release);
+        self.handback_signal.notify_all();
+    }
+
+    /// Block until a handback for flush `seq` (or newer) is posted, the
+    /// pipeline is stopped, or `timeout` elapses. Returns whether the
+    /// handback barrier was reached — on a timeout the caller still drains
+    /// whatever is posted (at shutdown that loses nothing: the guest is
+    /// tearing down anyway).
+    pub(crate) fn wait_for_handback(&self, seq: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut handback = self
+            .handback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if self.handback_seq.load(Ordering::Acquire) >= seq {
+                return true;
+            }
+            if self.stopped.load(Ordering::Acquire) {
+                return false;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return self.handback_seq.load(Ordering::Acquire) >= seq;
+            }
+            let (guard, _timed_out) = self
+                .handback_signal
+                .wait_timeout(handback, deadline.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            handback = guard;
+        }
     }
 
     /// Take a pending handback, if any (emu thread, under the big lock).
@@ -225,13 +272,14 @@ fn capture_thread(channel: Arc<super::PresentChannel>, wake: Box<dyn Fn() + Send
         ahash::HashMap::new()
     };
     while let Some(flush) = channel.capture.wait_flush() {
+        let flush_seq = flush.seq;
         targets.apply_flush(&flush);
         targets.replay(&flush.ops);
         let handback = targets.take_handback();
         // A zero-sized window (minimized at flush time) has nothing to
         // publish — post the handback and drop the frame.
         if flush.win_w == 0 || flush.win_h == 0 {
-            channel.capture.post_handback(handback);
+            channel.capture.post_handback(handback, flush_seq);
             continue;
         }
         let t0 = super::frame_timing_enabled().then(Instant::now);
@@ -277,7 +325,7 @@ fn capture_thread(channel: Arc<super::PresentChannel>, wake: Box<dyn Fn() + Send
                 .capture
                 .record_frame(u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX));
         }
-        channel.capture.post_handback(handback);
+        channel.capture.post_handback(handback, flush_seq);
         if should_wake {
             wake();
         }

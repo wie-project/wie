@@ -26,11 +26,15 @@
 //!    buffers back; the emu thread installs the handback at the next flush
 //!    boundary AND at every render-target `LockRect`/`UnlockRect` (a sync
 //!    point, so guest writes always land on top of the render thread's latest
-//!    state; reads are at most one frame stale while a replay is still in
-//!    flight). The implicit backbuffer is never handed back — the guest has
-//!    no object for it, so it lives solely on the render thread. Depth
-//!    buffers are never handed back either — no guest-visible read path
-//!    exists for them.
+//!    state). A guest that locks an RT for READ-BACK while ops are still
+//!    pending triggers `sync_flush_for_target_read`: the pending stream is
+//!    flushed immediately (zero publish dims — no frame) and the emu thread
+//!    rendezvous-waits for that flush's handback, so the read-back sees the
+//!    rasterized texels, never a pre-raster frame (real D3D9 semantics: the
+//!    LockRect must expose what the preceding draws rendered). The implicit
+//!    backbuffer is never handed back — the guest has no object for it, so
+//!    it lives solely on the render thread. Depth buffers are never handed
+//!    back either — no guest-visible read path exists for them.
 //! 3. **Order is preserved by folding state into the ops.** There are only
 //!    two op kinds: `Clear` (self-contained) and `Draw` (a full snapshot of
 //!    the device state the draw consumes — matrices, viewport, render state,
@@ -171,6 +175,10 @@ pub(crate) enum CaptureOp {
 /// render thread needs to (re)build its private target copies, and the
 /// publish metadata the commit path carries (`present/commit.rs`).
 pub(crate) struct CaptureFlush {
+    /// Monotonic flush sequence (assigned by the pipeline's `enqueue`); the
+    /// handback this flush's replay produces carries the same number — the
+    /// render-target LockRect rendezvous waits on it.
+    pub seq: u64,
     /// Device window that receives the frame.
     pub hwnd: Hwnd,
     /// Backbuffer dimensions (the guest render resolution).
@@ -529,7 +537,38 @@ pub(crate) fn drain_handback(state: &mut WinApiState) {
 /// inputs the render thread needs, move the stream into a [`CaptureFlush`],
 /// and enqueue it on the channel.
 pub(crate) fn flush_present(state: &mut WinApiState, win_w: u32, win_h: u32) {
+    let flush = build_flush(state, win_w, win_h);
+    state.present().channel.enqueue_capture_flush(flush);
+}
+
+/// Synchronous rendezvous for guest render-target READ-BACK: the replay only
+/// runs on the render thread at flush boundaries, so a guest that renders
+/// into an offscreen RT and `LockRect`s it BEFORE any `Present` (the gui_d3d9
+/// L6 self-test) would read empty texels. This drains any handback, and when
+/// ops are pending flushes them right now with zero publish dims (the render
+/// thread replays + posts the handback and skips the frame publish), then
+/// waits for that flush's handback so the emu-side target texels are the
+/// rasterized ones the guest expects. Rare path (RT locks with a non-empty
+/// stream) — the rendezvous cost is fine there.
+pub(crate) fn sync_flush_for_target_read(state: &mut WinApiState) {
     drain_handback(state);
+    if state.d3d9().d3d9_capture_stream.is_empty() {
+        return;
+    }
+    // win_w/win_h = 0: the render thread replays + posts the handback but
+    // publishes no frame (nothing was Presented).
+    let flush = build_flush(state, 0, 0);
+    let seq = state.present().channel.enqueue_capture_flush(flush);
+    state
+        .present()
+        .channel
+        .capture_wait_for_handback(seq, std::time::Duration::from_secs(2));
+    drain_handback(state);
+}
+
+/// Collect the pending op stream + the target inputs it references into one
+/// flush (the Publish-dims and rendezvous callers share this).
+fn build_flush(state: &mut WinApiState, win_w: u32, win_h: u32) -> CaptureFlush {
     let (bb_w, bb_h, hwnd) = {
         let d3d = state.d3d9();
         (
@@ -581,7 +620,9 @@ pub(crate) fn flush_present(state: &mut WinApiState, win_w: u32, win_h: u32) {
         .get(&hwnd)
         .copied()
         .unwrap_or(crate::present::DEFAULT_BACKGROUND_COLOR);
-    state.present().channel.enqueue_capture_flush(CaptureFlush {
+    CaptureFlush {
+        // The pipeline's enqueue assigns the real sequence number.
+        seq: 0,
         hwnd,
         bb_w,
         bb_h,
@@ -591,7 +632,7 @@ pub(crate) fn flush_present(state: &mut WinApiState, win_w: u32, win_h: u32) {
         ops,
         rt_inputs,
         depth_inputs,
-    });
+    }
 }
 
 // ── render-thread replay ─────────────────────────────────────────────────

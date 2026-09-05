@@ -543,10 +543,13 @@ fn lock_rect_render_target(
     p_locked_rect: u64,
     p_rect: u64,
 ) -> Result<u64> {
-    // Wave 2 capture sync point: install a pending render-thread handback
-    // FIRST so the exposed current texels include the latest replay output.
+    // Wave 2 capture sync point: the replay runs on the render thread at
+    // flush boundaries, so a guest that renders into this RT and locks it
+    // BEFORE any Present needs the pending ops replayed RIGHT NOW — flush
+    // + rendezvous-wait, then install the handback (see
+    // `capture::sync_flush_for_target_read`).
     if super::capture::capture_enabled(state) {
-        super::capture::drain_handback(state);
+        super::capture::sync_flush_for_target_read(state);
     }
     let Some(record) = state.d3d9().d3d9_render_targets.get(&rt_va) else {
         return Ok(D3DERR_INVALIDCALL);
