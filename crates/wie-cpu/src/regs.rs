@@ -146,6 +146,18 @@ pub struct RegFile {
     /// accesses resolve to. The primary thread keeps the fixed [`crate::GS_BASE`];
     /// workers are rebound to their per-thread TEB page.
     gs_base: u64,
+    /// x87 register stack, PHYSICAL indices st(0)=stack top: physical slot
+    /// `x87_top` holds st(0), `(x87_top + i) % 8` holds st(i). The JIT never
+    /// touches these (x87 lowers to the interpreter, which now degrades
+    /// instead of stopping on the exotic remainder).
+    pub(crate) x87: [f64; 8],
+    /// x87 TOP-of-stack pointer — the PHYSICAL index of st(0) (0..7).
+    pub(crate) x87_top: u8,
+    /// x87 status word: condition codes (C0/C1/C2/C3) + TOP + exception
+    /// bits the guest reads after `fcom` / `fnstsw`.
+    pub(crate) x87_sw: u16,
+    /// x87 control word (stored; only used by guests that flip precision).
+    pub(crate) x87_cw: u16,
 }
 
 impl Default for RegFile {
@@ -157,9 +169,20 @@ impl Default for RegFile {
             rflags: Rflags::DEFAULT,
             mxcsr: Self::MXCSR_DEFAULT,
             gs_base: crate::GS_BASE,
+            x87: [0.0; 8],
+            x87_top: 0,
+            x87_sw: 0,
+            x87_cw: 0x037F,
         }
     }
 }
+
+/// x87 status-word condition-code bits (`fnstsw` / `fstsw` observers).
+pub(crate) const X87_C0: u16 = 1 << 8;
+#[allow(dead_code)] // used when the C1 flag gains a consumer (fprem sign etc.)
+pub(crate) const X87_C1: u16 = 1 << 9;
+pub(crate) const X87_C2: u16 = 1 << 10;
+pub(crate) const X87_C3: u16 = 1 << 14;
 
 impl RegFile {
     /// MXCSR exception-mask field: bits 7–12, one per masked exception

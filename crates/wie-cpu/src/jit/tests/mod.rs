@@ -2252,3 +2252,98 @@ fn unimplemented_mnemonic_degrades_instead_of_stopping() {
         "RIP must advance past the degraded instruction"
     );
 }
+
+/// Wave 4 x87 subset: `fld`/`fsub`/`fstp` on m64 operands and the
+/// `fcomp` → `fnstsw` condition-code idiom, executed through the iced
+/// interpreter (the JIT bails x87 to the interpreter, which now implements
+/// the common scalar ops instead of degrading).
+#[test]
+fn x87_scalar_load_store_arith_and_compare() {
+    use crate::regs::X87_C0;
+
+    const CODE: u64 = SIMD_BASE;
+    const DATA: u64 = SIMD_BASE + 0x1000;
+
+    crate::exec::iced_decode_cache_flush();
+    let mut iced = IcedCpu::open_x86_64();
+    iced.virtual_alloc(
+        SIMD_BASE,
+        0x2000,
+        MEM_RESERVE | MEM_COMMIT,
+        protect::PAGE_EXECUTE_READWRITE,
+    )
+    .expect("iced alloc");
+
+    // Hand-encoded program (RIP-relative displacements filled in below):
+    //   DD 05 d1   fld   qword [rip+a]    ; push 6.0
+    //   DC 25 d2   fsub  qword [rip+b]    ; st0 = 6.0 - 4.0
+    //   DD 1D d3   fstp  qword [rip+z]    ; z = 2.0, pop
+    //   DF E0      fnstsw ax              ; sanity: TOP back at 0
+    let code: Vec<u8> = {
+        let mut c: Vec<u8> = Vec::new();
+        c.extend_from_slice(&[0xDD, 0x05]);
+        c.extend_from_slice(
+            &(DATA.wrapping_sub(CODE + 6) as u32).to_le_bytes(), // a
+        );
+        let s2 = u64::try_from(c.len()).unwrap_or(0);
+        c.extend_from_slice(&[0xDC, 0x25]);
+        c.extend_from_slice(
+            &(DATA.wrapping_add(8).wrapping_sub(CODE + s2 + 6) as u32).to_le_bytes(), // b
+        );
+        let s3 = u64::try_from(c.len()).unwrap_or(0);
+        c.extend_from_slice(&[0xDD, 0x1D]);
+        c.extend_from_slice(
+            &(DATA.wrapping_add(16).wrapping_sub(CODE + s3 + 6) as u32).to_le_bytes(), // z
+        );
+        c.extend_from_slice(&[0xDF, 0xE0]);
+        c
+    };
+    let bytes = |v: f64| v.to_bits().to_le_bytes();
+    iced.mem_write(CODE, &code).expect("code");
+    iced.mem_write(DATA, &bytes(6.0)).expect("a");
+    iced.mem_write(DATA + 8, &bytes(4.0)).expect("b");
+    iced.mem_write(DATA + 16, &bytes(0.0)).expect("z");
+    iced.write_rip(CODE).expect("rip");
+
+    for _ in 0..4 {
+        iced.step_once().expect("x87 step");
+    }
+    let mut out = [0_u8; 8];
+    iced.mem_read(DATA + 16, &mut out).expect("read z");
+    assert_eq!(
+        f64::from_bits(u64::from_le_bytes(out)),
+        2.0,
+        "fld/fsub/fstp must compute 6.0 - 4.0"
+    );
+    assert_eq!(
+        iced.regs().x87_top,
+        0,
+        "the stack must be back at TOP=0 after push/sub/pop"
+    );
+
+    // fcomp → fnstsw: 4.0 < 6.0 must set C0 (the sahf/jb idiom).
+    let code2: Vec<u8> = {
+        let base = CODE + 0x100;
+        let mut c: Vec<u8> = Vec::new();
+        c.extend_from_slice(&[0xDD, 0x05]);
+        c.extend_from_slice(&(DATA.wrapping_add(8).wrapping_sub(base + 6) as u32).to_le_bytes()); // fld b
+        let s2 = u64::try_from(c.len()).unwrap_or(0);
+        c.extend_from_slice(&[0xDC, 0x1D]);
+        c.extend_from_slice(
+            &(DATA.wrapping_sub(base + s2 + 6) as u32).to_le_bytes(), // fcomp a
+        );
+        c.extend_from_slice(&[0xDF, 0xE0]); // fnstsw ax
+        c
+    };
+    iced.mem_write(CODE + 0x100, &code2).expect("code2");
+    iced.write_rip(CODE + 0x100).expect("rip2");
+    for _ in 0..3 {
+        iced.step_once().expect("x87 compare step");
+    }
+    let ax = iced.regs().read_reg(iced_x86::Register::AX).unwrap_or(0);
+    assert_ne!(
+        ax & u64::from(X87_C0),
+        0,
+        "fcomp(4.0, 6.0) must set C0 (st0 < other)"
+    );
+}

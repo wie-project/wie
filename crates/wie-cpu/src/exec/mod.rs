@@ -14,6 +14,7 @@ mod ops;
 mod sse;
 mod sse_types;
 mod string;
+mod x87;
 
 use crate::CpuError;
 use crate::consts::{DWORD_BYTES, QWORD_BITS, SHIFT_MASK_32, SHIFT_MASK_64, XMM_BYTES};
@@ -695,31 +696,84 @@ fn execute_one(
             Ok(())
         }
 
-        other => {
-            // Degrade-not-die (Wave 4): trace once per mnemonic, count the
-            // execution, and continue with partial state (RIP already
-            // advanced, no register/memory effects) instead of stopping the
-            // session.
-            if *DEGRADE_ENABLED {
-                DEGRADED_INSNS.fetch_add(1, Ordering::Relaxed);
-                let mut seen = degrade_locked_seen();
-                if seen.insert(other as u32) {
-                    tracing::warn!(
-                        target: "wiecpu",
-                        ip = format_args!("{:#x}", instr.ip()),
-                        mnemonic = format!("{other:?}"),
-                        "unimplemented mnemonic — executing as partial no-op \
-                         (degrade-not-die; WIE_DEGRADE=0 restores the stop)"
-                    );
-                }
+        // Wave 4 x87 subset: the scalar stack ops; anything exec_x87 does not
+        // implement flows into the same degrade-not-die fallback.
+        Mnemonic::Fld
+        | Mnemonic::Fldz
+        | Mnemonic::Fld1
+        | Mnemonic::Fst
+        | Mnemonic::Fstp
+        | Mnemonic::Fild
+        | Mnemonic::Fist
+        | Mnemonic::Fistp
+        | Mnemonic::Fadd
+        | Mnemonic::Faddp
+        | Mnemonic::Fiadd
+        | Mnemonic::Fsub
+        | Mnemonic::Fsubp
+        | Mnemonic::Fsubr
+        | Mnemonic::Fsubrp
+        | Mnemonic::Fisub
+        | Mnemonic::Fisubr
+        | Mnemonic::Fmul
+        | Mnemonic::Fmulp
+        | Mnemonic::Fimul
+        | Mnemonic::Fdiv
+        | Mnemonic::Fdivp
+        | Mnemonic::Fdivr
+        | Mnemonic::Fdivrp
+        | Mnemonic::Fidiv
+        | Mnemonic::Fidivr
+        | Mnemonic::Fcom
+        | Mnemonic::Fcomp
+        | Mnemonic::Fcompp
+        | Mnemonic::Ficom
+        | Mnemonic::Ficomp
+        | Mnemonic::Fucom
+        | Mnemonic::Fucomp
+        | Mnemonic::Fucompp
+        | Mnemonic::Fnstsw
+        | Mnemonic::Fstsw
+        | Mnemonic::Fnstcw
+        | Mnemonic::Fstcw
+        | Mnemonic::Fldcw
+        | Mnemonic::Fchs
+        | Mnemonic::Fabs
+        | Mnemonic::Fsqrt => {
+            if x87::exec_x87(mem, regs, instr)? {
                 Ok(())
             } else {
-                Err(StepExecError::Cpu(CpuError::Message(format!(
-                    "unimplemented mnemonic {other:?} at {:#x}",
-                    instr.ip()
-                ))))
+                degrade_fallback(instr, instr.mnemonic())
             }
         }
+
+        other => degrade_fallback(instr, other),
+    }
+}
+
+/// Degrade-not-die (Wave 4): trace once per mnemonic, count the execution,
+/// and continue with partial state (RIP already advanced, no register/memory
+/// effects) instead of stopping the session. `WIE_DEGRADE=0` restores the
+/// hard stop for bisect.
+fn degrade_fallback(instr: &Instruction, other: Mnemonic) -> Result<(), StepExecError> {
+    if *DEGRADE_ENABLED {
+        DEGRADED_INSNS.fetch_add(1, Ordering::Relaxed);
+        let mut seen = degrade_locked_seen();
+        if seen.insert(other as u32) {
+            tracing::warn!(
+                target: "wiecpu",
+                ip = format_args!("{:#x}", instr.ip()),
+                mnemonic = format!("{other:?}"),
+                "unimplemented mnemonic — executing as partial no-op \
+                 (degrade-not-die; WIE_DEGRADE=0 restores the stop)"
+            );
+        }
+        Ok(())
+    } else {
+        Err(StepExecError::Cpu(CpuError::Message(format!(
+            "unimplemented mnemonic {other:?} at {:#x}",
+            instr.ip()
+        ))))
     }
 }
 
@@ -1323,7 +1377,7 @@ fn memory_op_size(instr: &Instruction) -> Result<usize, StepExecError> {
     Ok(sz)
 }
 
-fn effective_address(regs: &RegFile, instr: &Instruction) -> Result<u64, StepExecError> {
+pub(crate) fn effective_address(regs: &RegFile, instr: &Instruction) -> Result<u64, StepExecError> {
     // iced stores the absolute address for RIP/EIP-relative in memory_displacement64().
     // For other bases, displacement is a signed offset added to base+index*scale.
     let base = instr.memory_base();
@@ -1358,7 +1412,11 @@ fn effective_address(regs: &RegFile, instr: &Instruction) -> Result<u64, StepExe
     Ok(addr)
 }
 
-fn read_mem_value(mem: &GuestMemory, addr: u64, size: usize) -> Result<u64, StepExecError> {
+pub(crate) fn read_mem_value(
+    mem: &GuestMemory,
+    addr: u64,
+    size: usize,
+) -> Result<u64, StepExecError> {
     if size == 0 || size > 8 {
         return Err(StepExecError::Cpu(CpuError::Message(format!(
             "bad mem read size {size}"
@@ -1386,7 +1444,7 @@ fn read_mem_value(mem: &GuestMemory, addr: u64, size: usize) -> Result<u64, Step
     })
 }
 
-fn write_mem_value(
+pub(crate) fn write_mem_value(
     mem: &GuestMemory,
     addr: u64,
     value: u64,

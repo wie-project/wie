@@ -54,7 +54,7 @@ Conventions that apply to every wave: workspace lints deny
 | Item | Status |
 | --- | --- |
 | Unimplemented mnemonic → per-instruction fallback (interpreter stub returning partial state), not session stop (`exec/mod.rs:656` today) | ⬜ |
-| x87 subset (fld/fmul/fadd/fstp/comparisons) — most common game FP path | ⬜ |
+| x87 subset (fld/fmul/fadd/fstp/comparisons) — most common game FP path | 🟡 **slice 1 landed 2026-09-05** — `exec/x87.rs`: 8-deep f64 stack in `RegFile` (TOP-relative st(i), push/pop), the scalar ops games/CRTs actually use (`fld/fst/fstp/fild/fist/fistp/fadd+fi+fp forms/fsub·r·i/fmul/fdiv/com·ucom with C0/C2/C3 + fnstsw/fstsw ax, fldz/fld1/fchs/fabs/fsqrt, fldcw/fnstcw`), exact dst/src operand order via the register-form model (FSUBP ST(i),ST(0) = ST(i)−ST(0) etc.). The JIT bails x87 to the interpreter — with slice 1's degrade-not-die the exotic remainder (f2xm1/fsin/fprem) no-ops instead of stopping. Tests: m64 load/sub/store round-trip + the fcomp→fnstsw C0 idiom |
 | Integer SSE via existing scalar helpers widened to packed forms | ⬜ |
 | Coverage metric: % of micro-suite instructions executed without stop | ⬜ |
 
