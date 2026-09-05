@@ -91,6 +91,50 @@ cargo nextest run -p wie-runtime -E 'test(gui_d3d9) or test(commit_thread)'
 
 Report all failures verbatim to the agent; do not fix or rerun silently.
 
+## Step 2 implementation notes (2026-09-05)
+
+Landed. The mirror is rev-gated, not per-site-cloned:
+
+- **Sync seam**: `WindowMirror` lives on `PresentChannel` behind its own
+  mutex. Mutation sites bump `WindowState.window_mirror_rev` via
+  `touch_window_mirror()` (central in `find_window_mut`, which covers
+  geometry/visibility/title/tracking, plus explicit bumps at focus
+  assignment sites, Set/ReleaseCapture, menu mutations, create/destroy).
+  `HandlerContext::finish()` — the universal per-handler exit — calls
+  `sync_window_mirror_if_dirty()`: two integer compares when clean.
+- **Keyboard direction**: the host cannot write `keyboard_state` without
+  the big lock, so `set_key_state` pushes `(vk, pressed)` events onto the
+  mirror; the guest-side readers (GetKeyState/GetAsyncKeyState/
+  GetKeyboardState, IsDialogMessage, EDIT caret/scroll, accelerator
+  translation) drain them under the big lock they already hold. Wholesale
+  array copy was rejected — it would clobber guest-written bits.
+- **Mirrored (no big lock, proven by probe tests)**: `window_at`,
+  `window_at_in`, `capture_target`, `mouse_tracking`,
+  `first_guest_window_handle`, `first_guest_window_info`,
+  `focused_top_level`, `window_menu_items` (fast path: mirror clean +
+  resolved handle == cached handle → cached tree with no lock; the
+  rebuild path stays locked and re-syncs the mirror), `set_key_state`.
+  The proof holds the big `WinApiState` lock in the test thread and runs
+  each accessor on a worker thread with a 2 s timeout — a lock-taker
+  surfaces as a panic, not a hang.
+- **Legitimately still take the big lock (documented in-place)**:
+  `focus_window` (rare), `edit_selection`/`control_text`/
+  `status_bar_part_text` (test-only observation accessors),
+  `take_host_geometry_request` (consumes a slot — a read-only mirror
+  can't express take), `present_publish_ns_last` (diagnostics).
+  `resize_window` keeps `try_lock` (never blocks) + an explicit
+  `sync_window_mirror()` because it mutates outside any handler's
+  `finish()`.
+- **File-size policy**: `present/mod.rs` and `session/window.rs` test
+  modules moved to exempt `present/tests.rs` and `session/window/tests.rs`.
+- **Fresh-session nuance**: `session/window.rs` unit tests that seed
+  `WindowState` directly call `sync_window_mirror()` after seeding —
+  integration tests (real guests) need nothing; every handler finish
+  syncs.
+- **Stale window**: the mirror syncs at handler exit, so a presenter read
+  can be one in-flight handler behind. Same cadence as the frame the
+  presenter paints; accepted for all mirrored reads.
+
 ## Step 1 implementation notes (2026-09-05)
 
 Landed, unresolved design decisions resolved as follows:

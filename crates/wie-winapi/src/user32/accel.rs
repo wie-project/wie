@@ -216,6 +216,8 @@ fn handle_translate_accelerator_impl(
     // `keyboard?`, before any `&mut state` access. The `?` None arm is
     // unreachable: the window-state slot exists by the dispatch model's
     // runtime invariant (`window_state()` get_or_init's it on demand).
+    // Host keyboard writes (set_key_state) reach the guest array here.
+    state.drain_key_writes();
     let keyboard: Option<&KeyboardState> = state.try_window_state().map(|ws| &ws.keyboard_state);
     let command_id: Option<u16> = state
         .process

@@ -386,6 +386,7 @@ fn handle_find_replace_text(
     // so the first keystrokes land in the find field.
     state.window_state().active_window_handle = Hwnd::from(dialog_hwnd);
     state.window_state().focus_window_handle = Hwnd::from(find_edit_hwnd);
+    state.window_state().touch_window_mirror();
     let _unused = deliver_focus_change(
         state,
         engine,
@@ -739,9 +740,11 @@ fn destroy_find_dialog(state: &mut WinApiState, session: &FindDialogSession) {
         .retain(|hwnd, _| !subtree.contains(hwnd));
     if subtree.contains(&state.window_state().focus_window_handle) {
         state.window_state().focus_window_handle = Hwnd::NULL;
+        state.window_state().touch_window_mirror();
     }
     if subtree.contains(&state.window_state().capture_window_handle) {
         state.window_state().capture_window_handle = Hwnd::NULL;
+        state.window_state().touch_window_mirror();
     }
     if subtree.contains(&state.window_state().active_window_handle) {
         state.window_state().active_window_handle = Hwnd::NULL;

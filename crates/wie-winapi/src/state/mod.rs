@@ -287,6 +287,12 @@ impl DllStateMap {
         let boxed = self.slots.get(dll_slot(id).0)?.as_ref()?;
         boxed.as_ref().downcast_ref::<T>()
     }
+
+    /// Mutable read access — `None` if the state was never initialized.
+    pub fn get_mut<T: 'static>(&mut self, id: DllId) -> Option<&mut T> {
+        let boxed = self.slots.get_mut(dll_slot(id).0)?.as_mut()?;
+        boxed.as_mut().downcast_mut::<T>()
+    }
 }
 
 /// The process clipboard (CF_TEXT only for this milestone; Task 2.6).
@@ -513,6 +519,12 @@ impl WinApiState {
         self.dll_states.get_or_init::<WindowState>(DllId::Window)
     }
 
+    /// Mutable read-only-fallback access — `None` if never initialized (the
+    /// mirror sync's write-back path).
+    pub fn try_window_state_mut(&mut self) -> Option<&mut WindowState> {
+        self.dll_states.get_mut::<WindowState>(DllId::Window)
+    }
+
     /// Lock the guest message queue, recovering from a poisoned mutex.
     pub fn lock_message_queue(&self) -> std::sync::MutexGuard<'_, present::MessageQueue> {
         self.message_queue
@@ -680,6 +692,82 @@ impl WinApiState {
     pub fn try_present(&self) -> Option<&present::PresentState> {
         self.dll_states.get::<present::PresentState>(DllId::Present)
     }
+
+    /// Rebuild the presenter-side window mirror from the current window
+    /// state — called from [`Self::sync_window_mirror_if_dirty`] (the
+    /// `HandlerContext::finish` seam) and by host-side mutators that bypass
+    /// the handler path (the GUI `resize_window`). See
+    /// `present::window_mirror`.
+    ///
+    /// Mirrors only what the host reads: geometry/visibility/title/menu/
+    /// tracking per record, focus, capture, and the menu-dirty gate. The
+    /// projection rebuild runs only after a mutation site bumped the rev.
+    pub fn sync_window_mirror_if_dirty(&mut self) {
+        let dirty = self
+            .try_window_state()
+            .is_some_and(|ws| ws.window_mirror_rev != ws.window_mirror_synced_rev);
+        if !dirty {
+            return;
+        }
+        self.sync_window_mirror();
+    }
+
+    /// Unconditionally rebuild the presenter-side window mirror from the
+    /// current window state (see [`Self::sync_window_mirror_if_dirty`]).
+    pub fn sync_window_mirror(&mut self) {
+        let Some(ws) = self.try_window_state() else {
+            return;
+        };
+        let windows: Vec<present::MirrorWindow> = ws
+            .windows
+            .iter()
+            .map(|w| present::MirrorWindow {
+                handle: w.handle,
+                parent: w.parent_handle,
+                x: w.x,
+                y: w.y,
+                width: w.width,
+                height: w.height,
+                visible: w.visible,
+                title: w.title.clone(),
+                menu_handle: w.menu_handle,
+                mouse_tracking: w.mouse_tracking,
+            })
+            .collect();
+        let (focus, capture, menu_dirty) = (
+            ws.focus_window_handle,
+            ws.capture_window_handle,
+            ws.menu_dirty,
+        );
+        let synced_rev = ws.window_mirror_rev;
+        self.present()
+            .channel
+            .sync_window_mirror(windows, focus, capture, menu_dirty);
+        if let Some(ws) = self.try_window_state_mut() {
+            ws.window_mirror_synced_rev = synced_rev;
+        }
+    }
+
+    /// Drain the host's pending keyboard writes into the guest keyboard-state
+    /// array — called by the guest keyboard-state readers (under the big
+    /// lock they already hold) so host `set_key_state` writes reach the
+    /// guest without ever taking that lock host-side.
+    pub fn drain_key_writes(&mut self) {
+        let writes = self.present().channel.drain_key_writes();
+        if writes.is_empty() {
+            return;
+        }
+        let ws = self.window_state();
+        for (vk, pressed) in writes {
+            if let Some(key) = ws.keyboard_state.get_mut(usize::from(vk)) {
+                if pressed {
+                    *key |= 0x80;
+                } else {
+                    *key &= !0x80;
+                }
+            }
+        }
+    }
 }
 
 /// Bundle of everything a WinAPI handler may need.
@@ -724,6 +812,12 @@ impl<'a> HandlerContext<'a> {
     /// Errors need no per-API context here — the dispatcher already wraps
     /// handler failures as `{lib}!{name}: {error}`.
     pub fn finish(&mut self, value: u64) -> Result<crate::WinApiHandlerResult> {
+        // Wave 2 Step 2: refresh the presenter-side window mirror after every
+        // handler dispatch. Rev-gated: the common case (no window mutation)
+        // is two integer compares — the projection rebuild only runs after a
+        // site bumped `window_mirror_rev`. Handlers that bail with a control
+        // signal before `finish` sync on their next successful dispatch.
+        self.state.sync_window_mirror_if_dirty();
         let return_address = self.engine.return_from_win64_api(value)?;
         Ok(crate::WinApiHandlerResult {
             return_address,

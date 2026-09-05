@@ -531,6 +531,15 @@ pub struct WindowState {
     /// Set by any menu mutation so the host menu-bar sync rebuilds its cached
     /// tree instead of reconstructing it every frame. Read by the runtime.
     pub menu_dirty: bool,
+    /// Wave 2 Step 2: bumped by every mutation the presenter-side window
+    /// mirror reflects (create/destroy, geometry, visibility, title, focus,
+    /// capture, tracking, menu-dirty). The `HandlerContext::finish` seam
+    /// compares it against `window_mirror_synced_rev` and rebuilds the
+    /// mirror only when they differ — the per-dispatch cost is two integer
+    /// compares.
+    pub window_mirror_rev: u64,
+    /// The `window_mirror_rev` value the mirror last synced at.
+    pub window_mirror_synced_rev: u64,
     /// Class-level `SetClassLongPtr` values keyed by (class atom, signed index).
     pub(crate) class_long_ptr_values: Vec<(u16, i64, u64)>,
     pub message_queue_idle_policy: MessageQueueIdlePolicy,
@@ -661,6 +670,13 @@ pub struct WindowState {
 }
 
 impl WindowState {
+    /// Bump the window-mirror revision — the one-liner every mirror-relevant
+    /// mutation site calls so the `HandlerContext::finish` seam knows to
+    /// rebuild the presenter-side projection (see `present::window_mirror`).
+    pub fn touch_window_mirror(&mut self) {
+        self.window_mirror_rev = self.window_mirror_rev.wrapping_add(1);
+    }
+
     /// The earliest next-fire deadline across armed timers, if any.
     ///
     /// Read by the runtime idle park (Painpoint 1) so an empty-queue
@@ -830,6 +846,8 @@ impl Default for WindowState {
             comm_dlg_extended_error: 0,
             menus: Vec::new(),
             menu_dirty: false,
+            window_mirror_rev: 0,
+            window_mirror_synced_rev: 0,
             accel_tables: Vec::new(),
             resource_menus: Vec::new(),
             pending_child_process_spawn: None,

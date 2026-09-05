@@ -76,6 +76,7 @@ pub fn handle_set_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     // WndProc captures implicitly while pressed) become the capture owner.
     if window_handle == 0 || is_known_window(state, window_handle) {
         state.window_state().capture_window_handle = crate::handles::Hwnd::from(window_handle);
+        state.window_state().touch_window_mirror();
     }
 
     ctx.finish(previous_window.as_u64())
@@ -91,6 +92,7 @@ pub fn handle_get_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 pub fn handle_release_capture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let state = &mut *ctx.state;
     state.window_state().capture_window_handle = crate::handles::Hwnd::NULL;
+    state.window_state().touch_window_mirror();
 
     let return_value = 1;
 
@@ -131,6 +133,10 @@ pub(crate) fn find_window(state: &mut WinApiState, handle: u64) -> Option<&Windo
 }
 
 pub(crate) fn find_window_mut(state: &mut WinApiState, handle: u64) -> Option<&mut WindowRecord> {
+    // The mutate accessor: bump the mirror revision so the finish seam
+    // rebuilds the presenter-side projection after whatever field writes the
+    // caller performs through the returned record.
+    state.window_state().touch_window_mirror();
     state
         .window_state()
         .windows

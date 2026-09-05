@@ -665,6 +665,7 @@ pub(crate) fn create_window_record(
         dialog_unicode: false,
         subclass_original_wndproc: 0,
     });
+    state.window_state().touch_window_mirror();
 
     Ok((handle, window_proc, class_unicode))
 }

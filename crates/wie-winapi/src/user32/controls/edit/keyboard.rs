@@ -27,6 +27,7 @@ use super::state::{edit_state_for_window, edit_state_mut, edit_text};
 /// line-aware in a multiline EDIT (Ctrl makes them document-wide). Returns
 /// whether the caret/selection moved.
 pub(super) fn edit_move_caret(state: &mut WinApiState, hwnd: u64, vk: u64) -> bool {
+    state.drain_key_writes();
     let extend = shift_is_down(state);
     let ctrl = ctrl_is_down(state);
     // The font engine is taken out of gdi state so the stored-font resolution

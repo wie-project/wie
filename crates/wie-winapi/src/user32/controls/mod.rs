@@ -800,6 +800,7 @@ impl ControlClassKind {
                 if self != ControlClassKind::Static {
                     // STATIC never takes keyboard focus (labels are not tab stops).
                     state.window_state().focus_window_handle = crate::handles::Hwnd::from(hwnd);
+                    state.window_state().touch_window_mirror();
                     if self == ControlClassKind::Button {
                         // Implicit capture: a pushed BUTTON holds the mouse capture
                         // until its WM_LBUTTONUP, so drag-off/release-on still
@@ -861,6 +862,7 @@ impl ControlClassKind {
                 if was_pressed {
                     if self == ControlClassKind::Button {
                         state.window_state().capture_window_handle = crate::handles::Hwnd::NULL;
+                        state.window_state().touch_window_mirror();
                         // The release restores the unpressed face — the same
                         // face-rect scope the press marked.
                         button_invalidate_pressed(state, hwnd);

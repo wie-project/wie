@@ -99,7 +99,9 @@ pub(crate) fn dispatch_edit_message(
                 window.flags.insert(WindowFlags::FOCUSED);
             }
             state.window_state().focus_window_handle = crate::handles::Hwnd::from(hwnd);
+            state.window_state().touch_window_mirror();
             state.window_state().capture_window_handle = crate::handles::Hwnd::from(hwnd);
+            state.window_state().touch_window_mirror();
             invalidate(state, hwnd);
             Ok(Some(0))
         }
@@ -116,7 +118,9 @@ pub(crate) fn dispatch_edit_message(
                 window.flags.insert(WindowFlags::FOCUSED);
             }
             state.window_state().focus_window_handle = crate::handles::Hwnd::from(hwnd);
+            state.window_state().touch_window_mirror();
             state.window_state().capture_window_handle = crate::handles::Hwnd::from(hwnd);
+            state.window_state().touch_window_mirror();
             invalidate(state, hwnd);
             Ok(Some(0))
         }
@@ -190,6 +194,7 @@ pub(crate) fn dispatch_edit_message(
                     // jumps). The notification fires only when the caret
                     // actually moved — a key at the document edge is a no-op
                     // and stays silent.
+                    state.drain_key_writes();
                     let notify = match vk {
                         VK_UP | VK_DOWN | VK_PRIOR | VK_NEXT => EN_VSCROLL,
                         VK_HOME | VK_END if ctrl_is_down(state) => EN_VSCROLL,

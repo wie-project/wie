@@ -136,6 +136,7 @@ impl ModalFrame {
         let mut signal = None;
         if let Some(focus_hwnd) = focus_hwnd {
             state.window_state().focus_window_handle = Hwnd::from(focus_hwnd);
+            state.window_state().touch_window_mirror();
             signal =
                 deliver_focus_change(state, engine, 0, focus_hwnd, OuterReturn::Fixed(focus_hwnd))?;
         }
@@ -210,6 +211,7 @@ impl ModalFrame {
                 let current_focus = state.window_state().focus_window_handle;
                 if current_focus != owner {
                     state.window_state().focus_window_handle = owner;
+                    state.window_state().touch_window_mirror();
                     signal = deliver_focus_change(
                         state,
                         engine,

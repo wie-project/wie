@@ -86,6 +86,9 @@ fn handle_is_dialog_message_impl(
         _ => DialogKeyAction::None,
     };
 
+    // Host keyboard writes (set_key_state) reach the guest array here —
+    // the Shift+Tab read below must see them.
+    state.drain_key_writes();
     match action {
         DialogKeyAction::None => ctx.finish(0),
         DialogKeyAction::Focus => {
@@ -232,6 +235,7 @@ fn advance_dialog_focus(
         .copied()
         .unwrap_or(crate::handles::Hwnd::NULL);
     state.window_state().focus_window_handle = next;
+    state.window_state().touch_window_mirror();
     deliver_focus_change(
         state,
         engine,

@@ -96,6 +96,7 @@ pub fn handle_enable_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 
     if mutated {
         state.window_state().menu_dirty = true;
+        state.window_state().touch_window_mirror();
     }
 
     // Windows returns -1 when no item matches; otherwise the previous state.
@@ -135,6 +136,7 @@ pub fn handle_check_menu_item(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
 
     if mutated {
         state.window_state().menu_dirty = true;
+        state.window_state().touch_window_mirror();
     }
 
     let return_value = u64::from(if mutated { previous_flags } else { u32::MAX });
@@ -291,6 +293,7 @@ pub(crate) fn load_resource_menu(
             menu_id,
         });
     state.window_state().menu_dirty = true;
+    state.window_state().touch_window_mirror();
     Ok(handle)
 }
 
@@ -456,6 +459,7 @@ fn handle_append_menu_impl(
         })?;
     record.items.push(entry);
     ws.menu_dirty = true;
+    ws.touch_window_mirror();
 
     ctx.finish(1)
 }
@@ -473,6 +477,7 @@ pub fn handle_set_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResu
     if let Some(window) = ws.windows.iter_mut().find(|w| w.handle == hwnd) {
         window.menu_handle = menu_handle;
         ws.menu_dirty = true;
+        ws.touch_window_mirror();
     }
     ctx.finish(1)
 }
@@ -489,6 +494,7 @@ pub fn handle_destroy_menu(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     ws.menus.retain(|m| m.handle != menu_handle);
     if ws.menus.len() != before {
         ws.menu_dirty = true;
+        ws.touch_window_mirror();
     }
     handle_menu_success(ctx)
 }

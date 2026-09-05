@@ -494,6 +494,7 @@ pub fn handle_destroy_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             .window_state()
             .windows
             .retain(|w| w.handle != crate::handles::Hwnd::from(window_handle));
+        state.window_state().touch_window_mirror();
         return ctx.finish(1);
     }
 
