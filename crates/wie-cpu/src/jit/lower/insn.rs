@@ -3,7 +3,7 @@
 
 use super::emit::MemEnv;
 use super::flags::{
-    clear_flags, flag_bit, flags_add, flags_logic, flags_sub, flags_zs_pf, iconst_u64,
+    FlagState, clear_flags, flag_bit, flags_add, flags_logic, flags_sub, flags_zs_pf, iconst_u64,
     lower_inc_dec_lazy, lower_neg_lazy, lower_not, replace_flag, select_flag,
 };
 use super::gpr::{
@@ -90,6 +90,7 @@ pub(super) fn flush_pending(
     bcx: &mut FunctionBuilder<'_>,
     rflags: &mut Value,
     pending: &mut PendingFlags,
+    flag_state: &mut Option<FlagState>,
 ) {
     match *pending {
         PendingFlags::None => {}
@@ -104,13 +105,23 @@ pub(super) fn flush_pending(
         }
         PendingFlags::Inc { a, res, bits } => {
             let one = iconst_u64(bcx, 1);
-            let cf = flag_bit(bcx, *rflags, Rflags::CF);
+            // CF bit value (I64 0/1): live fs.cf (i1) widened, else packed read.
+            let cf = if let Some(fs) = flag_state.as_ref() {
+                select_flag(bcx, fs.cf, Rflags::CF)
+            } else {
+                flag_bit(bcx, *rflags, Rflags::CF)
+            };
             let with = flags_add(bcx, *rflags, a, one, res, bits);
             *rflags = replace_flag(bcx, with, Rflags::CF, cf);
         }
         PendingFlags::Dec { a, res, bits } => {
             let one = iconst_u64(bcx, 1);
-            let cf = flag_bit(bcx, *rflags, Rflags::CF);
+            // CF bit value (I64 0/1): live fs.cf (i1) widened, else packed read.
+            let cf = if let Some(fs) = flag_state.as_ref() {
+                select_flag(bcx, fs.cf, Rflags::CF)
+            } else {
+                flag_bit(bcx, *rflags, Rflags::CF)
+            };
             let with = flags_sub(bcx, *rflags, a, one, res, bits);
             *rflags = replace_flag(bcx, with, Rflags::CF, cf);
         }
@@ -123,6 +134,9 @@ pub(super) fn flush_pending(
         } => {
             *rflags = materialize_shift_flags(bcx, *rflags, kind, dst, res, count_mod, bits);
         }
+    }
+    if let Some(fs) = flag_state {
+        fs.resync(bcx, *rflags);
     }
     *pending = PendingFlags::None;
 }
@@ -242,6 +256,7 @@ pub(super) fn lower_insn(
     dirty: &mut [bool; 16],
     rflags: &mut Value,
     pending: &mut PendingFlags,
+    flag_state: &mut Option<FlagState>,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
 ) -> Result<(), String> {
@@ -272,18 +287,25 @@ pub(super) fn lower_insn(
         Mnemonic::Pop => lower_pop(bcx, instr, gpr, dirty, *rflags, mem),
         // PUSHFQ/POPFQ/LEAVE: need live flags (push) or overwrite them (pop).
         Mnemonic::Pushfq => {
-            flush_pending(bcx, rflags, pending);
+            flush_pending(bcx, rflags, pending, flag_state);
             lower_pushfq(bcx, gpr, dirty, *rflags, mem, instr.ip())
         }
         Mnemonic::Popfq => {
             // Overwrites full RFLAGS — drop pending without materializing.
             *pending = PendingFlags::None;
-            lower_popfq(bcx, gpr, dirty, rflags, mem, instr.ip())
+            lower_popfq(bcx, gpr, dirty, rflags, mem, instr.ip())?;
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
+            Ok(())
         }
         Mnemonic::Leave => lower_leave(bcx, gpr, dirty, *rflags, mem, instr.ip()),
         Mnemonic::Cld => {
             // DF only; pending ALU flags stay deferred.
             *rflags = clear_flags(bcx, *rflags, Rflags::DF);
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
             Ok(())
         }
         Mnemonic::Std => {
@@ -291,6 +313,9 @@ pub(super) fn lower_insn(
             let bit = iconst_u64(bcx, u64::from(Rflags::DF));
             let cleared = clear_flags(bcx, *rflags, Rflags::DF);
             *rflags = bcx.ins().bor(cleared, bit);
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
             Ok(())
         }
         Mnemonic::Bswap => lower_bswap(bcx, instr, gpr, dirty),
@@ -298,31 +323,31 @@ pub(super) fn lower_insn(
         Mnemonic::Not => lower_not(bcx, instr, gpr, dirty, *rflags, mem),
         // Bit test ops: flush pending flags, set CF directly.
         Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
-            flush_pending(bcx, rflags, pending);
+            flush_pending(bcx, rflags, pending, flag_state);
             lower_bit_test_op(bcx, instr, gpr, dirty, rflags, mem)
         }
         // Xadd: exchange and add — flush flags, swap dst↔src, set flags as ADD.
         Mnemonic::Xadd => {
-            flush_pending(bcx, rflags, pending);
+            flush_pending(bcx, rflags, pending, flag_state);
             lower_xadd(bcx, instr, gpr, dirty, rflags, mem)
         }
         // CmpXchg: compare and exchange — flush flags, atomically compare with accumulator.
         Mnemonic::Cmpxchg => {
-            flush_pending(bcx, rflags, pending);
+            flush_pending(bcx, rflags, pending, flag_state);
             lower_cmpxchg(bcx, instr, gpr, dirty, rflags, mem)
         }
         // Bsr/Bsf: bit scans — flush flags, scan for the set-bit index.
         Mnemonic::Bsr => {
-            flush_pending(bcx, rflags, pending);
+            flush_pending(bcx, rflags, pending, flag_state);
             lower_bsr(bcx, instr, gpr, dirty, rflags, mem)
         }
         Mnemonic::Bsf => {
-            flush_pending(bcx, rflags, pending);
+            flush_pending(bcx, rflags, pending, flag_state);
             lower_bsf(bcx, instr, gpr, dirty, rflags, mem)
         }
         // Lzcnt: count leading zeros — flush flags, zero src yields width.
         Mnemonic::Lzcnt => {
-            flush_pending(bcx, rflags, pending);
+            flush_pending(bcx, rflags, pending, flag_state);
             lower_lzcnt(bcx, instr, gpr, dirty, rflags, mem)
         }
         // Lazy-capable ALU (overwrite pending without materializing).
@@ -335,20 +360,25 @@ pub(super) fn lower_insn(
         Mnemonic::Test => lower_cmp_test_lazy(bcx, instr, gpr, rflags, pending, mem, false),
         // Need live CF / complex flags → flush then eager.
         Mnemonic::Adc | Mnemonic::Sbb => {
-            flush_pending(bcx, rflags, pending);
+            flush_pending(bcx, rflags, pending, flag_state);
             lower_arith(
                 bcx,
                 instr,
                 gpr,
                 dirty,
                 rflags,
+                flag_state.as_ref(),
                 mem,
                 if instr.mnemonic() == Mnemonic::Adc {
                     Arith::Adc
                 } else {
                     Arith::Sbb
                 },
-            )
+            )?;
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
+            Ok(())
         }
         // Inc/dec: lazy with CF preserved on flush (Intel: INC/DEC do not touch CF).
         Mnemonic::Inc => lower_inc_dec_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, true),
@@ -358,35 +388,91 @@ pub(super) fn lower_insn(
             lower_neg_lazy(bcx, instr, gpr, dirty, rflags, pending, mem)
         }
         Mnemonic::Imul => {
-            flush_pending(bcx, rflags, pending);
+            flush_pending(bcx, rflags, pending, flag_state);
             lower_imul(bcx, instr, gpr, dirty, rflags, mem)
         }
         Mnemonic::Div | Mnemonic::Idiv => {
-            flush_pending(bcx, rflags, pending);
+            flush_pending(bcx, rflags, pending, flag_state);
             lower_div(bcx, instr, gpr, dirty, rflags, mem)
         }
         // Shift/rotate: compute result now; defer flag packing (unless count_mod==0).
-        Mnemonic::Shl | Mnemonic::Sal => {
-            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Shl)
-        }
-        Mnemonic::Shr => {
-            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Shr)
-        }
-        Mnemonic::Sar => {
-            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Sar)
-        }
-        Mnemonic::Rol => {
-            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Rol)
-        }
-        Mnemonic::Ror => {
-            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Ror)
-        }
-        Mnemonic::Rcl => {
-            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Rcl)
-        }
-        Mnemonic::Rcr => {
-            lower_shift_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, ShiftKind::Rcr)
-        }
+        Mnemonic::Shl | Mnemonic::Sal => lower_shift_lazy(
+            bcx,
+            instr,
+            gpr,
+            dirty,
+            rflags,
+            pending,
+            flag_state,
+            mem,
+            ShiftKind::Shl,
+        ),
+        Mnemonic::Shr => lower_shift_lazy(
+            bcx,
+            instr,
+            gpr,
+            dirty,
+            rflags,
+            pending,
+            flag_state,
+            mem,
+            ShiftKind::Shr,
+        ),
+        Mnemonic::Sar => lower_shift_lazy(
+            bcx,
+            instr,
+            gpr,
+            dirty,
+            rflags,
+            pending,
+            flag_state,
+            mem,
+            ShiftKind::Sar,
+        ),
+        Mnemonic::Rol => lower_shift_lazy(
+            bcx,
+            instr,
+            gpr,
+            dirty,
+            rflags,
+            pending,
+            flag_state,
+            mem,
+            ShiftKind::Rol,
+        ),
+        Mnemonic::Ror => lower_shift_lazy(
+            bcx,
+            instr,
+            gpr,
+            dirty,
+            rflags,
+            pending,
+            flag_state,
+            mem,
+            ShiftKind::Ror,
+        ),
+        Mnemonic::Rcl => lower_shift_lazy(
+            bcx,
+            instr,
+            gpr,
+            dirty,
+            rflags,
+            pending,
+            flag_state,
+            mem,
+            ShiftKind::Rcl,
+        ),
+        Mnemonic::Rcr => lower_shift_lazy(
+            bcx,
+            instr,
+            gpr,
+            dirty,
+            rflags,
+            pending,
+            flag_state,
+            mem,
+            ShiftKind::Rcr,
+        ),
         m @ (Mnemonic::Cmove
         | Mnemonic::Cmovne
         | Mnemonic::Cmova
@@ -403,7 +489,7 @@ pub(super) fn lower_insn(
         | Mnemonic::Cmovns
         | Mnemonic::Cmovp
         | Mnemonic::Cmovnp) => {
-            flush_pending(bcx, rflags, pending);
+            flush_pending(bcx, rflags, pending, flag_state);
             lower_cmov(bcx, instr, gpr, dirty, *rflags, mem, m)
         }
         m @ (Mnemonic::Sete
@@ -422,7 +508,7 @@ pub(super) fn lower_insn(
         | Mnemonic::Setns
         | Mnemonic::Setp
         | Mnemonic::Setnp) => {
-            flush_pending(bcx, rflags, pending);
+            flush_pending(bcx, rflags, pending, flag_state);
             lower_setcc(bcx, instr, gpr, dirty, *rflags, mem, m)
         }
         Mnemonic::Movaps
@@ -604,7 +690,7 @@ pub(super) fn lower_insn(
         }
         // FP compare → RFLAGS (flush deferred ALU flags first).
         Mnemonic::Comiss | Mnemonic::Ucomiss | Mnemonic::Comisd | Mnemonic::Ucomisd => {
-            flush_pending(bcx, rflags, pending);
+            flush_pending(bcx, rflags, pending, flag_state);
             let is_double = matches!(instr.mnemonic(), Mnemonic::Comisd | Mnemonic::Ucomisd);
             lower_sse_comis(bcx, instr, gpr, rflags, mem, xmm, is_double)
         }

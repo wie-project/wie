@@ -154,6 +154,19 @@ pub(super) fn decompose_packed(bcx: &mut FunctionBuilder<'_>, rflags: Value) -> 
 }
 
 impl FlagState {
+    /// Re-derive every per-flag i1 from a freshly written packed carrier.
+    /// Call after each `*rflags` mutation so mid-instruction flag readers
+    /// (INC/DEC CF-preserve, adc/sbb carry-in) see the current values.
+    pub(super) fn resync(&mut self, bcx: &mut FunctionBuilder<'_>, packed: Value) {
+        self.zf = flag_set(bcx, packed, Rflags::ZF);
+        self.sf = flag_set(bcx, packed, Rflags::SF);
+        self.cf = flag_set(bcx, packed, Rflags::CF);
+        self.of = flag_set(bcx, packed, Rflags::OF);
+        self.pf = flag_set(bcx, packed, Rflags::PF);
+        self.af = flag_set(bcx, packed, Rflags::AF);
+        self.old = packed;
+    }
+
     /// Pack the SSA flags into the packed rflags carrier, keeping the previous
     /// rflags value for bits we do not track (DF, IF, reserved).
     fn pack(&self, bcx: &mut FunctionBuilder<'_>) -> Value {
@@ -180,6 +193,18 @@ impl FlagState {
 #[allow(dead_code)]
 pub(super) fn pack_state(bcx: &mut FunctionBuilder<'_>, fs: &FlagState) -> Value {
     fs.pack(bcx)
+}
+
+/// Re-derive an optional FlagState from a freshly written packed carrier.
+/// No-op when the SSA path is off (no state to keep fresh).
+pub(super) fn resync_state(
+    bcx: &mut FunctionBuilder<'_>,
+    flag_state: &mut Option<FlagState>,
+    packed: Value,
+) {
+    if let Some(fs) = flag_state {
+        fs.resync(bcx, packed);
+    }
 }
 
 pub(super) fn pf_cond(bcx: &mut FunctionBuilder<'_>, result: Value) -> Value {

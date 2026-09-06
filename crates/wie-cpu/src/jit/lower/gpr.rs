@@ -3,8 +3,8 @@
 
 use super::emit::MemEnv;
 use super::flags::{
-    clear_flags, flag_bit, flags_add, flags_logic, flags_sub, iconst_u64, mask_width, replace_flag,
-    select_flag,
+    FlagState, clear_flags, flag_bit, flags_add, flags_logic, flags_sub, iconst_u64, mask_width,
+    replace_flag, select_flag,
 };
 use super::insn::PendingFlags;
 use super::mem::{call_load, call_store};
@@ -824,12 +824,15 @@ pub(super) fn lower_cmp_test_lazy(
 }
 
 /// Eager ALU (adc/sbb): needs live CF from flushed flags.
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_arith(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
     rflags: &mut Value,
+    flag_state: Option<&FlagState>,
     mem: &mut MemEnv,
     op: Arith,
 ) -> Result<(), String> {
@@ -838,7 +841,12 @@ pub(super) fn lower_arith(
     let b_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
     let a = mask_width(bcx, a_raw, bits);
     let b = mask_width(bcx, b_raw, bits);
-    let cf_val = flag_bit(bcx, *rflags, Rflags::CF);
+    // Carry-in CF bit value (I64 0/1): live fs.cf (i1) widened, else packed read.
+    let cf_val = if let Some(fs) = flag_state {
+        select_flag(bcx, fs.cf, Rflags::CF)
+    } else {
+        flag_bit(bcx, *rflags, Rflags::CF)
+    };
     let res = match op {
         Arith::Add => bcx.ins().iadd(a, b),
         Arith::Adc => {

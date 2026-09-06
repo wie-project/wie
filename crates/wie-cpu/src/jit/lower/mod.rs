@@ -565,7 +565,7 @@ use analysis::{
 use emit::{
     MemEnv, SuperStack, emit_block_wide_stack_guard, emit_body_and_term, term_chain_targets,
 };
-use flags::{flag_bit, iconst_u64, mask_width};
+use flags::{FlagState, flag_bit, iconst_u64, mask_width};
 use gpr::{
     bool_to_i64, effective_addr, flag_set, mark_dirty, op_width_bits, read_op_mem, reg_index,
     sext_to_i64, write_gpr, write_op_mem,
@@ -1407,12 +1407,13 @@ pub(super) fn lower_shift_lazy(
     dirty: &mut [bool; 16],
     rflags: &mut Value,
     pending: &mut PendingFlags,
+    flag_state: &mut Option<FlagState>,
     mem: &mut MemEnv,
     kind: ShiftKind,
 ) -> Result<(), String> {
     // Prior ALU flags must be in `rflags` before we record a Shift pending
     // (shift flags are applied relative to current rflags for OF when count!=1).
-    flush_pending(bcx, rflags, pending);
+    flush_pending(bcx, rflags, pending, flag_state);
 
     let bits = op_width_bits(instr, 0)?;
     let dst_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;

@@ -2,7 +2,7 @@
 //! terminator helpers (chaining, shadow stack, self-loops, fast UCRT inline ops).
 
 use super::analysis::{ensure_gprs_loaded, ensure_xmm_loaded};
-use super::flags::{FlagState, decompose_packed, iconst_u64};
+use super::flags::{FlagState, decompose_packed, iconst_u64, resync_state};
 use super::gpr::mark_dirty;
 use super::insn::{PendingFlags, flush_pending, lower_insn};
 use super::mem::call_load;
@@ -861,16 +861,12 @@ pub(super) fn emit_body_and_term(
         ensure_gprs_loaded(bcx, ctx_ptr, gpr_vals, gpr_loaded, &d.instr, flags);
         ensure_xmm_loaded(bcx, ctx_ptr, flags, &d.instr, xmm_vals, xmm_loaded);
         if is_string_op(&d.instr) {
-            flush_pending(bcx, rflags_val, &mut pending);
-            if let Some(fs) = &mut flag_state {
-                fs.old = *rflags_val;
-            }
+            flush_pending(bcx, rflags_val, &mut pending, &mut flag_state);
+            resync_state(bcx, &mut flag_state, *rflags_val);
             string_exit_rip = Some(lower_string(
                 bcx, &d.instr, gpr_vals, rflags_val, gpr_loaded, mem_env,
             )?);
-            if let Some(fs) = &mut flag_state {
-                fs.old = *rflags_val;
-            }
+            resync_state(bcx, &mut flag_state, *rflags_val);
         } else {
             lower_insn(
                 bcx,
@@ -879,12 +875,11 @@ pub(super) fn emit_body_and_term(
                 gpr_dirty,
                 rflags_val,
                 &mut pending,
+                &mut flag_state,
                 mem_env,
                 xmm_vals,
             )?;
-        }
-        if let Some(fs) = &mut flag_state {
-            fs.old = *rflags_val;
+            resync_state(bcx, &mut flag_state, *rflags_val);
         }
     }
 
@@ -892,10 +887,8 @@ pub(super) fn emit_body_and_term(
         || needs_flags
         || !matches!(pending, PendingFlags::None)
     {
-        flush_pending(bcx, rflags_val, &mut pending);
-        if let Some(fs) = &mut flag_state {
-            fs.old = *rflags_val;
-        }
+        flush_pending(bcx, rflags_val, &mut pending, &mut flag_state);
+        resync_state(bcx, &mut flag_state, *rflags_val);
     }
 
     if let Some(t) = term {
