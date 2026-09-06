@@ -167,6 +167,42 @@ impl FlagState {
         self.old = packed;
     }
 
+    /// Compute ADD/SUB-family flags once (predicate-direct) from operands.
+    /// When `keep_cf` (INC/DEC) the incoming CF is preserved untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn assign_arith(
+        &mut self,
+        bcx: &mut FunctionBuilder<'_>,
+        dst: Value,
+        src: Value,
+        result: Value,
+        bits: u32,
+        sub: bool,
+        keep_cf: bool,
+    ) {
+        let (cf_c, of_c, af_c) = add_sub_preds(bcx, dst, src, result, bits, sub);
+        let (zf, sf, pf) = zs_pf_preds(bcx, result, bits);
+        self.zf = zf;
+        self.sf = sf;
+        self.pf = pf;
+        self.of = of_c;
+        self.af = af_c;
+        if !keep_cf {
+            self.cf = cf_c;
+        }
+    }
+
+    /// AND/OR/XOR/TEST flags: CF=OF=0, ZS/PF from result.
+    pub(super) fn assign_logic(&mut self, bcx: &mut FunctionBuilder<'_>, result: Value, bits: u32) {
+        let (zf, sf, pf) = zs_pf_preds(bcx, result, bits);
+        self.zf = zf;
+        self.sf = sf;
+        self.pf = pf;
+        let zero = iconst_u64(bcx, 0);
+        self.cf = bcx.ins().icmp_imm(IntCC::Equal, zero, 1); // false
+        self.of = bcx.ins().icmp_imm(IntCC::Equal, zero, 1); // false
+    }
+
     /// Pack the SSA flags into the packed rflags carrier, keeping the previous
     /// rflags value for bits we do not track (DF, IF, reserved).
     fn pack(&self, bcx: &mut FunctionBuilder<'_>) -> Value {
@@ -190,9 +226,12 @@ impl FlagState {
     }
 }
 
-#[allow(dead_code)]
-pub(super) fn pack_state(bcx: &mut FunctionBuilder<'_>, fs: &FlagState) -> Value {
-    fs.pack(bcx)
+pub(super) fn pack_state(bcx: &mut FunctionBuilder<'_>, fs: &mut FlagState) -> Value {
+    let packed = fs.pack(bcx);
+    // Keep the carrier in sync so later packs preserve only the untracked bits
+    // (DF, IF, reserved) from the current architectural state, never a stale one.
+    fs.old = packed;
+    packed
 }
 
 /// Re-derive an optional FlagState from a freshly written packed carrier.

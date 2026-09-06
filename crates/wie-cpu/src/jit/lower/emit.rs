@@ -870,10 +870,10 @@ pub(super) fn emit_body_and_term(
         ensure_xmm_loaded(bcx, ctx_ptr, flags, &d.instr, xmm_vals, xmm_loaded);
         if is_string_op(&d.instr) {
             flush_pending(bcx, rflags_val, &mut pending, &mut flag_state);
-            resync_state(bcx, &mut flag_state, *rflags_val);
             string_exit_rip = Some(lower_string(
                 bcx, &d.instr, gpr_vals, rflags_val, gpr_loaded, mem_env,
             )?);
+            // The string helper round-trips packed rflags through JitCtx.
             resync_state(bcx, &mut flag_state, *rflags_val);
         } else {
             lower_insn(
@@ -887,7 +887,6 @@ pub(super) fn emit_body_and_term(
                 mem_env,
                 xmm_vals,
             )?;
-            resync_state(bcx, &mut flag_state, *rflags_val);
         }
     }
 

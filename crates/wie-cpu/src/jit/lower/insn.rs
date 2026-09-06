@@ -4,7 +4,7 @@
 use super::emit::MemEnv;
 use super::flags::{
     FlagState, clear_flags, flag_bit, flags_add, flags_logic, flags_sub, flags_zs_pf, iconst_u64,
-    lower_inc_dec_lazy, lower_neg_lazy, lower_not, replace_flag, select_flag,
+    lower_inc_dec_lazy, lower_neg_lazy, lower_not, pack_state, replace_flag, select_flag,
 };
 use super::gpr::{
     Arith, lower_arith, lower_arith_lazy, lower_bit_test_op, lower_bsf, lower_bsr, lower_bswap,
@@ -95,35 +95,56 @@ pub(super) fn flush_pending(
     match *pending {
         PendingFlags::None => {}
         PendingFlags::Add { a, b, res, bits } => {
-            *rflags = flags_add(bcx, *rflags, a, b, res, bits);
+            if let Some(fs) = flag_state {
+                fs.assign_arith(bcx, a, b, res, bits, false, false);
+                *rflags = pack_state(bcx, fs);
+            } else {
+                *rflags = flags_add(bcx, *rflags, a, b, res, bits);
+            }
         }
         PendingFlags::Sub { a, b, res, bits } => {
-            *rflags = flags_sub(bcx, *rflags, a, b, res, bits);
+            if let Some(fs) = flag_state {
+                fs.assign_arith(bcx, a, b, res, bits, true, false);
+                *rflags = pack_state(bcx, fs);
+            } else {
+                *rflags = flags_sub(bcx, *rflags, a, b, res, bits);
+            }
         }
         PendingFlags::Logic { res, bits } => {
-            *rflags = flags_logic(bcx, *rflags, res, bits);
+            if let Some(fs) = flag_state {
+                fs.assign_logic(bcx, res, bits);
+                *rflags = pack_state(bcx, fs);
+            } else {
+                *rflags = flags_logic(bcx, *rflags, res, bits);
+            }
         }
         PendingFlags::Inc { a, res, bits } => {
-            let one = iconst_u64(bcx, 1);
-            // CF bit value (I64 0/1): live fs.cf (i1) widened, else packed read.
-            let cf = if let Some(fs) = flag_state.as_ref() {
-                select_flag(bcx, fs.cf, Rflags::CF)
+            if let Some(fs) = flag_state {
+                let one = iconst_u64(bcx, 1);
+                // INC preserves CF: assign arith flags but keep the incoming fs.cf.
+                fs.assign_arith(bcx, a, one, res, bits, false, true);
+                *rflags = pack_state(bcx, fs);
             } else {
-                flag_bit(bcx, *rflags, Rflags::CF)
-            };
-            let with = flags_add(bcx, *rflags, a, one, res, bits);
-            *rflags = replace_flag(bcx, with, Rflags::CF, cf);
+                let one = iconst_u64(bcx, 1);
+                // CF bit value (I64 0/1): live fs.cf (i1) widened, else packed read.
+                let cf = flag_bit(bcx, *rflags, Rflags::CF);
+                let with = flags_add(bcx, *rflags, a, one, res, bits);
+                *rflags = replace_flag(bcx, with, Rflags::CF, cf);
+            }
         }
         PendingFlags::Dec { a, res, bits } => {
-            let one = iconst_u64(bcx, 1);
-            // CF bit value (I64 0/1): live fs.cf (i1) widened, else packed read.
-            let cf = if let Some(fs) = flag_state.as_ref() {
-                select_flag(bcx, fs.cf, Rflags::CF)
+            if let Some(fs) = flag_state {
+                let one = iconst_u64(bcx, 1);
+                // DEC preserves CF: assign arith flags but keep the incoming fs.cf.
+                fs.assign_arith(bcx, a, one, res, bits, true, true);
+                *rflags = pack_state(bcx, fs);
             } else {
-                flag_bit(bcx, *rflags, Rflags::CF)
-            };
-            let with = flags_sub(bcx, *rflags, a, one, res, bits);
-            *rflags = replace_flag(bcx, with, Rflags::CF, cf);
+                let one = iconst_u64(bcx, 1);
+                // CF bit value (I64 0/1): live fs.cf (i1) widened, else packed read.
+                let cf = flag_bit(bcx, *rflags, Rflags::CF);
+                let with = flags_sub(bcx, *rflags, a, one, res, bits);
+                *rflags = replace_flag(bcx, with, Rflags::CF, cf);
+            }
         }
         PendingFlags::Shift {
             kind,
@@ -132,11 +153,12 @@ pub(super) fn flush_pending(
             count_mod,
             bits,
         } => {
+            // Shifts stay packed until M5; fs re-derived from the materialized word.
             *rflags = materialize_shift_flags(bcx, *rflags, kind, dst, res, count_mod, bits);
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
         }
-    }
-    if let Some(fs) = flag_state {
-        fs.resync(bcx, *rflags);
     }
     *pending = PendingFlags::None;
 }
@@ -324,31 +346,61 @@ pub(super) fn lower_insn(
         // Bit test ops: flush pending flags, set CF directly.
         Mnemonic::Bt | Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
             flush_pending(bcx, rflags, pending, flag_state);
-            lower_bit_test_op(bcx, instr, gpr, dirty, rflags, mem)
+            lower_bit_test_op(bcx, instr, gpr, dirty, rflags, mem)?;
+            // Eager writer: re-derive fs from the freshly packed carrier.
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
+            Ok(())
         }
         // Xadd: exchange and add — flush flags, swap dst↔src, set flags as ADD.
         Mnemonic::Xadd => {
             flush_pending(bcx, rflags, pending, flag_state);
-            lower_xadd(bcx, instr, gpr, dirty, rflags, mem)
+            lower_xadd(bcx, instr, gpr, dirty, rflags, mem)?;
+            // Eager writer: re-derive fs from the freshly packed carrier.
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
+            Ok(())
         }
         // CmpXchg: compare and exchange — flush flags, atomically compare with accumulator.
         Mnemonic::Cmpxchg => {
             flush_pending(bcx, rflags, pending, flag_state);
-            lower_cmpxchg(bcx, instr, gpr, dirty, rflags, mem)
+            lower_cmpxchg(bcx, instr, gpr, dirty, rflags, mem)?;
+            // Eager writer: re-derive fs from the freshly packed carrier.
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
+            Ok(())
         }
         // Bsr/Bsf: bit scans — flush flags, scan for the set-bit index.
         Mnemonic::Bsr => {
             flush_pending(bcx, rflags, pending, flag_state);
-            lower_bsr(bcx, instr, gpr, dirty, rflags, mem)
+            lower_bsr(bcx, instr, gpr, dirty, rflags, mem)?;
+            // Eager writer: re-derive fs from the freshly packed carrier.
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
+            Ok(())
         }
         Mnemonic::Bsf => {
             flush_pending(bcx, rflags, pending, flag_state);
-            lower_bsf(bcx, instr, gpr, dirty, rflags, mem)
+            lower_bsf(bcx, instr, gpr, dirty, rflags, mem)?;
+            // Eager writer: re-derive fs from the freshly packed carrier.
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
+            Ok(())
         }
         // Lzcnt: count leading zeros — flush flags, zero src yields width.
         Mnemonic::Lzcnt => {
             flush_pending(bcx, rflags, pending, flag_state);
-            lower_lzcnt(bcx, instr, gpr, dirty, rflags, mem)
+            lower_lzcnt(bcx, instr, gpr, dirty, rflags, mem)?;
+            // Eager writer: re-derive fs from the freshly packed carrier.
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
+            Ok(())
         }
         // Lazy-capable ALU (overwrite pending without materializing).
         Mnemonic::Add => lower_arith_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, Arith::Add),
@@ -389,11 +441,21 @@ pub(super) fn lower_insn(
         }
         Mnemonic::Imul => {
             flush_pending(bcx, rflags, pending, flag_state);
-            lower_imul(bcx, instr, gpr, dirty, rflags, mem)
+            lower_imul(bcx, instr, gpr, dirty, rflags, mem)?;
+            // Eager writer: re-derive fs from the freshly packed carrier.
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
+            Ok(())
         }
         Mnemonic::Div | Mnemonic::Idiv => {
             flush_pending(bcx, rflags, pending, flag_state);
-            lower_div(bcx, instr, gpr, dirty, rflags, mem)
+            lower_div(bcx, instr, gpr, dirty, rflags, mem)?;
+            // Eager writer: re-derive fs from the freshly packed carrier.
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
+            Ok(())
         }
         // Shift/rotate: compute result now; defer flag packing (unless count_mod==0).
         Mnemonic::Shl | Mnemonic::Sal => lower_shift_lazy(
@@ -692,7 +754,12 @@ pub(super) fn lower_insn(
         Mnemonic::Comiss | Mnemonic::Ucomiss | Mnemonic::Comisd | Mnemonic::Ucomisd => {
             flush_pending(bcx, rflags, pending, flag_state);
             let is_double = matches!(instr.mnemonic(), Mnemonic::Comisd | Mnemonic::Ucomisd);
-            lower_sse_comis(bcx, instr, gpr, rflags, mem, xmm, is_double)
+            lower_sse_comis(bcx, instr, gpr, rflags, mem, xmm, is_double)?;
+            // Eager 6-bit writer: re-derive fs from the freshly packed carrier.
+            if let Some(fs) = flag_state {
+                fs.resync(bcx, *rflags);
+            }
+            Ok(())
         }
         // Integer ↔ FP converts.
         Mnemonic::Cvtsi2ss | Mnemonic::Cvtsi2sd => {
