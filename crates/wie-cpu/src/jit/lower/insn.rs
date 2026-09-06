@@ -490,7 +490,7 @@ pub(super) fn lower_insn(
         | Mnemonic::Cmovp
         | Mnemonic::Cmovnp) => {
             flush_pending(bcx, rflags, pending, flag_state);
-            lower_cmov(bcx, instr, gpr, dirty, *rflags, mem, m)
+            lower_cmov(bcx, instr, gpr, dirty, *rflags, flag_state.as_ref(), mem, m)
         }
         m @ (Mnemonic::Sete
         | Mnemonic::Setne
@@ -509,7 +509,7 @@ pub(super) fn lower_insn(
         | Mnemonic::Setp
         | Mnemonic::Setnp) => {
             flush_pending(bcx, rflags, pending, flag_state);
-            lower_setcc(bcx, instr, gpr, dirty, *rflags, mem, m)
+            lower_setcc(bcx, instr, gpr, dirty, *rflags, flag_state.as_ref(), mem, m)
         }
         Mnemonic::Movaps
         | Mnemonic::Movups

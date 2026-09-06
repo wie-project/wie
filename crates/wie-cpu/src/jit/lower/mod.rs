@@ -1249,12 +1249,15 @@ pub(super) enum SseBit {
     Andn,
 }
 
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_term(
     bcx: &mut FunctionBuilder<'_>,
     term: BlockTerm,
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
     rflags: Value,
+    flag_state: Option<&FlagState>,
     mem: &mut MemEnv,
     term_ip: u64,
 ) -> Result<Value, String> {
@@ -1266,7 +1269,10 @@ pub(super) fn lower_term(
             not_taken,
         } => {
             // Flags already flushed before terminator when pending/jcc.
-            let cond = flag_cond(bcx, rflags, mnemonic)?;
+            let cond = match flag_state {
+                Some(fs) => flag_cond_fs(bcx, fs, mnemonic)?,
+                None => flag_cond(bcx, rflags, mnemonic)?,
+            };
             let t = iconst_u64(bcx, taken);
             let n = iconst_u64(bcx, not_taken);
             Ok(bcx.ins().select(cond, t, n))
@@ -1307,6 +1313,33 @@ pub(super) fn flag_cond(
     let sf1 = bool_to_i64(bcx, sf);
     let of1 = bool_to_i64(bcx, of);
     let pf1 = bool_to_i64(bcx, pf);
+    cond_from_bits(bcx, m, zf1, cf1, sf1, of1, pf1)
+}
+
+/// SSA path: same condition computed directly from the FlagState i1s.
+pub(super) fn flag_cond_fs(
+    bcx: &mut FunctionBuilder<'_>,
+    fs: &FlagState,
+    m: Mnemonic,
+) -> Result<Value, String> {
+    let zf = bool_to_i64(bcx, fs.zf);
+    let cf = bool_to_i64(bcx, fs.cf);
+    let sf = bool_to_i64(bcx, fs.sf);
+    let of = bool_to_i64(bcx, fs.of);
+    let pf = bool_to_i64(bcx, fs.pf);
+    cond_from_bits(bcx, m, zf, cf, sf, of, pf)
+}
+
+/// Shared jcc/cmov/setcc condition over the five flag bits as I64 values.
+fn cond_from_bits(
+    bcx: &mut FunctionBuilder<'_>,
+    m: Mnemonic,
+    zf1: Value,
+    cf1: Value,
+    sf1: Value,
+    of1: Value,
+    pf1: Value,
+) -> Result<Value, String> {
     let zero = iconst_u64(bcx, 0);
     let one = iconst_u64(bcx, 1);
     let not_zf = bcx.ins().bxor(zf1, one);
@@ -1351,16 +1384,22 @@ pub(super) fn flag_cond(
     Ok(bcx.ins().icmp(IntCC::NotEqual, cond_i64, zero))
 }
 
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_cmov(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
     rflags: Value,
+    flag_state: Option<&FlagState>,
     mem: &mut MemEnv,
     m: Mnemonic,
 ) -> Result<(), String> {
-    let cond = flag_cond(bcx, rflags, m)?;
+    let cond = match flag_state {
+        Some(fs) => flag_cond_fs(bcx, fs, m)?,
+        None => flag_cond(bcx, rflags, m)?,
+    };
     let src = read_op_mem(bcx, instr, 1, gpr, rflags, mem)?;
     let reg = instr.op_register(0);
     let idx = reg_index(reg)?;
@@ -1374,16 +1413,22 @@ pub(super) fn lower_cmov(
     Ok(())
 }
 
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_setcc(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
     rflags: Value,
+    flag_state: Option<&FlagState>,
     mem: &mut MemEnv,
     m: Mnemonic,
 ) -> Result<(), String> {
-    let cond = flag_cond(bcx, rflags, m)?;
+    let cond = match flag_state {
+        Some(fs) => flag_cond_fs(bcx, fs, m)?,
+        None => flag_cond(bcx, rflags, m)?,
+    };
     let one = iconst_u64(bcx, 1);
     let zero = iconst_u64(bcx, 0);
     let val = bcx.ins().select(cond, one, zero);

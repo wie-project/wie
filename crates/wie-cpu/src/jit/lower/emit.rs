@@ -10,7 +10,7 @@ use super::string::lower_string;
 use super::{
     EDGE_IC_SLOTS, MAX_CHAIN_DEPTH, OFF_CHAIN_DEPTH, OFF_EDGE_IC_FN, OFF_EDGE_IC_VA, OFF_FAULT,
     OFF_INV_GEN_PTR, OFF_RIP, OFF_SHADOW_RET, OFF_SHADOW_SP, SHADOW_DEPTH, TLB_PROT_R, TLB_PROT_W,
-    flag_cond, lower_term,
+    flag_cond, flag_cond_fs, lower_term,
 };
 
 use super::super::block::{BlockStackPinPlan, BlockTerm, DecodedInsn, is_string_op};
@@ -438,6 +438,7 @@ pub(super) fn lower_self_loop_term(
     gpr_loaded: &[bool; 16],
     gpr_dirty: &[bool; 16],
     rflags: Value,
+    flag_state: Option<&FlagState>,
     rflags_ptr: Value,
     _needs_flags: bool,
     exit: Block,
@@ -480,7 +481,10 @@ pub(super) fn lower_self_loop_term(
             taken,
             not_taken,
         } => {
-            let cond = flag_cond(bcx, rflags, mnemonic)?;
+            let cond = match flag_state {
+                Some(fs) => flag_cond_fs(bcx, fs, mnemonic)?,
+                None => flag_cond(bcx, rflags, mnemonic)?,
+            };
             let taken_blk = bcx.create_block();
             let not_blk = bcx.create_block();
             bcx.ins().brif(cond, taken_blk, &[], not_blk, &[]);
@@ -554,6 +558,7 @@ pub(super) fn lower_jcc_chain(
     gpr_loaded: &[bool; 16],
     gpr_dirty: Option<&[bool; 16]>,
     rflags: Value,
+    flag_state: Option<&FlagState>,
     rflags_ptr: Value,
     needs_flags: bool,
     exit: Block,
@@ -562,7 +567,10 @@ pub(super) fn lower_jcc_chain(
     inv_guard: bool,
     inv_gen_baked: u64,
 ) -> Result<bool, String> {
-    let cond = flag_cond(bcx, rflags, mnemonic)?;
+    let cond = match flag_state {
+        Some(fs) => flag_cond_fs(bcx, fs, mnemonic)?,
+        None => flag_cond(bcx, rflags, mnemonic)?,
+    };
     let taken_blk = bcx.create_block();
     let not_blk = bcx.create_block();
     bcx.ins().brif(cond, taken_blk, &[], not_blk, &[]);
@@ -954,6 +962,7 @@ pub(super) fn emit_body_and_term(
                 gpr_loaded,
                 gpr_dirty,
                 *rflags_val,
+                flag_state.as_ref(),
                 rflags_ptr,
                 needs_flags,
                 exit,
@@ -967,7 +976,16 @@ pub(super) fn emit_body_and_term(
             if let BlockTerm::Call { return_ip, .. } = t {
                 shadow_push(bcx, ctx_ptr, flags, return_ip);
             }
-            let exit_rip = lower_term(bcx, t, gpr_vals, gpr_dirty, *rflags_val, mem_env, term_ip)?;
+            let exit_rip = lower_term(
+                bcx,
+                t,
+                gpr_vals,
+                gpr_dirty,
+                *rflags_val,
+                flag_state.as_ref(),
+                mem_env,
+                term_ip,
+            )?;
             let exit_rip = if matches!(t, BlockTerm::Ret) {
                 shadow_pop_check(bcx, ctx_ptr, flags, exit_rip)
             } else {
@@ -994,6 +1012,7 @@ pub(super) fn emit_body_and_term(
                         gpr_loaded,
                         Some(gpr_dirty),
                         *rflags_val,
+                        flag_state.as_ref(),
                         rflags_ptr,
                         needs_flags,
                         exit,
