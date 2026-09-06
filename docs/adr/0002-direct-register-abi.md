@@ -45,22 +45,29 @@ Default **on**; opt-out via `WIE_JIT_DIRECT_REGS=0`/`false`/`off` restores exist
   executed on every block edge, the 750k-transitions tax), block-exit
   stores, and dispatcher exit writeback. Full list in
   `docs/implementation-plan.md` Wave 3 row 1.
-- **Direct chaining (landed)**: chain hops are now tail calls
-  (`return_call`/`return_call_indirect`, `WIE_JIT_TAILCHAIN`, default on) —
-  the successor reuses the caller frame (no prologue/epilogue/ret per hop).
-  The `MAX_CHAIN_DEPTH` counter is deliberately KEPT as the periodic
-  dispatcher bounce: stop requests / Ctrl+C / hook checks only run when
-  control re-enters the Rust pump, so an unbounded tail chain must never
-  remove the bounce cadence. `WIE_JIT_TAILCHAIN=0` restores the nested-call
-  hop for bisect.
+- **Tail-call chaining (REVERTED to default-off — never landed)**: commit
+  f415d6b switched chain hops to `return_call`/`return_call_indirect`
+  (`WIE_JIT_TAILCHAIN`, default on) — the successor reuses the caller frame
+  (no prologue/epilogue/ret per hop), with the `MAX_CHAIN_DEPTH` counter
+  deliberately KEPT as the periodic dispatcher bounce. **Every block with a
+  chain edge failed Cranelift verification on every platform**: only
+  `CallConv::Tail` supports `return_call` in Cranelift 0.133, and the block
+  signature must stay on the host default (`AppleAarch64`/`SystemV`) to
+  remain callable from Rust as `extern "C"` — the verifier rejects it with
+  "calling convention `…` does not support tail calls". The gate was flipped
+  back to default-off (`WIE_JIT_TAILCHAIN=1` force-enables for experiments)
+  and the shipped hop is the nested-call + `MAX_CHAIN_DEPTH` guard shape.
+  Tail chaining stays viable only once the prologue stub (below) lets blocks
+  adopt a tail-call-capable convention or Cranelift lifts the restriction.
 - **ABI constraint (the load-bearing finding)**: literal x19–x28 residency
   cannot be expressed through Cranelift under the standard aarch64 C ABI —
   a 17-result block signature does not fit the result register window, and
   no custom call-convention hook is available. The viable staged path is:
-  (1) tail-call chaining (done), (2) a hand-written per-block prologue
-  stub (the `trampolines.rs` pattern) that shuffles x19–x28/x14 against the
-  C-ABI frame with chaining linking the post-prologue body label, (3) SSA
-  rflags layered onto that stub boundary. `WIE_JIT_DIRECT_REGS` remains
-  reserved for step 2; the SSA-rflags design (pack/unpack deletion,
-  `PendingFlags` → i1 booleans, `flag_cond` consuming ZF/SF/CF/OF directly)
-  is unchanged and ordered after the stub.
+  (1) tail-call chaining (blocked — see above; Cranelift rejects
+  `return_call` under every ABI convention), (2) a hand-written per-block
+  prologue stub (the `trampolines.rs` pattern) that shuffles x19–x28/x14
+  against the C-ABI frame with chaining linking the post-prologue body
+  label, (3) SSA rflags layered onto that stub boundary.
+  `WIE_JIT_DIRECT_REGS` remains reserved for step 2; the SSA-rflags design
+  (pack/unpack deletion, `PendingFlags` → i1 booleans, `flag_cond` consuming
+  ZF/SF/CF/OF directly) is unchanged and ordered after the stub.

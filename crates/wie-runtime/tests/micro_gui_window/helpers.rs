@@ -337,3 +337,102 @@ pub(crate) fn count_edit_ink(session: &wie_runtime::RuntimeSession, owner: u64) 
     }
     ink
 }
+
+/// A frame observed by a [`FrameWatcher`] that matched the watcher's
+/// predicate, with the host-side timing of the `take_frame` that captured it
+/// (`present_us`) and the guest-side publish cost of that frame
+/// (`publish_us`, 0 when frame timing was not enabled for the session).
+pub(crate) struct ObservedFrame {
+    pub frame: wie_winapi::present::SurfaceFrame,
+    pub publish_us: u128,
+    pub present_us: u128,
+}
+
+/// Samples the guest's published frames from a background thread so a
+/// transient frame can never be missed.
+///
+/// The inter-iteration `take_frame` polls in the `run_until_stop` loops only
+/// see the LATEST published frame. Under host load one iteration can span the
+/// whole lifetime of a transient surface — gui_blit's resting frame is
+/// replaced by the modal dialog's composite, and gui_dialog's OK-button face
+/// exists only between two timer ticks — so the observation is missed even
+/// though the frame was published and rendered correctly (both flakes
+/// reproduce only on a loaded host; see [`GUI_SUITE_LOCK`], which serializes
+/// the suite but cannot fix host-speed-dependent observation).
+///
+/// The watcher runs on its own thread through the same cross-thread
+/// [`wie_runtime::GuestHandle`] seam the present-commit render thread uses,
+/// sampling every 1 ms — independent of how long each `run_until_stop`
+/// iteration takes. It records the FIRST frame matching `pred` and exits
+/// (each sampled frame is a full 4 MB clone, so the watcher does not keep
+/// running after a hit). The hwnd is resolved from the presenter-side window
+/// mirror once, then only the lock-free frame channel is touched. Stop by
+/// dropping the watcher (the `Drop` joins the thread).
+pub(crate) struct FrameWatcher {
+    observed_rx: std::sync::mpsc::Receiver<ObservedFrame>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FrameWatcher {
+    /// Spawn a watcher on `handle` recording the first published frame for
+    /// which `pred` returns true.
+    pub(crate) fn spawn(
+        handle: wie_runtime::GuestHandle,
+        pred: impl Fn(&wie_winapi::present::SurfaceFrame) -> bool + Send + 'static,
+    ) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let watcher_stop = std::sync::Arc::clone(&stop);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let mut hwnd = None;
+            while !watcher_stop.load(Ordering::Relaxed) {
+                let Some(h) = hwnd.or_else(|| handle.first_guest_window_handle()) else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                };
+                hwnd = Some(h);
+                let present_t0 = std::time::Instant::now();
+                let Some(frame) = handle.take_frame(h) else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                };
+                let present_us = present_t0.elapsed().as_micros();
+                if pred(&frame) {
+                    let observed = ObservedFrame {
+                        publish_us: handle.present_publish_ns_last() / 1_000,
+                        frame,
+                        present_us,
+                    };
+                    // Receiver gone (test dropped us) → end the thread.
+                    if tx.send(observed).is_err() {
+                        break;
+                    }
+                    return; // hit recorded — the watcher's job is done
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        Self {
+            observed_rx: rx,
+            stop,
+            join: Some(join),
+        }
+    }
+
+    /// The first frame that matched, once observed.
+    pub(crate) fn observed(&self) -> Option<ObservedFrame> {
+        self.observed_rx.try_recv().ok()
+    }
+}
+
+impl Drop for FrameWatcher {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}

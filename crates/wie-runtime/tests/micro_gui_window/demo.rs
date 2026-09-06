@@ -7,7 +7,7 @@ use crate::helpers::{
     D3D9_FAR_DEPTH_0RGB, D3D9_FOGGED_0RGB, D3D9_MIP_MAGENTA_0RGB, D3D9_MIP_YELLOW_0RGB,
     D3D9_NEAR_DEPTH_0RGB, D3D9_QUAD_BLUE_0RGB, D3D9_QUAD_GREEN_0RGB, D3D9_QUAD_RED_0RGB,
     D3D9_QUAD_WHITE_0RGB, D3D9_RED_QUAD_0RGB, D3D9_RESTING_FRAME_HASH, D3D9_SCISSOR_INSIDE_0RGB,
-    DIALOG_OK_BUTTON_SAMPLE, GUI_BLIT_RESTING_FRAME_HASH,
+    DIALOG_OK_BUTTON_SAMPLE, FrameWatcher, GUI_BLIT_RESTING_FRAME_HASH,
     assert_frame_renders_gradient_text_and_controls, drive_gui_session, frame_hash,
     gui_suite_serialize, micro_exe,
 };
@@ -341,8 +341,20 @@ fn gui_blit_comprehensive_regression() {
     // the frame-time budget gate below (no `WIE_RUNTIME_PROFILE` env needed).
     session.enable_frame_timing();
 
+    // The resting frame is transient (the dialog composites over the owner on
+    // timer tick 4), so a background watcher samples the channel — the
+    // inter-iteration polls below can span the frame's whole lifetime on a
+    // loaded host and never see it (see [`FrameWatcher`]).
+    let watcher = {
+        let handle = session.guest_handle();
+        FrameWatcher::spawn(handle, |frame| {
+            // Hash only the text-free gradient rows (200..800): text
+            // pixels are font-dependent, the gradient is not.
+            frame_hash(frame, 200, 800) == GUI_BLIT_RESTING_FRAME_HASH
+        })
+    };
+
     let mut iterations = 0;
-    let mut saw_resting_frame = false;
     let exit_code = loop {
         let summary = session
             .run_until_stop(1_000_000)
@@ -353,46 +365,9 @@ fn gui_blit_comprehensive_regression() {
             "gui_blit.exe did not exit within 300 iterations"
         );
 
-        // Frame check: the deterministic resting frame (gradient + text +
-        // children, no dialog, no counter text) must appear at some point.
-        // The dialog / transient frames hash differently and are ignored.
-        // `present_us` times the host take_frame (the B1 publish→present
-        // hand-off); the FNV hash runs AFTER the timed window so the budget
-        // measures the frame pipeline, not test-side verification.
-        if let Some(owner) = session.first_guest_window_handle() {
-            let present_t0 = std::time::Instant::now();
-            let frame = session.take_frame(owner);
-            let present_us = present_t0.elapsed().as_micros();
-            if let Some(frame) = frame
-                // Hash only the text-free gradient rows (200..800): text
-                // pixels are font-dependent, the gradient is not.
-                && frame_hash(&frame, 200, 800) == GUI_BLIT_RESTING_FRAME_HASH
-            {
-                assert_frame_renders_gradient_text_and_controls(&frame);
-                // B9 regression net: publish+present must stay cheap. The
-                // 10 ms ceiling is deliberately generous — it catches
-                // pathological regressions (e.g. a full 4 MB clone or another
-                // full copy reintroduced into publish or take_frame), not
-                // tight tuning. Measured in debug builds at 1280×800.
-                let publish_us = session.present_publish_ns_last() / 1_000;
-                assert!(
-                    publish_us + present_us < 10_000,
-                    "frame publish+present budget exceeded: publish={publish_us}us \
-                     present={present_us}us (10 ms ceiling)"
-                );
-                saw_resting_frame = true;
-            }
-        }
-
         match summary.termination {
             EntryTraceTermination::ExitProcess { code } => break Some(code),
             EntryTraceTermination::WaitingForMessage => {
-                // Poll every 10 ms so the resting frame is captured well
-                // inside the pre-dialog window: the guest opens its modal
-                // dialog on timer tick 4 (~200 ms), and that dialog's frame
-                // composites over the owner, replacing the gradient frame
-                // the hash gate needs. 50 ms polls leave only ~4 chances;
-                // 10 ms gives ~20 within the same window.
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             other => {
@@ -401,16 +376,29 @@ fn gui_blit_comprehensive_regression() {
         }
     };
 
+    let observed = watcher.observed();
+    drop(watcher); // stop + join the sampler before asserting
     assert_eq!(
         exit_code,
         Some(0),
         "gui_blit.exe must exit 0 (proves timer + menu + control + dialog \
          stages all ran); got {exit_code:?}"
     );
+    let observed = observed.expect(
+        "the deterministic resting frame was never observed in the \
+         owner's published surface",
+    );
+    assert_frame_renders_gradient_text_and_controls(&observed.frame);
+    // B9 regression net: publish+present must stay cheap. The 10 ms ceiling
+    // is deliberately generous — it catches pathological regressions (e.g. a
+    // full 4 MB clone or another full copy reintroduced into publish or
+    // take_frame), not tight tuning. Measured in debug builds at 1280×800.
     assert!(
-        saw_resting_frame,
-        "the deterministic resting frame hash 0x{GUI_BLIT_RESTING_FRAME_HASH:016X} \
-         was never observed in the owner's published surface"
+        observed.publish_us + observed.present_us < 10_000,
+        "frame publish+present budget exceeded: publish={}us present={}us \
+         (10 ms ceiling)",
+        observed.publish_us,
+        observed.present_us
     );
 }
 
@@ -484,8 +472,24 @@ fn gui_dialog_modal_loop_and_end_dialog() {
         .set_guest_env("WIE_SELFTEST", "1")
         .expect("inject WIE_SELFTEST");
 
+    // The dialog face is transient (open between two timer ticks), so a
+    // background watcher samples the channel — the inter-iteration polls
+    // below can span the dialog's whole lifetime on a loaded host and never
+    // see it (see [`FrameWatcher`]).
+    let watcher = {
+        let handle = session.guest_handle();
+        FrameWatcher::spawn(handle, |frame| {
+            let (x, y) = DIALOG_OK_BUTTON_SAMPLE;
+            if x >= frame.width || y >= frame.height {
+                return false;
+            }
+            let idx = usize::try_from(y).unwrap_or(0) * frame.stride as usize
+                + usize::try_from(x).unwrap_or(0);
+            frame.pixels.get(idx).copied() == Some(BTNFACE_0RGB)
+        })
+    };
+
     let mut iterations = 0;
-    let mut saw_dialog_face = false;
     let exit_code = loop {
         let summary = session
             .run_until_stop(1_000_000)
@@ -495,22 +499,6 @@ fn gui_dialog_modal_loop_and_end_dialog() {
             iterations < 300,
             "gui_dialog.exe did not exit within 300 iterations"
         );
-
-        // Presentation-model check: while the dialog is open it composites
-        // into the owner's published surface — the OK button face (BTNFACE)
-        // must appear at its centered position at some point during the run.
-        if let Some(owner) = session.first_guest_window_handle()
-            && let Some(frame) = session.take_frame(owner)
-        {
-            let (x, y) = DIALOG_OK_BUTTON_SAMPLE;
-            if x < frame.width && y < frame.height {
-                let idx = usize::try_from(y).unwrap_or(0) * frame.stride as usize
-                    + usize::try_from(x).unwrap_or(0);
-                if frame.pixels.get(idx).copied() == Some(BTNFACE_0RGB) {
-                    saw_dialog_face = true;
-                }
-            }
-        }
 
         match summary.termination {
             EntryTraceTermination::ExitProcess { code } => break Some(code),
@@ -523,6 +511,8 @@ fn gui_dialog_modal_loop_and_end_dialog() {
         }
     };
 
+    let observed = watcher.observed();
+    drop(watcher); // stop + join the sampler before asserting
     assert_eq!(
         exit_code,
         Some(0),
@@ -530,7 +520,7 @@ fn gui_dialog_modal_loop_and_end_dialog() {
          IsDialogMessage Enter → EndDialog(1) flow); got {exit_code:?}"
     );
     assert!(
-        saw_dialog_face,
+        observed.is_some(),
         "the dialog's OK-button face (BTNFACE 0xF0F0F0) was never observed in \
          the owner's published surface"
     );

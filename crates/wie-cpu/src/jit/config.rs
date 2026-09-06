@@ -85,6 +85,8 @@ pub(super) struct JitConfig {
     jit_workers: usize,
     /// Tail-call block chaining: chain hops are `return_call`s (no host-stack
     /// growth, no depth guard, no per-hop ret) instead of nested `call`s.
+    /// Experimental and default-off — no ABI calling convention supports
+    /// Cranelift tail calls (see the constructor for details).
     tail_chain_enabled: bool,
     #[allow(dead_code)]
     direct_regs_enabled: bool,
@@ -209,11 +211,19 @@ impl JitConfig {
                 std::env::var("WIE_JIT_CHAIN"),
                 Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             ),
-            // Tail-call chain hops (`WIE_JIT_TAILCHAIN=0` disables — falls
-            // back to the nested-call + depth-guard hop).
-            tail_chain_enabled: !matches!(
+            // Tail-call chain hops. Default **off**: Cranelift only permits
+            // `return_call` under `CallConv::Tail` (non-ABI-stable), while the
+            // block signature must stay on the host default (`AppleAarch64` /
+            // `SystemV`) to remain callable from Rust as `extern "C"` — so
+            // every ABI convention rejects tail hops at verification
+            // ("calling convention `…` does not support tail calls") and every
+            // block would fall back to the interpreter. The nested-call +
+            // depth-guard hop is the shipped shape; this flag survives for
+            // experimenting once Cranelift lifts the restriction
+            // (`WIE_JIT_TAILCHAIN=1` to force it on).
+            tail_chain_enabled: matches!(
                 std::env::var("WIE_JIT_TAILCHAIN"),
-                Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+                Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
             ),
             // Background compiler worker. Default: on for real runs, off under
             // `cfg(test)` (hotness is 0 there, so every block is eager; the
@@ -423,8 +433,11 @@ impl JitConfig {
     }
 
     /// Tail-call chain hops (no host-stack growth / depth guard). Default
-    /// **on**; `WIE_JIT_TAILCHAIN=0` disables for bisect (fallback is the
-    /// nested-`call` + `MAX_CHAIN_DEPTH` guard hop).
+    /// **off** — the verifier rejects `return_call` under every ABI calling
+    /// convention (`CallConv::Tail` is the only one that supports them and it
+    /// is not callable from Rust as `extern "C"`). `WIE_JIT_TAILCHAIN=1`
+    /// force-enables for experiments; the shipped hop is the nested-`call` +
+    /// `MAX_CHAIN_DEPTH` guard shape.
     #[must_use]
     pub(super) fn tail_chain_enabled(&self) -> bool {
         self.tail_chain_enabled

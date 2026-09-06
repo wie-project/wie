@@ -198,14 +198,14 @@ fn emit_inv_gen_check(
 
 /// Writeback + set RIP + chain to the successor (direct or late-bound).
 ///
-/// Two hop shapes, selected by `WIE_JIT_TAILCHAIN` (default on):
-/// - **Tail hop**: `return_call`/`return_call_indirect` — the successor
-///   reuses this frame (no prologue/epilogue, no per-hop ret). The
-///   `MAX_CHAIN_DEPTH` counter stays as the periodic dispatcher bounce
-///   (every <=48 hops) the pump's stop/interrupt checks rely on.
-/// - **Nested hop** (`=0`): host C ABI `call`/`call_indirect` — blocks stay
+/// Two hop shapes, selected by `WIE_JIT_TAILCHAIN` (default **off**):
+/// - **Nested hop** (shipped): host C ABI `call`/`call_indirect` — blocks stay
 ///   callable from Rust as plain `extern "C"`; past [`MAX_CHAIN_DEPTH`] we
 ///   return to the Rust dispatcher with RIP already advanced.
+/// - **Tail hop** (`=1`, experimental): `return_call`/`return_call_indirect` —
+///   the successor reuses this frame (no prologue/epilogue, no per-hop ret).
+///   Currently unusable: Cranelift's verifier rejects `return_call` under
+///   every ABI calling convention, and the block signature must stay ABI.
 ///
 /// Both shapes keep the inv-gen guard (the SMC safety net) on every edge.
 // The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
@@ -250,14 +250,15 @@ pub(super) fn emit_chain_or_exit(
         let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, |_| {});
     }
 
-    // Tail-call chaining (`WIE_JIT_TAILCHAIN`, default on): the hop is a
-    // `return_call`/`return_call_indirect` — the caller's frame is reused, so
-    // there is no prologue/epilogue or per-hop ret. The `MAX_CHAIN_DEPTH`
-    // guard is KEPT: it is the periodic dispatcher bounce (every <=48 hops)
-    // the pump relies on for stop requests / Ctrl+C / hook checks — without
-    // it a tight chained loop would never re-enter Rust. Each hop costs one
-    // load + compare + counter bump instead of a full nested C frame.
-    // `WIE_JIT_TAILCHAIN=0` restores the nested-call hop.
+    // Tail-call chaining (`WIE_JIT_TAILCHAIN=1`, experimental / default off):
+    // the hop is a `return_call`/`return_call_indirect` — the caller's frame is
+    // reused, so there is no prologue/epilogue or per-hop ret. The
+    // `MAX_CHAIN_DEPTH` guard is KEPT: it is the periodic dispatcher bounce
+    // (every <=48 hops) the pump relies on for stop requests / Ctrl+C / hook
+    // checks — without it a tight chained loop would never re-enter Rust. Each
+    // hop costs one load + compare + counter bump instead of a full nested C
+    // frame. Currently unusable: the verifier rejects `return_call` under
+    // every ABI calling convention (block sig must stay `extern "C"`).
     if super::super::config::JitConfig::get().tail_chain_enabled() {
         // Host-stack guard repurposed as the dispatcher-bounce cadence: cap
         // and re-enter from Rust (RIP + GPRs are already flushed).

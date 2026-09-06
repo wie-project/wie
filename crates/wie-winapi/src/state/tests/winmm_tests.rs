@@ -326,11 +326,14 @@ fn test_wave_out_write_sinks_pcm_and_queues_wom_done() {
     fmt[14..16].copy_from_slice(&16_u16.to_le_bytes()); // wBitsPerSample
     engine.mem_write(format_va, &fmt).expect("write format");
     let flags = 0x0003_0000_u64; // CALLBACK_FUNCTION
+    // Win64 stack args live ABOVE rsp: arg5 (fdwOpen) at [rsp+0x28], arg6
+    // (dwInstance) at [rsp+0x30] — the same convention the handler's
+    // `read_stack_arg` uses (see set_time_set_event_flags).
     engine
-        .mem_write(STACK_TOP - 0x28, &flags.to_le_bytes())
+        .mem_write(STACK_TOP + 0x28, &flags.to_le_bytes())
         .expect("write fdwOpen slot");
     engine
-        .mem_write(STACK_TOP - 0x30, &0x7A_u64.to_le_bytes())
+        .mem_write(STACK_TOP + 0x30, &0x7A_u64.to_le_bytes())
         .expect("write dwInstance slot");
     write_regs(&mut engine, phwo, 0, format_va, callback_va, 0);
     assert_eq!(dispatch_winmm(&mut engine, &mut state, "waveOutOpen"), 0);
@@ -347,6 +350,13 @@ fn test_wave_out_write_sinks_pcm_and_queues_wom_done() {
     hdr[24..28].copy_from_slice(&0x12_u32.to_le_bytes()); // PREPARED|INQUEUE
     engine.mem_write(header_va, &hdr).expect("write header");
 
+    // Sample the clock BEFORE the write dispatch: the handler queues at
+    // `its_now + duration`, and `its_now >= now`, so the not-due-yet and
+    // due-by-+300 assertions below hold regardless of how much wall time the
+    // dispatch itself burns (a descheduled debug-build test thread could
+    // otherwise overshoot the 100 ms buffer duration between the two).
+    let now =
+        u32::try_from(crate::kernel32::clock::tick_count_32() & u64::from(u32::MAX)).unwrap_or(0);
     write_regs(&mut engine, 0x5500_0101, header_va, 0, 0, 0);
     assert_eq!(dispatch_winmm(&mut engine, &mut state, "waveOutWrite"), 0);
 
@@ -368,18 +378,17 @@ fn test_wave_out_write_sinks_pcm_and_queues_wom_done() {
         0,
         "WHDR_INQUEUE must be cleared after write"
     );
-    // 3. A WOM_DONE completion is queued (~200 ms out) for the function
+    // 3. A WOM_DONE completion is queued (~100 ms out) for the function
     // callback, carrying the wave-out handle.
-    let now =
-        u32::try_from(crate::kernel32::clock::tick_count_32() & u64::from(u32::MAX)).unwrap_or(0);
-    // The completion is NOT due yet: the buffer is ~200 ms of audio
-    // (allow slack for clock sampling between the write and this read).
+    // The completion is NOT due yet: the buffer is ~100 ms of audio and the
+    // handler's clock sample is at or after `now`.
     assert!(
         state.pop_next_due_timer(now).is_none(),
-        "a ~200 ms buffer must not complete immediately"
+        "a ~100 ms buffer must not complete immediately"
     );
-    // Advancing the guest clock past the buffer's duration delivers it.
-    let later = now.wrapping_add(300);
+    // Advancing the guest clock past the buffer's duration delivers it (the
+    // slack dwarfs any dispatch pause between the two clock samples).
+    let later = now.wrapping_add(1_000);
     let due = state
         .pop_next_due_timer(later)
         .expect("the WOM_DONE completion must fire ~200 ms out");
@@ -444,6 +453,21 @@ fn test_time_begin_period_records_and_timer_wheel_probes() {
     assert_eq!(state.winmm().timer_period_ms(), 2, "the period is recorded");
 
     // Queue a completion 40 ms out (now = 1_000): the wheel sees it.
+    // `queue_wave_out_done` only queues for a REGISTERED device handle, so
+    // seed the fake wave-out the way `waveOutOpen` would (the wheel probes
+    // below don't care about the dispatch itself).
+    state.winmm().register_wave_out(
+        0x5500_0101,
+        crate::winmm::WaveFormat {
+            channels: 2,
+            samples_per_sec: 22_050,
+            block_align: 4,
+            bits_per_sample: 16,
+        },
+        0xBEEF_0000,
+        0x7A,
+        0x0003_0000, // CALLBACK_FUNCTION
+    );
     state.winmm().queue_wave_out_done(0x5500_0101, 40, 1_000);
     assert_eq!(
         state.winmm().next_due_in_ms(1_000),

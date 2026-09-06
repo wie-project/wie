@@ -204,7 +204,9 @@ check removal) and re-run the hash suite; then Step 2.
 
 Progress this session: Wave 2 closed (slices 3-4 + capture default-on +
 acceptance harness), Wave 3 slice 1 (tail-call chain hops
-`WIE_JIT_TAILCHAIN`, ADR-0002 feasibility pass), Wave 4 slice 1
+`WIE_JIT_TAILCHAIN`, ADR-0002 feasibility pass — **since reverted to
+default-off: Cranelift 0.133 rejects `return_call` under every ABI
+calling convention, see ADR-0002 status**), Wave 4 slice 1
 (degrade-not-die fallback + `degraded_insns` metric), Wave 5 slice 1
 (waveOut playback sink + timed `WOM_DONE`).
 
