@@ -2,7 +2,7 @@
 //! terminator helpers (chaining, shadow stack, self-loops, fast UCRT inline ops).
 
 use super::analysis::{ensure_gprs_loaded, ensure_xmm_loaded};
-use super::flags::iconst_u64;
+use super::flags::{FlagState, decompose_packed, iconst_u64};
 use super::gpr::mark_dirty;
 use super::insn::{PendingFlags, flush_pending, lower_insn};
 use super::mem::call_load;
@@ -850,15 +850,27 @@ pub(super) fn emit_body_and_term(
 ) -> Result<(), String> {
     let mut pending = PendingFlags::None;
     let mut string_exit_rip: Option<Value> = None;
+    let ssa_flags = super::super::config::JitConfig::get().ssa_flags_enabled();
+    let mut flag_state: Option<FlagState> = if ssa_flags && pass_flags {
+        Some(decompose_packed(bcx, *rflags_val))
+    } else {
+        None
+    };
 
     for d in body {
         ensure_gprs_loaded(bcx, ctx_ptr, gpr_vals, gpr_loaded, &d.instr, flags);
         ensure_xmm_loaded(bcx, ctx_ptr, flags, &d.instr, xmm_vals, xmm_loaded);
         if is_string_op(&d.instr) {
             flush_pending(bcx, rflags_val, &mut pending);
+            if let Some(fs) = &mut flag_state {
+                fs.old = *rflags_val;
+            }
             string_exit_rip = Some(lower_string(
                 bcx, &d.instr, gpr_vals, rflags_val, gpr_loaded, mem_env,
             )?);
+            if let Some(fs) = &mut flag_state {
+                fs.old = *rflags_val;
+            }
         } else {
             lower_insn(
                 bcx,
@@ -871,6 +883,9 @@ pub(super) fn emit_body_and_term(
                 xmm_vals,
             )?;
         }
+        if let Some(fs) = &mut flag_state {
+            fs.old = *rflags_val;
+        }
     }
 
     if matches!(term, Some(BlockTerm::Jcc { .. }))
@@ -878,6 +893,9 @@ pub(super) fn emit_body_and_term(
         || !matches!(pending, PendingFlags::None)
     {
         flush_pending(bcx, rflags_val, &mut pending);
+        if let Some(fs) = &mut flag_state {
+            fs.old = *rflags_val;
+        }
     }
 
     if let Some(t) = term {

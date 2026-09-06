@@ -76,6 +76,8 @@ pub(super) struct JitConfig {
     mem_path_trace: bool,
     super_mode: SuperMode,
     chain_enabled: bool,
+    #[allow(dead_code)]
+    ssa_flags_enabled: bool,
     bg_enabled: bool,
     bg_wait_timeout: Duration,
     opt_level: &'static str,
@@ -209,6 +211,10 @@ impl JitConfig {
             // Late-bound + direct block chaining (`WIE_JIT_CHAIN=0` disables).
             chain_enabled: !matches!(
                 std::env::var("WIE_JIT_CHAIN"),
+                Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+            ),
+            ssa_flags_enabled: !matches!(
+                std::env::var("WIE_JIT_SSA_FLAGS"),
                 Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             ),
             // Tail-call chain hops. Default **off**: Cranelift only permits
@@ -372,6 +378,12 @@ impl JitConfig {
     #[must_use]
     pub(super) fn chain_enabled(&self) -> bool {
         self.chain_enabled
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub(super) fn ssa_flags_enabled(&self) -> bool {
+        self.ssa_flags_enabled
     }
 
     /// Background compiler worker. Default: on for real runs, off under
