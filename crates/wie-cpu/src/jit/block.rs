@@ -351,8 +351,17 @@ fn is_lowerable(instr: &Instruction) -> bool {
                 (OpKind::Register, OpKind::Register)
             )
         }
-        // Movmskpd/Movmskps: r32 ← sign bits of packed FP elements (reg/m128 src).
-        Mnemonic::Movmskpd | Mnemonic::Movmskps => sse_bitwise_is_lowerable(instr),
+        // Movmskpd/Movmskps: r32/r64 ← sign bits of packed FP elements
+        // (dst GPR, src xmm/m128; op0 is NOT xmm, so not sse_bitwise_shape).
+        Mnemonic::Movmskpd | Mnemonic::Movmskps => {
+            instr.op0_kind() == OpKind::Register
+                && (instr.op_register(0).is_gpr32() || instr.op_register(0).is_gpr64())
+                && match instr.op1_kind() {
+                    OpKind::Register => instr.op_register(1).is_xmm(),
+                    OpKind::Memory => mem_ea_ok(instr) && mem_size_ok_sse(instr),
+                    _ => false,
+                }
+        }
         Mnemonic::Xorps
         | Mnemonic::Xorpd
         | Mnemonic::Pxor
