@@ -18,9 +18,10 @@ use std::borrow::Cow;
 use std::sync::{Arc, MutexGuard};
 use std::time::Instant;
 use wie_cpu::CpuError;
+use wie_winapi::winmm::{DueTimer, DueTimerKind, WOM_DONE, WaveOutCallbackKind};
 use wie_winapi::{
-    GuestCallbackRequest, HostParkReason, KernelHandle, WinApiControlSignal, WinApiState,
-    dll_loader,
+    GuestCallbackRequest, HostParkReason, KernelHandle, KernelObject, WinApiControlSignal,
+    WinApiState, dll_loader,
 };
 
 /// Primary-thread hook state for one `run_until_stop` segment.
@@ -65,6 +66,64 @@ struct SessionPumpHooks<'a> {
 }
 
 impl<'a> SessionPumpHooks<'a> {
+    /// Build the bridged callback for a due WINMM entry, or deliver it in
+    /// place when the device uses a non-function callback kind.
+    ///
+    /// `timeSetEvent` timers and `CALLBACK_FUNCTION` wave-out completions
+    /// return `Some(GuestCallbackRequest)` (the caller runs the bridged
+    /// callback). `CALLBACK_WINDOW` completions post `MM_WOM_DONE` to the
+    /// callback HWND (`dwCallback`), `CALLBACK_EVENT` completions set the
+    /// callback event, and a vanished device delivers nothing — all three
+    /// return `None` and the caller falls through to normal dispatch.
+    fn due_callback_request(
+        guard: &mut MutexGuard<'_, WinApiState>,
+        due: DueTimer,
+    ) -> Result<Option<GuestCallbackRequest>> {
+        match due.kind {
+            DueTimerKind::TimeEvent => Ok(Some(GuestCallbackRequest::timer(
+                due.handle,
+                due.callback_va,
+                due.user_data,
+            ))),
+            DueTimerKind::WaveOutDone => {
+                // Re-query the device record: the due timer's callback_va is
+                // the `dwCallback` the device was opened with, but the
+                // *delivery* depends on its callback kind.
+                let callback_kind = guard
+                    .winmm()
+                    .wave_out_record(due.handle)
+                    .map(|(_, _, _, kind)| WaveOutCallbackKind::from_fdw_open(kind))
+                    .unwrap_or(WaveOutCallbackKind::Null);
+                match callback_kind {
+                    WaveOutCallbackKind::Function => Ok(Some(GuestCallbackRequest::wave_out_done(
+                        due.handle,
+                        due.callback_va,
+                        due.user_data,
+                        WOM_DONE,
+                    ))),
+                    WaveOutCallbackKind::Window => {
+                        guard.lock_message_queue().push(
+                            wie_winapi::handles::Hwnd::from(due.callback_va),
+                            WOM_DONE,
+                            due.handle,
+                            0,
+                        )?;
+                        Ok(None)
+                    }
+                    WaveOutCallbackKind::Event => {
+                        if let Some(KernelObject::Event(event)) =
+                            guard.kernel.sync.object(due.callback_va)
+                        {
+                            event.set();
+                        }
+                        Ok(None)
+                    }
+                    WaveOutCallbackKind::Null => Ok(None),
+                }
+            }
+        }
+    }
+
     /// Shared native-panel bridge dispatch (file dialog, message box, print
     /// dialog, page setup, print job). Take the bridge out first (it lives
     /// behind the shared state lock), then drop the guard: the native panel
@@ -627,48 +686,41 @@ impl QuantumHooks for SessionPumpHooks<'_> {
             };
             let due = guard.pop_next_due_timer(now);
             if let Some(due) = due {
-                let request = match due.kind {
-                    wie_winapi::winmm::DueTimerKind::TimeEvent => {
-                        wie_winapi::GuestCallbackRequest::timer(
-                            due.handle,
-                            due.callback_va,
-                            due.user_data,
-                        )
+                // Route the due entry. `timeSetEvent` timers and
+                // `CALLBACK_FUNCTION` wave-out completions run through the
+                // bridged-callback machinery; `CALLBACK_WINDOW` completions
+                // are posted to the callback HWND as `MM_WOM_DONE` and
+                // `CALLBACK_EVENT` completions set the callback event —
+                // neither begins a guest callback, so both fall through to
+                // the regular dispatch body below.
+                let request = Self::due_callback_request(&mut guard, due)?;
+                if let Some(request) = request {
+                    self.charged_api = self.charged_api.saturating_add(1);
+                    let outer_library = self.intern_outer_api_name(resolved.library.clone());
+                    let outer_name = self.intern_outer_api_name(resolved.name.clone());
+                    self.events.push(EntryTraceEvent {
+                        index: api_index,
+                        library: Arc::clone(&outer_library),
+                        name: Arc::clone(&outer_name),
+                        fake_target_va: hook_address,
+                        handled: true,
+                        return_value: None,
+                        return_address: None,
+                    });
+                    drop(guard);
+                    if let Err(error) = self.begin_guest_callback(
+                        core,
+                        request,
+                        outer_library,
+                        outer_name,
+                        hook_address,
+                    ) {
+                        return Ok(Step::Stop(EntryTraceTermination::RuntimeStop(format!(
+                            "failed to begin timer callback: {error}"
+                        ))));
                     }
-                    wie_winapi::winmm::DueTimerKind::WaveOutDone => {
-                        wie_winapi::GuestCallbackRequest::wave_out_done(
-                            due.handle,
-                            due.callback_va,
-                            due.user_data,
-                            wie_winapi::winmm::WOM_DONE,
-                        )
-                    }
-                };
-                self.charged_api = self.charged_api.saturating_add(1);
-                let outer_library = self.intern_outer_api_name(resolved.library.clone());
-                let outer_name = self.intern_outer_api_name(resolved.name.clone());
-                self.events.push(EntryTraceEvent {
-                    index: api_index,
-                    library: Arc::clone(&outer_library),
-                    name: Arc::clone(&outer_name),
-                    fake_target_va: hook_address,
-                    handled: true,
-                    return_value: None,
-                    return_address: None,
-                });
-                drop(guard);
-                if let Err(error) = self.begin_guest_callback(
-                    core,
-                    request,
-                    outer_library,
-                    outer_name,
-                    hook_address,
-                ) {
-                    return Ok(Step::Stop(EntryTraceTermination::RuntimeStop(format!(
-                        "failed to begin timer callback: {error}"
-                    ))));
+                    return Ok(Step::Next);
                 }
-                return Ok(Step::Next);
             }
         }
 
@@ -835,37 +887,36 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                             };
                             let due = guard.pop_next_due_timer(now);
                             if let Some(due) = due {
-                                let request = wie_winapi::GuestCallbackRequest::timer(
-                                    due.handle,
-                                    due.callback_va,
-                                    due.user_data,
-                                );
-                                self.charged_api = self.charged_api.saturating_add(1);
-                                let outer_library =
-                                    self.intern_outer_api_name(resolved.library.clone());
-                                let outer_name = self.intern_outer_api_name(resolved.name.clone());
-                                self.events.push(EntryTraceEvent {
-                                    index: api_index,
-                                    library: Arc::clone(&outer_library),
-                                    name: Arc::clone(&outer_name),
-                                    fake_target_va: hook_address,
-                                    handled: true,
-                                    return_value: None,
-                                    return_address: None,
-                                });
-                                drop(guard);
-                                if let Err(error) = self.begin_guest_callback(
-                                    core,
-                                    request,
-                                    outer_library,
-                                    outer_name,
-                                    hook_address,
-                                ) {
-                                    return Ok(Step::Stop(EntryTraceTermination::RuntimeStop(
-                                        format!("failed to begin timer callback: {error}"),
-                                    )));
+                                let request = Self::due_callback_request(&mut guard, due)?;
+                                if let Some(request) = request {
+                                    self.charged_api = self.charged_api.saturating_add(1);
+                                    let outer_library =
+                                        self.intern_outer_api_name(resolved.library.clone());
+                                    let outer_name =
+                                        self.intern_outer_api_name(resolved.name.clone());
+                                    self.events.push(EntryTraceEvent {
+                                        index: api_index,
+                                        library: Arc::clone(&outer_library),
+                                        name: Arc::clone(&outer_name),
+                                        fake_target_va: hook_address,
+                                        handled: true,
+                                        return_value: None,
+                                        return_address: None,
+                                    });
+                                    drop(guard);
+                                    if let Err(error) = self.begin_guest_callback(
+                                        core,
+                                        request,
+                                        outer_library,
+                                        outer_name,
+                                        hook_address,
+                                    ) {
+                                        return Ok(Step::Stop(EntryTraceTermination::RuntimeStop(
+                                            format!("failed to begin timer callback: {error}"),
+                                        )));
+                                    }
+                                    return Ok(Step::Next);
                                 }
-                                return Ok(Step::Next);
                             }
                         }
                         *self.next_api_index = self

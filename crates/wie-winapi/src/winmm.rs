@@ -26,13 +26,47 @@ const TIME_PERIODIC: u32 = 0x0001;
 /// A due multimedia timer ready to fire.
 ///
 /// Returned by [`WinmmState::pop_due_timers`]; the pump turns each into a
-/// [`crate::GuestCallbackRequest`] for the guest `LPTIMECALLBACK`.
+/// [`crate::GuestCallbackRequest`] for the guest `LPTIMECALLBACK`, or — for a
+/// `waveOut` completion whose device was opened with a window or event
+/// callback — a queued window message / event signal instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DueTimerKind {
     /// A `timeSetEvent` timer (`LPTIMECALLBACK`, uMsg = 0).
     TimeEvent,
     /// A completed `waveOutWrite` buffer (`waveOutProc`, uMsg = `WOM_DONE`).
     WaveOutDone,
+}
+
+/// How a `waveOut` device was opened (`fdwOpen & CALLBACK_TYPEMASK`).
+///
+/// Mirrors the Windows `CALLBACK_*` constants. The pump dispatches a due
+/// `WOM_DONE` differently per kind: `Function` invokes the guest `waveOutProc`
+/// through the callback bridge, `Window` posts `MM_WOM_*` to the callback
+/// HWND, `Event` signals the callback event, and `Null` delivers nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveOutCallbackKind {
+    /// `CALLBACK_NULL` — no callback, nothing delivered.
+    Null,
+    /// `CALLBACK_FUNCTION` — `dwCallback` is a guest function pointer.
+    Function,
+    /// `CALLBACK_WINDOW` — `dwCallback` is an HWND that receives `MM_WOM_*`.
+    Window,
+    /// `CALLBACK_EVENT` — `dwCallback` is an event handle, signaled per
+    /// completion.
+    Event,
+}
+
+impl WaveOutCallbackKind {
+    /// Parse the callback-kind bits of `fdwOpen` (`CALLBACK_TYPEMASK`).
+    #[must_use]
+    pub const fn from_fdw_open(fdw_open: u64) -> Self {
+        match fdw_open & CALLBACK_TYPEMASK {
+            CALLBACK_FUNCTION => Self::Function,
+            CALLBACK_WINDOW => Self::Window,
+            CALLBACK_EVENT => Self::Event,
+            _ => Self::Null,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +257,10 @@ pub const WHDR_INQUEUE: u32 = 0x0000_0010;
 const CALLBACK_TYPEMASK: u64 = 0x0007_0000;
 /// `CALLBACK_FUNCTION` — dwCallback is a guest function pointer.
 const CALLBACK_FUNCTION: u64 = 0x0003_0000;
+/// `CALLBACK_WINDOW` — dwCallback is an HWND that receives `MM_WOM_*`.
+const CALLBACK_WINDOW: u64 = 0x0001_0000;
+/// `CALLBACK_EVENT` — dwCallback is an event handle, signaled per completion.
+const CALLBACK_EVENT: u64 = 0x0005_0000;
 /// Playback sink cap: 8 MiB of submitted PCM (see `WinmmState::playback_sink`).
 const PLAYBACK_SINK_CAP: usize = 8 * 1024 * 1024;
 
@@ -734,11 +772,15 @@ pub fn handle_wave_out_write(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
             .context("failed to update WAVEHDR.dwFlags")?;
     }
 
-    // Timed WOM_DONE for function callbacks: duration = frames / rate.
+    // Timed WOM_DONE for any non-NULL callback kind: duration = frames / rate.
+    // The pump routes the due entry per kind (Function -> bridge callback,
+    // Window -> MM_WOM_DONE posted to the HWND, Event -> event set).
     if state
         .winmm()
         .wave_out_record(hwo)
-        .is_some_and(|(_, _, _, callback_kind)| callback_kind == CALLBACK_FUNCTION)
+        .is_some_and(|(_, _, _, callback_kind)| {
+            WaveOutCallbackKind::from_fdw_open(callback_kind) != WaveOutCallbackKind::Null
+        })
     {
         let format = state.winmm().wave_out_format(hwo).unwrap_or(WaveFormat {
             channels: 2,
