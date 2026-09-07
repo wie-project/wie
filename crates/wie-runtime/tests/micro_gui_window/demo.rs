@@ -459,8 +459,8 @@ fn gui_dialog_modal_loop_and_end_dialog() {
     use wie_runtime::EntryTraceTermination;
 
     // Drive like the persistent GUI loop (YieldOnIdle + host-clock sleeps).
-    // The exe opens a modal dialog from its timer; the in-guest DialogBoxParam
-    // stub runs the modal loop, the timer-driven VK_RETURN exercises
+    // The exe opens a modal dialog immediately; the in-guest DialogBoxParam
+    // stub runs the modal loop, the HOST-posted VK_RETURN exercises
     // IsDialogMessage (Enter → WM_COMMAND(IDOK) → EndDialog(1)), and the exe
     // exits 0 only if DialogBoxParam returned 1 AND the WM_INITDIALOG sentinel
     // ran (SetDlgItemText + GetDlgItemText round-trip inside the dlgProc).
@@ -471,23 +471,29 @@ fn gui_dialog_modal_loop_and_end_dialog() {
     session
         .set_guest_env("WIE_SELFTEST", "1")
         .expect("inject WIE_SELFTEST");
+    // Host-driven close: disable the exe's timer auto-close (TIMER_TICKS).
+    // The auto-close races the first WM_PAINT under load — the dialog can
+    // close before its face is ever published, and the observation below
+    // misses even though the flow completed (the same flake class
+    // gui_demo_dialog_opens_on_click documents). The dialog instead stays
+    // open until the host has proof it painted, then the host closes it.
+    session
+        .set_guest_env("WIE_DIALOG_HOSTDRIVEN", "1")
+        .expect("inject WIE_DIALOG_HOSTDRIVEN");
 
-    // The dialog face is transient (open between two timer ticks), so a
-    // background watcher samples the channel — the inter-iteration polls
-    // below can span the dialog's whole lifetime on a loaded host and never
-    // see it (see [`FrameWatcher`]).
-    let watcher = {
-        let handle = session.guest_handle();
-        FrameWatcher::spawn(handle, |frame| {
-            let (x, y) = DIALOG_OK_BUTTON_SAMPLE;
-            if x >= frame.width || y >= frame.height {
-                return false;
-            }
-            let idx = usize::try_from(y).unwrap_or(0) * frame.stride as usize
-                + usize::try_from(x).unwrap_or(0);
-            frame.pixels.get(idx).copied() == Some(BTNFACE_0RGB)
-        })
-    };
+    // Win32 constants for the host-posted close (mirrors
+    // gui_dialog_shift_tab_moves_focus).
+    const VK_RETURN: u16 = 0x0D;
+    const WM_KEYDOWN: u32 = 0x0100;
+
+    // The dialog stays open (host-driven close), so the face cannot
+    // disappear before it is observed: poll the owner's published surface
+    // synchronously every iteration and gate the close on the first
+    // sighting (the deterministic pattern from
+    // gui_demo_dialog_opens_on_click).
+    let handle = session.guest_handle();
+    let mut saw_face = false;
+    let mut closed_dialog = false;
 
     let mut iterations = 0;
     let exit_code = loop {
@@ -500,6 +506,35 @@ fn gui_dialog_modal_loop_and_end_dialog() {
             "gui_dialog.exe did not exit within 300 iterations"
         );
 
+        // Presentation-model check: the dialog composites into the owner's
+        // published surface while it is open.
+        if let Some(owner) = session.first_guest_window_handle()
+            && let Some(frame) = session.take_frame(owner)
+        {
+            let (x, y) = DIALOG_OK_BUTTON_SAMPLE;
+            if x < frame.width && y < frame.height {
+                let idx = usize::try_from(y).unwrap_or(0) * frame.stride as usize
+                    + usize::try_from(x).unwrap_or(0);
+                if frame.pixels.get(idx).copied() == Some(BTNFACE_0RGB) {
+                    saw_face = true;
+                }
+            }
+        }
+        // Gate the close on the observed face: post ENTER to the dialog
+        // (owner's first child #32770) so IsDialogMessage turns it into
+        // WM_COMMAND(IDOK) → EndDialog(1).
+        if saw_face && !closed_dialog {
+            let owner_now = session.first_guest_window_handle().unwrap_or(0);
+            let dialog = session
+                .guest_windows_snapshot()
+                .iter()
+                .find(|(_, cls, ..)| cls == "#32770")
+                .map(|(h, ..)| *h)
+                .unwrap_or(owner_now);
+            handle.post_message(dialog, WM_KEYDOWN, u64::from(VK_RETURN), 0);
+            closed_dialog = true;
+        }
+
         match summary.termination {
             EntryTraceTermination::ExitProcess { code } => break Some(code),
             EntryTraceTermination::WaitingForMessage => {
@@ -511,8 +546,6 @@ fn gui_dialog_modal_loop_and_end_dialog() {
         }
     };
 
-    let observed = watcher.observed();
-    drop(watcher); // stop + join the sampler before asserting
     assert_eq!(
         exit_code,
         Some(0),
@@ -520,7 +553,7 @@ fn gui_dialog_modal_loop_and_end_dialog() {
          IsDialogMessage Enter → EndDialog(1) flow); got {exit_code:?}"
     );
     assert!(
-        observed.is_some(),
+        saw_face,
         "the dialog's OK-button face (BTNFACE 0xF0F0F0) was never observed in \
          the owner's published surface"
     );
