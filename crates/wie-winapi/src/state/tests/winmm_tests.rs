@@ -482,3 +482,27 @@ fn test_time_begin_period_records_and_timer_wheel_probes() {
     assert_eq!(dispatch_winmm(&mut engine, &mut state, "timeEndPeriod"), 0);
     assert_eq!(state.winmm().timer_period_ms(), 0, "cleared");
 }
+
+#[test]
+fn test_wave_out_callback_kind_classification() {
+    // Pins `WaveOutCallbackKind::from_fdw_open` against the Windows
+    // `CALLBACK_*` values so the routing (Function -> bridge callback,
+    // Window -> MM_WOM_DONE to the HWND, Event -> event set) stays faithful.
+    use crate::winmm::WaveOutCallbackKind as Kind;
+    let cases = [
+        (0x0000_0000_u64, Kind::Null),       // CALLBACK_NULL
+        (0x0001_0000, Kind::Window),         // CALLBACK_WINDOW
+        (0x0002_0000, Kind::Null),           // CALLBACK_THREAD (unsupported -> Null)
+        (0x0003_0000, Kind::Function),       // CALLBACK_FUNCTION
+        (0x0005_0000, Kind::Event),          // CALLBACK_EVENT
+        (0x0003_0000 | 0x2, Kind::Function), // flags ride alongside the kind
+        (0x4, Kind::Null),                   // no kind + flags -> Null
+    ];
+    for (fdw_open, expected) in cases {
+        assert_eq!(
+            Kind::from_fdw_open(fdw_open),
+            expected,
+            "fdwOpen = {fdw_open:#x}"
+        );
+    }
+}
