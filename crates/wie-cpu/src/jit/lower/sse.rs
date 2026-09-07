@@ -1092,6 +1092,7 @@ pub(super) fn lower_sse_int_binop(
             | exec::SseIntOp::Packsswb
             | exec::SseIntOp::Packssdw
             | exec::SseIntOp::Packuswb
+            | exec::SseIntOp::Psadbw
             | exec::SseIntOp::Punpcklbw
             | exec::SseIntOp::Punpcklwd
             | exec::SseIntOp::Punpckldq

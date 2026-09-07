@@ -693,7 +693,8 @@ pub(super) fn lower_insn(
         | Mnemonic::Pcmpgtd
         | Mnemonic::Packsswb
         | Mnemonic::Packssdw
-        | Mnemonic::Packuswb => {
+        | Mnemonic::Packuswb
+        | Mnemonic::Psadbw => {
             let op = sse_int_op(instr.mnemonic()).ok_or("sse int op")?;
             lower_sse_int_binop(bcx, instr, gpr, *rflags, mem, xmm, op)
         }

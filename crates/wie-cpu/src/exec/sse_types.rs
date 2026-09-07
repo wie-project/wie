@@ -63,6 +63,7 @@ pub(crate) enum SseIntOp {
     PunpckHiBw = 33,
     PunpckHiWd = 34,
     PunpckHiDq = 35,
+    Psadbw = 36,
 }
 
 impl SseIntOp {
@@ -112,6 +113,7 @@ impl TryFrom<u64> for SseIntOp {
             33 => Self::PunpckHiBw,
             34 => Self::PunpckHiWd,
             35 => Self::PunpckHiDq,
+            36 => Self::Psadbw,
             _ => return Err(()),
         })
     }

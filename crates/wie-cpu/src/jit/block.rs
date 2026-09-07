@@ -406,6 +406,7 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Packsswb
         | Mnemonic::Packssdw
         | Mnemonic::Packuswb
+        | Mnemonic::Psadbw
         | Mnemonic::Punpcklbw
         | Mnemonic::Punpcklwd
         | Mnemonic::Punpckldq

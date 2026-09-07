@@ -678,6 +678,7 @@ pub(super) fn sse_int_op(m: Mnemonic) -> SseIntOp {
         Mnemonic::Packsswb => SseIntOp::Packsswb,
         Mnemonic::Packssdw => SseIntOp::Packssdw,
         Mnemonic::Packuswb => SseIntOp::Packuswb,
+        Mnemonic::Psadbw => SseIntOp::Psadbw,
         _ => {
             // Unreachable: the dispatch arms only call `sse_int_op` for the
             // mnemonics enumerated above.
@@ -1060,6 +1061,19 @@ pub(super) fn exec_sse_unpcklpd(
     Ok(())
 }
 
+/// Half-lane SAD: sum of absolute differences of the 8 unsigned bytes in `a`/`b`.
+/// Max 8*255 = 2040, fits the low 16 bits. Shared by interpreter + JIT helper.
+pub(super) fn sse_psadbw_half(a: u64, b: u64) -> u64 {
+    (0..QWORD_BYTES)
+        .map(|i| {
+            let shift = i * usize::try_from(BITS_PER_BYTE).unwrap_or(0);
+            let a_byte = (a >> shift) & 0xff;
+            let b_byte = (b >> shift) & 0xff;
+            a_byte.abs_diff(b_byte)
+        })
+        .sum()
+}
+
 /// `Psadbw` — sum of absolute differences of unsigned bytes.
 /// Low 8 bytes → summed into lower 16 bits of lower qword.
 /// High 8 bytes → summed into lower 16 bits of upper qword.
@@ -1070,23 +1084,9 @@ pub(super) fn exec_sse_psadbw(
 ) -> Result<(), StepExecError> {
     let a = read_sse_op(mem, regs, instr, 0, XMM_BYTES)?;
     let b = read_sse_op(mem, regs, instr, 1, XMM_BYTES)?;
-    let low_sum: u64 = (0..QWORD_BYTES)
-        .map(|i| {
-            let shift = i * usize::try_from(BITS_PER_BYTE).unwrap_or(0);
-            let a_byte = ((a >> shift) & 0xff) as u64;
-            let b_byte = ((b >> shift) & 0xff) as u64;
-            a_byte.abs_diff(b_byte)
-        })
-        .sum();
-    let high_sum: u64 = (0..QWORD_BYTES)
-        .map(|i| {
-            let shift = (i + QWORD_BYTES) * usize::try_from(BITS_PER_BYTE).unwrap_or(0);
-            let a_byte = ((a >> shift) & 0xff) as u64;
-            let b_byte = ((b >> shift) & 0xff) as u64;
-            a_byte.abs_diff(b_byte)
-        })
-        .sum();
-    let result = u128::from(low_sum) | (u128::from(high_sum) << 64);
+    let low = sse_psadbw_half(a as u64, b as u64);
+    let high = sse_psadbw_half((a >> 64) as u64, (b >> 64) as u64);
+    let result = u128::from(low) | (u128::from(high) << 64);
     write_sse_op(mem, regs, instr, 0, result, XMM_BYTES, false)
 }
 
@@ -1272,6 +1272,7 @@ pub(crate) fn sse_int_binop_half(op: SseIntOp, a: u64, b: u64) -> u64 {
             );
             sse_punpck_half(a, b, bits, high)
         }
+        SseIntOp::Psadbw => sse_psadbw_half(a, b),
     }
 }
 
