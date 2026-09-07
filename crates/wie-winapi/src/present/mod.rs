@@ -328,6 +328,23 @@ impl PresentChannel {
             .drain_key_writes()
     }
 
+    /// Record the latest host cursor position in guest-logical screen pixels
+    /// (channel-only — the host's `set_cursor_pos` never touches the big
+    /// lock, mirroring `push_key_write`).
+    pub fn push_cursor_pos(&self, x: i32, y: i32) {
+        self.window_mirror
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_cursor_pos(x, y);
+    }
+
+    /// Read the latest host cursor position — a copy, NOT a drain
+    /// (`GetCursorPos` is level-triggered). A poisoned mirror reads as
+    /// `None` (the `(0, 0)` fallback), like `mirror_windows`.
+    pub(crate) fn cursor_pos(&self) -> Option<(i32, i32)> {
+        self.window_mirror.lock().ok()?.cursor_pos()
+    }
+
     /// Enable/disable D3D9 Present-commit mode (Wave 2). Only call after the
     /// committer thread spawned (`spawn_present_committer`), so every enqueued
     /// commit has a live consumer. `WIE_PRESENT_COMMIT=0` keeps the legacy

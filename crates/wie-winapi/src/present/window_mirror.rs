@@ -60,6 +60,10 @@ pub(crate) struct WindowMirror {
     menu_dirty: bool,
     /// Pending host keyboard writes, drained by the guest keyboard readers.
     key_writes: Vec<(u16, bool)>,
+    /// Latest host-reported cursor position in guest-logical screen pixels.
+    /// Read-current (copy), never drained: `GetCursorPos` is
+    /// level-triggered and must report the same position on repeated calls.
+    cursor_pos: Option<(i32, i32)>,
 }
 
 impl WindowMirror {
@@ -101,5 +105,18 @@ impl WindowMirror {
     /// into `WindowState::keyboard_state` before reading).
     pub(crate) fn drain_key_writes(&mut self) -> Vec<(u16, bool)> {
         std::mem::take(&mut self.key_writes)
+    }
+
+    /// Record the latest host cursor position (the host never touches the
+    /// big lock).
+    pub(crate) fn set_cursor_pos(&mut self, x: i32, y: i32) {
+        self.cursor_pos = Some((x, y));
+    }
+
+    /// Read the latest host cursor position (a copy, NOT a drain — cursor
+    /// position is level-triggered, so repeated `GetCursorPos` calls report
+    /// the same position until the host pushes a newer one).
+    pub(crate) fn cursor_pos(&self) -> Option<(i32, i32)> {
+        self.cursor_pos
     }
 }

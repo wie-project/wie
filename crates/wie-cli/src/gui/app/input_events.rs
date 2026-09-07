@@ -341,6 +341,23 @@ impl WieApp {
                     i32::from(rx),
                     i32::from(ry),
                 );
+                // Mirror the cursor into guest-screen space for GetCursorPos
+                // (level-triggered read, no big lock): the event top-level's
+                // record origin plus the client-relative logical position. An
+                // unresolvable event window keeps the legacy (0,0) origin.
+                let (origin_x, origin_y) = handle
+                    .top_level_origin(event_hwnd.unwrap_or(primary_hwnd))
+                    .unwrap_or((0, 0));
+                handle.set_cursor_pos(
+                    origin_x
+                        .saturating_add(
+                            input::physical_to_logical(position.x.max(0.0), event_sf) as i32
+                        ),
+                    origin_y
+                        .saturating_add(
+                            input::physical_to_logical(position.y.max(0.0), event_sf) as i32
+                        ),
+                );
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = matches!(state, winit::event::ElementState::Pressed);

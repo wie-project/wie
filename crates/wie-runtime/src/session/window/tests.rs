@@ -1193,3 +1193,36 @@ fn set_key_state_queues_without_the_big_lock_and_guest_drains_it() {
         assert_eq!(key & 0x80, 0x80, "the pressed bit lands after the drain");
     }
 }
+
+/// `set_cursor_pos` pushes the latest host cursor position onto the mirror —
+/// no big lock while the guest holds it — and the guest-side `GetCursorPos`
+/// reader copies it out under the big lock it already holds. Read-current,
+/// not drain: repeated reads report the same position, and a newer push
+/// overwrites (latest wins).
+#[test]
+fn set_cursor_pos_without_the_big_lock_and_guest_reads_it() {
+    let (handle, _a, _a_button) = handle_with_seeded_mirror();
+    probe_without_big_lock(&handle, "set_cursor_pos", move |h| {
+        h.set_cursor_pos(12, 34);
+    });
+    {
+        let mut state = handle.state.lock().expect("lock state");
+        assert_eq!(
+            state.cursor_pos(),
+            Some((12, 34)),
+            "the pushed position reads back"
+        );
+        assert_eq!(
+            state.cursor_pos(),
+            Some((12, 34)),
+            "cursor reads are non-destructive (no drain)"
+        );
+    }
+    probe_without_big_lock(&handle, "set_cursor_pos", move |h| {
+        h.set_cursor_pos(-5, 300);
+    });
+    {
+        let mut state = handle.state.lock().expect("lock state");
+        assert_eq!(state.cursor_pos(), Some((-5, 300)), "the latest push wins");
+    }
+}

@@ -25,7 +25,7 @@ fn test_get_async_key_state_down() {
     let mut state = default_winapi_state();
     // VK_RETURN high bit set — index is a compile-time constant in bounds.
     state.window_state().keyboard_state.set(0x0D, 0x80);
-    write_regs(&mut engine, 0x0D, 0, 0, 0, 0);
+    write_regs(&mut engine, 0x0D, 0, 0, 0, STACK_TOP);
     assert_return_value!(
         user32::handle_get_async_key_state(&mut HandlerContext::new(
             &mut engine,
@@ -33,6 +33,79 @@ fn test_get_async_key_state_down() {
             &mut state
         )),
         0x81
+    );
+}
+
+/// GetCursorPos with no host push yet reports the legacy (0, 0) and TRUE.
+/// POINT is 8 bytes, x @0, y @4 (see `guest_layout::WinPoint`).
+#[test]
+fn test_get_cursor_pos_default_without_host_push() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let point_va = 0x4000_u64;
+    write_regs(&mut engine, point_va, 0, 0, 0, STACK_TOP);
+    assert_return_value!(
+        user32::handle_get_cursor_pos(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        1
+    );
+    let read_i32 = |engine: &mut IcedCpu, addr: u64| -> i32 {
+        let mut b = [0_u8; 4];
+        engine.mem_read(addr, &mut b).expect("read POINT i32");
+        i32::from_le_bytes(b)
+    };
+    assert_eq!(read_i32(&mut engine, point_va), 0, "POINT.x fallback");
+    assert_eq!(read_i32(&mut engine, point_va + 4), 0, "POINT.y fallback");
+}
+
+/// GetCursorPos returns the host-pushed mirror position. Level-triggered:
+/// two consecutive calls report the same position (no drain).
+#[test]
+fn test_get_cursor_pos_returns_mirrored_position() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    state.present().channel.push_cursor_pos(321, 234);
+    let point_va = 0x4000_u64;
+    let read_i32 = |engine: &mut IcedCpu, addr: u64| -> i32 {
+        let mut b = [0_u8; 4];
+        engine.mem_read(addr, &mut b).expect("read POINT i32");
+        i32::from_le_bytes(b)
+    };
+    for _ in 0..2 {
+        write_regs(&mut engine, point_va, 0, 0, 0, STACK_TOP);
+        assert_return_value!(
+            user32::handle_get_cursor_pos(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            1
+        );
+        assert_eq!(read_i32(&mut engine, point_va), 321, "POINT.x mirrors host");
+        assert_eq!(
+            read_i32(&mut engine, point_va + 4),
+            234,
+            "POINT.y mirrors host"
+        );
+    }
+}
+
+/// A NULL out-pointer still returns TRUE (the tolerant write-skip).
+#[test]
+fn test_get_cursor_pos_null_pointer_returns_true() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_regs(&mut engine, 0, 0, 0, 0, STACK_TOP);
+    assert_return_value!(
+        user32::handle_get_cursor_pos(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        1
     );
 }
 

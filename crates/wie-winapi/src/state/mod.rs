@@ -777,6 +777,14 @@ impl WinApiState {
             }
         }
     }
+
+    /// Read the latest host-pushed cursor position in guest-logical screen
+    /// pixels — called by the `GetCursorPos` reader under the big lock it
+    /// already holds. A copy, NOT a drain (`None` until the first host
+    /// push, which the handler reports as the legacy `(0, 0)`).
+    pub fn cursor_pos(&mut self) -> Option<(i32, i32)> {
+        self.present().channel.cursor_pos()
+    }
 }
 
 /// Bundle of everything a WinAPI handler may need.

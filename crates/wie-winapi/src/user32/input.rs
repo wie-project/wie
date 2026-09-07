@@ -64,16 +64,23 @@ pub fn handle_track_mouse_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     ctx.finish(return_value)
 }
 /// Handles `USER32.dll!GetCursorPos`.
+///
+/// Reports the latest host-pushed cursor position in guest-logical screen
+/// pixels (see `WinApiState::cursor_pos`); `None` before the first host
+/// push keeps the legacy `(0, 0)`. Level-triggered: the mirror read is a
+/// copy, so repeated calls report the same position.
 pub fn handle_get_cursor_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
     let point_va = read_arg(engine, ArgReg::Rcx, "GetCursorPos")?;
 
     if point_va != 0 {
+        let (x, y) = state.cursor_pos().unwrap_or((0, 0));
         // One shared-lock borrow instead of two per-field writes; the POINT
         // layout lives in `crate::guest_layout::WinPoint`.
         with_typed_write::<WinPoint, _, _>(engine, point_va, |point| {
-            point.x = 0;
-            point.y = 0;
+            point.x = x;
+            point.y = y;
             Ok(())
         })
         .context("failed to write POINT for GetCursorPos")?;

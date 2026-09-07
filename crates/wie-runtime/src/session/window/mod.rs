@@ -402,6 +402,48 @@ impl GuestHandle {
         self.present_channel.push_key_write(vk, pressed);
     }
 
+    /// Record the latest host cursor position in guest-logical screen pixels
+    /// for the guest's `GetCursorPos` reader.
+    ///
+    /// Wave 5 (P4): pushes onto the presenter-side window mirror — no big
+    /// `WinApiState` lock here (this runs per cursor move on the event-loop
+    /// thread). The guest reader copies the latest value out under the big
+    /// lock it already holds; the read is a copy, NOT a drain, because
+    /// cursor position is level-triggered.
+    pub fn set_cursor_pos(&self, x: i32, y: i32) {
+        self.present_channel.push_cursor_pos(x, y);
+    }
+
+    /// Guest-logical screen origin of the top-level window owning `hwnd`
+    /// (that record's `(x, y)`).
+    ///
+    /// Wave 5 (P4): `GetCursorPos` reports guest-screen coordinates, so the
+    /// host adds the owning top-level's record origin to the
+    /// client-relative cursor position before pushing it (see
+    /// [`Self::set_cursor_pos`]). Reads the presenter-side window mirror —
+    /// never the big `WinApiState` lock. `None` when `hwnd` is not a live
+    /// guest window.
+    #[must_use]
+    pub fn top_level_origin(&self, hwnd: u64) -> Option<(i32, i32)> {
+        let start = wie_winapi::handles::Hwnd::from(hwnd);
+        self.present_channel
+            .mirror_windows(|windows| {
+                let mut current = start;
+                // Ascend the parent chain to the top-level ancestor. The
+                // depth is bounded by the record count so a corrupt parent
+                // cycle cannot spin the event loop.
+                for _ in 0..windows.len().saturating_add(1) {
+                    let record = windows.iter().find(|w| w.handle == current)?;
+                    if record.parent == wie_winapi::handles::Hwnd::NULL {
+                        return Some((record.x, record.y));
+                    }
+                    current = record.parent;
+                }
+                None
+            })
+            .flatten()
+    }
+
     /// Return info for the first guest window: (hwnd, title, width, height).
     ///
     /// Wave 2 Step 2: reads the presenter-side window mirror — never the big
