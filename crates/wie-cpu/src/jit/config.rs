@@ -76,7 +76,6 @@ pub(super) struct JitConfig {
     mem_path_trace: bool,
     super_mode: SuperMode,
     chain_enabled: bool,
-    #[allow(dead_code)]
     ssa_flags_enabled: bool,
     bg_enabled: bool,
     bg_wait_timeout: Duration,
@@ -381,7 +380,6 @@ impl JitConfig {
     }
 
     #[must_use]
-    #[allow(dead_code)]
     pub(super) fn ssa_flags_enabled(&self) -> bool {
         self.ssa_flags_enabled
     }
