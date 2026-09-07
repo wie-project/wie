@@ -565,7 +565,7 @@ use analysis::{
 use emit::{
     MemEnv, SuperStack, emit_block_wide_stack_guard, emit_body_and_term, term_chain_targets,
 };
-use flags::{FlagState, flag_bit, iconst_u64, mask_width};
+use flags::{FlagState, flag_bit, iconst_u64, mask_width, select_flag};
 use gpr::{
     bool_to_i64, effective_addr, flag_set, mark_dirty, op_width_bits, read_op_mem, reg_index,
     sext_to_i64, write_gpr, write_op_mem,
@@ -1495,7 +1495,11 @@ pub(super) fn lower_shift_lazy(
         }
         ShiftKind::Rcl => {
             // Rcl: CF into LSB, shift left by count, MSB into CF
-            let cf_val = flag_bit(bcx, *rflags, Rflags::CF);
+            let cf_val = if let Some(fs) = flag_state.as_ref() {
+                select_flag(bcx, fs.cf, Rflags::CF)
+            } else {
+                flag_bit(bcx, *rflags, Rflags::CF)
+            };
             let left = bcx.ins().ishl(dst, count_mod);
             let right_amt = bcx.ins().isub(bits_v, count_mod);
             let right = bcx.ins().ushr(dst, right_amt);
@@ -1505,7 +1509,11 @@ pub(super) fn lower_shift_lazy(
         }
         ShiftKind::Rcr => {
             // Rcr: CF into MSB, shift right by count
-            let cf_val = flag_bit(bcx, *rflags, Rflags::CF);
+            let cf_val = if let Some(fs) = flag_state.as_ref() {
+                select_flag(bcx, fs.cf, Rflags::CF)
+            } else {
+                flag_bit(bcx, *rflags, Rflags::CF)
+            };
             let right = bcx.ins().ushr(dst, count_mod);
             let left_amt = bcx.ins().isub(bits_v, count_mod);
             let left = bcx.ins().ishl(dst, left_amt);

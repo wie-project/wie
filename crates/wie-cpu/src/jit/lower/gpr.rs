@@ -4,7 +4,7 @@
 use super::emit::MemEnv;
 use super::flags::{
     FlagState, clear_flags, flag_bit, flags_add, flags_logic, flags_sub, iconst_u64, mask_width,
-    replace_flag, select_flag,
+    pack_state, replace_flag, select_flag,
 };
 use super::insn::PendingFlags;
 use super::mem::{call_load, call_store};
@@ -832,7 +832,7 @@ pub(super) fn lower_arith(
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
     rflags: &mut Value,
-    flag_state: Option<&FlagState>,
+    flag_state: Option<&mut FlagState>,
     mem: &mut MemEnv,
     op: Arith,
 ) -> Result<(), String> {
@@ -842,7 +842,7 @@ pub(super) fn lower_arith(
     let a = mask_width(bcx, a_raw, bits);
     let b = mask_width(bcx, b_raw, bits);
     // Carry-in CF bit value (I64 0/1): live fs.cf (i1) widened, else packed read.
-    let cf_val = if let Some(fs) = flag_state {
+    let cf_val = if let Some(fs) = flag_state.as_deref() {
         select_flag(bcx, fs.cf, Rflags::CF)
     } else {
         flag_bit(bcx, *rflags, Rflags::CF)
@@ -864,13 +864,29 @@ pub(super) fn lower_arith(
     };
     let res_m = mask_width(bcx, res, bits);
     write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, res_m, bits)?;
-    *rflags = match op {
-        Arith::Xor | Arith::And | Arith::Or => flags_logic(bcx, *rflags, res_m, bits),
-        Arith::Add => flags_add(bcx, *rflags, a, b, res_m, bits),
-        Arith::Adc => flags_adc(bcx, *rflags, a, b, cf_val, res_m, bits),
-        Arith::Sub => flags_sub(bcx, *rflags, a, b, res_m, bits),
-        Arith::Sbb => flags_sbb(bcx, *rflags, a, b, cf_val, res_m, bits),
-    };
+    match flag_state {
+        // Predicate-direct: write fs i1s once, pack the carrier from fields so
+        // the caller and later packed-boundary reads see the fresh word.
+        Some(fs) => {
+            match op {
+                Arith::Xor | Arith::And | Arith::Or => fs.assign_logic(bcx, res_m, bits),
+                Arith::Add => fs.assign_arith(bcx, a, b, res_m, bits, false, false),
+                Arith::Adc => fs.assign_adc(bcx, a, b, cf_val, res_m, bits),
+                Arith::Sub => fs.assign_arith(bcx, a, b, res_m, bits, true, false),
+                Arith::Sbb => fs.assign_sbb(bcx, a, b, cf_val, res_m, bits),
+            }
+            *rflags = pack_state(bcx, fs);
+        }
+        None => {
+            *rflags = match op {
+                Arith::Xor | Arith::And | Arith::Or => flags_logic(bcx, *rflags, res_m, bits),
+                Arith::Add => flags_add(bcx, *rflags, a, b, res_m, bits),
+                Arith::Adc => flags_adc(bcx, *rflags, a, b, cf_val, res_m, bits),
+                Arith::Sub => flags_sub(bcx, *rflags, a, b, res_m, bits),
+                Arith::Sbb => flags_sbb(bcx, *rflags, a, b, cf_val, res_m, bits),
+            };
+        }
+    }
     Ok(())
 }
 

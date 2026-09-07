@@ -153,10 +153,13 @@ pub(super) fn flush_pending(
             count_mod,
             bits,
         } => {
-            // Shifts stay packed until M5; fs re-derived from the materialized word.
-            *rflags = materialize_shift_flags(bcx, *rflags, kind, dst, res, count_mod, bits);
             if let Some(fs) = flag_state {
-                fs.resync(bcx, *rflags);
+                // Predicate-direct: shift flags from fs + operands (count_mod==0
+                // preserves all fields), pack only for the carrier.
+                fs.assign_shift(bcx, kind, dst, res, count_mod, bits);
+                *rflags = pack_state(bcx, fs);
+            } else {
+                *rflags = materialize_shift_flags(bcx, *rflags, kind, dst, res, count_mod, bits);
             }
         }
     }
@@ -419,7 +422,7 @@ pub(super) fn lower_insn(
                 gpr,
                 dirty,
                 rflags,
-                flag_state.as_ref(),
+                flag_state.as_mut(),
                 mem,
                 if instr.mnemonic() == Mnemonic::Adc {
                     Arith::Adc
@@ -427,9 +430,6 @@ pub(super) fn lower_insn(
                     Arith::Sbb
                 },
             )?;
-            if let Some(fs) = flag_state {
-                fs.resync(bcx, *rflags);
-            }
             Ok(())
         }
         // Inc/dec: lazy with CF preserved on flush (Intel: INC/DEC do not touch CF).

@@ -2,8 +2,8 @@
 //! select/replace helpers.
 
 use super::emit::MemEnv;
-use super::gpr::{flag_set, op_width_bits, read_op_mem, write_op_mem};
-use super::insn::PendingFlags;
+use super::gpr::{bool_to_i64, flag_set, op_width_bits, read_op_mem, sext_to_i64, write_op_mem};
+use super::insn::{PendingFlags, ShiftKind};
 
 use crate::regs::Rflags;
 use cranelift::prelude::*;
@@ -201,6 +201,199 @@ impl FlagState {
         let zero = iconst_u64(bcx, 0);
         self.cf = bcx.ins().icmp_imm(IntCC::Equal, zero, 1); // false
         self.of = bcx.ins().icmp_imm(IntCC::Equal, zero, 1); // false
+    }
+
+    /// SBB flags, predicate-direct mirror of `flags_sbb`: full-width borrow CF.
+    /// `cf` is the carry-in as a WIDENED I64 0/1 lane (select_flag), never an i1.
+    pub(super) fn assign_sbb(
+        &mut self,
+        bcx: &mut FunctionBuilder<'_>,
+        d: Value,
+        s: Value,
+        cf: Value,
+        result: Value,
+        bits: u32,
+    ) {
+        // Base ZF/SF/PF/AF/OF from (d - s) via add_sub_preds(sub=true); the CF
+        // from the base sub is replaced by the wide borrow below.
+        let (_, of_c, af_c) = add_sub_preds(bcx, d, s, result, bits, true);
+        let (zf, sf, pf) = zs_pf_preds(bcx, result, bits);
+        self.zf = zf;
+        self.sf = sf;
+        self.pf = pf;
+        self.of = of_c;
+        self.af = af_c;
+        // Correct CF for carry-in: CF = d < s + cf (full width; s+cf may exceed).
+        let s_plus_cf = bcx.ins().iadd(s, cf);
+        let cf_b = if bits >= 64 {
+            // 64-bit: overflow of s+cf means always borrow; else d < s+cf.
+            let c_ov = bcx.ins().icmp(IntCC::UnsignedLessThan, s_plus_cf, s); // s+cf wrapped
+            let c_lt = bcx.ins().icmp(IntCC::UnsignedLessThan, d, s_plus_cf);
+            let c_ovi = bool_to_i64(bcx, c_ov);
+            let c_lti = bool_to_i64(bcx, c_lt);
+            let any = bcx.ins().bor(c_ovi, c_lti);
+            let zero = iconst_u64(bcx, 0);
+            bcx.ins().icmp(IntCC::NotEqual, any, zero)
+        } else {
+            // s/d masked to operand width; s+cf may be 2^bits — then CF always set.
+            bcx.ins().icmp(IntCC::UnsignedLessThan, d, s_plus_cf)
+        };
+        self.cf = cf_b;
+    }
+
+    /// ADC flags, predicate-direct mirror of `flags_adc`: iced
+    /// `set_add_flags(d, s+cf, result)` then CF from the wide add.
+    /// `cf` is the carry-in as a WIDENED I64 0/1 lane (select_flag), never an i1.
+    pub(super) fn assign_adc(
+        &mut self,
+        bcx: &mut FunctionBuilder<'_>,
+        d: Value,
+        s: Value,
+        cf: Value,
+        result: Value,
+        bits: u32,
+    ) {
+        let s_eff = bcx.ins().iadd(s, cf);
+        let s_eff_m = mask_width(bcx, s_eff, bits);
+        // Base flags from add(d, s_eff, result) via add_sub_preds(sub=false);
+        // the CF from the base add is replaced by the wide-add CF below.
+        let (_, of_c, af_c) = add_sub_preds(bcx, d, s_eff_m, result, bits, false);
+        let (zf, sf, pf) = zs_pf_preds(bcx, result, bits);
+        self.zf = zf;
+        self.sf = sf;
+        self.pf = pf;
+        self.of = of_c;
+        self.af = af_c;
+        // Wide-add CF.
+        let cf_b = if bits >= 64 {
+            let sum_ds = bcx.ins().iadd(d, s);
+            let c1 = bcx.ins().icmp(IntCC::UnsignedLessThan, sum_ds, d);
+            let sum = bcx.ins().iadd(sum_ds, cf);
+            let c2 = bcx.ins().icmp(IntCC::UnsignedLessThan, sum, sum_ds);
+            let c1i = bool_to_i64(bcx, c1);
+            let c2i = bool_to_i64(bcx, c2);
+            let any = bcx.ins().bor(c1i, c2i);
+            let zero = iconst_u64(bcx, 0);
+            bcx.ins().icmp(IntCC::NotEqual, any, zero)
+        } else {
+            let t = bcx.ins().iadd(d, s);
+            let sum = bcx.ins().iadd(t, cf);
+            let sh = iconst_u64(bcx, u64::from(bits));
+            let shifted = bcx.ins().ushr(sum, sh);
+            let zero = iconst_u64(bcx, 0);
+            bcx.ins().icmp(IntCC::NotEqual, shifted, zero)
+        };
+        self.cf = cf_b;
+    }
+
+    /// Shift/rotate flags, mirroring `materialize_shift_flags` semantics but
+    /// predicate-direct: reads incoming CF/OF from the existing fs fields and
+    /// writes the i1s once. count_mod==0 leaves all fields unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn assign_shift(
+        &mut self,
+        bcx: &mut FunctionBuilder<'_>,
+        kind: ShiftKind,
+        dst: Value,
+        result: Value,
+        count_mod: Value,
+        bits: u32,
+    ) {
+        let one = iconst_u64(bcx, 1);
+        let zero_c = iconst_u64(bcx, 0);
+        let is_zero = bcx.ins().icmp_imm(IntCC::Equal, count_mod, 0);
+        let is_one = bcx.ins().icmp_imm(IntCC::Equal, count_mod, 1);
+        let sign = iconst_u64(bcx, 1_u64 << bits.saturating_sub(1).min(63));
+        let sb = iconst_u64(bcx, u64::from(bits.saturating_sub(1)));
+        // Incoming CF/OF/ZF/SF/PF: shift flags apply relative to prior state.
+        let old_cf = self.cf;
+        let old_of = self.of;
+        let old_zf = self.zf;
+        let old_sf = self.sf;
+        let old_pf = self.pf;
+
+        // CF (as an I64 0/1 lane first — Rcl/Rcr OF XOR compares it as a lane).
+        let cf_bit = match kind {
+            ShiftKind::Shl => {
+                let cm1 = bcx.ins().isub(count_mod, one);
+                let t = bcx.ins().ishl(dst, cm1);
+                let cf = bcx.ins().ushr(t, sb);
+                bcx.ins().band(cf, one)
+            }
+            ShiftKind::Shr => {
+                let cm1 = bcx.ins().isub(count_mod, one);
+                let cf = bcx.ins().ushr(dst, cm1);
+                bcx.ins().band(cf, one)
+            }
+            ShiftKind::Sar => {
+                let signed = sext_to_i64(bcx, dst, bits);
+                let cm1 = bcx.ins().isub(count_mod, one);
+                let cf = bcx.ins().ushr(signed, cm1);
+                bcx.ins().band(cf, one)
+            }
+            ShiftKind::Rol => bcx.ins().band(result, one),
+            ShiftKind::Ror => {
+                let cf = bcx.ins().ushr(result, sb);
+                bcx.ins().band(cf, one)
+            }
+            ShiftKind::Rcl => bcx.ins().band(result, one),
+            ShiftKind::Rcr => {
+                let rbit = bcx.ins().ushr(result, sb);
+                bcx.ins().band(rbit, one)
+            }
+        };
+        // The packed code selects old CF back in for Rcl/Rcr at count 0; the
+        // outer select below covers count_mod==0 for every kind uniformly.
+        let cf_cond = bcx.ins().icmp_imm(IntCC::NotEqual, cf_bit, 0);
+        self.cf = bcx.ins().select(is_zero, old_cf, cf_cond);
+
+        let of_cond = match kind {
+            ShiftKind::Shl => {
+                let x = bcx.ins().bxor(result, dst);
+                let b = bcx.ins().band(x, sign);
+                bcx.ins().icmp_imm(IntCC::NotEqual, b, 0)
+            }
+            ShiftKind::Shr => {
+                let b = bcx.ins().band(dst, sign);
+                bcx.ins().icmp_imm(IntCC::NotEqual, b, 0)
+            }
+            ShiftKind::Sar => bcx.ins().icmp_imm(IntCC::Equal, zero_c, 1), // false
+            ShiftKind::Rol => {
+                let hi_sh = bcx.ins().ushr(result, sb);
+                let hi = bcx.ins().band(hi_sh, one);
+                let lo = bcx.ins().band(result, one);
+                bcx.ins().icmp(IntCC::NotEqual, hi, lo)
+            }
+            ShiftKind::Ror => {
+                let hi_sh = bcx.ins().ushr(result, sb);
+                let b1 = bcx.ins().band(hi_sh, one);
+                let sb2 = iconst_u64(bcx, u64::from(bits.saturating_sub(2)));
+                let lo_sh = bcx.ins().ushr(result, sb2);
+                let b2 = bcx.ins().band(lo_sh, one);
+                bcx.ins().icmp(IntCC::NotEqual, b1, b2)
+            }
+            ShiftKind::Rcl | ShiftKind::Rcr => {
+                // OF = (CF XOR result[top]); under is_one the cf lane equals the
+                // shifted-out bit, matching the packed code's use of `cf_bit`.
+                let hi = bcx.ins().ushr(result, sb);
+                let hi_bit = bcx.ins().band(hi, one);
+                bcx.ins().icmp(IntCC::NotEqual, cf_bit, hi_bit)
+            }
+        };
+        // OF updates only when count_mod==1 (packed `of_merged` select).
+        self.of = bcx.ins().select(is_one, of_cond, old_of);
+
+        // ZS/PF only for the same kinds the packed writer gates (keeps the
+        // pre-existing JIT behavior for Rcl/Rcr, which iced does not set).
+        if matches!(
+            kind,
+            ShiftKind::Shl | ShiftKind::Shr | ShiftKind::Sar | ShiftKind::Rcl | ShiftKind::Rcr
+        ) {
+            let (zf, sf, pf) = zs_pf_preds(bcx, result, bits);
+            self.zf = bcx.ins().select(is_zero, old_zf, zf);
+            self.sf = bcx.ins().select(is_zero, old_sf, sf);
+            self.pf = bcx.ins().select(is_zero, old_pf, pf);
+        }
     }
 
     /// Pack the SSA flags into the packed rflags carrier, keeping the previous
