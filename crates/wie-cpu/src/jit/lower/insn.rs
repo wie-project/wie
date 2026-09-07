@@ -791,6 +791,16 @@ pub(super) fn lower_insn(
         Mnemonic::Cvtpd2ps => {
             lower_sse_cvtpd_packed(bcx, instr, gpr, *rflags, mem, xmm, exec::SseCvtOp::Cvtpd2ps)
         }
+        // CVTTPD2DQ: two doubles → two dwords (truncated, host helper).
+        Mnemonic::Cvttpd2dq => lower_sse_cvtpd_packed(
+            bcx,
+            instr,
+            gpr,
+            *rflags,
+            mem,
+            xmm,
+            exec::SseCvtOp::Cvttpd2dq,
+        ),
         // Scalar converts: low lane only, upper destination bits preserved.
         Mnemonic::Cvtsd2ss => lower_sse_cvt_scalar_preserve(
             bcx,

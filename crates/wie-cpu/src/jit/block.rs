@@ -438,6 +438,7 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Cvtps2pd
         | Mnemonic::Cvtpd2dq
         | Mnemonic::Cvtpd2ps
+        | Mnemonic::Cvttpd2dq
         | Mnemonic::Cvtsd2ss
         | Mnemonic::Cvtss2sd => sse_bitwise_is_lowerable(instr),
         // Scalar / packed FP sqrt + min/max.
