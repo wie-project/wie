@@ -336,6 +336,13 @@ fn is_lowerable(instr: &Instruction) -> bool {
         Mnemonic::Movlps | Mnemonic::Movlpd | Mnemonic::Movhps | Mnemonic::Movhpd => {
             sse_mov_is_lowerable(instr, 8)
         }
+        // Movhlps/Movlhps: reg-reg half-lane shuffles (dst xmm, src xmm only).
+        Mnemonic::Movhlps | Mnemonic::Movlhps => {
+            matches!(
+                (instr.op0_kind(), instr.op1_kind()),
+                (OpKind::Register, OpKind::Register)
+            )
+        }
         // Pmovmskb/Vpmovmskb: r32 ← sign bits of the 16 source-xmm bytes
         // (reg-only form; the VEX prefix decodes to its own mnemonic).
         Mnemonic::Pmovmskb | Mnemonic::Vpmovmskb => {
