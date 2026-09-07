@@ -259,6 +259,46 @@ pub(super) fn lower_sse_pmovmskb(
     write_gpr(bcx, gpr, dirty, r0, mask)
 }
 
+/// `MOVMSKPD/MOVMSKPS r32, xmm/m128` — pack the sign bit of each packed FP
+/// element into the low GPR bits (pd: 2×f64, ps: 4×f32); upper bits zeroed.
+// The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lower_sse_movmsk(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &mut [Value; 16],
+    dirty: &mut [bool; 16],
+    rflags: Value,
+    mem: &mut MemEnv,
+    xmm: &mut [Value; 32],
+    double: bool,
+) -> Result<(), String> {
+    let r0 = instr.op_register(0);
+    if !(r0.is_gpr32() || r0.is_gpr64()) {
+        return Err("movmsk dst".into());
+    }
+    let (lo, hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "movmsk")?;
+    let (lanes, esize_bits) = if double {
+        (2_u64, 64_u64)
+    } else {
+        (4_u64, 32_u64)
+    };
+    let mut mask = iconst_u64(bcx, 0);
+    let one = iconst_u64(bcx, 1);
+    for lane in 0_u64..lanes {
+        let pos = lane * esize_bits + esize_bits - 1;
+        // Bit positions ≥ 64 live in the high half.
+        let (half, sub) = if pos < 64 { (lo, pos) } else { (hi, pos - 64) };
+        let sign_shift = iconst_u64(bcx, sub);
+        let lane_pos = iconst_u64(bcx, lane);
+        let bit = bcx.ins().ushr(half, sign_shift);
+        let bit = bcx.ins().band(bit, one);
+        let bit = bcx.ins().ishl(bit, lane_pos);
+        mask = bcx.ins().bor(mask, bit);
+    }
+    write_gpr(bcx, gpr, dirty, r0, mask)
+}
+
 pub(super) fn lower_sse_movd(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,

@@ -351,6 +351,8 @@ fn is_lowerable(instr: &Instruction) -> bool {
                 (OpKind::Register, OpKind::Register)
             )
         }
+        // Movmskpd/Movmskps: r32 ← sign bits of packed FP elements (reg/m128 src).
+        Mnemonic::Movmskpd | Mnemonic::Movmskps => sse_bitwise_is_lowerable(instr),
         Mnemonic::Xorps
         | Mnemonic::Xorpd
         | Mnemonic::Pxor
