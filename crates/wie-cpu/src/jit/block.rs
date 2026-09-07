@@ -421,7 +421,9 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Punpckhwd
         | Mnemonic::Punpckhdq
         | Mnemonic::Punpcklqdq
-        | Mnemonic::Punpckhqdq => sse_bitwise_is_lowerable(instr),
+        | Mnemonic::Punpckhqdq
+        | Mnemonic::Unpcklpd
+        | Mnemonic::Unpckhpd => sse_bitwise_is_lowerable(instr),
         // Packed integer shifts: `xmm, imm8` or `xmm, xmm/m128` (variable count).
         Mnemonic::Psllw
         | Mnemonic::Pslld

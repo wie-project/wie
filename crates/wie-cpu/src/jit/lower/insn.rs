@@ -650,7 +650,9 @@ pub(super) fn lower_insn(
                 lower_sse_packed_fp(bcx, instr, gpr, *rflags, mem, xmm, bin_op, width)
             }
         }
-        Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq => lower_sse_punpck(bcx, instr, xmm, mem),
+        Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq | Mnemonic::Unpcklpd | Mnemonic::Unpckhpd => {
+            lower_sse_punpck(bcx, instr, xmm, mem)
+        }
         Mnemonic::Punpcklbw
         | Mnemonic::Punpcklwd
         | Mnemonic::Punpckldq

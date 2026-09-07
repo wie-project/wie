@@ -474,10 +474,10 @@ pub(super) fn exec_sse_punpck(
     let src = instr.op_register(1);
     let a = regs.read_xmm(dst)?;
     let b = regs.read_xmm(src)?;
-    let new = if instr.mnemonic() == Mnemonic::Punpcklqdq {
+    let new = if matches!(instr.mnemonic(), Mnemonic::Punpcklqdq | Mnemonic::Unpcklpd) {
         (a & u128::from(u64::MAX)) | ((b & u128::from(u64::MAX)) << 64)
     } else {
-        // Punpckhqdq
+        // Punpckhqdq / Unpckhpd
         ((a >> 64) & u128::from(u64::MAX)) | (b & !u128::from(u64::MAX))
     };
     regs.write_xmm(dst, new)?;
@@ -1043,21 +1043,6 @@ pub(super) fn exec_sse_cvtss2sd(
     let old = regs.read_xmm(dst)?;
     let r = (old & 0xffff_ffff_ffff_ffff_0000_0000_0000_0000_u128) | u128::from(f.to_bits());
     regs.write_xmm(dst, r)?;
-    Ok(())
-}
-
-/// `Unpcklpd` — unpack low packed double-precision floats (identical to punpcklqdq).
-pub(super) fn exec_sse_unpcklpd(
-    regs: &mut RegFile,
-    instr: &Instruction,
-) -> Result<(), StepExecError> {
-    let dst = instr.op_register(0);
-    let src = instr.op_register(1);
-    let a = regs.read_xmm(dst)?;
-    let b = regs.read_xmm(src)?;
-    // Low 64 bits from dst, low 64 bits from src.
-    let result = (a & u128::from(u64::MAX)) | ((b & u128::from(u64::MAX)) << QWORD_BITS);
-    regs.write_xmm(dst, result)?;
     Ok(())
 }
 

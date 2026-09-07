@@ -40,7 +40,7 @@ use sse::{
     exec_sse_movq, exec_sse_packed_fp, exec_sse_pmovmskb, exec_sse_psadbw, exec_sse_pshufb,
     exec_sse_pshufd, exec_sse_pshuflw_hw, exec_sse_punpck, exec_sse_punpck_lanes,
     exec_sse_rcp_rsqrt, exec_sse_scalar_fp, exec_sse_shift, exec_sse_shufpd, exec_sse_sqrt_packed,
-    exec_sse_sqrt_scalar, exec_sse_unpcklpd, is_sse_movsd, sse_int_op, sse_shift_op,
+    exec_sse_sqrt_scalar, is_sse_movsd, sse_int_op, sse_shift_op,
 };
 use sse_types::{FpOp, SseBitOp};
 use string::{exec_cmps, exec_lods, exec_movs, exec_scas, exec_stos};
@@ -521,7 +521,10 @@ fn execute_one(
         Mnemonic::Movlps | Mnemonic::Movlpd => exec_sse_movlpd(mem, regs, instr),
         Mnemonic::Movhlps | Mnemonic::Movlhps => exec_sse_movhlps(regs, instr),
         // SSE2 unpack / shuffle / compare.
-        Mnemonic::Punpcklqdq | Mnemonic::Punpckhqdq => exec_sse_punpck(regs, instr),
+        Mnemonic::Punpcklqdq
+        | Mnemonic::Punpckhqdq
+        | Mnemonic::Unpcklpd
+        | Mnemonic::Unpckhpd => exec_sse_punpck(regs, instr),
         Mnemonic::Punpcklbw
         | Mnemonic::Punpcklwd
         | Mnemonic::Punpckldq
@@ -577,7 +580,6 @@ fn execute_one(
         // Whole-XMM byte shifts (66 0F 73 /3 ib and /7 ib; imm8 count only).
         Mnemonic::Psrldq | Mnemonic::Pslldq => exec_sse_byte_shift(regs, instr),
         Mnemonic::Psadbw => exec_sse_psadbw(mem, regs, instr),
-        Mnemonic::Unpcklpd => exec_sse_unpcklpd(regs, instr),
         // FP sqrt / min / max (scalar + packed).
         Mnemonic::Sqrtss => exec_sse_sqrt_scalar(mem, regs, instr, false),
         Mnemonic::Sqrtsd => exec_sse_sqrt_scalar(mem, regs, instr, true),

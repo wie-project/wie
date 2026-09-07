@@ -398,8 +398,8 @@ pub(super) fn lower_sse_punpck(
     let (lo_a, hi_a) = read_xmm_pair(xmm, r0)?;
     let (lo_b, hi_b) = read_xmm_pair(xmm, r1)?;
     let (new_lo, new_hi) = match instr.mnemonic() {
-        Mnemonic::Punpcklqdq => (lo_a, lo_b),
-        _ => (hi_a, hi_b), // Punpckhqdq
+        Mnemonic::Punpcklqdq | Mnemonic::Unpcklpd => (lo_a, lo_b),
+        _ => (hi_a, hi_b), // Punpckhqdq / Unpckhpd
     };
     store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, new_lo, new_hi);
     Ok(())
