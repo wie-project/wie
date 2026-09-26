@@ -108,8 +108,10 @@ fn test_winmm_wave_out_get_dev_caps_w_writes_struct() {
     assert_eq!(channels, 2, "stereo fake device");
     let name = String::from_utf16_lossy(
         b[20..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .take_while(|&u| u != 0)
             .collect::<Vec<u16>>()
             .as_slice(),

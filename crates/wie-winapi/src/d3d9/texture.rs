@@ -606,7 +606,7 @@ fn lock_rect_render_target(
                 .unwrap_or(0)
                 .saturating_mul(usize::try_from(width).unwrap_or(0))
                 .saturating_add(usize::try_from(left).unwrap_or(0));
-            for (col, chunk) in row_bytes.chunks_exact_mut(4).enumerate() {
+            for (col, chunk) in row_bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let texel = record
                     .pixels
                     .get(row_start.saturating_add(col))
@@ -692,9 +692,8 @@ fn unlock_rect_render_target(
                 continue;
             }
             let mut texels: Vec<u32> = Vec::with_capacity(row_width);
-            for chunk in row_bytes.chunks_exact(4) {
-                let bytes: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
-                texels.push(u32::from_le_bytes(bytes));
+            for chunk in row_bytes.as_chunks::<4>().0 {
+                texels.push(u32::from_le_bytes(*chunk));
             }
             let row_start = usize::try_from(row)
                 .unwrap_or(0)
@@ -879,9 +878,8 @@ fn unlock_rect_common(
             }
             // Copy the row into the level's host texels (D3DCOLOR byte order).
             let mut texels: Vec<u32> = Vec::with_capacity(row_width);
-            for chunk in row_bytes.chunks_exact(4) {
-                let bytes: [u8; 4] = chunk.try_into().unwrap_or([0; 4]);
-                texels.push(u32::from_le_bytes(bytes));
+            for chunk in row_bytes.as_chunks::<4>().0 {
+                texels.push(u32::from_le_bytes(*chunk));
             }
             let row_start = usize::try_from(row)
                 .unwrap_or(0)

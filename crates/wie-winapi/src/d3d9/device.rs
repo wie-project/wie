@@ -443,9 +443,7 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
         // bound → a no-op (documented), matching D3D9's behavior.
         let depth_stencil = state.d3d9().d3d9_depth_stencil;
         if let Some(record) = state.d3d9().d3d9_depth_surfaces.get_mut(&depth_stencil) {
-            for slot in std::sync::Arc::make_mut(&mut record.depth) {
-                *slot = z_value;
-            }
+            std::sync::Arc::make_mut(&mut record.depth).fill(z_value);
         } else {
             tracing::trace!(target: "wiegui", "D3D9 Clear: ZBUFFER flag ignored (no depth surface)");
         }
@@ -568,13 +566,9 @@ pub fn handle_clear(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
                     }
                 }
             } else if rt == 0 {
-                for pixel in &mut state.d3d9().d3d9_backbuffer {
-                    *pixel = color_0rgb;
-                }
+                state.d3d9().d3d9_backbuffer.fill(color_0rgb);
             } else if let Some(record) = state.d3d9().d3d9_render_targets.get_mut(&rt) {
-                for pixel in std::sync::Arc::make_mut(&mut record.pixels) {
-                    *pixel = color_0rgb;
-                }
+                std::sync::Arc::make_mut(&mut record.pixels).fill(color_0rgb);
             }
             // The whole frame changed — a partial Present region is invalid.
             if rt == 0 {

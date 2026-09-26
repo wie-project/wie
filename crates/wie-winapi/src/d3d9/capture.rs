@@ -803,9 +803,7 @@ impl ReplayTargets {
         if clear.depth
             && let Some((_, _, texels)) = self.depths.get_mut(&clear.depth_stencil)
         {
-            for slot in texels {
-                *slot = clear.z_value;
-            }
+            texels.fill(clear.z_value);
         }
         if !clear.target {
             return;

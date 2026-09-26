@@ -368,7 +368,7 @@ fn set_shader_constant_f(
             .mem_read(float_address, &mut bytes)
             .context("failed to read shader constant data")?;
         let mut chunks = [[0_u8; 4]; 4];
-        for (chunk, byte_chunk) in chunks.iter_mut().zip(bytes.chunks_exact(4)) {
+        for (chunk, byte_chunk) in chunks.iter_mut().zip(bytes.as_chunks::<4>().0) {
             chunk.copy_from_slice(byte_chunk);
         }
         for (channel, chunk) in chunks.into_iter().enumerate() {
@@ -400,7 +400,7 @@ fn get_shader_constant_f(
         };
         let address = data_va.wrapping_add(u64::from(index).wrapping_mul(16));
         let mut bytes = [0_u8; 16];
-        for (channel, byte_chunk) in bytes.chunks_exact_mut(4).enumerate() {
+        for (channel, byte_chunk) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let chunk = value.get(channel).copied().unwrap_or(0.0).to_le_bytes();
             byte_chunk.copy_from_slice(&chunk);
         }
@@ -530,9 +530,9 @@ fn set_shader_constant_i(
         engine
             .mem_read(int_address, &mut bytes)
             .context("failed to read shader integer constant data")?;
-        for (channel, byte_chunk) in bytes.chunks_exact(4).enumerate() {
+        for (channel, byte_chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
             if let Some(slot_channel) = slot.get_mut(channel) {
-                *slot_channel = i32::from_le_bytes(byte_chunk.try_into().unwrap_or([0; 4]));
+                *slot_channel = i32::from_le_bytes(*byte_chunk);
             }
         }
     }
@@ -559,7 +559,7 @@ fn get_shader_constant_i(
         };
         let address = data_va.wrapping_add(u64::from(index).wrapping_mul(16));
         let mut bytes = [0_u8; 16];
-        for (channel, byte_chunk) in bytes.chunks_exact_mut(4).enumerate() {
+        for (channel, byte_chunk) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let chunk = value.get(channel).copied().unwrap_or(0).to_le_bytes();
             byte_chunk.copy_from_slice(&chunk);
         }

@@ -493,7 +493,7 @@ fn fill_gradient_rect(
             .saturating_add(
                 u64::try_from(usize::try_from(left).unwrap_or(0).saturating_mul(4)).unwrap_or(0),
             );
-        for (px, slot) in row.chunks_exact_mut(4).enumerate() {
+        for (px, slot) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let x = left.saturating_add(i32::try_from(px).unwrap_or(0));
             let num = if horizontal {
                 x.saturating_sub(x0)

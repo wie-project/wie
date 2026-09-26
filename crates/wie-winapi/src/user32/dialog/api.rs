@@ -512,8 +512,8 @@ mod tests {
         let mut raw = [0_u8; 128];
         engine.mem_read(ptr, &mut raw).expect("read guest buffer");
         let mut units = Vec::new();
-        for pair in raw.chunks_exact(2) {
-            let unit = u16::from_le_bytes([pair[0], pair[1]]);
+        for pair in raw.as_chunks::<2>().0 {
+            let unit = u16::from_le_bytes(*pair);
             if unit == 0 {
                 break;
             }

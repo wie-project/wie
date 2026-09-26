@@ -401,10 +401,8 @@ mod tests {
         // on the NULs rather than stopping at the first one.
         let mut entries: Vec<String> = Vec::new();
         let mut current = String::new();
-        for pair in bytes.chunks_exact(2) {
-            let mut raw = [0_u8; 2];
-            raw.copy_from_slice(pair);
-            match char::from_u32(u32::from(u16::from_le_bytes(raw))) {
+        for pair in bytes.as_chunks::<2>().0 {
+            match char::from_u32(u32::from(u16::from_le_bytes(*pair))) {
                 Some('\0') if current.is_empty() => {}
                 Some('\0') => {
                     entries.push(std::mem::take(&mut current));

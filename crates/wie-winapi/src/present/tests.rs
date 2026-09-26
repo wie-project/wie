@@ -274,9 +274,7 @@ fn background_filled_frame_has_no_black_pixels() {
     state.set_background_color(hwnd, background);
     state.ensure_surface(hwnd, 32, 24);
     if let Some(surf) = state.surfaces.get_mut(&hwnd) {
-        for px in &mut surf.pixels {
-            *px = background;
-        }
+        surf.pixels.fill(background);
     }
     state.record = Some(Box::new(empty_frame()));
     state.publish(hwnd);
@@ -305,9 +303,7 @@ fn black_background_is_legitimate_and_recorded() {
     state.set_background_color(hwnd, black);
     state.ensure_surface(hwnd, 8, 8);
     if let Some(surf) = state.surfaces.get_mut(&hwnd) {
-        for px in &mut surf.pixels {
-            *px = black;
-        }
+        surf.pixels.fill(black);
     }
     state.publish(hwnd);
     let frame = state.published.get(&hwnd).expect("published frame");
@@ -638,9 +634,7 @@ fn reconcile_publishes_stale_top_levels_and_advances_their_rev() {
     state.ensure_surface(hwnd, 32, 16);
     // Paint recognizable content so the reconcile's republish carries it.
     if let Some(surf) = state.surfaces.get_mut(&hwnd) {
-        for px in &mut surf.pixels {
-            *px = 0x00FF_FFFF;
-        }
+        surf.pixels.fill(0x00FF_FFFF);
     }
     state.revisions.content_rev.insert(hwnd, ContentRev(3));
     state

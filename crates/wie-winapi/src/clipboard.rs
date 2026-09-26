@@ -457,13 +457,10 @@ pub(crate) fn store_clipboard_format_bytes(state: &mut WinApiState, format: u32,
         }
         CF_UNICODETEXT => {
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|pair| {
-                    u16::from_le_bytes([
-                        pair.first().copied().unwrap_or(0),
-                        pair.get(1).copied().unwrap_or(0),
-                    ])
-                })
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
                 .take_while(|&unit| unit != 0)
                 .collect();
             state.clipboard().set_text(String::from_utf16_lossy(&units));

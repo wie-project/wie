@@ -795,7 +795,7 @@ pub(super) fn draw_gl_vertices(ctx: &mut GlCtx, mode: u32, verts: &[GlVertex]) {
             }
         }
         GL_LINES => {
-            for pair in clip.chunks_exact(2) {
+            for pair in clip.as_chunks::<2>().0 {
                 draw_clip_vertices(ctx, pair);
             }
         }
@@ -815,7 +815,7 @@ pub(super) fn draw_gl_vertices(ctx: &mut GlCtx, mode: u32, verts: &[GlVertex]) {
             }
         }
         GL_TRIANGLES => {
-            for tri in clip.chunks_exact(3) {
+            for tri in clip.as_chunks::<3>().0 {
                 draw_clip_vertices(ctx, tri);
             }
         }
@@ -834,13 +834,10 @@ pub(super) fn draw_gl_vertices(ctx: &mut GlCtx, mode: u32, verts: &[GlVertex]) {
             }
         }
         GL_QUADS => {
-            for quad in clip.chunks_exact(4) {
-                if let (Some(a), Some(b), Some(c), Some(d)) =
-                    (quad.first(), quad.get(1), quad.get(2), quad.get(3))
-                {
-                    draw_clip_vertices(ctx, &[*a, *b, *c]);
-                    draw_clip_vertices(ctx, &[*a, *c, *d]);
-                }
+            for quad in clip.as_chunks::<4>().0 {
+                let [a, b, c, d] = *quad;
+                draw_clip_vertices(ctx, &[a, b, c]);
+                draw_clip_vertices(ctx, &[a, c, d]);
             }
         }
         GL_QUAD_STRIP => {
@@ -910,14 +907,10 @@ pub(crate) fn gl_clear(ctx: &mut GlCtx, mask: u32) {
     }
     if mask & GL_COLOR_BUFFER_BIT != 0 {
         let color = pack_color(ctx.clear_color);
-        for pixel in &mut ctx.backbuffer {
-            *pixel = color;
-        }
+        ctx.backbuffer.fill(color);
     }
     if mask & GL_DEPTH_BUFFER_BIT != 0 {
-        for slot in &mut ctx.depth {
-            *slot = ctx.clear_depth;
-        }
+        ctx.depth.fill(ctx.clear_depth);
     }
 }
 

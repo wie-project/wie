@@ -206,10 +206,8 @@ fn read_guest_utf16_raw(engine: &mut IcedCpu, addr: u64, max_units: usize) -> St
         .mem_read(addr, &mut bytes)
         .expect("read guest UTF-16 buffer");
     let mut units: Vec<u16> = Vec::new();
-    for pair in bytes.chunks_exact(2) {
-        let lo = pair.first().copied().expect("two-byte chunk lo");
-        let hi = pair.get(1).copied().expect("two-byte chunk hi");
-        let unit = u16::from_le_bytes([lo, hi]);
+    for pair in bytes.as_chunks::<2>().0 {
+        let unit = u16::from_le_bytes(*pair);
         if unit == 0 {
             break;
         }

@@ -254,7 +254,9 @@ fn blend_row_dib(buf: &mut [u8], fg: u32, alphas: &[u8]) {
     let fb = fg & 0xFF;
     let opaque = fg & 0x00FF_FFFF;
     for (slot, &alpha) in buf[..n.saturating_mul(4)]
-        .chunks_exact_mut(4)
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
         .zip(alphas.iter())
     {
         let a = u32::from(alpha);
@@ -262,7 +264,7 @@ fn blend_row_dib(buf: &mut [u8], fg: u32, alphas: &[u8]) {
             continue;
         }
         let inv = 255_u32.wrapping_sub(a);
-        let existing = u32::from_le_bytes(slot.try_into().unwrap_or([0; 4]));
+        let existing = u32::from_le_bytes(*slot);
         let dr = (existing >> 16) & 0xFF;
         let dg = (existing >> 8) & 0xFF;
         let db = existing & 0xFF;
