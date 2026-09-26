@@ -12,12 +12,13 @@ WIE emulates 64-bit Windows user-mode PE binaries on macOS Apple Silicon. Guest 
 # Build the CLI (release is what the test suite and perf numbers assume)
 cargo build -p wie-cli --release
 
-# Full pre-PR gate: fmt --check, clippy -D warnings, cargo nextest, micro-suite
+# Pre-PR gate: fmt --check, clippy (advisory), cargo nextest, micro-suite
 ./scripts/check.sh
 
 # Individual steps
 cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets            # what the gate runs
+cargo clippy --workspace --all-targets -- -D warnings   # stricter; worth running before a PR
 cargo nextest run --workspace
 cargo nextest run -p wie-cpu <test_name>    # single test
 
@@ -40,9 +41,15 @@ Building `micro-exes/` requires the mingw cross-compiler: `x86_64-w64-mingw32-gc
 
 Prefer kill-switch env vars over deep debugging first — `docs/RUNBOOK.md` maps symptoms to switches. Key ones: `WIE_CPU=iced` (rule out JIT miscompile), `WIE_JIT_MEM=slow` (helper-only memory), `WIE_JIT_CHAIN=0`, `WIE_STRING_BULK=0`, `WIE_JIT_SIMD=0`, `WIE_MPROTECT=0`. `WIE_RUNTIME_PROFILE=1` prints wall/CPU%, host-stop counts, and JIT counters; while it is armed, Ctrl+C stops the session cleanly, dumps the report to stderr, and exits 130. The full knob table is in docs/RUNBOOK.md.
 
-## Lint policy (strict — shapes all code)
+## Lint policy (strict in intent — read the enforcement note, it is narrower)
 
-Workspace lints deny: `unwrap_used`, `expect_used`, `panic`, `unreachable`, `todo`, `unimplemented`, `indexing_slicing`, `as_conversions`, all cast lints, and `clippy::pedantic`. Use `?`/`ok_or_else`, `.get()`, and `u64::from(x)`/`try_from` instead. `unsafe_code` is denied workspace-wide; only `wie-cpu` allows it locally for Cranelift JIT entry points — keep new `unsafe` confined there. `#[allow(...)]` escapes should be rare (CONTRIBUTING.md).
+Intended policy, and what you must write to: no `unwrap`/`expect`/`panic`/`unreachable`/`todo`/`unimplemented`, no `indexing_slicing`, no `as_conversions`, no cast lints, no `clippy::pedantic`, and `unsafe` confined to `wie-cpu`. Use `?`/`ok_or_else`, `.get()`, and `u64::from(x)`/`try_from`. `#[allow(...)]` escapes should be rare (CONTRIBUTING.md).
+
+**What is actually enforced today — do not assume the above is enforced:**
+
+- **No clippy lints are denied.** `Cargo.toml` has no `[workspace.lints.clippy]` section at all: *"No clippy lints are denied here: clippy runs at its defaults and is advisory in CI."* Clippy is advisory because `scripts/check.sh` and `.github/workflows/ci.yml` both invoke it **without** `-D warnings`, even though this file used to document `-D warnings`. The stricter command is worth running before a PR, but the gate does not.
+- **`[workspace.lints.rust]` only binds where a crate opts in.** Only `wie-cpu` and `wie-winapi` have `[lints] workspace = true`. `wie-pe`, `wie-runtime` and `wie-cli` do not, so the table's `unsafe_code = "deny"`, `unused_imports`, `rust_2018_idioms` etc. are **inert in those three crates**. In practice `wie-cli` carries ~21 `unsafe` sites (4 files) that nothing currently denies; `wie-winapi`'s 5 are properly annotated with `#[expect(unsafe_code)]`.
+- Closing that gap means adding `[lints] workspace = true` to the three crates and then annotating or removing the `unsafe` in `wie-cli`. That is a deliberate policy decision, not a mechanical fix.
 
 ## Architecture
 
