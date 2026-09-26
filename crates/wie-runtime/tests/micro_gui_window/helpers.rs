@@ -11,7 +11,7 @@ use std::path::Path;
 
 pub(crate) use crate::common::{micro_exe, real_exe};
 
-/// Serializes the 7 GUI micro-tests so they run one at a time.
+/// Serializes the GUI micro-tests so they run one at a time.
 ///
 /// Each test drives its guest synchronously on its own test thread, and the
 /// guest's 50 ms WM_TIMER advances only while `run_until_stop` executes. Under
@@ -22,16 +22,28 @@ pub(crate) use crate::common::{micro_exe, real_exe};
 /// against the dialog's timer-driven auto-close and landing gui_blit's
 /// resting-frame capture after the dialog has composited over the owner.
 /// Both flakes reproduce only under that parallel load and pass in isolation,
-/// so the suite takes a process-wide lock and runs one test at a time. The
-/// wall-time cost is small: the suite is dominated by gui_blit's ~11 s either
-/// way.
+/// so the suite takes a process-wide lock and runs one test at a time.
+///
+/// SCOPE — this lock only works when the tests share a process, i.e. under
+/// `cargo test`. `cargo nextest` (what this project gates on) defaults to
+/// process-per-test, so each of the suite's 52 tests gets its own address
+/// space and its own copy of this mutex, and nothing is serialized: measured
+/// on an 8-core host, 8 `micro_gui_window-*` processes ran concurrently
+/// before the config-level group existed. The real serialization is
+/// `test-group = "gui"` + `[test-groups.gui] max-threads = 1` in
+/// `.config/nextest.toml`, which nextest applies across processes. Under that
+/// group, gui_blit took 21.1 s under 4x CPU oversubscription where the
+/// unserialized run took 64.9 s. Keep this lock: it is what protects the
+/// `cargo test` path, and it costs nothing when nextest's group is in force.
 pub(crate) static GUI_SUITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Acquire the suite-wide serialization lock (see [`GUI_SUITE_LOCK`]).
 ///
-/// Held for the whole test; the guard's `Drop` runs on unwinding too, so a
-/// panicking test cannot deadlock its successors (the next `lock()` sees a
-/// poisoned mutex and recovers via `PoisonError::into_inner`).
+/// A no-op for exclusion under `cargo nextest` (one process per test); kept
+/// for the `cargo test` path. Held for the whole test; the guard's `Drop` runs
+/// on unwinding too, so a panicking test cannot deadlock its successors (the
+/// next `lock()` sees a poisoned mutex and recovers via
+/// `PoisonError::into_inner`).
 pub(crate) fn gui_suite_serialize() -> std::sync::MutexGuard<'static, ()> {
     GUI_SUITE_LOCK
         .lock()
@@ -337,17 +349,22 @@ pub(crate) struct ObservedFrame {
 /// replaced by the modal dialog's composite, and gui_dialog's OK-button face
 /// exists only between two timer ticks — so the observation is missed even
 /// though the frame was published and rendered correctly (both flakes
-/// reproduce only on a loaded host; see [`GUI_SUITE_LOCK`], which serializes
-/// the suite but cannot fix host-speed-dependent observation).
+/// reproduce only on a loaded host; see [`GUI_SUITE_LOCK`] for what the
+/// in-process lock does and does not cover, and the `gui` test group in
+/// `.config/nextest.toml` for the cross-process serialization).
 ///
 /// The watcher runs on its own thread through the same cross-thread
 /// [`wie_runtime::GuestHandle`] seam the present-commit render thread uses,
 /// sampling every 1 ms — independent of how long each `run_until_stop`
-/// iteration takes. It records the FIRST frame matching `pred` and exits
-/// (each sampled frame is a full 4 MB clone, so the watcher does not keep
-/// running after a hit). The hwnd is resolved from the presenter-side window
-/// mirror once, then only the lock-free frame channel is touched. Stop by
-/// dropping the watcher (the `Drop` joins the thread).
+/// iteration takes. It records the FIRST frame matching `pred` and exits.
+/// A sample is cheap, not a 4 MB copy: `SurfaceFrame::pixels` is an
+/// `Arc<Vec<u32>>` and `take_frame` clones the frame handle under the
+/// present lock, measured at 1-9 us. (An earlier revision of this comment
+/// claimed a full-surface clone per poll; that stopped being true when
+/// publish and take_frame went zero-copy.) Collect the result with
+/// [`FrameWatcher::finish`], which waits for the sampler instead of racing
+/// it; dropping the watcher also stops and joins it, so an early return
+/// cannot leak the thread.
 pub(crate) struct FrameWatcher {
     observed_rx: std::sync::mpsc::Receiver<ObservedFrame>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -401,9 +418,43 @@ impl FrameWatcher {
         }
     }
 
-    /// The first frame that matched, once observed.
-    pub(crate) fn observed(&self) -> Option<ObservedFrame> {
-        self.observed_rx.try_recv().ok()
+    /// The first frame that matched, once the sampler has been given a chance
+    /// to finish what it has in flight.
+    ///
+    /// Read this instead of polling the channel yourself. A single
+    /// non-blocking `try_recv` right after the guest loop races the sampler
+    /// thread, and the race is lost on a loaded host: the presenter publishes
+    /// on its own thread, so the last frame of a session can land *after*
+    /// `ExitProcess` has already returned the test to this line. Measured at
+    /// 3x CPU oversubscription: the sampler recorded the frame at t+85.7s and
+    /// the test's read had already returned `None` — 3 runs, 3 failures, all
+    /// with the correct frame hash in hand one moment too late.
+    ///
+    /// So: poll the channel for up to `grace`, return as soon as the frame
+    /// arrives, then stop and join the sampler. The happy path costs nothing
+    /// (the frame is normally recorded long before the guest exits, and the
+    /// first `try_recv` succeeds), so `grace` is only ever paid on a run that
+    /// is about to fail anyway. It does not weaken the guard: the same
+    /// predicate still has to match, and the frame still has to be a genuine
+    /// publish from this session — it just may not have been published at the
+    /// instant the guest returned.
+    pub(crate) fn finish(&mut self, grace: std::time::Duration) -> Option<ObservedFrame> {
+        use std::sync::atomic::Ordering;
+        let deadline = std::time::Instant::now() + grace;
+        let found = loop {
+            if let Ok(frame) = self.observed_rx.try_recv() {
+                break Some(frame);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        found.or_else(|| self.observed_rx.try_recv().ok())
     }
 }
 

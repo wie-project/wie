@@ -342,7 +342,7 @@ fn gui_blit_comprehensive_regression() {
     // timer tick 4), so a background watcher samples the channel — the
     // inter-iteration polls below can span the frame's whole lifetime on a
     // loaded host and never see it (see [`FrameWatcher`]).
-    let watcher = {
+    let mut watcher = {
         let handle = session.guest_handle();
         FrameWatcher::spawn(handle, |frame| {
             // Hash only the text-free gradient rows (200..800): text
@@ -373,8 +373,13 @@ fn gui_blit_comprehensive_regression() {
         }
     };
 
-    let observed = watcher.observed();
-    drop(watcher); // stop + join the sampler before asserting
+    // Wait for the sampler rather than racing it: the presenter publishes on
+    // its own thread, so under host load the resting frame can land just
+    // AFTER the guest's ExitProcess has returned us to this line. See
+    // `FrameWatcher::finish`. 5 s is ~3x the observed late-publish gap
+    // (~1.3 s at 3x CPU oversubscription) and is only ever paid on a run
+    // that is about to fail anyway.
+    let observed = watcher.finish(std::time::Duration::from_secs(5));
     assert_eq!(
         exit_code,
         Some(0),
@@ -386,10 +391,29 @@ fn gui_blit_comprehensive_regression() {
          owner's published surface",
     );
     assert_frame_renders_gradient_text_and_controls(&observed.frame);
-    // B9 regression net: publish+present must stay cheap. The 10 ms ceiling
-    // is deliberately generous — it catches pathological regressions (e.g. a
-    // full 4 MB clone or another full copy reintroduced into publish or
-    // take_frame), not tight tuning. Measured in debug builds at 1280×800.
+    // B9 regression net: publish+present must stay cheap.
+    //
+    // WHAT THIS ACTUALLY MEASURES (measured 2026-09-26, 6 runs, dev profile,
+    // 1280x800, 8-core M3, including 4x CPU oversubscription):
+    //   publish_us = `present_publish_ns_last()` = wall clock around the
+    //     presenter's `publish()` body — which since the zero-copy change is
+    //     an `Arc` move, so it measures lock wait + host scheduling, not copy
+    //     volume. Observed 0-2 us.
+    //   present_us = wall clock of the watcher's `take_frame()` on the
+    //     sampler thread. Observed 1-9 us.
+    // So the observed envelope is single-digit microseconds and the 10 ms
+    // ceiling is ~1000x headroom: this is a canary against a gross stall
+    // (a reintroduced full-surface copy inside a lock, a present that
+    // serializes on the compositor), NOT a latency SLO and NOT a
+    // single-extra-copy detector — one 4 MB memcpy is ~400 us here, which
+    // 10 ms would not notice. It was left at 10 ms deliberately: it is the
+    // only value that is both far above the noise a loaded runner produces
+    // and far below "something is structurally wrong". Tightening it to
+    // catch one extra copy (~100 us) would make it fail on a loaded CI
+    // runner, and gating it off the push path would make it invisible —
+    // the exact trade the "a missing guest PE is a failure" rule exists to
+    // prevent. See docs/TESTING.md, "What the gui_blit frame budget
+    // measures".
     assert!(
         observed.publish_us + observed.present_us < 10_000,
         "frame publish+present budget exceeded: publish={}us present={}us \

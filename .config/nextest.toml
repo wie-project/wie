@@ -8,9 +8,24 @@ fail-fast = false
 test-threads = "num-cpus"
 # Show which tests are running.
 status-level = "skip"
-# Label anything slower than this SLOW instead of letting a genuinely slow
-# guest run sit silently inside a normal-looking run.
-slow-timeout = "60s"
+# Two jobs in one setting, and the difference matters:
+#   period          = label a test SLOW after this long (display only)
+#   terminate-after = N → HARD KILL the test process after N periods, fail
+#                     it, and keep the run going (this is the real timeout)
+# nextest's shipped default is "60s with no termination on timeout", so a
+# hung test used to print SLOW every 60 s forever: the run only ended when
+# something outside nextest killed it (observed twice in this repo — a test
+# that ran 2321 s, and `wie-cpu jit::tests::trip_tests::
+# self_loop_reports_dynamic_retired_instructions` at 881 s during the work
+# that added the profile-wide bound below).
+# 10 x 60 s = a 10-minute ceiling for any single test in the suite. The
+# slowest legitimate test measured anywhere in this repo is 100.6 s
+# (gui_blit at 3x CPU oversubscription on an already-busy host), so this is
+# ~6x headroom on the worst case and cannot fail a healthy run — but it turns
+# an unbounded hang into a red `TIMEOUT [600s]` line that names the test,
+# which is the difference between a diagnosable failure and a build that dies
+# with no output.
+slow-timeout = { period = "60s", terminate-after = 10, grace-period = "20s" }
 
 [profile.default.junit]
 # Write JUnit XML reports for CI integration.
@@ -27,27 +42,68 @@ path = "target/nextest/junit.xml"
 # only place the two `slow-timeout` values live. To run just the slow set:
 #
 #   cargo nextest run --profile default \
-#     -E 'package(wie-runtime) + binary(/^(micro_|clock_stub$|idle_park_wake$)/)'
+#     -E 'package(wie-runtime) & binary(/^(micro_|clock_stub$|idle_park_wake$)/)'
 #
 # Both blocks together are exactly the set the `fast` profile excludes.
+#
+# FILTER SYNTAX — `&` is intersection, `+` is UNION, `-` is difference, and
+# `,` is not accepted at all (verified with `cargo nextest debug
+# parse-filterset` and by counting `cargo nextest list` output). The GUI
+# filter here used to be written `package(wie-runtime) + binary(...)`, i.e.
+# a union: it matched all 180 tests in the package, not the 52 in the GUI
+# binary, and because the FIRST matching override wins it also swallowed
+# the `120s` block below. Hence `&` here and the explicit `- binary(…)` in
+# the second block.
 # ---------------------------------------------------------------------------
 
-# The GUI integration suite. Every test in it takes the process-wide
-# `GUI_SUITE_LOCK` (crates/wie-runtime/tests/micro_gui_window/helpers.rs), so
-# 13 tests that could otherwise use 8 cores run strictly one at a time, and
-# each one JIT-compiles a real guest window (gui_blit alone is ~11 s of JIT
-# compile). This is the single biggest block of wall time in the suite.
+# The GUI integration suite (52 tests in crates/wie-runtime/tests/
+# micro_gui_window). Two things distinguish it from the rest of the suite:
+#
+# 1. `test-group = "gui"` + `[test-groups.gui] max-threads = 1` below is the
+#    ONLY thing that actually serializes it. The in-process
+#    `GUI_SUITE_LOCK` (helpers.rs) cannot: nextest's default is
+#    process-per-test, so each of the 52 tests is its own OS process with
+#    its own copy of that mutex. Measured before this block existed: 8
+#    concurrent `micro_gui_window-*` processes on an 8-core host, i.e. all
+#    of them JIT-compiling a 1280x800 guest at once. Under 4x CPU
+#    oversubscription that contention cost gui_blit 64.9 s; serialized, the
+#    same test under the same load took 21.1 s. The lock is kept for the
+#    `cargo test` (single-process) case, where it does work.
+# 2. Each test JIT-compiles a real guest window (gui_blit is ~11 s of that
+#    alone), so it is the slowest group by a wide margin.
+#
+# `slow-timeout` here is a LABEL, not a kill: nextest only prints SLOW once
+# `period` has elapsed. `terminate-after = 2` is the part that ends a hung
+# test — after 2 x 300 s nextest SIGTERMs the process and fails it, which is
+# what the old `period = "300s"` alone never did (a hung GUI test used to run
+# until the CI job hit its own limit). Worst case measured for a single GUI
+# test is 100.6 s (3x CPU oversubscription on top of an already-busy host,
+# load average >100), and 64.9 s unserialized under 32 burners; 600 s is ~6x
+# the worst of those, and the serialization above is what keeps the real
+# number far below it.
+# `grace-period` is how long the process gets to exit on SIGTERM before
+# nextest force-kills it (default 10 s; these are multi-threaded processes
+# with a 4 MB frame in flight, so give them room to unwind).
 [[profile.default.overrides]]
-filter = 'package(wie-runtime) + binary(micro_gui_window)'
-slow-timeout = { period = "300s" }
+filter = 'package(wie-runtime) & binary(micro_gui_window)'
+test-group = "gui"
+slow-timeout = { period = "300s", terminate-after = 2, grace-period = "20s" }
 
-# The rest of the wie-runtime integration tests: also real guest PEs through
-# the JIT, just without the suite-wide lock. Much cheaper, still far heavier
-# than the pure unit tests. The first alternative also covers
-# `micro_gui_window`, so this one filter selects both groups.
+# The rest of the wie-runtime integration tests (45 tests): also real guest
+# PEs through the JIT, just without a serialization requirement. Much
+# cheaper, still far heavier than the pure unit tests. Labelled at 120 s and
+# hard-killed at 240 s for the same reason as above.
 [[profile.default.overrides]]
-filter = 'package(wie-runtime) + binary(/^(micro_|clock_stub$|idle_park_wake$)/)'
-slow-timeout = { period = "120s" }
+filter = 'package(wie-runtime) & binary(/^(micro_|clock_stub$|idle_park_wake$)/) - binary(micro_gui_window)'
+slow-timeout = { period = "120s", terminate-after = 2, grace-period = "20s" }
+
+# The group the first override names. `max-threads` is the documented
+# nextest mechanism for mutual exclusion (since 0.9.48) and — unlike an
+# in-process mutex — it works under process-per-test. Verify with
+# `cargo nextest show-config test-groups` and by watching
+# `pgrep -f 'deps/micro_gui_window-'` during a run: it must never exceed 1.
+[test-groups.gui]
+max-threads = 1
 
 # ---------------------------------------------------------------------------
 # `fast` — the inner dev loop. Everything except the two groups above.
@@ -58,13 +114,13 @@ slow-timeout = { period = "120s" }
 # `not group(...)` are all rejected with "predicate not allowed in
 # `default-filter` expressions". The exclusion therefore has to be spelled as
 # a single negated predicate rather than the more readable
-# `all() - (package(wie-runtime) + binary(...))`, which is only available on
+# `all() - (package(wie-runtime) & binary(...))`, which is only available on
 # the command line. The two forms select the same tests.
 #
 # The regex drops `micro_gui_window` too (it starts with `micro_`), so one
 # alternative covers both groups. It is not scoped with `package(wie-runtime)`
-# only because that would need a union, which the single-predicate form
-# forbids; no other workspace crate has a test binary with these names.
+# only because that would need an intersection, which the single-predicate
+# form forbids; no other workspace crate has a test binary with these names.
 # ---------------------------------------------------------------------------
 [profile.fast]
 fail-fast = true
@@ -72,6 +128,13 @@ test-threads = "num-cpus"
 retries = 0
 default-filter = 'not binary(/^(micro_|clock_stub$|idle_park_wake$)/)'
 
+# NOT USED. Both `scripts/check.sh` and `.github/workflows/ci.yml` run
+# `cargo nextest run --workspace` with no `--profile`, so they both use
+# `default` and therefore both get the two overrides and the `gui` test group
+# above. Kept only so nobody wires CI to it by accident: it has no overrides,
+# so a run under it would silently lose the GUI serialization and both hard
+# timeouts. If you ever want a distinct CI profile, give it the same
+# `overrides` blocks, or delete this one.
 [profile.ci]
 # CI profile: stricter settings.
 fail-fast = true

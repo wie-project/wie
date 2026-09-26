@@ -55,11 +55,22 @@ Runs, in order: `check-file-sizes.sh`, `cargo fmt --all --check`, `cargo clippy
 `make -C micro-exes` and `scripts/run-micro-suite.sh`. Nothing in the fast lane
 short-circuits any of it.
 
+The nextest invocation here is byte-for-byte the one in
+`.github/workflows/ci.yml`, and both use the `default` profile, so both get
+the same overrides, the same `gui` test group and the same three timeouts.
+That is the point: the timeout and serialization policy lives in
+`.config/nextest.toml`, not in a flag one of the two callers passes. The two
+gates differ in exactly one place, on purpose — the final micro-suite step:
+locally it is the full data-driven `all` sweep, in CI it is the four cheap
+deterministic categories. `docs/testing-model.md` says why. (The `[profile.ci]`
+block in `.config/nextest.toml` is unused dead config; do not wire CI to it —
+it has no overrides and would silently lose all of the above.)
+
 ### Running the slow groups on their own
 
 ```sh
 cargo nextest run --profile default \
-  -E 'package(wie-runtime) + binary(/^(micro_|clock_stub$|idle_park_wake$)/)'
+  -E 'package(wie-runtime) & binary(/^(micro_|clock_stub$|idle_park_wake$)/)'
 ```
 
 That single filter selects both slow groups (`micro_gui_window` starts with
@@ -67,38 +78,177 @@ That single filter selects both slow groups (`micro_gui_window` starts with
 
 ```sh
 cargo nextest run --profile default \
-  -E 'package(wie-runtime) + binary(micro_gui_window)'
+  -E 'package(wie-runtime) & binary(micro_gui_window)'
 ```
+
+**Filter syntax: `&` is intersection, `+` is UNION, `-` is difference, and `,`
+is rejected outright** (verified with `cargo nextest debug parse-filterset`,
+and by counting `cargo nextest list --workspace -E …` output). The two
+`overrides` blocks in `.config/nextest.toml` used to be written
+`package(wie-runtime) + binary(...)`, which is a union: it matched all 180
+tests in the package instead of the 52 in the GUI binary, and because the
+**first** matching override wins it also swallowed the `120s` block. Always
+check a filter's cardinality before trusting it —
+`cargo nextest list --workspace -E '<expr>' | wc -l`.
 
 Note on naming: nextest has no way to *name* a group in config. An
 `[[profile.default.overrides]]` block is selected by its filter, and the
 implicit `group(...)` operator only accepts synthesized names that are not
 addressable from a shell — both `group(slow)` and `group(<the filter text>)`
 are rejected by the filter parser. So the two `overrides` blocks are the
-source of truth for the filter expressions and their relaxed `slow-timeout`
-values; refer to the groups by their filter, not by name.
+source of truth for the filter expressions and their timeout values; refer to
+the groups by their filter, not by name. (The GUI group is the one exception:
+`test-group = "gui"` gives it a real name, usable as
+`cargo nextest show-config test-groups` and
+`cargo nextest run -E 'group(gui)'`.)
+
+## Timeouts: what actually kills a test
+
+nextest 0.9.143 has one setting with two jobs, and only one of them is a
+timeout (`cargo nextest help repo-config`, "Timeout configuration"):
+
+| key | meaning |
+| --- | --- |
+| `period` | label the test **SLOW** in the output after this long. Display only. |
+| `terminate-after` | **N periods after which the test process is killed** and the test fails. This is the timeout. |
+| `grace-period` | how long the process gets to exit after SIGTERM before it is force-killed (default 10 s). |
+| `on-timeout` | `"fail"` (default) or `"pass"`. Never set it to `pass` here. |
+
+nextest's shipped default is `60s with no termination on timeout`, so before
+this was configured a hung test printed `SLOW [> 60.000s]` every minute
+forever and the run only ended when something outside nextest killed it.
+Current values in `.config/nextest.toml`:
+
+| scope | setting | label | hard kill |
+| --- | --- | --- | --- |
+| whole profile | `slow-timeout` | 60 s | 600 s |
+| `gui` group (52 tests) | override | 300 s | 600 s |
+| `guest` group (45 tests) | override | 120 s | 240 s |
+
+`terminate-after` is set on all three, so no test in this repo can hang a
+run. Proof it works, on the same shape scaled down 12x
+(`period = "5s", terminate-after = 3`) against a test that never returns:
+
+```
+Summary [  15.006s] 2 tests run: 0 passed, 1 failed, 1 timed out, 192 skipped
+   TIMEOUT [  15.005s] (2/2) wie-cpu jit::tests::trip_tests::self_loop_reports_dynamic_retired_instructions
+```
+
+The headroom is not tight anywhere: the slowest legitimate test measured
+anywhere in the repo is 100.6 s (`gui_blit` at 3x CPU oversubscription on an
+already-busy host), the guest group's slowest is 3.1 s, and every other test in
+the workspace finishes in well under 60 s. A ceiling only ever fires on a run
+that is already lost, and it converts a silent hang into a red line naming the
+test.
+
+`global-timeout` (a ceiling on the whole run, since 0.9.100) is deliberately
+**not** set: the full suite is ~50 s, so a global bound adds nothing the
+per-test bounds do not already give, and it is the one setting that could cut
+a legitimately slow run short.
+
+**Profiles inherit what they do not define.** `[profile.fast]` sets no
+`slow-timeout`, and it picks up `[profile.default]`'s — verified by pointing a
+scratch config's default profile at a 15 s ceiling and watching `--profile
+fast` time out at exactly 15.007 s. So the 600 s ceiling protects the dev lane
+too, which is what you want: a hang in `test-fast.sh` now dies with a red
+`TIMEOUT [600s]` line instead of sitting there until you Ctrl-C it. The
+`[[profile.default.overrides]]` blocks are *not* inherited (they are
+per-profile), which is harmless — the `fast` profile's `default-filter`
+excludes exactly the binaries they match.
+
+## The GUI suite runs one test at a time
+
+`crates/wie-runtime/tests/micro_gui_window` is 52 tests, of which **13
+actually execute** (the other 39 drive RNotepad from `real_exes/`, which is
+gitignored and absent on a clean CI runner, so they announce a skip and pass
+— see [docs/testing-model.md](testing-model.md)).
+
+Those 13 are serialized by nextest, not by the test code:
+
+```toml
+[[profile.default.overrides]]
+filter = 'package(wie-runtime) & binary(micro_gui_window)'
+test-group = "gui"
+
+[test-groups.gui]
+max-threads = 1
+```
+
+`GUI_SUITE_LOCK` in `helpers.rs` **cannot** do this. nextest's default is
+process-per-test, so each of the 52 tests is its own OS process with its own
+copy of that mutex; before the group existed, `pgrep -f
+'deps/micro_gui_window-'` during a run showed **8 concurrent processes** on an
+8-core host, each JIT-compiling a 1280x800 guest. The in-process lock is kept
+because it does work under `cargo test`, which shares one process.
+
+Serialization is not only about fairness, it is the single biggest
+reliability win available here. Back-to-back runs on the same host, same 32
+burner processes (4x CPU oversubscription on 8 cores):
+
+| | worst GUI test | group wall | outcome |
+| --- | --- | --- | --- |
+| 8-way parallel (before) | 64.9 s (`gui_blit`) | ~70 s | `gui_blit` **failed** |
+| `max-threads = 1` (after) | 21.1 s | 122 s | passed |
+
+i.e. the worst individual test got ~3x faster and stopped failing, at the cost
+of ~50 s of group wall clock — a trade worth making on a 3-core CI runner,
+where 8 concurrent JIT compiles is 2.7x oversubscription. The absolute numbers
+move a lot with ambient load: the same serialized group measured later at load
+average >100 had a 100.6 s worst test and 172 s wall, still 52/52 green. Plan
+against the 600 s per-test ceiling, not against these.
+
+Verify the serialization still holds after any config edit:
+
+```sh
+cargo nextest show-config test-groups          # group: gui (max threads = 1)
+cargo nextest run -E 'binary(micro_gui_window)' &
+for i in $(seq 1 8); do sleep 3; pgrep -cf 'deps/micro_gui_window-'; done
+```
+
+## What the gui_blit frame budget measures
+
+`demo::gui_blit_comprehensive_regression` ends with
+
+```rust
+assert!(observed.publish_us + observed.present_us < 10_000, …)
+```
+
+which looks like a latency SLO and is not one. The two halves:
+
+* `publish_us` = `present_publish_ns_last()` = wall clock around the
+  presenter's `publish()` body. Since publish went zero-copy (an `Arc` move
+  out of the surface) this measures lock wait and host scheduling, not copy
+  volume.
+* `present_us` = wall clock of the watcher's `take_frame()`, i.e. a mutex
+  acquisition plus an `Arc` clone — not a 4 MB copy, whatever an older
+  comment in `helpers.rs` claimed.
+
+Measured over 8 runs on an 8-core M3, dev profile, 1280x800, including 3x and
+4x CPU oversubscription: `publish_us` 0-2 us, `present_us` 1-9 us. The 10 ms
+ceiling is therefore ~1000x the observed envelope. It is a **canary against a
+gross structural stall** (a full-surface copy reintroduced inside a lock, a
+present that serializes on the compositor), and it explicitly does *not*
+detect a single extra 4 MB copy — that is ~400 us here, 25x under the
+ceiling.
+
+Do not "fix" it by tightening (a ~100 us ceiling would catch one extra copy
+and fail on a loaded runner) or by moving it off the push path (an assertion
+that CI does not run is the exact hole the missing-fixture rule exists to
+close). The load-sensitive part of this test was never this assert — it was
+the frame *observation* one line above it; see
+[docs/testing-model.md](testing-model.md#loaded-runner-behaviour).
 
 ## The two slow groups
 
-**`gui` — `crates/wie-runtime/tests/micro_gui_window` (13 tests).** Every test
-in this binary takes the process-wide `GUI_SUITE_LOCK`
-(`crates/wie-runtime/tests/micro_gui_window/helpers.rs`). The lock is not
-optional: under the default parallel schedule the CPU-heavy tests starve the
-other test threads' 50 ms sleep quanta, so guests catch up in multi-tick bursts
-and race their timer-driven state transitions against each other. So 13 tests
-that could use 8 cores run strictly one at a time, and each JIT-compiles a real
-guest window (`gui_blit` alone is ~11 s of JIT compile). The suite's wall time
-is dominated by `gui_blit` either way, so serializing it costs little. The
-frame-hash assertions in this suite are real regression guards for the
+**`gui` — `crates/wie-runtime/tests/micro_gui_window` (52 tests, 13 run
+without RNotepad).** Serialized by the `gui` test group above; each executed
+test JIT-compiles a real guest window (`gui_blit` alone is ~11-17 s of that).
+The frame-hash assertions in this suite are real regression guards for the
 present/paint/D3D9/GL paths — do not `#[ignore]` them to make a run faster.
 
-**`guest` — the rest of the `wie-runtime` integration tests.** They spawn real
-guest PEs and run the JIT, without the suite-wide lock. Cheaper than `gui`, but
-still far heavier than the pure unit tests.
-
-The profile-wide `slow-timeout` is `60s`; each slow group carries a relaxed
-one (`120s` / `300s`) so nextest labels a genuinely slow guest run as SLOW
-rather than painting it red.
+**`guest` — the rest of the `wie-runtime` integration tests (45 tests).** They
+spawn real guest PEs and run the JIT, without a serialization requirement.
+Cheaper than `gui` (slowest 3.1 s), still far heavier than the unit tests.
 
 ## Why the dev profile is split
 
