@@ -277,9 +277,12 @@ fn execute_one(
         | Mnemonic::Outsd
         // PAUSE (F3 90): spin-wait hint used inside CRT / std::mutex / spinlocks
         // when the compiler emits contention-friendly busy-waits. On real hardware
-        // it hints the pipeline to pause; semantically it's a no-op. Failure mode
-        // before this stub was intermittent worker crashes in `cpp_threads` when
-        // the CRT lock happened to spin (see also the JIT `Mnemonic::Pause` lower).
+        // it hints the pipeline to pause; semantically it's a no-op (iced reports
+        // op_count == 0, no used registers/memory, rflags_modified() == 0). Failure
+        // mode before this stub was intermittent worker crashes in `cpp_threads`
+        // when the CRT lock happened to spin. The JIT drops it for the same reason —
+        // see the true-no-op arm in `jit::lower::insn` and the
+        // `jit::tests::pause_tests` contract test.
         | Mnemonic::Pause
         // Prefetch hints (0F 18 /0-/3, 0F 0D /1, 0F 0D /2): cache hints with no
         // architectural effect — SDL2's memcpy paths emit them liberally.

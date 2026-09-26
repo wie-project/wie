@@ -19,8 +19,7 @@ use wie_runtime::EntryTraceTermination;
 #[test]
 fn gui_d3d9_capture_stream_frame_matches_legacy_hash() {
     let Some(path) = micro_exe("gui_d3d9.exe") else {
-        eprintln!("skip: micro-exes/out/gui_d3d9.exe not built (run make -C micro-exes gui_exes)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();

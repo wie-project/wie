@@ -56,7 +56,7 @@ Key design points:
 - **SMC correctness.** Guest stores to code pages are recorded; after each block run, any `Ready` block overlapping a written page is dropped (`drain_pending_code_writes`).
 - **SIMD.** SSE2 lowers to ARM64 NEON via Cranelift's ISLE rules by default (`WIE_JIT_SIMD=1`); `WIE_JIT_SIMD=0` calls scalar `wie_sse_*` Rust helpers. Tests dual-execute every SSE2 op on JIT and iced and assert identical state.
 - **Pooled workers (Wave3 default).** Background compiles run on a `min(3, available_parallelism()-1)` UTILITY pool (see `JitConfig::jit_workers`); Cranelift contexts are pooled — steady zero-alloc, no `WIE_JIT_WORKERS` env required.
-- **Direct register hand-off (Q8/C, Wave3 default on).** Chained blocks keep live GPRs/rflags in native regs (x19–x28 / x14 on aarch64); opt-out with `WIE_JIT_DIRECT_REGS=0` for bisect. See ADR 0002.
+- **Direct register hand-off (Q8/C) — NOT built.** Chained blocks still cross the `JitCtx` spill/reload boundary; the x19–x28 residency design in ADR 0002 is unbuilt and had no lowering call sites, so its inert `WIE_JIT_DIRECT_REGS` env gate was removed 2026-09-25. See ADR 0002's implementation-status note and the Wave 3 rows in `docs/implementation-plan.md`.
 
 ## Software translation and the TLB
 

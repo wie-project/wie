@@ -6,12 +6,12 @@
 
 use super::SC_CLOSE;
 use super::{
-    Context, GuestCallbackRequest, HandlerContext, MessageQueueIdlePolicy, Msg,
-    QueuedWindowMessage, Result, WM_CHAR, WM_CLOSE, WM_DEADCHAR, WM_DESTROY, WM_ERASEBKGND,
-    WM_GETFONT, WM_KEYDOWN, WM_KEYUP, WM_MDICREATE, WM_PAINT, WM_QUIT, WM_SETFONT, WM_SYSCHAR,
-    WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WinApiControlSignal, WinApiHandlerResult,
-    WinApiState, WinMsg, create_mdi_child_from_struct, dispatch_control_proc, find_window,
-    find_window_mut, is_known_window, read_u32, with_typed_read, write_message_structure,
+    Context, GuestCallbackRequest, HandlerContext, MessageQueueIdlePolicy, Msg, Result, WM_CHAR,
+    WM_CLOSE, WM_DEADCHAR, WM_DESTROY, WM_ERASEBKGND, WM_GETFONT, WM_KEYDOWN, WM_KEYUP,
+    WM_MDICREATE, WM_PAINT, WM_QUIT, WM_SETFONT, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WinApiControlSignal, WinApiHandlerResult, WinApiState, WinMsg,
+    create_mdi_child_from_struct, dispatch_control_proc, find_window, find_window_mut,
+    is_known_window, read_u32, with_typed_read, write_message_structure,
 };
 use crate::OuterReturn;
 use crate::gdi32::{ArgReg, read_arg};
@@ -55,9 +55,13 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     // so the filter and the returned MSG both carry the effective target.
     retarget_keyboard_messages(state);
 
+    // Every dequeue reads ONLY the calling thread's sub-queue (Windows: one
+    // message queue per thread).
+    let tid = state.kernel.threads.current_tid();
+
     let matching_index = {
         let queue = state.lock_message_queue();
-        queue.messages.iter().position(|queued| {
+        queue.queues.messages(tid).iter().position(|queued| {
             message_matches_filter(
                 state,
                 window_filter,
@@ -71,13 +75,17 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let return_value = if let Some(index) = matching_index {
         let queued = if w_remove_msg != 0 {
             // PM_REMOVE: remove from queue.
-            let mut queue = state.lock_message_queue();
-            queue.messages.remove(index)
+            state
+                .lock_message_queue()
+                .queues
+                .queue_for(tid)
+                .remove(index)
         } else {
-            // PM_NOREMOVE: leave in queue. Index is from `position` on this Vec.
+            // PM_NOREMOVE: leave in queue. Index is from `position` on this sub-queue.
             let queue = state.lock_message_queue();
             queue
-                .messages
+                .queues
+                .messages(tid)
                 .get(index)
                 .cloned()
                 .context("PeekMessageA matching index vanished")?
@@ -93,7 +101,8 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     } else if synthesize_idle_messages(state, window_filter, minimum_message, maximum_message)? {
         // A WM_TIMER / WM_PAINT was queued; return it on this same call.
         let mut queue = state.lock_message_queue();
-        let synthesized_index = queue.messages.iter().position(|queued| {
+        let messages = queue.queues.queue_for(tid);
+        let synthesized_index = messages.iter().position(|queued| {
             message_matches_filter(
                 state,
                 window_filter,
@@ -108,11 +117,10 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         };
         let queued = if w_remove_msg != 0 {
             // PM_REMOVE: remove from queue.
-            queue.messages.remove(synthesized_index)
+            messages.remove(synthesized_index)
         } else {
             // PM_NOREMOVE: leave in queue.
-            queue
-                .messages
+            messages
                 .get(synthesized_index)
                 .cloned()
                 .context("PeekMessageA synthesized index vanished")?
@@ -168,13 +176,16 @@ pub fn handle_post_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 
     let message = low_u32(message_raw, "PostMessageA message")?;
 
-    // HWND_BROADCAST (0xFFFF) and thread messages (NULL=0) are not yet
-    // supported, so the gate is intentionally narrower than real Windows.
+    // HWND_BROADCAST (0xFFFF) and thread messages (NULL=0) are still not
+    // supported, so the gate remains narrower than real Windows. (Thread
+    // messages now DO route per-thread, but only via `PostThreadMessageW`.)
     let valid_window = is_known_window(state, window_handle);
 
     if valid_window {
-        let mut queue = state.lock_message_queue();
-        queue.push(
+        // Routes to the queue of the thread that owns the window, NOT the
+        // caller's: with per-thread queues a message posted to a foreign
+        // window must land in that window's thread's queue.
+        state.post_message(
             crate::handles::Hwnd::from(window_handle),
             message,
             word_parameter,
@@ -350,13 +361,15 @@ fn empty_queue_result(
              * Regression mode: represent an empty queue as a synthetic
              * WM_QUIT so the guest performs its normal teardown.
              */
+            let tid = state.kernel.threads.current_tid();
             let mut queue = state.lock_message_queue();
-            queue.push(crate::handles::Hwnd::NULL, WM_QUIT, 0, 0)?;
-            // `push` appends, but this synthetic WM_QUIT is returned directly
-            // to the guest (never left in the queue) — take it back out.
+            queue.push_to(tid, crate::handles::Hwnd::NULL, WM_QUIT, 0, 0)?;
+            // `push_to` appends, but this synthetic WM_QUIT is returned
+            // directly to the guest (never left in the queue) — take it back
+            // out of THIS thread's sub-queue.
             let quit_message = queue
-                .messages
-                .pop()
+                .queues
+                .pop_back(tid)
                 .context("synthesized WM_QUIT vanished")?;
             drop(queue);
             write_message_structure(engine, message_address, &quit_message)?;
@@ -399,9 +412,13 @@ pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     // so the filter and the returned MSG both carry the effective target.
     retarget_keyboard_messages(state);
 
+    // Every dequeue reads ONLY the calling thread's sub-queue (Windows: one
+    // message queue per thread).
+    let tid = state.kernel.threads.current_tid();
+
     let matching_index = {
         let queue = state.lock_message_queue();
-        queue.messages.iter().position(|queued| {
+        queue.queues.messages(tid).iter().position(|queued| {
             message_matches_filter(
                 state,
                 window_filter,
@@ -416,9 +433,11 @@ pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         // GetMessage returns -1 on failure.
         u64::from(u32::MAX)
     } else if let Some(index) = matching_index {
-        let mut queue = state.lock_message_queue();
-        let queued = queue.messages.remove(index);
-        drop(queue);
+        let queued = state
+            .lock_message_queue()
+            .queues
+            .queue_for(tid)
+            .remove(index);
 
         tracing::debug!(
             target: "wiegui",
@@ -432,7 +451,8 @@ pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     } else if synthesize_idle_messages(state, window_filter, minimum_message, maximum_message)? {
         // A WM_TIMER / WM_PAINT was queued; re-scan once and return it.
         let mut queue = state.lock_message_queue();
-        let Some(synthesized_index) = queue.messages.iter().position(|queued| {
+        let messages = queue.queues.queue_for(tid);
+        let Some(synthesized_index) = messages.iter().position(|queued| {
             message_matches_filter(
                 state,
                 window_filter,
@@ -446,7 +466,7 @@ pub fn handle_get_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
             // anyway, fall through to the empty-queue policy.
             return empty_queue_result(engine, state, message_address, "GetMessageA");
         };
-        let queued = queue.messages.remove(synthesized_index);
+        let queued = messages.remove(synthesized_index);
         drop(queue);
         tracing::debug!(
             target: "wiegui",
@@ -520,20 +540,8 @@ pub(crate) fn handle_default_window_procedure(
                 hwnd,
                 "DefWindowProc: WM_CLOSE -> WM_DESTROY"
             );
-            let mut queue = state.lock_message_queue();
-            let time = queue.next_message_time;
-            queue.next_message_time = time
-                .checked_add(1)
-                .context("DefWindowProc: message time overflow")?;
-            queue.messages.push(QueuedWindowMessage {
-                window_handle: crate::handles::Hwnd::from(hwnd),
-                message: WM_DESTROY,
-                word_parameter: 0,
-                long_parameter: 0,
-                time,
-                point_x: 0,
-                point_y: 0,
-            });
+            // Same thread as the window: `post_message` routes to the owner.
+            state.post_message(crate::handles::Hwnd::from(hwnd), WM_DESTROY, 0, 0)?;
             0
         }
         WinMsg::WM_ERASEBKGND => {
@@ -576,20 +584,7 @@ pub(crate) fn handle_default_window_procedure(
         }
         WinMsg::WM_SYSCOMMAND if wparam == SC_CLOSE => {
             // Same as WM_CLOSE
-            let mut queue = state.lock_message_queue();
-            let time = queue.next_message_time;
-            queue.next_message_time = time
-                .checked_add(1)
-                .context("DefWindowProc: message time overflow")?;
-            queue.messages.push(QueuedWindowMessage {
-                window_handle: crate::handles::Hwnd::from(hwnd),
-                message: WM_CLOSE,
-                word_parameter: 0,
-                long_parameter: 0,
-                time,
-                point_x: 0,
-                point_y: 0,
-            });
+            state.post_message(crate::handles::Hwnd::from(hwnd), WM_CLOSE, 0, 0)?;
             0
         }
         // WM_NCCALCSIZE (no non-client area) and everything else: no-op.
@@ -803,10 +798,11 @@ pub fn handle_post_quit_message(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
         "PostQuitMessage"
     );
 
-    let mut queue = state.lock_message_queue();
-    // `push` stamps the message and broadcasts a MessagePosted wake token to
-    // any parked GetMessage (Painpoint 1).
-    queue.push(crate::handles::Hwnd::NULL, WM_QUIT, exit_code, 0)?;
+    // `PostQuitMessage` posts WM_QUIT to the CALLING thread's queue
+    // (Windows: the exit code is a thread-local flag, and only the thread
+    // that asked to quit leaves its loop). NULL hwnd → no window owner →
+    // `push` falls back to the caller's own tid.
+    state.post_message(crate::handles::Hwnd::NULL, WM_QUIT, exit_code, 0)?;
 
     let return_address = engine
         .return_from_win64_api(0)

@@ -447,6 +447,51 @@ fn test_d3d9_present_publishes_surface_frame() {
     }
 }
 
+#[test]
+fn test_d3d9_present_counts_entry_before_output_branch() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    {
+        let d3d = state.d3d9();
+        d3d.d3d9_backbuffer_width = 4;
+        d3d.d3d9_backbuffer_height = 3;
+        d3d.d3d9_backbuffer = vec![0_u32; 12];
+        d3d.d3d9_present_hwnd = crate::handles::Hwnd::from(0x7777);
+    }
+    state.window_state().window_width = 4;
+    state.window_state().window_height = 3;
+
+    assert_eq!(state.present().channel.present_enqueued(), 0);
+
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_present(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        0
+    );
+    assert_eq!(state.present().channel.present_enqueued(), 1);
+
+    state.d3d9().d3d9_backbuffer.clear();
+    write_regs(&mut engine, 1, 0, 0, 0, 0);
+    assert_return_value!(
+        d3d9::handle_present(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        0
+    );
+
+    assert_eq!(
+        state.present().channel.present_enqueued(),
+        2,
+        "Present entries are counted before the output-eligibility branch"
+    );
+}
+
 // ── L6 render-target handlers ─────────────────────────────────────
 
 /// CreateRenderTarget(4x4, A8R8G8B8) → a surface object with its own texels.

@@ -6,22 +6,14 @@
 //! surface or a message loop, so it needs no GUI_SUITE_LOCK serialization
 //! (same as the print_bmp GDI micro).
 
-use std::path::PathBuf;
+mod common;
 
-fn micro_exe(name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("micro-exes/out");
-    path.push(name);
-    path.is_file().then_some(path)
-}
+use common::micro_exe;
 
 #[test]
 fn gdi_alpha_blends_onto_dib() {
     let Some(pe) = micro_exe("gdi_alpha.exe") else {
-        eprintln!("skip: gdi_alpha.exe not built (run make -C micro-exes gdi_alpha)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let summary = wie_runtime::run_micro_exe(&pe, 256).expect("run_micro_exe");
     assert_eq!(

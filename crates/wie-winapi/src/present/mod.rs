@@ -9,11 +9,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
-mod commit;
+mod publish_tail;
 mod queue;
 mod stream;
 mod window_mirror;
-pub use commit::{CommitterHandle, spawn_present_committer};
 pub use queue::{MessageQueue, MessageSignal};
 pub use stream::{CaptureStreamerHandle, spawn_capture_streamer};
 pub use window_mirror::MirrorWindow;
@@ -213,13 +212,10 @@ pub struct PresentChannel {
     inner: Mutex<ChannelInner>,
     published_seq: AtomicU64,
     taken_seq: AtomicU64,
-    /// Wave 2 (Option A1): the D3D9 Present-commit pipeline — latest-wins
-    /// commit slot, backbuffer spare pool, committer counters. Own mutex
-    /// inside, so an enqueue never contends the frame-slot lock.
-    pub(crate) commit: commit::PresentCommit,
+    present_enqueued: AtomicU64,
     /// Wave 2 slice 2: the D3D9 command-capture pipeline — latest-wins flush
-    /// slot, handback slot, replay counters. Own mutex inside (the same
-    /// isolation argument as `commit`).
+    /// slot, handback slot, replay counters. Own mutex inside, so a flush
+    /// never contends the frame-slot lock.
     pub(crate) capture: stream::CapturePipeline,
     /// Wave 2 Step 2: the presenter-side window mirror (geometry, focus,
     /// capture, menu-dirty, host→guest key writes) behind its own mutex —
@@ -263,7 +259,7 @@ impl PresentChannel {
             }),
             published_seq: AtomicU64::new(0),
             taken_seq: AtomicU64::new(0),
-            commit: commit::PresentCommit::new(),
+            present_enqueued: AtomicU64::new(0),
             capture: stream::CapturePipeline::new(),
             window_mirror: Mutex::new(window_mirror::WindowMirror::default()),
         }
@@ -345,39 +341,6 @@ impl PresentChannel {
         self.window_mirror.lock().ok()?.cursor_pos()
     }
 
-    /// Enable/disable D3D9 Present-commit mode (Wave 2). Only call after the
-    /// committer thread spawned (`spawn_present_committer`), so every enqueued
-    /// commit has a live consumer. `WIE_PRESENT_COMMIT=0` keeps the legacy
-    /// inline present path regardless.
-    pub fn set_commit_enabled(&self, enabled: bool) {
-        self.commit.set_enabled(enabled);
-    }
-
-    /// Whether D3D9 `Present` enqueues a commit (render-thread path) instead
-    /// of stretching + publishing inline under the big lock.
-    #[must_use]
-    pub fn commit_enabled(&self) -> bool {
-        self.commit.enabled()
-    }
-
-    /// Accumulated committer stretch+publish wall time (ns).
-    #[must_use]
-    pub fn commit_ns(&self) -> u64 {
-        self.commit.commit_ns()
-    }
-
-    /// Most recent committer stretch+publish wall time (ns).
-    #[must_use]
-    pub fn commit_ns_last(&self) -> u64 {
-        self.commit.commit_ns_last()
-    }
-
-    /// Committed (render-thread published) frame count.
-    #[must_use]
-    pub fn commit_frames(&self) -> u64 {
-        self.commit.commit_frames()
-    }
-
     /// Enable/disable the D3D9 command-capture pipeline (Wave 2 slice 2).
     /// Only call after the capture render thread spawned
     /// (`spawn_capture_streamer`), so every enqueued flush has a live
@@ -429,6 +392,17 @@ impl PresentChannel {
     #[must_use]
     pub fn capture_ns_last(&self) -> u64 {
         self.capture.ns_last()
+    }
+
+    /// Record one accepted D3D9 `Present` entry.
+    pub fn record_d3d9_present(&self) {
+        self.present_enqueued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Number of accepted D3D9 `Present` entries recorded.
+    #[must_use]
+    pub fn present_enqueued(&self) -> u64 {
+        self.present_enqueued.load(Ordering::Relaxed)
     }
 
     /// Publish `frame` into the latest-wins slot. Returns the displaced
@@ -1077,7 +1051,7 @@ impl PresentState {
         frame_height: u32,
     ) {
         if let Some(surface) = self.surfaces.get_mut(&hwnd) {
-            commit::blit_frame_into(
+            publish_tail::blit_frame_into(
                 &mut surface.pixels,
                 surface.stride,
                 surface.width,
@@ -1088,37 +1062,6 @@ impl PresentState {
             );
         }
         self.publish(hwnd);
-    }
-
-    /// Wave 2 (Option A1): enqueue a D3D9 Present commit — hand the finished
-    /// backbuffer to the commit slot (a pointer move into the `Arc`; no pixel
-    /// copy) and return the buffer the emu thread should draw the next frame
-    /// into (a recycled spare when one exists, else an empty Vec the caller
-    /// sizes). The commit thread performs the stretch + publish off the big
-    /// lock. Only called when [`PresentChannel::commit_enabled`].
-    pub(crate) fn enqueue_present_commit(
-        &mut self,
-        hwnd: crate::handles::Hwnd,
-        bb_w: u32,
-        bb_h: u32,
-        win_w: u32,
-        win_h: u32,
-        backbuffer: Vec<u32>,
-    ) -> Vec<u32> {
-        let background = self
-            .background_colors
-            .get(&hwnd)
-            .copied()
-            .unwrap_or(DEFAULT_BACKGROUND_COLOR);
-        self.channel.commit.enqueue(commit::CommitJob {
-            hwnd,
-            pixels: Arc::new(backbuffer),
-            bb_w,
-            bb_h,
-            win_w,
-            win_h,
-            background,
-        })
     }
 
     /// Request a host-side registry sync without publishing a frame.

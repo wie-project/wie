@@ -35,6 +35,11 @@
 #define IDC_LBL_DLG    23
 #define IDC_DLG_EDIT   1003
 #define TIMER_TICKS     6
+// Short mode: three ticks. Tick 1 opens the modal dialog (the step the flow
+// keys off), tick 2 is the first chance to verify, tick 3 is a retry for the
+// host-driven dialog close — the wait is already tick-retrying, so a smaller
+// budget only shortens the tail.
+#define TIMER_TICKS_SHORT 3
 
 static HWND g_hwnd;
 static HINSTANCE g_inst;
@@ -43,6 +48,18 @@ static int g_selftest;
 static int g_timer_count;
 static wchar_t g_dialog_text_w[128];
 static int g_dialog_result;
+
+// Opt-in short mode: WIE_SHORT=1 in the *guest* environment (injected host-side
+// through WIE_GUEST_ENV="WIE_SHORT=1") cuts the WM_TIMER budget. With WIE_SHORT
+// absent — every normal run and every existing test — g_ticks holds TIMER_TICKS
+// and the fixture is unchanged; short mode is opt-in only.
+static int g_ticks = TIMER_TICKS;
+
+static int short_mode(void) {
+    char buf[16];
+    DWORD n = GetEnvironmentVariableA("WIE_SHORT", buf, sizeof(buf));
+    return n == 1 && buf[0] == '1';
+}
 
 static int selftest_enabled(void) {
     char buf[16];
@@ -252,7 +269,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             // verification therefore waits for the dialog to actually close
             // (g_dialog_result != -1): if it is still open, skip this tick
             // and let the next timer tick retry.
-            if (g_timer_count >= TIMER_TICKS && g_dialog_result != -1) {
+            if (g_timer_count >= g_ticks && g_dialog_result != -1) {
                 // Verify every component echoed. Each step exits with a
                 // distinct code so CI failures pinpoint the component.
                 char buf[128];
@@ -396,6 +413,10 @@ void entry(void) {
     SendMessageA(g_combo, CB_ADDSTRING, 0, (LPARAM)"Combo Item 1");
     SendMessageA(g_combo, CB_ADDSTRING, 0, (LPARAM)"Combo Item 2");
     SendMessageA(g_combo, CB_ADDSTRING, 0, (LPARAM)"Combo Item 3");
+
+    if (short_mode()) {
+        g_ticks = TIMER_TICKS_SHORT;
+    }
 
     if (SetTimer(g_hwnd, 1, 100, NULL) == 0) {
         ExitProcess(103);

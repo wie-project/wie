@@ -978,6 +978,17 @@ pub struct WindowRecord {
     /// Parent or owner window.
     pub parent_handle: crate::handles::Hwnd,
 
+    /// Guest thread that created this window, i.e. the thread whose message
+    /// queue owns its posted messages (Windows: the queue of the thread that
+    /// created the window).
+    ///
+    /// Set from `ThreadState::current_tid` in `create_window_record` and
+    /// mirrored into `present::MessageQueues` so host-side posts can route
+    /// without the big state lock. `0` means "owner not recorded" — never a
+    /// real guest tid (`PRIMARY_THREAD_ID` is `0x5678`) — and routing then
+    /// falls back to the posting thread.
+    pub owner_tid: u32,
+
     /// Menu handle or child-window identifier.
     pub menu_handle: u64,
 

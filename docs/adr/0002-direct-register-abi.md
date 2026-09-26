@@ -71,3 +71,28 @@ Default **on**; opt-out via `WIE_JIT_DIRECT_REGS=0`/`false`/`off` restores exist
   `WIE_JIT_DIRECT_REGS` remains reserved for step 2; the SSA-rflags design
   (pack/unpack deletion, `PendingFlags` → i1 booleans, `flag_cond` consuming
   ZF/SF/CF/OF directly) is unchanged and ordered after the stub.
+
+## Status note (2026-09-25) — inert surfaces removed
+
+The **Decision** and **2026-09-05 feasibility** sections above are the dated
+historical record and are unchanged, but two of the knobs they name are no
+longer live:
+
+- **`WIE_JIT_DIRECT_REGS` is gone from the code.** `JitConfig::direct_regs_enabled`
+  and its `WIE_JIT_DIRECT_REGS` parse were deleted 2026-09-25 from
+  `crates/wie-cpu/src/jit/config.rs`. It had **zero lowering call sites** (no
+  x19–x28 handoff exists), so the "Default **on** … opt-out" reversibility claim
+  in this ADR never described a real second code path. The direct-register ABI
+  remains an **open** item: the plan is a per-block prologue stub (step 2)
+  followed by SSA rflags at that boundary (step 3). When it lands it will need
+  a genuine bisect switch, which this ADR must then re-advertise.
+- **`WIE_JIT_TAILCHAIN` is gone too.** The tail-call emission
+  (`return_call` / `return_call_indirect`) and its config gate were deleted
+  2026-09-25 from `crates/wie-cpu/src/jit/lower/emit.rs` — the branch is dead
+  code by construction, since Cranelift 0.133's verifier rejects it under every
+  calling convention the block signature can use. The **shipped** hop is the
+  nested host C ABI `call`/`call_indirect` with the `MAX_CHAIN_DEPTH` guard,
+  the monomorphic edge IC, the late-bound chain table, and the dispatcher
+  fallback, all unchanged. Tail chaining stays viable only once the prologue
+  stub lets blocks adopt a tail-call-capable convention or Cranelift lifts the
+  restriction; until then it is a blocked design, not a debug knob.

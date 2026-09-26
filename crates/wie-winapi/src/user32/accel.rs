@@ -229,8 +229,9 @@ fn handle_translate_accelerator_impl(
         });
 
     let return_value = if let Some(command_id) = command_id {
-        let mut queue = state.lock_message_queue();
-        queue.push(
+        // The WM_COMMAND goes to the queue of the thread that owns the window
+        // the accelerator fired in.
+        state.post_message(
             Hwnd::from(window_handle),
             WM_COMMAND,
             // MAKEWPARAM(id, 0): accelerator command ids are u16, so the

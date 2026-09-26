@@ -695,35 +695,6 @@ impl GuestHandle {
         }
     }
 
-    /// Enable D3D9 Present-commit mode (implementation-plan Wave 2, Option
-    /// A1): spawns the Present-committer render thread on this session's
-    /// channel and flips the commit gate, so `IDirect3DDevice9::Present`
-    /// hands its finished backbuffer to the render thread instead of
-    /// stretching + publishing inline under the big `WinApiState` lock.
-    ///
-    /// `wake` is the frame-arrival callback the committer fires after a
-    /// publish that passes the channel wake gate — the same closure shape
-    /// [`Self::set_wake`] registers for the guest publish path.
-    /// `WIE_PRESENT_COMMIT=0` disables the feature entirely (the legacy
-    /// inline path stays).
-    ///
-    /// Keep the returned handle alive for the session's lifetime: dropping it
-    /// stops and joins the render thread (its `Drop`). `None` = the thread
-    /// could not spawn — the legacy path stays active.
-    pub fn enable_present_commit(
-        &self,
-        wake: Box<dyn Fn() + Send + 'static>,
-    ) -> Option<wie_winapi::present::CommitterHandle> {
-        if std::env::var("WIE_PRESENT_COMMIT").is_ok_and(|v| v == "0") {
-            return None;
-        }
-        let committer =
-            wie_winapi::present::spawn_present_committer(Arc::clone(&self.present_channel), wake)?;
-        // Flip the gate only after the consumer exists.
-        self.present_channel.set_commit_enabled(true);
-        Some(committer)
-    }
-
     /// Enable the D3D9 command-capture pipeline (implementation-plan Wave 2
     /// slice 2): spawns the capture render thread on this session's channel
     /// and flips the capture gate, so `Draw*`/`Clear` handlers record ops
@@ -740,7 +711,7 @@ impl GuestHandle {
     ///
     /// `wake` is the frame-arrival callback the render thread fires after a
     /// publish that passes the channel wake gate — the same closure shape
-    /// [`Self::set_wake`] and [`Self::enable_present_commit`] register.
+    /// [`Self::set_wake`] registers.
     ///
     /// Keep the returned handle alive for the session's lifetime: dropping
     /// it stops and joins the render thread (its `Drop`). `None` = the

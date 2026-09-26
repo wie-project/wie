@@ -240,7 +240,8 @@ fn bridge_or_post(
         *bridged = Some(WinApiControlSignal::GuestCallbackRequested { request });
         return Ok(());
     }
-    state.lock_message_queue().push(
+    // Queued behind the bridged message: route to the window's owning thread.
+    state.post_message(
         crate::handles::Hwnd::from(request.window_handle),
         request.message,
         request.word_parameter,

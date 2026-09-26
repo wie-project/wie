@@ -131,6 +131,379 @@ impl D3d9Iface {
     }
 }
 
+/// The `kind=Com` iface byte reserved for `IDirectInput8`.
+///
+/// D3D9 owns 0..=7 (see [`D3d9Iface::ALL`]) and every other byte decodes to
+/// `D3d9Iface::Unknown`, so DirectInput takes a disjoint high pair. Picking
+/// 240/241 rather than 8/9 keeps the D3D9 decode table — and the
+/// `D3d9Iface::Unknown` fallback that catches any other byte — bit-for-bit
+/// unchanged, so no D3D9 VA can be re-decoded as DirectInput or vice versa.
+const DINPUT8_IFACE_DIRECT_INPUT8: u8 = 240;
+
+/// The `kind=Com` iface byte reserved for `IDirectInputDevice8`.
+const DINPUT8_IFACE_DEVICE8: u8 = 241;
+
+/// DirectInput COM interface identity (`kind=Com` high payload byte).
+///
+/// Same ABI contract as [`D3d9Iface`]: the byte is a real vtable's interface
+/// identity as WIE encodes it, so the discriminants must not shift. The
+/// variant list is derived from the real vtable layouts in
+/// `/opt/homebrew/opt/mingw-w64/toolchain-x86_64/x86_64-w64-mingw32/include/dinput.h`:
+/// `IDirectInput8W` (dinput.h:2402-2417) and `IDirectInputDevice8W`
+/// (dinput.h:1992-2031). The A and W vtables have identical method order —
+/// only the string widths in the signatures differ — so one enum serves both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DInput8Iface {
+    /// `IDirectInput8` (the DirectInput8Create-returned object).
+    DirectInput8,
+    /// `IDirectInputDevice8` (a per-device object from `CreateDevice`).
+    DirectInputDevice8,
+    /// Not one of the DirectInput8 interfaces (raw byte preserved).
+    Unknown(u8),
+}
+
+impl DInput8Iface {
+    /// The real DirectInput8 interfaces.
+    pub const ALL: [Self; 2] = [Self::DirectInput8, Self::DirectInputDevice8];
+
+    /// Decode the ABI iface byte (never fails — unknown bytes stay decodable).
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            DINPUT8_IFACE_DIRECT_INPUT8 => Self::DirectInput8,
+            DINPUT8_IFACE_DEVICE8 => Self::DirectInputDevice8,
+            _ => Self::Unknown(v),
+        }
+    }
+
+    /// The raw ABI iface byte (re-encodes identically).
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::DirectInput8 => DINPUT8_IFACE_DIRECT_INPUT8,
+            Self::DirectInputDevice8 => DINPUT8_IFACE_DEVICE8,
+            Self::Unknown(v) => v,
+        }
+    }
+}
+
+/// Which COM surface a `kind=Com` fake VA belongs to.
+///
+/// One `FakeVa::Com` carries either a D3D9 or a DirectInput8 interface, so
+/// the decoded iface is a two-way sum rather than a flat enum: the D3D9 and
+/// DirectInput8 vtable byte spaces are disjoint (see
+/// [`DINPUT8_IFACE_DIRECT_INPUT8`]), which is what keeps the decode total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComIface {
+    /// A D3D9 interface (0..=7 plus the `Unknown` fallback).
+    D3d9(D3d9Iface),
+    /// A DirectInput8 interface (240/241 plus the `Unknown` fallback).
+    DInput8(DInput8Iface),
+}
+
+impl ComIface {
+    /// Decode the `kind=Com` high payload byte.
+    ///
+    /// Total: the two reserved DirectInput8 bytes are matched first, and
+    /// *everything else* falls through to the D3D9 decoder — so a D3D9
+    /// `Unknown` byte can never be mistaken for DirectInput.
+    #[must_use]
+    pub const fn from_byte(byte: u8) -> Self {
+        if byte == DINPUT8_IFACE_DIRECT_INPUT8 {
+            Self::DInput8(DInput8Iface::DirectInput8)
+        } else if byte == DINPUT8_IFACE_DEVICE8 {
+            Self::DInput8(DInput8Iface::DirectInputDevice8)
+        } else {
+            Self::D3d9(D3d9Iface::from_u8(byte))
+        }
+    }
+
+    /// The raw `kind=Com` high payload byte (re-encodes identically).
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::D3d9(iface) => iface.as_u8(),
+            Self::DInput8(iface) => iface.as_u8(),
+        }
+    }
+
+    /// The DLL name runtime dispatch resolves this interface's methods under.
+    #[must_use]
+    pub const fn library(self) -> &'static str {
+        match self {
+            Self::D3d9(_) => "D3D9.dll",
+            Self::DInput8(_) => "dinput8.dll",
+        }
+    }
+
+    /// Decode a vtable slot for this interface.
+    #[must_use]
+    pub const fn decode_method(self, slot: u8) -> ComMethod {
+        match self {
+            Self::D3d9(D3d9Iface::Direct3D9) => match Direct3D9Method::from_u8(slot) {
+                Some(m) => ComMethod::Direct3D9(m),
+                None => ComMethod::Unknown(slot),
+            },
+            Self::D3d9(D3d9Iface::Device9) => match Device9Method::from_u8(slot) {
+                Some(m) => ComMethod::Device9(m),
+                None => ComMethod::Unknown(slot),
+            },
+            Self::D3d9(D3d9Iface::Texture9) => match Texture9Method::from_u8(slot) {
+                Some(m) => ComMethod::Texture9(m),
+                None => ComMethod::Unknown(slot),
+            },
+            Self::D3d9(D3d9Iface::Surface9) => match Surface9Method::from_u8(slot) {
+                Some(m) => ComMethod::Surface9(m),
+                None => ComMethod::Unknown(slot),
+            },
+            Self::D3d9(D3d9Iface::PixelShader9) => match PixelShader9Method::from_u8(slot) {
+                Some(m) => ComMethod::PixelShader9(m),
+                None => ComMethod::Unknown(slot),
+            },
+            Self::D3d9(D3d9Iface::VertexShader9) => match VertexShader9Method::from_u8(slot) {
+                Some(m) => ComMethod::VertexShader9(m),
+                None => ComMethod::Unknown(slot),
+            },
+            Self::D3d9(D3d9Iface::VertexBuffer9) => match VertexBuffer9Method::from_u8(slot) {
+                Some(m) => ComMethod::VertexBuffer9(m),
+                None => ComMethod::Unknown(slot),
+            },
+            Self::D3d9(D3d9Iface::IndexBuffer9) => match IndexBuffer9Method::from_u8(slot) {
+                Some(m) => ComMethod::IndexBuffer9(m),
+                None => ComMethod::Unknown(slot),
+            },
+            Self::D3d9(D3d9Iface::Unknown(_)) => ComMethod::Unknown(slot),
+            Self::DInput8(DInput8Iface::DirectInput8) => match DirectInput8Method::from_u8(slot) {
+                Some(m) => ComMethod::DirectInput8(m),
+                None => ComMethod::Unknown(slot),
+            },
+            Self::DInput8(DInput8Iface::DirectInputDevice8) => {
+                match DirectInputDevice8Method::from_u8(slot) {
+                    Some(m) => ComMethod::DirectInputDevice8(m),
+                    None => ComMethod::Unknown(slot),
+                }
+            }
+            Self::DInput8(DInput8Iface::Unknown(_)) => ComMethod::Unknown(slot),
+        }
+    }
+}
+
+/// `IDirectInput8` vtable method (the `DirectInput8Create` object).
+///
+/// The slot is ABI — a real vtable position in `IDirectInput8W`
+/// (`dinput.h:2402-2417`, whose slot order is fixed by the `IUnknown` base
+/// plus the `IDirectInput` → `IDirectInput2` → `IDirectInput7` →
+/// `IDirectInput8` chain), so the discriminants must not shift. Unmodeled
+/// slots are carried by [`ComMethod::Unknown`].
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectInput8Method {
+    QueryInterface = 0,
+    AddRef = 1,
+    Release = 2,
+    CreateDevice = 3,
+    EnumDevices = 4,
+    GetDeviceStatus = 5,
+    RunControlPanel = 6,
+    Initialize = 7,
+    FindDevice = 8,
+    EnumDevicesBySemantics = 9,
+    ConfigureDevices = 10,
+}
+
+impl DirectInput8Method {
+    /// Total `IDirectInput8` vtable slots (the fake vtable fills every position).
+    pub const VTABLE_SLOTS: usize = 11;
+
+    /// Decode a vtable slot; `None` for unmodeled slots.
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::QueryInterface),
+            1 => Some(Self::AddRef),
+            2 => Some(Self::Release),
+            3 => Some(Self::CreateDevice),
+            4 => Some(Self::EnumDevices),
+            5 => Some(Self::GetDeviceStatus),
+            6 => Some(Self::RunControlPanel),
+            7 => Some(Self::Initialize),
+            8 => Some(Self::FindDevice),
+            9 => Some(Self::EnumDevicesBySemantics),
+            10 => Some(Self::ConfigureDevices),
+            _ => None,
+        }
+    }
+
+    /// The raw vtable slot byte (`#[repr(u8)]` — the discriminant IS the slot).
+    #[must_use]
+    pub const fn slot(self) -> u8 {
+        self as u8
+    }
+
+    /// Trace name (`IDirectInput8::Xxx`).
+    #[must_use]
+    pub fn name(self) -> Cow<'static, str> {
+        match self {
+            Self::QueryInterface => Cow::Borrowed("IDirectInput8::QueryInterface"),
+            Self::AddRef => Cow::Borrowed("IDirectInput8::AddRef"),
+            Self::Release => Cow::Borrowed("IDirectInput8::Release"),
+            Self::CreateDevice => Cow::Borrowed("IDirectInput8::CreateDevice"),
+            Self::EnumDevices => Cow::Borrowed("IDirectInput8::EnumDevices"),
+            Self::GetDeviceStatus => Cow::Borrowed("IDirectInput8::GetDeviceStatus"),
+            Self::RunControlPanel => Cow::Borrowed("IDirectInput8::RunControlPanel"),
+            Self::Initialize => Cow::Borrowed("IDirectInput8::Initialize"),
+            Self::FindDevice => Cow::Borrowed("IDirectInput8::FindDevice"),
+            Self::EnumDevicesBySemantics => Cow::Borrowed("IDirectInput8::EnumDevicesBySemantics"),
+            Self::ConfigureDevices => Cow::Borrowed("IDirectInput8::ConfigureDevices"),
+        }
+    }
+}
+
+/// `IDirectInputDevice8` vtable method (a per-device object).
+///
+/// The slot is ABI — a real vtable position in `IDirectInputDevice8W`
+/// (`dinput.h:1992-2031`), whose order is fixed by the
+/// `IDirectInputDeviceA/W` → `…2` → `…7` → `…8` inheritance chain. Note
+/// that the DirectInput8 interface has **no** `GetCapabilities` on
+/// `IDirectInput8` itself (that is a device-interface method, slot 3), and no
+/// `SendDeviceChangeAck` at all: the DX-era ack call is `SendDeviceData`
+/// (slot 26) in the `IDirectInputDevice2` block.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectInputDevice8Method {
+    QueryInterface = 0,
+    AddRef = 1,
+    Release = 2,
+    GetCapabilities = 3,
+    EnumObjects = 4,
+    GetProperty = 5,
+    SetProperty = 6,
+    Acquire = 7,
+    Unacquire = 8,
+    GetDeviceState = 9,
+    GetDeviceData = 10,
+    SetDataFormat = 11,
+    SetEventNotification = 12,
+    SetCooperativeLevel = 13,
+    GetObjectInfo = 14,
+    GetDeviceInfo = 15,
+    RunControlPanel = 16,
+    Initialize = 17,
+    CreateEffect = 18,
+    EnumEffects = 19,
+    GetEffectInfo = 20,
+    GetForceFeedbackState = 21,
+    SendForceFeedbackCommand = 22,
+    EnumCreatedEffectObjects = 23,
+    Escape = 24,
+    Poll = 25,
+    SendDeviceData = 26,
+    EnumEffectsInFile = 27,
+    WriteEffectToFile = 28,
+    BuildActionMap = 29,
+    SetActionMap = 30,
+    GetImageInfo = 31,
+}
+
+impl DirectInputDevice8Method {
+    /// Total `IDirectInputDevice8` vtable slots (the fake vtable fills every
+    /// position).
+    pub const VTABLE_SLOTS: usize = 32;
+
+    /// Decode a vtable slot; `None` for unmodeled slots.
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::QueryInterface),
+            1 => Some(Self::AddRef),
+            2 => Some(Self::Release),
+            3 => Some(Self::GetCapabilities),
+            4 => Some(Self::EnumObjects),
+            5 => Some(Self::GetProperty),
+            6 => Some(Self::SetProperty),
+            7 => Some(Self::Acquire),
+            8 => Some(Self::Unacquire),
+            9 => Some(Self::GetDeviceState),
+            10 => Some(Self::GetDeviceData),
+            11 => Some(Self::SetDataFormat),
+            12 => Some(Self::SetEventNotification),
+            13 => Some(Self::SetCooperativeLevel),
+            14 => Some(Self::GetObjectInfo),
+            15 => Some(Self::GetDeviceInfo),
+            16 => Some(Self::RunControlPanel),
+            17 => Some(Self::Initialize),
+            18 => Some(Self::CreateEffect),
+            19 => Some(Self::EnumEffects),
+            20 => Some(Self::GetEffectInfo),
+            21 => Some(Self::GetForceFeedbackState),
+            22 => Some(Self::SendForceFeedbackCommand),
+            23 => Some(Self::EnumCreatedEffectObjects),
+            24 => Some(Self::Escape),
+            25 => Some(Self::Poll),
+            26 => Some(Self::SendDeviceData),
+            27 => Some(Self::EnumEffectsInFile),
+            28 => Some(Self::WriteEffectToFile),
+            29 => Some(Self::BuildActionMap),
+            30 => Some(Self::SetActionMap),
+            31 => Some(Self::GetImageInfo),
+            _ => None,
+        }
+    }
+
+    /// The raw vtable slot byte (`#[repr(u8)]` — the discriminant IS the slot).
+    #[must_use]
+    pub const fn slot(self) -> u8 {
+        self as u8
+    }
+
+    /// Trace name (`IDirectInputDevice8::Xxx`).
+    #[must_use]
+    pub fn name(self) -> Cow<'static, str> {
+        match self {
+            Self::QueryInterface => Cow::Borrowed("IDirectInputDevice8::QueryInterface"),
+            Self::AddRef => Cow::Borrowed("IDirectInputDevice8::AddRef"),
+            Self::Release => Cow::Borrowed("IDirectInputDevice8::Release"),
+            Self::GetCapabilities => Cow::Borrowed("IDirectInputDevice8::GetCapabilities"),
+            Self::EnumObjects => Cow::Borrowed("IDirectInputDevice8::EnumObjects"),
+            Self::GetProperty => Cow::Borrowed("IDirectInputDevice8::GetProperty"),
+            Self::SetProperty => Cow::Borrowed("IDirectInputDevice8::SetProperty"),
+            Self::Acquire => Cow::Borrowed("IDirectInputDevice8::Acquire"),
+            Self::Unacquire => Cow::Borrowed("IDirectInputDevice8::Unacquire"),
+            Self::GetDeviceState => Cow::Borrowed("IDirectInputDevice8::GetDeviceState"),
+            Self::GetDeviceData => Cow::Borrowed("IDirectInputDevice8::GetDeviceData"),
+            Self::SetDataFormat => Cow::Borrowed("IDirectInputDevice8::SetDataFormat"),
+            Self::SetEventNotification => {
+                Cow::Borrowed("IDirectInputDevice8::SetEventNotification")
+            }
+            Self::SetCooperativeLevel => Cow::Borrowed("IDirectInputDevice8::SetCooperativeLevel"),
+            Self::GetObjectInfo => Cow::Borrowed("IDirectInputDevice8::GetObjectInfo"),
+            Self::GetDeviceInfo => Cow::Borrowed("IDirectInputDevice8::GetDeviceInfo"),
+            Self::RunControlPanel => Cow::Borrowed("IDirectInputDevice8::RunControlPanel"),
+            Self::Initialize => Cow::Borrowed("IDirectInputDevice8::Initialize"),
+            Self::CreateEffect => Cow::Borrowed("IDirectInputDevice8::CreateEffect"),
+            Self::EnumEffects => Cow::Borrowed("IDirectInputDevice8::EnumEffects"),
+            Self::GetEffectInfo => Cow::Borrowed("IDirectInputDevice8::GetEffectInfo"),
+            Self::GetForceFeedbackState => {
+                Cow::Borrowed("IDirectInputDevice8::GetForceFeedbackState")
+            }
+            Self::SendForceFeedbackCommand => {
+                Cow::Borrowed("IDirectInputDevice8::SendForceFeedbackCommand")
+            }
+            Self::EnumCreatedEffectObjects => {
+                Cow::Borrowed("IDirectInputDevice8::EnumCreatedEffectObjects")
+            }
+            Self::Escape => Cow::Borrowed("IDirectInputDevice8::Escape"),
+            Self::Poll => Cow::Borrowed("IDirectInputDevice8::Poll"),
+            Self::SendDeviceData => Cow::Borrowed("IDirectInputDevice8::SendDeviceData"),
+            Self::EnumEffectsInFile => Cow::Borrowed("IDirectInputDevice8::EnumEffectsInFile"),
+            Self::WriteEffectToFile => Cow::Borrowed("IDirectInputDevice8::WriteEffectToFile"),
+            Self::BuildActionMap => Cow::Borrowed("IDirectInputDevice8::BuildActionMap"),
+            Self::SetActionMap => Cow::Borrowed("IDirectInputDevice8::SetActionMap"),
+            Self::GetImageInfo => Cow::Borrowed("IDirectInputDevice8::GetImageInfo"),
+        }
+    }
+}
+
 /// `IDirect3D9` vtable method. The slot is ABI (a real vtable position), so
 /// the discriminants must not shift. Unmodeled slots are carried by
 /// [`ComMethod::Unknown`].
@@ -733,6 +1106,10 @@ pub enum ComMethod {
     VertexShader9(VertexShader9Method),
     VertexBuffer9(VertexBuffer9Method),
     IndexBuffer9(IndexBuffer9Method),
+    /// An `IDirectInput8` vtable slot.
+    DirectInput8(DirectInput8Method),
+    /// An `IDirectInputDevice8` vtable slot.
+    DirectInputDevice8(DirectInputDevice8Method),
     /// Unmodeled slot (raw byte preserved).
     Unknown(u8),
 }
@@ -741,42 +1118,8 @@ impl ComMethod {
     /// Decode a method slot for `iface` (never fails — unknown slots fall
     /// back to [`Self::Unknown`], preserving the raw byte).
     #[must_use]
-    pub const fn decode(iface: D3d9Iface, slot: u8) -> Self {
-        match iface {
-            D3d9Iface::Direct3D9 => match Direct3D9Method::from_u8(slot) {
-                Some(m) => Self::Direct3D9(m),
-                None => Self::Unknown(slot),
-            },
-            D3d9Iface::Device9 => match Device9Method::from_u8(slot) {
-                Some(m) => Self::Device9(m),
-                None => Self::Unknown(slot),
-            },
-            D3d9Iface::Texture9 => match Texture9Method::from_u8(slot) {
-                Some(m) => Self::Texture9(m),
-                None => Self::Unknown(slot),
-            },
-            D3d9Iface::Surface9 => match Surface9Method::from_u8(slot) {
-                Some(m) => Self::Surface9(m),
-                None => Self::Unknown(slot),
-            },
-            D3d9Iface::PixelShader9 => match PixelShader9Method::from_u8(slot) {
-                Some(m) => Self::PixelShader9(m),
-                None => Self::Unknown(slot),
-            },
-            D3d9Iface::VertexShader9 => match VertexShader9Method::from_u8(slot) {
-                Some(m) => Self::VertexShader9(m),
-                None => Self::Unknown(slot),
-            },
-            D3d9Iface::VertexBuffer9 => match VertexBuffer9Method::from_u8(slot) {
-                Some(m) => Self::VertexBuffer9(m),
-                None => Self::Unknown(slot),
-            },
-            D3d9Iface::IndexBuffer9 => match IndexBuffer9Method::from_u8(slot) {
-                Some(m) => Self::IndexBuffer9(m),
-                None => Self::Unknown(slot),
-            },
-            D3d9Iface::Unknown(_) => Self::Unknown(slot),
-        }
+    pub const fn decode(iface: ComIface, slot: u8) -> Self {
+        iface.decode_method(slot)
     }
 
     /// The raw method slot byte.
@@ -791,6 +1134,8 @@ impl ComMethod {
             Self::VertexShader9(m) => m.slot(),
             Self::VertexBuffer9(m) => m.slot(),
             Self::IndexBuffer9(m) => m.slot(),
+            Self::DirectInput8(m) => m.slot(),
+            Self::DirectInputDevice8(m) => m.slot(),
             Self::Unknown(v) => v,
         }
     }
@@ -800,7 +1145,7 @@ impl ComMethod {
     /// name-table lookup — an unknown name resolves to no handler, as before);
     /// unknown interfaces keep the legacy `Com{iface}::Method{slot}` string.
     #[must_use]
-    pub fn name(self, iface: D3d9Iface) -> Cow<'static, str> {
+    pub fn name(self, iface: ComIface) -> Cow<'static, str> {
         match self {
             Self::Direct3D9(m) => m.name(),
             Self::Device9(m) => m.name(),
@@ -810,20 +1155,45 @@ impl ComMethod {
             Self::VertexShader9(m) => m.name(),
             Self::VertexBuffer9(m) => m.name(),
             Self::IndexBuffer9(m) => m.name(),
+            Self::DirectInput8(m) => m.name(),
+            Self::DirectInputDevice8(m) => m.name(),
             Self::Unknown(v) => match iface {
-                D3d9Iface::Direct3D9 => Cow::Owned(format!("IDirect3D9::Slot{v:03}")),
-                D3d9Iface::Device9 => Cow::Owned(format!("IDirect3DDevice9::Slot{v:03}")),
-                D3d9Iface::Texture9 => Cow::Owned(format!("IDirect3DTexture9::Slot{v:03}")),
-                D3d9Iface::Surface9 => Cow::Owned(format!("IDirect3DSurface9::Slot{v:03}")),
-                D3d9Iface::PixelShader9 => Cow::Owned(format!("IDirect3DPixelShader9::Slot{v:03}")),
-                D3d9Iface::VertexShader9 => {
+                ComIface::D3d9(D3d9Iface::Direct3D9) => {
+                    Cow::Owned(format!("IDirect3D9::Slot{v:03}"))
+                }
+                ComIface::D3d9(D3d9Iface::Device9) => {
+                    Cow::Owned(format!("IDirect3DDevice9::Slot{v:03}"))
+                }
+                ComIface::D3d9(D3d9Iface::Texture9) => {
+                    Cow::Owned(format!("IDirect3DTexture9::Slot{v:03}"))
+                }
+                ComIface::D3d9(D3d9Iface::Surface9) => {
+                    Cow::Owned(format!("IDirect3DSurface9::Slot{v:03}"))
+                }
+                ComIface::D3d9(D3d9Iface::PixelShader9) => {
+                    Cow::Owned(format!("IDirect3DPixelShader9::Slot{v:03}"))
+                }
+                ComIface::D3d9(D3d9Iface::VertexShader9) => {
                     Cow::Owned(format!("IDirect3DVertexShader9::Slot{v:03}"))
                 }
-                D3d9Iface::VertexBuffer9 => {
+                ComIface::D3d9(D3d9Iface::VertexBuffer9) => {
                     Cow::Owned(format!("IDirect3DVertexBuffer9::Slot{v:03}"))
                 }
-                D3d9Iface::IndexBuffer9 => Cow::Owned(format!("IDirect3DIndexBuffer9::Slot{v:03}")),
-                D3d9Iface::Unknown(_) => Cow::Owned(format!("Com{}::Method{v}", iface.as_u8())),
+                ComIface::D3d9(D3d9Iface::IndexBuffer9) => {
+                    Cow::Owned(format!("IDirect3DIndexBuffer9::Slot{v:03}"))
+                }
+                ComIface::D3d9(D3d9Iface::Unknown(raw)) => {
+                    Cow::Owned(format!("Com{}::Method{v}", raw))
+                }
+                ComIface::DInput8(DInput8Iface::DirectInput8) => {
+                    Cow::Owned(format!("IDirectInput8::Slot{v:03}"))
+                }
+                ComIface::DInput8(DInput8Iface::DirectInputDevice8) => {
+                    Cow::Owned(format!("IDirectInputDevice8::Slot{v:03}"))
+                }
+                ComIface::DInput8(DInput8Iface::Unknown(raw)) => {
+                    Cow::Owned(format!("Com{}::Method{v}", raw))
+                }
             },
         }
     }
@@ -839,7 +1209,7 @@ pub enum FakeVa {
     /// Import without a dense id (UCRT, ordinals, …); index into soft table.
     Unresolved(u16),
     /// COM vtable slot.
-    Com { iface: D3d9Iface, method: ComMethod },
+    Com { iface: ComIface, method: ComMethod },
     /// Runtime special.
     Special(u16),
 }
@@ -867,7 +1237,7 @@ impl FakeVa {
             }
             Self::Com { iface, method } => encode_parts(
                 KIND_COM,
-                ((iface.as_u8() as u16) << 8) | (method.slot() as u16),
+                ((iface.as_byte() as u16) << 8) | (method.slot() as u16),
             ),
             Self::Special(id) => encode_parts(KIND_SPECIAL, id),
         }
@@ -892,9 +1262,21 @@ pub const fn encode_unresolved(index: u16) -> u64 {
     FakeVa::Unresolved(index).encode()
 }
 
-/// Encode a COM method address.
+/// Encode a COM method address for a D3D9 interface.
 #[must_use]
 pub const fn encode_com(iface: D3d9Iface, method: u8) -> u64 {
+    encode_com_for(ComIface::D3d9(iface), method)
+}
+
+/// Encode a COM method address for a DirectInput8 interface.
+#[must_use]
+pub const fn encode_com_dinput8(iface: DInput8Iface, method: u8) -> u64 {
+    encode_com_for(ComIface::DInput8(iface), method)
+}
+
+/// Encode a COM method address for an already-summed [`ComIface`].
+#[must_use]
+pub const fn encode_com_for(iface: ComIface, method: u8) -> u64 {
     FakeVa::Com {
         iface,
         method: ComMethod::decode(iface, method),
@@ -953,7 +1335,7 @@ pub fn decode(va: u64) -> Option<FakeVa> {
             Some(FakeVa::Export(id))
         }
         KIND_COM => {
-            let iface = D3d9Iface::from_u8((payload >> 8) as u8);
+            let iface = ComIface::from_byte((payload >> 8) as u8);
             let method = (payload & 0xFF) as u8;
             Some(FakeVa::Com {
                 iface,
@@ -1006,7 +1388,7 @@ mod tests {
         assert_eq!(
             decode(va),
             Some(FakeVa::Com {
-                iface: D3d9Iface::Device9,
+                iface: ComIface::D3d9(D3d9Iface::Device9),
                 method: ComMethod::Device9(Device9Method::SetRenderState)
             })
         );
@@ -1021,7 +1403,7 @@ mod tests {
         assert_eq!(
             decode(va),
             Some(FakeVa::Com {
-                iface: D3d9Iface::Direct3D9,
+                iface: ComIface::D3d9(D3d9Iface::Direct3D9),
                 method: ComMethod::Direct3D9(Direct3D9Method::CreateDevice)
             })
         );
@@ -1029,7 +1411,7 @@ mod tests {
         assert_eq!(
             decode(encoded),
             Some(FakeVa::Com {
-                iface: D3d9Iface::Texture9,
+                iface: ComIface::D3d9(D3d9Iface::Texture9),
                 method: ComMethod::Texture9(Texture9Method::UnlockRect)
             })
         );
@@ -1043,7 +1425,7 @@ mod tests {
         assert_eq!(
             decode(va),
             Some(FakeVa::Com {
-                iface: D3d9Iface::Unknown(9),
+                iface: ComIface::D3d9(D3d9Iface::Unknown(9)),
                 method: ComMethod::Unknown(3)
             })
         );
@@ -1053,7 +1435,7 @@ mod tests {
         assert_eq!(
             decode(va),
             Some(FakeVa::Com {
-                iface: D3d9Iface::Device9,
+                iface: ComIface::D3d9(D3d9Iface::Device9),
                 method: ComMethod::Unknown(250)
             })
         );
@@ -1065,13 +1447,13 @@ mod tests {
         // round-trip for every interface, known or not.
         for iface in D3d9Iface::ALL {
             for slot in 0..=u8::MAX {
-                let method = ComMethod::decode(iface, slot);
+                let method = ComMethod::decode(ComIface::D3d9(iface), slot);
                 assert_eq!(method.slot(), slot, "slot must round-trip for {iface:?}");
             }
         }
         // Unknown iface bytes keep their slot byte too.
         for slot in 0..=u8::MAX {
-            let method = ComMethod::decode(D3d9Iface::Unknown(9), slot);
+            let method = ComMethod::decode(ComIface::D3d9(D3d9Iface::Unknown(9)), slot);
             assert_eq!(method.slot(), slot);
         }
         assert_eq!(D3d9Iface::Unknown(9).as_u8(), 9);
@@ -1185,19 +1567,21 @@ mod tests {
         // The trace names are load-bearing: they drive the D3D9 name-table
         // lookup, so they must match the pre-refactor strings exactly.
         assert_eq!(
-            ComMethod::Direct3D9(Direct3D9Method::GetDeviceCaps).name(D3d9Iface::Direct3D9),
+            ComMethod::Direct3D9(Direct3D9Method::GetDeviceCaps)
+                .name(ComIface::D3d9(D3d9Iface::Direct3D9)),
             "IDirect3D9::GetDeviceCaps"
         );
         assert_eq!(
-            ComMethod::Device9(Device9Method::SetRenderState).name(D3d9Iface::Device9),
+            ComMethod::Device9(Device9Method::SetRenderState)
+                .name(ComIface::D3d9(D3d9Iface::Device9)),
             "IDirect3DDevice9::SetRenderState"
         );
         assert_eq!(
-            ComMethod::Unknown(250).name(D3d9Iface::Device9),
+            ComMethod::Unknown(250).name(ComIface::D3d9(D3d9Iface::Device9)),
             "IDirect3DDevice9::Slot250"
         );
         assert_eq!(
-            ComMethod::Unknown(3).name(D3d9Iface::Unknown(5)),
+            ComMethod::Unknown(3).name(ComIface::D3d9(D3d9Iface::Unknown(5))),
             "Com5::Method3"
         );
     }

@@ -1,21 +1,40 @@
-# Handoff — Wave 2 remaining steps (ordered)
+# Handoff — Wave 2 close-out (current status)
 
-Context: `docs/implementation-plan.md` is the live plan. Wave 1 done, Wave 2
-slice 1 (D3D9 Present-commit render thread, `present/commit.rs`) landed in
-`3cb2370`. Branch: `feat/dll-coverage`.
+Context: `docs/implementation-plan.md` is the live plan. Branch: `feat/dll-coverage`.
 
-**Status update (2026-09-05, after slice 1):** Step 1 (D3D9 draw-command
-capture) is implemented, awaiting the user's gates — see the checklist at
-the bottom. Steps 2/3 unchanged.
+**Current close-out (2026-09-25):** Wave 2 implementation is complete. Commits
+`3cb2370`, `22b56c7`, `7eb4c1d`, `25dba15`, and `7c08ef3` landed the D3D9
+command capture/render thread, window mirror, RT read-back rendezvous, and GUI
+default-on wiring; the superseded Present-commit render thread was removed
+afterwards, so the **capture stream render thread is the sole GUI
+render-thread path** (`WIE_CAPTURE_STREAM=0` remains the legacy escape hatch
+and the headless/CI hash oracle). **Acceptance passes.**
+`WAVE2_BASELINE=1 ./scripts/acceptance-wave2.sh 40` exited **0** on a release
+build through the native logged-in GUI path, on a run taken after the commit
+path was deleted, with
+`present_enqueued=693`, `capture_frames=693`,
+`frames_published=1` (GDI/GL/DIB counter, not the capture denominator),
+`handler_ms/present=0.096` (PASS, ≤1 ms), and
+`present_ms=241.008` (PASS, >0). That report has no `commit_frames` key at
+all: the commit path and its profile key are deleted, and the live acceptance
+schema is capture-only. Process `cpu%=0.0` is informational only, not
+a guest-thread acceptance gate. The baseline was appended at
+`docs/baselines/wave2-acceptance.txt`, latest row timestamp
+`2026-09-25T19:10:12Z`; the older `2026-09-25T17:57:50Z` row (with
+`commit_frames=0`) is kept as frozen pre-removal evidence.
+The earlier script repairs (duplicate `ROOT` line, canonical
+`out/gui_d3d9.exe` target, missing-PE guard) are historical fixes, not current
+blockers.
 
-**Rule: do NOT run tests yourself.** Implement, then tell the user which
-commands to run and stop. The user runs the gates and reports results.
+The acceptance result is recorded. The dated implementation notes below are
+retained as handoff history; the live plan is authoritative for current
+sequencing.
 
 Conventions: workspace lints deny `unwrap_used`/`expect_used`/`panic`/
-`indexing_slicing`/`as_conversions`; new modules stay under the 1500-line
-cap; `pub(crate)` only where needed; docs updated in the same commit.
+`indexing_slicing`/`as_conversions`; new modules stay under the 1500-line cap;
+`pub(crate)` only where needed; docs updated in the same commit.
 
-## Step 1 — D3D9 draw-command capture (the core of Wave 2)
+## Step 1 — D3D9 draw-command capture (historical implementation record)
 
 Goal: `Draw*` handlers stop rasterizing on the emu thread; they append
 self-contained draw ops to a per-device stream. `Present` (already committed
@@ -49,7 +68,7 @@ committer replays the ops into its own backbuffer, then publishes as today.
   with a test that runs `gui_d3d9.exe` with the capture path enabled and pins
   `D3D9_RESTING_FRAME_HASH` (model: `commit.rs` test).
 
-## Step 2 — Kill the remaining big-lock reads (Wave 2 item 3)
+## Step 2 — Kill the remaining big-lock reads (historical implementation record)
 
 Mirror presenter-side reads into `PresentChannel` (same pattern as the
 z-order/window-rev mirrors). Audited list (in `session/window.rs`):
@@ -60,15 +79,31 @@ settle. Snapshot under the source lock at mutation sites, read via the
 channel; each accessor gets a test proving it no longer takes the big lock
 (or note which ones legitimately still need it).
 
-## Step 3 — Acceptance measurement
+## Step 3 — Acceptance measurement (passed 2026-09-25, post-removal run)
 
-Land the FPS harness (see Wave-0 row in `implementation-plan.md`) into the
-local capture protocol, then run the 40 s `WIE_RUNTIME_PROFILE=1` capture on
-the D3D9 loop micro (`gui_d3d9.exe` / doomretro) and check: guest >90% CPU,
-emu thread ≤1 ms/frame on D3D9 handlers, `commit_ms` separate from guest
-time. Commit the baseline to `docs/baselines/`.
+The harness is landed in `7c08ef3` and is documented in the live plan. The
+duplicate `ROOT` assignment and the missing-PE build target were repaired
+earlier — historical fixes, not current blockers. The prescribed run
+`WAVE2_BASELINE=1 ./scripts/acceptance-wave2.sh 40` exited **0** on a release
+build through the native logged-in GUI path. The old `frames_published`/CPU
+check was replaced by the production capture-path invariants:
+`present_enqueued=693`, `capture_frames=693`,
+`frames_published=1` (GDI/GL/DIB counter, not the capture denominator),
+`handler_ms/present=0.096` (PASS, ≤1 ms),
+`present_ms=241.008` (PASS, >0). The report carries no `commit_frames` key:
+the commit path and its profile key are deleted with the superseded commit
+render thread, so the current acceptance schema is capture-only. Process
+`cpu%=0.0` is informational only, not a guest-thread acceptance gate. The
+baseline was appended at `docs/baselines/wave2-acceptance.txt` (latest row
+timestamp `2026-09-25T19:10:12Z`); the earlier `2026-09-25T17:57:50Z` row, with
+its `commit_frames=0` sample, remains as frozen pre-removal evidence.
 
-## Then (later waves, do not start before Wave 2 closes)
+## Later waves (historical sequencing; current status is in the live plan)
+
+The original sequencing below is retained for handoff context. It is superseded
+where it says Wave 2 must close before later work: Wave 3 SSA-rflags, Wave 4
+packed SSE/degrade-not-die/x87, and Wave 5 playback/timer/callback routing
+have since landed, while their explicitly listed open work remains open.
 
 - Wave 3: ADR-0002 direct-register ABI + SSA rflags → block chaining →
   multi-module compile (`long_loop` 0.25 s → ≤0.10 s).
@@ -200,9 +235,14 @@ check removal) and re-run the hash suite; then Step 2.
   run it on an idle machine with a release build and commit the
   baseline.
 
-## Remaining-lane continuation notes (2026-09-05, post slice 4 + Wave 3/4/5 slice 1)
+## Remaining-lane continuation notes (2026-09-05, historical; superseded by the current close-out above)
 
-Progress this session: Wave 2 closed (slices 3-4 + capture default-on +
+The notes below preserve the handoff as written on 2026-09-05. They are not a
+current acceptance record: SSA-rflags, broad Wave 4 coverage, and Wave 5
+callback routing landed afterward, while Wave 2 acceptance was still blocked
+by the hard-invariant failure recorded at the time.
+
+Progress this session: Wave 2 implementation closed (slices 3-4 + capture default-on +
 acceptance harness), Wave 3 slice 1 (tail-call chain hops
 `WIE_JIT_TAILCHAIN`, ADR-0002 feasibility pass — **since reverted to
 default-off: Cranelift 0.133 rejects `return_call` under every ABI

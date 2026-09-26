@@ -3,22 +3,14 @@
 //! (GetFileVersionInfoSizeW → GetFileVersionInfoW → VerQueryValueW) and
 //! asserts the fixed info, the FileVersion string, and the Translation pair.
 
-use std::path::PathBuf;
+mod common;
 
-fn micro_exe(name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("micro-exes/out");
-    path.push(name);
-    path.is_file().then_some(path)
-}
+use common::micro_exe;
 
 #[test]
 fn version_query_reads_its_own_version_resource() {
     let Some(pe) = micro_exe("version_query.exe") else {
-        eprintln!("skip: version_query.exe not built");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
 
     // The version handlers are file ops: they run under the bottle policy.

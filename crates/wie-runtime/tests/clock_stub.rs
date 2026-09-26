@@ -1,19 +1,12 @@
 //! B5 clock-table integration: in-guest clock stubs fire with zero host stops.
 //!
 //! Requires a mingw-built micro-exe that calls a clock API (`guess_price.exe`
-//! seeds its RNG with `srand(GetTickCount())`); skips when not built
-//! (`make -C micro-exes`).
+//! seeds its RNG with `srand(GetTickCount())`); a missing binary fails the test
+//! (`make -C micro-exes`; see `tests/common/mod.rs`).
 
-use std::path::PathBuf;
+mod common;
 
-fn micro_exe(name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("micro-exes/out");
-    path.push(name);
-    path.is_file().then_some(path)
-}
+use common::micro_exe;
 
 /// `guess_price.exe` calls `GetTickCount()` (via `srand`) at startup. With the
 /// B5 host-written clock table planted, GetTickCount must NOT appear among the
@@ -21,8 +14,7 @@ fn micro_exe(name: &str) -> Option<PathBuf> {
 #[test]
 fn get_tick_count_is_a_guest_stub_not_a_host_stop() {
     let Some(path) = micro_exe("guess_price.exe") else {
-        eprintln!("skip: micro-exes/out/guess_price.exe not built (run make -C micro-exes)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
 
     let mut session =

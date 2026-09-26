@@ -430,11 +430,33 @@ fn advance_index(e: &mut EnumerationState) -> Option<&EnumItem> {
 /// Advance a font enumeration to the next item (called by the runtime on each
 /// non-zero callback return). Returns `Some(next_request)` to re-enter the
 /// callback, or `None` when the enumeration is complete.
+///
+/// # Why a gdi32 entry point dispatches to DirectInput
+///
+/// The runtime's full-iteration continuation path names exactly ONE advance
+/// function — `session::pump` calls this one directly — so a second lane with
+/// its own item list needs a way in. Rather than teach the run loop about a
+/// neutral dispatcher, this function is a **router**: it offers the
+/// `enumeration_id` to the DirectInput lane first (which owns ids from its own
+/// counter, so the two tables never collide) and falls through to the font
+/// path unchanged when no DirectInput enumeration owns the id. Font behaviour
+/// is therefore byte-identical to before this router existed.
+///
+/// This is a deliberate layering compromise: a GDI32 module reaching into
+/// DirectInput reads wrong. The neutral alternative — the runtime calling a
+/// dispatcher that owns both tables — is the right end state and is recorded as
+/// a follow-up; it was rejected here because it means editing the run loop
+/// (`session/pump.rs`), and a mistake in the run loop costs a hang rather than
+/// a wrong pixel. Revisit when a third full-iteration lane appears and the
+/// table-per-module split has to become a trait object anyway.
 pub fn advance_enumeration(
     engine: &mut dyn wie_cpu::CpuEngine,
-    _state: &mut WinApiState,
+    state: &mut WinApiState,
     enumeration_id: u64,
 ) -> Result<Option<GuestCallbackRequest>> {
+    if let Some(next) = crate::dinput::advance_enumeration(engine, state, enumeration_id)? {
+        return Ok(Some(next));
+    }
     let mut enums = ENUMERATIONS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -228,23 +228,13 @@ impl PersistentJitCache {
     /// Resolve config from the environment: `WIE_JIT_CACHE`.
     ///
     /// - unset → default dir under `$WIE_CACHE_DIR` / XDG cache home
-    ///   (`wie/jit`), DISABLED under `cfg(test)` (suite determinism);
+    ///   (`wie/jit`), DISABLED whenever this process is a test process (see
+    ///   [`under_test_process`]) so that suites stay deterministic and no two
+    ///   test processes share one ledger file;
     /// - `0` / `false` / `off` → disabled;
     /// - anything else → that value used as the cache directory.
     pub(super) fn new() -> Self {
-        let resolved: Option<Option<PathBuf>> = match std::env::var("WIE_JIT_CACHE") {
-            Ok(v)
-                if v.is_empty()
-                    || v == "0"
-                    || v.eq_ignore_ascii_case("false")
-                    || v.eq_ignore_ascii_case("off") =>
-            {
-                Some(None) // explicitly disabled
-            }
-            Ok(v) => Some(Some(PathBuf::from(v))), // explicit dir override
-            Err(_) => (!cfg!(test)).then_some(Some(default_cache_dir())), // default on (off in tests)
-        };
-        match resolved.flatten() {
+        match resolve_config(std::env::var("WIE_JIT_CACHE").ok(), under_test_process()) {
             Some(dir) => Self {
                 enabled: true,
                 base_dir: dir,
@@ -626,6 +616,57 @@ impl Drop for PersistentJitCache {
     }
 }
 
+/// True when this process is a test process, and the on-disk ledger must stay
+/// off for suite determinism.
+///
+/// `cfg!(test)` alone is NOT sufficient. It is true only for a crate's own
+/// `#[cfg(test)] mod tests`, which means the `wie-cpu` rlib gets linked into
+/// its unit-test binary with the flag set. Integration tests under
+/// `crates/*/tests/` link `wie-cpu` as an ordinary external dependency, so
+/// `cfg!(test)` is FALSE there — and `cargo nextest` runs every test in its
+/// own process (`NEXTEST_EXECUTION_MODE=process-per-test`). Without the
+/// runtime check below, all of those processes would open, read, rewrite and
+/// `rename` the SAME `$cache/wie/jit/<pe-hash>.bin` concurrently: a
+/// last-writer-wins ledger plus torn-read exposure, i.e. a latent flake and
+/// data-corruption source that has nothing to do with the emulator being
+/// wrong.
+///
+/// `cargo-nextest` exports `NEXTEST=1` (plus `NEXTEST_EXECUTION_MODE`,
+/// `NEXTEST_RUN_ID`, …) into every test process; that is the marker we key
+/// on. Plain `cargo test` exports no distinguishing variable at all (verified:
+/// it exports only the same `CARGO_*` set a plain `cargo run` does), so an
+/// integration test run under `cargo test` still needs `WIE_JIT_CACHE=0` by
+/// hand. `cargo test` is not part of this project's gate — see
+/// scripts/check.sh and docs/TESTING.md, which use nextest throughout.
+fn under_test_process() -> bool {
+    // `cfg!(test)`: our own unit tests, which link us with `cfg(test)` set.
+    // `NEXTEST`: cargo-nextest, which covers integration tests linked as an
+    // external crate (no `cfg(test)` in wie-cpu at all).
+    cfg!(test) || std::env::var_os("NEXTEST").is_some()
+}
+
+/// Pure `WIE_JIT_CACHE` precedence resolver, split out of [`PersistentJitCache::new`]
+/// so the whole decision table is unit-testable without mutating the process
+/// environment (which would be `unsafe` under this crate's lint set and racy
+/// under `cargo test`'s shared-process model).
+///
+/// An explicit `WIE_JIT_CACHE` always wins — including in tests — so a
+/// developer debugging the ledger can point a test run at a scratch dir.
+fn resolve_config(explicit: Option<String>, under_test: bool) -> Option<PathBuf> {
+    match explicit {
+        None => (!under_test).then(default_cache_dir),
+        Some(v)
+            if v.is_empty()
+                || v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off") =>
+        {
+            None
+        }
+        Some(v) => Some(PathBuf::from(v)),
+    }
+}
+
 /// Default cache directory: `$WIE_CACHE_DIR`, else XDG cache home, else the
 /// macOS / Linux user-cache convention. `None` disables persistence.
 fn default_cache_dir() -> PathBuf {
@@ -796,5 +837,42 @@ mod tests {
     fn fnv1a_is_stable() {
         // FNV-1a reference vector for "foobar".
         assert_eq!(fnv1a(b"foobar"), 0x85944171f73967e8);
+    }
+
+    #[test]
+    fn test_processes_never_persist_by_default() {
+        // We ARE a `cfg(test)` process, so the default must be disabled. This
+        // is the property the nextest integration suites depend on: they link
+        // wie-cpu WITHOUT `cfg(test)`, so for them the load-bearing half of
+        // the condition is the `NEXTEST` probe, and `under_test` below stands
+        // in for it.
+        assert!(under_test_process());
+        assert!(resolve_config(None, true).is_none());
+    }
+
+    #[test]
+    fn non_test_process_keeps_the_default_dir() {
+        // The non-test default must be unchanged by the isolation work.
+        assert!(resolve_config(None, false).is_some());
+    }
+
+    #[test]
+    fn explicit_env_always_wins_over_test_detection() {
+        // `under_test` says "off", but an explicit dir is honoured so a
+        // developer can debug the ledger from a test.
+        let explicit = Some("/tmp/wie-jit-cache-explicit".to_string());
+        assert_eq!(
+            resolve_config(explicit.clone(), true),
+            Some(PathBuf::from("/tmp/wie-jit-cache-explicit"))
+        );
+        // ... and the disabling spellings still disable, in tests and out.
+        for off in ["", "0", "false", "FALSE", "off", "Off"] {
+            let v = Some(off.to_string());
+            assert!(
+                resolve_config(v.clone(), false).is_none(),
+                "{off:?} must disable"
+            );
+            assert!(resolve_config(v, true).is_none(), "{off:?} must disable");
+        }
     }
 }

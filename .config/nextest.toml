@@ -8,10 +8,69 @@ fail-fast = false
 test-threads = "num-cpus"
 # Show which tests are running.
 status-level = "skip"
+# Label anything slower than this SLOW instead of letting a genuinely slow
+# guest run sit silently inside a normal-looking run.
+slow-timeout = "60s"
 
 [profile.default.junit]
 # Write JUnit XML reports for CI integration.
 path = "target/nextest/junit.xml"
+
+# ---------------------------------------------------------------------------
+# The two slow groups.
+#
+# nextest has no way to NAME a group in config: an `overrides` block is
+# selected by its filter, and the implicit `group(...)` operator takes
+# synthesized names that are not addressable from a shell (both
+# `group(slow)` and `group(<the filter text>)` are rejected). So these two
+# blocks are the single source of truth for the filter expressions, and the
+# only place the two `slow-timeout` values live. To run just the slow set:
+#
+#   cargo nextest run --profile default \
+#     -E 'package(wie-runtime) + binary(/^(micro_|clock_stub$|idle_park_wake$)/)'
+#
+# Both blocks together are exactly the set the `fast` profile excludes.
+# ---------------------------------------------------------------------------
+
+# The GUI integration suite. Every test in it takes the process-wide
+# `GUI_SUITE_LOCK` (crates/wie-runtime/tests/micro_gui_window/helpers.rs), so
+# 13 tests that could otherwise use 8 cores run strictly one at a time, and
+# each one JIT-compiles a real guest window (gui_blit alone is ~11 s of JIT
+# compile). This is the single biggest block of wall time in the suite.
+[[profile.default.overrides]]
+filter = 'package(wie-runtime) + binary(micro_gui_window)'
+slow-timeout = { period = "300s" }
+
+# The rest of the wie-runtime integration tests: also real guest PEs through
+# the JIT, just without the suite-wide lock. Much cheaper, still far heavier
+# than the pure unit tests. The first alternative also covers
+# `micro_gui_window`, so this one filter selects both groups.
+[[profile.default.overrides]]
+filter = 'package(wie-runtime) + binary(/^(micro_|clock_stub$|idle_park_wake$)/)'
+slow-timeout = { period = "120s" }
+
+# ---------------------------------------------------------------------------
+# `fast` — the inner dev loop. Everything except the two groups above.
+# `./scripts/test-fast.sh` wraps it. Use it while iterating, then run
+# `./scripts/check.sh` before opening a PR.
+#
+# `default-filter` accepts exactly ONE predicate: unions, set difference and
+# `not group(...)` are all rejected with "predicate not allowed in
+# `default-filter` expressions". The exclusion therefore has to be spelled as
+# a single negated predicate rather than the more readable
+# `all() - (package(wie-runtime) + binary(...))`, which is only available on
+# the command line. The two forms select the same tests.
+#
+# The regex drops `micro_gui_window` too (it starts with `micro_`), so one
+# alternative covers both groups. It is not scoped with `package(wie-runtime)`
+# only because that would need a union, which the single-predicate form
+# forbids; no other workspace crate has a test binary with these names.
+# ---------------------------------------------------------------------------
+[profile.fast]
+fail-fast = true
+test-threads = "num-cpus"
+retries = 0
+default-filter = 'not binary(/^(micro_|clock_stub$|idle_park_wake$)/)'
 
 [profile.ci]
 # CI profile: stricter settings.

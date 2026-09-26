@@ -32,17 +32,19 @@ impl GuestHandle {
         point_y: i32,
     ) {
         if let Ok(mut queue) = self.queue.lock() {
-            let time = queue.next_message_time;
-            queue.next_message_time = time.wrapping_add(1);
-            queue.messages.push(wie_winapi::QueuedWindowMessage {
-                window_handle: wie_winapi::handles::Hwnd::from(hwnd),
-                message: msg,
-                word_parameter: wparam,
-                long_parameter: lparam,
-                time,
+            // Routed to the queue of the thread that owns `hwnd` (the queue's
+            // routing mirror, fed at window creation) — the host knows no
+            // "current thread", so an unknown window falls back to the
+            // primary. `push_host` stamps the message and broadcasts the
+            // `MessagePosted` wake token, like `queue.push_to`.
+            queue.push_host(
+                wie_winapi::handles::Hwnd::from(hwnd),
+                msg,
+                wparam,
+                lparam,
                 point_x,
                 point_y,
-            });
+            );
             // Wake a guest blocked in run_windowed's condvar wait.
             {
                 let mut triggered = queue
@@ -53,13 +55,6 @@ impl GuestHandle {
                 *triggered = true;
             }
             queue.signal.cvar.notify_one();
-            // Wake a guest parked on its per-thread inbox (Painpoint 1): the
-            // queue carries the session's wake hub (wired at init), so host
-            // input injection delivers a token without touching the big
-            // state mutex. An unwired (default) queue broadcasts into an
-            // empty hub — a no-op. Tokens are hints: the parked pump
-            // re-checks the queue filter on wake.
-            queue.wake.broadcast(wie_winapi::Wake::MessagePosted);
         }
     }
 

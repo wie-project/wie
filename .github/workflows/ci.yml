@@ -35,17 +35,71 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
 
+      # The guest fixtures under micro-exes/out/ are cross-compiled PE64
+      # binaries and are NOT tracked in git (micro-exes/.gitignore ignores
+      # out/). Without this toolchain step every guest-PE integration test in
+      # crates/wie-runtime/tests/ has no binary to run — and since a missing
+      # fixture is a test failure (crates/wie-runtime/tests/common/mod.rs), the
+      # test step below would fail on a clean runner.
+      #
+      # `brew install mingw-w64` is the same toolchain the project documents
+      # (Homebrew mingw-w64); it ships prebuilt bottles for macOS on Apple
+      # Silicon, so no compilation happens on the runner. The trailing
+      # verification is deliberate: a silently missing compiler would show up
+      # as ~40 confusing "missing guest fixture" failures instead of one clear
+      # message here.
+      #
+      # Moving this job to ubuntu-latest? The equivalent is either
+      #   sudo apt-get update && sudo apt-get install -y mingw-w64
+      # (provides x86_64-w64-mingw32-gcc) or the pinned MSYS2 action
+      #   uses: msys2/setup-msys2@v2
+      #   with: { msystem: MINGW64, update: true, install: mingw-w64-gcc }
+      - name: Install mingw-w64 cross toolchain
+        run: |
+          brew install mingw-w64
+          x86_64-w64-mingw32-gcc --version
+          x86_64-w64-mingw32-g++ --version
+
       - name: Formatting
         run: cargo fmt --all --check
 
       - name: File sizes
         run: ./scripts/check-file-sizes.sh
 
+      # No -D warnings: scripts/check.sh (the authoritative local gate) runs
+      # clippy advisory, and the workspace lint table denies no clippy lints
+      # (Cargo.toml [workspace.lints]). Keep the two invocations identical.
       - name: Clippy
         run: cargo clippy --workspace --all-targets
+
+      # Before the tests: the guest-PE integration tests fail (not skip) when
+      # their fixture is absent. `all` also builds the category targets the
+      # micro-suite step runs, but it is written out here so the ordering
+      # requirement is visible at the point where it matters.
+      - name: Build guest fixtures
+        run: make -C micro-exes
 
       - name: Tests
         run: cargo nextest run --workspace
 
       - name: Build release
         run: cargo build -p wie-cli --release
+
+      # The micro-suite is the end-to-end gate: it runs whole guest programs
+      # through the release `wie` binary and asserts their exit codes. Only
+      # the cheap, deterministic categories run on the push path:
+      #   console_tests  1 exe
+      #   pthread_tests   2 exes
+      #   cpp_exes        5 exes
+      #   dll_tests       6 exes + sibling DLL staging
+      # Deliberately NOT here (they belong on a schedule/nightly axis, see
+      # docs/testing-model.md): `all` (the ~70-exe data-driven sweep, which
+      # includes long_loop's fixed 40 s window), `--matrix` (repeats a category
+      # under WIE_JIT_MEM=slow/pin and the multi-minute WIE_CPU=iced leg), and
+      # the 40 s fixed-window GUI harnesses.
+      - name: Micro-suite
+        run: |
+          ./scripts/run-micro-suite.sh console_tests
+          ./scripts/run-micro-suite.sh pthread_tests
+          ./scripts/run-micro-suite.sh cpp_exes
+          ./scripts/run-micro-suite.sh dll_tests

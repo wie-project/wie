@@ -14,9 +14,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths sib_copy mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps wininet_http gl_quad dir_watch ole_clip font_enum child_proc spawn_child mbwc_lasterror
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths sib_copy mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps wininet_http gl_quad dir_watch ole_clip font_enum child_proc spawn_child mbwc_lasterror istextunicode
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps wininet_http gl_quad dir_watch ole_clip font_enum child_proc spawn_child mbwc_lasterror
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps wininet_http gl_quad dir_watch ole_clip font_enum child_proc spawn_child mbwc_lasterror istextunicode
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -56,6 +56,7 @@ seh_access_violation: $(OUT)/seh_access_violation.exe
 seh_div_zero: $(OUT)/seh_div_zero.exe
 print_bmp: $(OUT)/print_bmp.exe
 version_query: $(OUT)/version_query.exe
+istextunicode: $(OUT)/istextunicode.exe
 setupapi_list: $(OUT)/setupapi_list.exe
 dbghelp_stub: $(OUT)/dbghelp_stub.exe
 crypt_hash: $(OUT)/crypt_hash.exe
@@ -540,4 +541,13 @@ mbwc_lasterror: $(OUT)/mbwc_lasterror.exe
 
 $(OUT)/mbwc_lasterror.exe: mbwc_lasterror/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+# ADVAPI32 IsTextUnicode (istextunicode): exercises the handler against
+# UTF-16LE, ASCII and BOM buffers. CRT-linked console program; the test
+# crates/wie-runtime/tests/micro_istextunicode.rs depends on this PE, and the
+# "missing fixture is a failure" rule means an unbuildable target is a red
+# test rather than a silent skip.
+$(OUT)/istextunicode.exe: istextunicode/main.c | $(OUT)
+	$(MINGW_CC) $(CRT_CFLAGS) -o $@ $< -ladvapi32
 	@echo "built $@"

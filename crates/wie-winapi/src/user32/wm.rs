@@ -83,6 +83,18 @@ impl WinMsg {
     pub const WM_DROPFILES: Self = Self(0x0233);
     pub const WM_MOUSEHOVER: Self = Self(0x02A1);
     pub const WM_MOUSELEAVE: Self = Self(0x02A3);
+    /// WM_INPUT — winuser.h:1173 (`0x00FF`).
+    ///
+    /// The raw-input delivery message. `wParam` is
+    /// `GET_RAWINPUT_CODE_WPARAM` (winuser.h:6294): `RIM_INPUT` for a focused
+    /// window, `RIM_INPUTSINK` for a `RIDEV_INPUTSINK` background one.
+    /// `lParam` is an opaque `HRAWINPUT` (winuser.h:6291) — a system handle the
+    /// guest passes to `GetRawInputData`, never a guest-dereferenceable
+    /// pointer. WIE's `WM_INPUT` posts come from
+    /// [`crate::user32::raw_input::post_raw_keyboard_event`] /
+    /// [`crate::user32::raw_input::post_raw_mouse_event`], which the host GUI
+    /// event path calls; the payloads are SYNTHESIZED, not hardware reports.
+    pub const WM_INPUT: Self = Self(0x00FF);
 
     // ── Clipboard edit messages (winuser.h) — sent by the Edit menu's
     // Cut/Copy/Paste/Clear/Undo commands to the focused edit control.

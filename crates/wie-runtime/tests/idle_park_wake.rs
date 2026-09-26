@@ -7,18 +7,10 @@
 //! registry semantics (spurious tokens, one-vs-all selection, concurrent
 //! stress) live in `wie-winapi::wake` and `sync_obj` unit tests.
 
-use std::time::{Duration, Instant};
+mod common;
 
-/// Locate a mingw-built micro PE under `micro-exes/out`. Skips when absent,
-/// like every other fixture-consuming test in this crate.
-fn micro_exe(name: &str) -> Option<std::path::PathBuf> {
-    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("micro-exes/out");
-    path.push(name);
-    path.is_file().then_some(path)
-}
+use common::micro_exe;
+use std::time::{Duration, Instant};
 
 const WM_APP: u32 = 0x8000;
 const WAKE_BOUND: Duration = Duration::from_secs(5);
@@ -29,7 +21,7 @@ const WAKE_BOUND: Duration = Duration::from_secs(5);
 #[test]
 fn post_message_from_another_thread_wakes_primary_inbox_within_bound() {
     let Some(path) = micro_exe("crt_hello.exe") else {
-        return; // fixture absent: skip
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // The session stays ALIVE on this thread for the whole park: its Drop
     // broadcasts Wake::Shutdown, which would otherwise answer the park with
@@ -62,7 +54,7 @@ fn post_message_from_another_thread_wakes_primary_inbox_within_bound() {
 #[test]
 fn session_teardown_shuts_down_a_parked_inbox() {
     let Some(path) = micro_exe("crt_hello.exe") else {
-        return; // fixture absent: skip
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let session =
         wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::ExitOnIdle)
@@ -90,7 +82,7 @@ fn session_teardown_shuts_down_a_parked_inbox() {
 #[test]
 fn concurrent_queue_pushes_wake_a_reparking_reader() {
     let Some(path) = micro_exe("crt_hello.exe") else {
-        return; // fixture absent: skip
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let session =
         wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::ExitOnIdle)

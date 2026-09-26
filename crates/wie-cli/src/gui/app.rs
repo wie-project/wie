@@ -603,6 +603,12 @@ struct WieApp {
     /// time window and slop rectangle posts WM_LBUTTONDBLCLK instead of
     /// WM_LBUTTONDOWN (the message Windows itself would synthesize).
     last_left_press: Option<(Instant, f64, f64, u64)>,
+    /// The last cursor position the RawInput lane reported, in client-relative
+    /// LOGICAL pixels. A synthesized `RAWMOUSE` movement report is RELATIVE, so
+    /// it needs the previous position to state a true delta; `None` before the
+    /// first move (that report then carries no movement, which is correct —
+    /// there was none to report). See `input_events::dispatch_window_event`.
+    last_raw_cursor: Option<(i32, i32)>,
     /// Currently held modifier keys (shift/ctrl/alt) — from ModifiersChanged.
     modifiers: winit::keyboard::ModifiersState,
     /// macOS application menu bar mirroring the guest window's menu.
@@ -967,36 +973,15 @@ pub fn run_gui_windowed(
                         crate::gui::print::enable_interactive_page_setup_dialogs(&mut session);
                         let handle = session.guest_handle();
 
-                        // Wave 2 (Option A1): D3D9 Present commits leave the
-                        // emu thread — the present-committer render thread
-                        // stretches + publishes the committed backbuffer off
-                        // the big lock, then fires the same Frame-event wake
-                        // the guest publish path uses. `WIE_PRESENT_COMMIT=0`
-                        // or a failed spawn keeps the legacy in-handler path
-                        // (the CI hash gates exercise that path headless).
-                        // The handle lives to the end of this closure — its
-                        // Drop stops + joins the render thread at teardown.
-                        let _present_committer = {
-                            let commit_proxy = proxy.clone();
-                            let commit_pending = pending_frame_guest.clone();
-                            handle.enable_present_commit(Box::new(move || {
-                                commit_pending.store(true, std::sync::atomic::Ordering::SeqCst);
-                                let _ = commit_proxy.send_event(WieEvent::Frame {
-                                    published_at: Instant::now(),
-                                });
-                            }))
-                        };
-
                         // Wave 2: the D3D9 Draw*/Clear handlers record ops
                         // and Present flushes the stream to the capture
                         // render thread (which replays + publishes off the
-                        // big lock). Default-on for GUI sessions now that
+                        // big lock) — the only GUI render-thread path.
+                        // Default-on for GUI sessions now that
                         // the hash-equivalence + RT read-back gates pass;
                         // `WIE_CAPTURE_STREAM=0` opts back out to the
                         // legacy in-handler raster path. The handle's Drop
-                        // stops + joins the thread at teardown. When capture
-                        // is on it supersedes the commit path (the Present
-                        // handler checks the capture gate first).
+                        // stops + joins the thread at teardown.
                         let _capture_streamer = if std::env::var("WIE_CAPTURE_STREAM")
                             .is_ok_and(|v| v == "0")
                         {
@@ -1195,6 +1180,7 @@ pub fn run_gui_windowed(
         wheel_accum_x: 0.0,
         wheel_accum_y: 0.0,
         last_left_press: None,
+        last_raw_cursor: None,
         modifiers: winit::keyboard::ModifiersState::default(),
         #[cfg(target_os = "macos")]
         menu_bar: crate::gui::menu_bar::MacMenuBar::new(proxy.clone()),

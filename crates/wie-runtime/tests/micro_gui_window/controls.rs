@@ -6,10 +6,7 @@ use crate::helpers::{drive_gui_session, gui_suite_serialize, micro_exe};
 #[test]
 fn gui_control_child_windows_and_command() {
     let Some(path) = micro_exe("gui_control.exe") else {
-        eprintln!(
-            "skip: micro-exes/out/gui_control.exe not built (run make -C micro-exes gui_exes)"
-        );
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -32,8 +29,7 @@ fn gui_control_child_windows_and_command() {
 #[test]
 fn gui_edit_multiline_edit_messages() {
     let Some(path) = micro_exe("gui_edit.exe") else {
-        eprintln!("skip: micro-exes/out/gui_edit.exe not built (run make -C micro-exes gui_exes)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();

@@ -220,8 +220,12 @@ fn is_near_branch(instr: &Instruction) -> bool {
 // packed-integer ops are `xmm, xmm/m128`); keep the groups readable by mnemonic.
 fn is_lowerable(instr: &Instruction) -> bool {
     match instr.mnemonic() {
-        // Nop, endbranch, sign-extension / DF / rflags stack: always lowerable.
+        // Nop, endbranch, PAUSE, sign-extension / DF / rflags stack: always
+        // lowerable. PAUSE is in the same class as Nop (pipeline hint, no arch
+        // state — see `jit::tests::pause_tests`); listing it here is what lets
+        // a `cpp_threads` worker spin block reach the lowerer at all.
         Mnemonic::Nop
+        | Mnemonic::Pause
         | Mnemonic::Endbr64
         | Mnemonic::Endbr32
         | Mnemonic::Prefetchnta

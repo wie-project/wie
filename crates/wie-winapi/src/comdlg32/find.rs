@@ -6,7 +6,7 @@ use crate::guest_layout::FindReplace;
 use crate::guest_memory::{with_typed_read, with_typed_write};
 use crate::guest_string::{read_utf16_lossy, write_utf16_c_string};
 use crate::handles::Hwnd;
-use crate::state::{FindDialogSession, QueuedWindowMessage};
+use crate::state::FindDialogSession;
 use crate::user32::controls::ControlClassKind;
 use crate::user32::{
     BS_DEFPUSHBUTTON, CommandPayload, CreateWindowRequest, WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP,
@@ -623,7 +623,7 @@ fn submit_find_dialog(
     })
     .context("failed to write FINDREPLACE on submit")?;
 
-    post_find_msgstring(state, &session);
+    post_find_msgstring(state, &session)?;
     Ok(())
 }
 
@@ -651,7 +651,7 @@ fn close_find_dialog(
     })
     .context("failed to write FINDREPLACE on close")?;
 
-    post_find_msgstring(state, &session);
+    post_find_msgstring(state, &session)?;
     destroy_find_dialog(state, &session);
     Ok(())
 }
@@ -659,20 +659,15 @@ fn close_find_dialog(
 /// Queue `FINDMSGSTRING` to the dialog's owner with lParam = the guest
 /// `FINDREPLACE` VA. The owner's GetMessage loop is already pumping (modeless
 /// dialog), so a plain queue push delivers it on the next drain.
-fn post_find_msgstring(state: &mut WinApiState, session: &FindDialogSession) {
+fn post_find_msgstring(state: &mut WinApiState, session: &FindDialogSession) -> Result<()> {
     let message_id = findmsgstring_id(state);
+    let hwnd = Hwnd::from(session.owner_hwnd);
+    // The owner's own pump is the one that reads it: route by window owner.
+    let tid = state
+        .window_owner_tid(hwnd)
+        .unwrap_or_else(|| state.kernel.threads.current_tid());
     let mut queue = state.lock_message_queue();
-    let time = queue.next_message_time;
-    queue.messages.push(QueuedWindowMessage {
-        window_handle: Hwnd::from(session.owner_hwnd),
-        message: message_id,
-        word_parameter: 0,
-        long_parameter: session.fr_ptr,
-        time,
-        point_x: 0,
-        point_y: 0,
-    });
-    queue.next_message_time = time.saturating_add(1);
+    queue.push_to(tid, hwnd, message_id, 0, session.fr_ptr)?;
     tracing::debug!(
         target: "wiegui",
         message_id,
@@ -680,6 +675,7 @@ fn post_find_msgstring(state: &mut WinApiState, session: &FindDialogSession) {
         fr_va = session.fr_ptr,
         "FINDMSGSTRING posted"
     );
+    Ok(())
 }
 
 /// Resolve the id `RegisterWindowMessageW("FINDMSGSTRING")` returns — or, if
@@ -899,10 +895,12 @@ mod tests {
             .registered_messages
             .get(super::FINDMSGSTRING_NAME)
             .copied();
+        let tid = state.kernel.threads.current_tid();
         let queue = state.lock_message_queue();
         findmsg_id.and_then(|id| {
             queue
-                .messages
+                .queues
+                .messages(tid)
                 .iter()
                 .find(|message| message.message == id)
                 .cloned()
@@ -1053,7 +1051,7 @@ mod tests {
         let checkbox = find_window(&mut state, session.match_case_hwnd).expect("checkbox");
         assert_eq!(checkbox.control_text, "[ ] Match case");
         // No FINDMSGSTRING is posted for a checkbox toggle.
-        assert!(state.lock_message_queue().messages.is_empty());
+        assert!(state.lock_message_queue().queues.is_empty());
     }
 
     #[test]

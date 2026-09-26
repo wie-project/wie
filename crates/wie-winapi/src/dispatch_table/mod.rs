@@ -176,6 +176,19 @@ pub fn dispatch_winapi(
     {
         return Ok(r);
     }
+    // DirectInput8 — the `DirectInput8Create` export plus both COM interfaces
+    // (`IDirectInput8::Xxx` / `IDirectInputDevice8::Xxx` trace names, which
+    // `fake_va::ComIface::library` also routes here).
+    if library.eq_ignore_ascii_case("dinput8.dll")
+        && let Some(r) = crate::dinput::dispatch_dinput8(ctx, name)?
+    {
+        return Ok(r);
+    }
+    if library.eq_ignore_ascii_case("dinput8.dll")
+        && let Some(r) = crate::dinput::dispatch_object_method(ctx, name)?
+    {
+        return Ok(r);
+    }
     // Mingw runtime DLLs (pthread, libstdc++).
     if library.eq_ignore_ascii_case("libwinpthread-1.dll")
         || library.eq_ignore_ascii_case("libwinpthread-1")

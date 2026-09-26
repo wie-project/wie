@@ -228,6 +228,12 @@ pub const DYNAMIC_FAKE_APIS: &[DynamicFakeApi] = fake_api_table![
     ("COMCTL32.dll", "InitCommonControlsEx"),
     ("UXTHEME.dll", "SetWindowTheme"),
     ("D3D9.dll", "Direct3DCreate9"),
+    // dinput8.dll also exports `DirectInput8Create` by ORDINAL 1 only (no
+    // named export in the PE), so `GetProcAddress(dinput8, "DirectInput8Create")`
+    // is the only way a late-bound guest can reach it. It is listed here as
+    // well as in the static import path so both routes land on the same
+    // handler.
+    ("dinput8.dll", "DirectInput8Create"),
 ];
 
 /// Names intentionally resolved to NULL by `GetProcAddress`.

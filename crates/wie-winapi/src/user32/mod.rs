@@ -106,6 +106,10 @@ pub(crate) const WM_SETFONT: u32 = wm::WinMsg::WM_SETFONT.as_u32();
 /// WM_GETFONT — the stored HFONT (0 when never set).
 pub(crate) const WM_GETFONT: u32 = wm::WinMsg::WM_GETFONT.as_u32();
 pub(crate) const WM_CONTEXTMENU: u32 = wm::WinMsg::WM_CONTEXTMENU.as_u32();
+/// WM_INPUT (winuser.h:1173) — the raw-input delivery message; the constant
+/// lives on [`wm::WinMsg`] with the rest of the table and is aliased here so
+/// the RawInput lane names it like every other `WM_*`.
+pub(crate) const WM_INPUT: u32 = wm::WinMsg::WM_INPUT.as_u32();
 pub(crate) const WM_COMMAND: u32 = wm::WinMsg::WM_COMMAND.as_u32();
 pub(crate) const WM_TIMER: u32 = wm::WinMsg::WM_TIMER.as_u32();
 #[cfg(test)]
@@ -264,6 +268,7 @@ pub mod lang;
 pub mod menu;
 pub mod message;
 pub mod misc;
+pub mod raw_input;
 pub mod rect;
 pub mod stubs;
 pub mod window;
@@ -279,6 +284,7 @@ pub use lang::*;
 pub use menu::*;
 pub use message::*;
 pub use misc::*;
+pub use raw_input::*;
 pub use rect::*;
 pub use stubs::*;
 pub use window::*;
@@ -637,6 +643,10 @@ pub(crate) fn create_window_record(
         menu::resolve_class_menu(state, request.menu_handle, registered_class.as_ref())?
     };
 
+    // The window belongs to the creating thread's message queue for the rest
+    // of its life: `PostMessage(hwnd)` routes there. `current_tid()` is the
+    // ACTIVE thread because every window is created inside a host API stop.
+    let owner_tid = state.kernel.threads.current_tid();
     state.window_state().windows.push(WindowRecord {
         handle: crate::handles::Hwnd::from(handle),
         class_atom,
@@ -647,6 +657,7 @@ pub(crate) fn create_window_record(
         style: request.style,
         extended_style: request.extended_style,
         parent_handle: crate::handles::Hwnd::from(request.parent_handle),
+        owner_tid,
         menu_handle,
         instance_handle: request.instance_handle,
         x: request.x,
@@ -666,6 +677,13 @@ pub(crate) fn create_window_record(
         subclass_original_wndproc: 0,
     });
     state.window_state().touch_window_mirror();
+    // Mirror the owner into the message queue's routing index so a HOST post
+    // (which locks only the queue, never this state) still reaches the right
+    // thread. Guest-side routing reads `WindowRecord::owner_tid` directly.
+    state
+        .lock_message_queue()
+        .queues
+        .register_window_owner(handle, owner_tid);
 
     Ok((handle, window_proc, class_unicode))
 }
@@ -780,6 +798,9 @@ pub fn dispatch_user32_extra(
     if let Some(result) = crate::clipboard::dispatch_clipboard(ctx, name)? {
         return Ok(Some(result));
     }
+    if let Some(result) = raw_input::dispatch_raw_input(ctx, name)? {
+        return Ok(Some(result));
+    }
     let n = name.to_ascii_lowercase();
     match n.as_str() {
         "attachthreadinput" => Ok(Some(stubs::handle_attach_thread_input(ctx)?)),
@@ -799,9 +820,6 @@ pub fn dispatch_user32_extra(
         "getmessageextrainfo" => Ok(Some(stubs::handle_get_message_extra_info(ctx)?)),
         "getmessagetime" => Ok(Some(stubs::handle_get_message_time(ctx)?)),
         "getpropw" => Ok(Some(stubs::handle_get_prop_w(ctx)?)),
-        "getrawinputdata" => Ok(Some(stubs::handle_get_raw_input_data(ctx)?)),
-        "getrawinputdeviceinfoa" => Ok(Some(stubs::handle_get_raw_input_device_info_a(ctx)?)),
-        "getrawinputdevicelist" => Ok(Some(stubs::handle_get_raw_input_device_list(ctx)?)),
         "getupdaterect" => Ok(Some(stubs::handle_get_update_rect(ctx)?)),
         "getwindowlongw" => Ok(Some(stubs::handle_get_window_long_w(ctx)?)),
         "intersectrect" => Ok(Some(stubs::handle_intersect_rect(ctx)?)),
@@ -815,7 +833,6 @@ pub fn dispatch_user32_extra(
             Ok(Some(stubs::handle_register_device_notification_w(ctx)?))
         }
         "registerhotkey" => Ok(Some(stubs::handle_register_hot_key(ctx)?)),
-        "registerrawinputdevices" => Ok(Some(stubs::handle_register_raw_input_devices(ctx)?)),
         "removepropw" => Ok(Some(stubs::handle_remove_prop_w(ctx)?)),
         "setcursorpos" => Ok(Some(stubs::handle_set_cursor_pos(ctx)?)),
         "setlayeredwindowattributes" => Ok(Some(stubs::handle_set_layered_window_attributes(ctx)?)),

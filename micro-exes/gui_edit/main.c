@@ -23,10 +23,26 @@
 
 #define IDC_EDIT     1
 #define TIMER_TICKS  5
+// Short mode: two ticks still give the window one paint cycle before the
+// self-test runs. The assertion groups themselves are tick-independent.
+#define TIMER_TICKS_SHORT 2
 
 static HWND g_edit;
 static int  g_selftest;
 static int  g_timer_count;
+
+// Opt-in short mode: WIE_SHORT=1 in the *guest* environment (injected host-side
+// through WIE_GUEST_ENV="WIE_SHORT=1") cuts the WM_TIMER budget. With WIE_SHORT
+// absent — every normal run and every existing test — g_ticks holds TIMER_TICKS
+// and the fixture is unchanged; short mode is opt-in only. run_selftest() still
+// runs all eight assertion groups in full.
+static int g_ticks = TIMER_TICKS;
+
+static int short_mode(void) {
+    char buf[16];
+    DWORD n = GetEnvironmentVariableA("WIE_SHORT", buf, sizeof(buf));
+    return n == 1 && buf[0] == '1';
+}
 
 // Self-test gate: the CI harness injects WIE_SELFTEST=1, which runs the
 // scripted timer-driven assertion suite and auto-quits. Interactive runs keep
@@ -149,7 +165,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_TIMER:
         g_timer_count++;
         InvalidateRect(hwnd, NULL, FALSE);
-        if (g_selftest && g_timer_count >= TIMER_TICKS) {
+        if (g_selftest && g_timer_count >= g_ticks) {
             int code = run_selftest();
             if (code != 0) {
                 ExitProcess(code);
@@ -215,6 +231,10 @@ void entry(void) {
         ExitProcess(112);
     }
 
+    if (short_mode()) {
+        g_ticks = TIMER_TICKS_SHORT;
+    }
+
     if (SetTimer(hwnd, 1, 50, NULL) == 0) {
         ExitProcess(113);
     }
@@ -230,7 +250,7 @@ void entry(void) {
     // PostQuitMessage only happens from the completed selftest (or WM_DESTROY
     // in interactive mode); reaching here without the timer budget means the
     // selftest never ran to completion.
-    if (g_selftest && g_timer_count < TIMER_TICKS) {
+    if (g_selftest && g_timer_count < g_ticks) {
         ExitProcess(120);
     }
 

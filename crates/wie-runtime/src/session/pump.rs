@@ -102,7 +102,12 @@ impl<'a> SessionPumpHooks<'a> {
                         WOM_DONE,
                     ))),
                     WaveOutCallbackKind::Window => {
-                        guard.lock_message_queue().push(
+                        // The callback HWND is a fake handle with no window
+                        // record, so the message lands on the calling
+                        // thread's queue — the one running this pump.
+                        let tid = guard.kernel.threads.current_tid();
+                        guard.lock_message_queue().push_to(
+                            tid,
                             wie_winapi::handles::Hwnd::from(due.callback_va),
                             WOM_DONE,
                             due.handle,

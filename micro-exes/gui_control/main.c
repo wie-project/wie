@@ -20,6 +20,9 @@
 
 #define ID_BUTTON 42
 #define TIMER_TICKS 5
+// Short mode: two ticks still give the window one paint cycle before the
+// self-click destroys it (tick 1 paints, tick 2 clicks).
+#define TIMER_TICKS_SHORT 2
 
 static HWND   g_button;
 static HWND   g_static;
@@ -30,6 +33,18 @@ static int g_timer_count = 0;
 static int g_selftest;
 static int g_width  = 1280;
 static int g_height = 800;
+
+// Opt-in short mode: WIE_SHORT=1 in the *guest* environment (injected host-side
+// through WIE_GUEST_ENV="WIE_SHORT=1") cuts the WM_TIMER budget. With WIE_SHORT
+// absent — every normal run and every existing test — g_ticks holds TIMER_TICKS
+// and the fixture is unchanged; short mode is opt-in only.
+static int g_ticks = TIMER_TICKS;
+
+static int short_mode(void) {
+    char buf[16];
+    DWORD n = GetEnvironmentVariableA("WIE_SHORT", buf, sizeof(buf));
+    return n == 1 && buf[0] == '1';
+}
 
 // Self-test gate: the CI harness injects WIE_SELFTEST=1, which runs the
 // scripted timer-driven self-click that destroys the window. Interactive runs
@@ -101,7 +116,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_TIMER:
         g_timer_count++;
         InvalidateRect(hwnd, NULL, FALSE);
-        if (g_selftest && g_timer_count >= TIMER_TICKS) {
+        if (g_selftest && g_timer_count >= g_ticks) {
             // Self-test: programmatic activation through the real SendMessage
             // path. The host control WndProc turns BM_CLICK into
             // WM_COMMAND(BN_CLICKED) to this window → DestroyWindow.
@@ -238,6 +253,10 @@ void entry(void) {
         }
     }
 
+    if (short_mode()) {
+        g_ticks = TIMER_TICKS_SHORT;
+    }
+
     if (SetTimer(hwnd, 1, 50, NULL) == 0) {
         ExitProcess(151);
     }
@@ -253,7 +272,7 @@ void entry(void) {
     // PostQuitMessage only happens from WM_DESTROY, which only happens after
     // the simulated click fired WM_COMMAND — this check proves the chain.
     // Interactive runs quit on 'q' or a real button click at any time.
-    if (g_selftest && g_timer_count < TIMER_TICKS) {
+    if (g_selftest && g_timer_count < g_ticks) {
         ExitProcess(152);
     }
 

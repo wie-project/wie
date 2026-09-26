@@ -17,7 +17,22 @@
 
 #define MAX_LEN 70
 #define HOT_ITERS 400
+// Short mode: the length sweep in [1, MAX_LEN] is the coverage and stays whole;
+// only the outer "make this block JIT-hot" repeat count shrinks.
+#define HOT_ITERS_SHORT 20
 #define GUARD 0xAA
+
+// Opt-in short mode: WIE_SHORT=1 in the *guest* environment (injected host-side
+// through WIE_GUEST_ENV="WIE_SHORT=1"). Absent that variable g_hot keeps the
+// HOT_ITERS value above, so the default path is unchanged — every length is
+// still checked the same number of times. Short mode only reduces redundancy.
+static int g_hot = HOT_ITERS;
+
+static int short_mode(void) {
+  char buf[16];
+  DWORD n = GetEnvironmentVariableA("WIE_SHORT", buf, sizeof(buf));
+  return n == 1 && buf[0] == '1';
+}
 
 static volatile unsigned char src[256];
 static volatile unsigned char dst[256];
@@ -72,7 +87,10 @@ static void check_stos(int n) {
 }
 
 void entry(void) {
-  for (int iter = 0; iter < HOT_ITERS; iter++) {
+  if (short_mode()) {
+    g_hot = HOT_ITERS_SHORT;
+  }
+  for (int iter = 0; iter < g_hot; iter++) {
     for (int n = 1; n <= MAX_LEN; n++) {
       check_movs(n);
       check_stos(n);

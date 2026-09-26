@@ -4,6 +4,7 @@
 mod bg_pool_tests;
 mod chain_tests;
 mod inv_gen_tests;
+mod pause_tests;
 mod strlen_repro;
 mod testb_high_byte;
 use super::*;

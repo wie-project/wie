@@ -372,7 +372,8 @@ fn test_peek_message_a_with_message() {
         .message_queue
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .messages
+        .queues
+        .queue_for(PRIMARY_THREAD_ID)
         .push(QueuedWindowMessage {
             window_handle: crate::handles::Hwnd::from(0x100),
             message: 15, // WM_PAINT
@@ -398,10 +399,9 @@ fn test_peek_message_a_with_message() {
     // WM_PAINT should have been removed from the queue.
     assert_eq!(
         state
-            .message_queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .messages
+            .lock_message_queue()
+            .queues
+            .messages(PRIMARY_THREAD_ID)
             .len(),
         0
     );
@@ -420,7 +420,8 @@ fn test_peek_message_a_noremove() {
         .message_queue
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .messages
+        .queues
+        .queue_for(PRIMARY_THREAD_ID)
         .push(QueuedWindowMessage {
             window_handle: crate::handles::Hwnd::from(0x100),
             message: 15,
@@ -444,10 +445,9 @@ fn test_peek_message_a_noremove() {
     // Message should still be in the queue.
     assert_eq!(
         state
-            .message_queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .messages
+            .lock_message_queue()
+            .queues
+            .messages(PRIMARY_THREAD_ID)
             .len(),
         1
     );
@@ -467,7 +467,8 @@ fn test_get_message_wm_quit_bypasses_window_filter() {
         .message_queue
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .messages
+        .queues
+        .queue_for(PRIMARY_THREAD_ID)
         .push(QueuedWindowMessage {
             window_handle: crate::handles::Hwnd::from(0x1234),
             message: 0x12, // WM_QUIT
@@ -546,7 +547,8 @@ fn test_get_message_dialog_filter_matches_descendants() {
         .message_queue
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .messages
+        .queues
+        .queue_for(PRIMARY_THREAD_ID)
         .push(QueuedWindowMessage {
             window_handle: crate::handles::Hwnd::from(child),
             message: 0x0100, // WM_KEYDOWN
@@ -599,7 +601,8 @@ fn test_empty_queue_yields_while_dialog_open_under_exit_on_idle() {
     assert!(
         state
             .lock_message_queue()
-            .messages
+            .queues
+            .messages(PRIMARY_THREAD_ID)
             .iter()
             .all(|m| m.message != 0x12)
     );
@@ -803,4 +806,303 @@ fn test_enum_display_settings_w_reports_custom_display_metrics() {
     };
     assert_eq!(read_u32(&mut engine, 0x50AC), 1728, "dmPelsWidth");
     assert_eq!(read_u32(&mut engine, 0x50B0), 1117, "dmPelsHeight");
+}
+
+// ── Per-thread (multi-queue) message pump ───────────────────────────
+//
+// Windows gives every guest thread its own message queue. These pin the
+// routing: `PostThreadMessageW` targets a queue by tid, `PostMessage` targets
+// the queue that owns the window, and `GetMessage`/`PeekMessage` only ever
+// dequeue the CALLING thread's messages.
+
+/// Messages queued for `tid` right now (the whole per-thread sub-queue).
+fn queued_for(state: &WinApiState, tid: u32) -> Vec<crate::QueuedWindowMessage> {
+    state.lock_message_queue().queues.messages(tid).to_vec()
+}
+
+/// A minimal window record owned by `owner_tid` (enough for the routing and
+/// the window filter; no WndProc so the pump dispatches it host-side).
+fn push_owned_window(state: &mut WinApiState, hwnd: u64, owner_tid: u32) {
+    state.window_state().windows.push(crate::WindowRecord {
+        handle: crate::handles::Hwnd::from(hwnd),
+        title: "Owned".to_owned(),
+        owner_tid,
+        width: 10,
+        height: 10,
+        ..Default::default()
+    });
+    state
+        .lock_message_queue()
+        .queues
+        .register_window_owner(hwnd, owner_tid);
+}
+
+/// Map the guest MSG struct the pump handlers write into.
+fn map_msg_struct(engine: &mut IcedCpu) -> u64 {
+    let msg_va = 0x4000;
+    engine
+        .mem_map(msg_va, 0x1000, wie_cpu::RwxPerms::ALL)
+        .expect("map msg struct");
+    msg_va
+}
+
+/// PeekMessage with `PM_REMOVE`, returning the handler's return value.
+fn peek_remove(
+    engine: &mut IcedCpu,
+    state: &mut WinApiState,
+    msg_va: u64,
+    window_filter: u64,
+) -> Result<u64> {
+    write_regs(engine, msg_va, window_filter, 0, 0, STACK_TOP);
+    engine
+        .mem_write(STACK_TOP + 0x28, &1_u32.to_le_bytes())
+        .expect("write PM_REMOVE");
+    Ok(
+        user32::handle_peek_message_a(&mut HandlerContext::new(engine, test_environment(), state))?
+            .return_value,
+    )
+}
+
+/// `PostThreadMessageW` to a foreign tid lands in THAT thread's queue and is
+/// invisible to the posting thread's own pump.
+#[test]
+fn post_thread_message_w_routes_to_the_target_thread_queue() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let msg_va = map_msg_struct(&mut engine);
+    let worker = state.kernel.threads.alloc_worker();
+    assert_ne!(worker, PRIMARY_THREAD_ID, "worker must be a distinct tid");
+
+    // PostThreadMessageW(tid = worker, WM_KEYDOWN, wParam = 0x41).
+    write_regs(&mut engine, u64::from(worker), 0x0100, 0x41, 0, STACK_TOP);
+    assert_return_value!(
+        user32::handle_post_thread_message_w(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        1
+    );
+
+    // The posting (primary) thread cannot see it.
+    assert_eq!(
+        peek_remove(&mut engine, &mut state, msg_va, 0).expect("primary PeekMessage"),
+        0,
+        "a foreign thread's message is invisible to the poster"
+    );
+    assert!(
+        queued_for(&state, PRIMARY_THREAD_ID).is_empty(),
+        "the primary queue stays empty"
+    );
+
+    // The target thread's own pump sees it.
+    state.kernel.threads.activate(worker);
+    assert_eq!(
+        peek_remove(&mut engine, &mut state, msg_va, 0).expect("worker PeekMessage"),
+        1,
+        "the target thread dequeues its own message"
+    );
+    let mut b = [0_u8; 4];
+    engine
+        .mem_read(msg_va + 8, &mut b)
+        .expect("read MSG.message");
+    assert_eq!(u32::from_le_bytes(b), 0x0100);
+    assert!(
+        queued_for(&state, worker).is_empty(),
+        "PM_REMOVE dequeued it"
+    );
+}
+
+/// `PostMessage(hwnd)` targets the queue that owns the window, not the
+/// posting thread's queue.
+#[test]
+fn post_message_routes_to_the_window_owning_thread_queue() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let msg_va = map_msg_struct(&mut engine);
+    let worker = state.kernel.threads.alloc_worker();
+    let hwnd = 0x6610_00A1_u64;
+    push_owned_window(&mut state, hwnd, worker);
+
+    // PostMessageA(hwnd, WM_COMMAND, 0x1234, 0) from the PRIMARY thread.
+    write_regs(&mut engine, hwnd, 0x0111, 0x1234, 0, STACK_TOP);
+    assert_return_value!(
+        user32::handle_post_message_a(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        1
+    );
+
+    assert_eq!(
+        peek_remove(&mut engine, &mut state, msg_va, 0).expect("primary PeekMessage"),
+        0,
+        "the poster never sees a message routed to another thread's queue"
+    );
+
+    state.kernel.threads.activate(worker);
+    assert_eq!(
+        peek_remove(&mut engine, &mut state, msg_va, 0).expect("worker PeekMessage"),
+        1,
+        "the owning thread dequeues it"
+    );
+    let mut b = [0_u8; 4];
+    engine
+        .mem_read(msg_va + 8, &mut b)
+        .expect("read MSG.message");
+    assert_eq!(u32::from_le_bytes(b), 0x0111, "WM_COMMAND");
+    engine
+        .mem_read(msg_va + 16, &mut b)
+        .expect("read MSG.wParam");
+    assert_eq!(u32::from_le_bytes(b), 0x1234, "wParam survives the route");
+}
+
+/// A window with no recorded owner (never a real tid, e.g. a `Default`
+/// record) falls back to the posting thread's own queue.
+#[test]
+fn post_message_to_an_unowned_window_uses_the_posting_thread_queue() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let msg_va = map_msg_struct(&mut engine);
+    let hwnd = 0x6610_00A2_u64;
+    push_owned_window(&mut state, hwnd, 0);
+
+    write_regs(&mut engine, hwnd, 0x0100, 0, 0, STACK_TOP);
+    assert_return_value!(
+        user32::handle_post_message_a(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        1
+    );
+    assert_eq!(
+        peek_remove(&mut engine, &mut state, msg_va, 0).expect("PeekMessage"),
+        1,
+        "an unowned window's message stays on the posting thread's queue"
+    );
+}
+
+/// `GetMessage` on one thread never drains the other thread's queue, in
+/// either direction.
+#[test]
+fn get_message_only_dequeues_the_calling_thread_queue() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let msg_va = map_msg_struct(&mut engine);
+    let worker = state.kernel.threads.alloc_worker();
+
+    // One message per thread, straight into the queues.
+    {
+        let mut queue = state.lock_message_queue();
+        queue
+            .push_to(
+                PRIMARY_THREAD_ID,
+                crate::handles::Hwnd::NULL,
+                0x0111,
+                0xAA,
+                0,
+            )
+            .expect("push primary");
+        queue
+            .push_to(worker, crate::handles::Hwnd::NULL, 0x0111, 0xBB, 0)
+            .expect("push worker");
+    }
+
+    // Primary's GetMessage takes the primary message (wParam 0xAA)...
+    write_regs(&mut engine, msg_va, 0, 0, 0, STACK_TOP);
+    let r = user32::handle_get_message_a(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("primary GetMessageA");
+    assert_eq!(r.return_value, 1);
+    let mut b = [0_u8; 4];
+    engine
+        .mem_read(msg_va + 16, &mut b)
+        .expect("read MSG.wParam");
+    assert_eq!(u32::from_le_bytes(b), 0xAA, "primary dequeued its own");
+    assert!(
+        queued_for(&state, worker).len() == 1,
+        "the worker message is untouched by the primary's GetMessage"
+    );
+
+    // ...and the worker's GetMessage takes the worker one (wParam 0xBB).
+    state.kernel.threads.activate(worker);
+    write_regs(&mut engine, msg_va, 0, 0, 0, STACK_TOP);
+    let r = user32::handle_get_message_a(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("worker GetMessageA");
+    assert_eq!(r.return_value, 1);
+    engine
+        .mem_read(msg_va + 16, &mut b)
+        .expect("read MSG.wParam");
+    assert_eq!(u32::from_le_bytes(b), 0xBB, "worker dequeued its own");
+    assert!(queued_for(&state, worker).is_empty());
+}
+
+/// `PostQuitMessage` posts to the CALLING thread's queue, and `WM_QUIT` still
+/// bypasses both the window and the message-range filter there.
+#[test]
+fn post_quit_message_targets_the_calling_thread_and_bypasses_filters() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    let msg_va = map_msg_struct(&mut engine);
+    let worker = state.kernel.threads.alloc_worker();
+
+    state.kernel.threads.activate(worker);
+    write_regs(&mut engine, 0x2A, 0, 0, 0, STACK_TOP);
+    user32::handle_post_quit_message(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("PostQuitMessage");
+
+    assert!(
+        queued_for(&state, PRIMARY_THREAD_ID).is_empty(),
+        "the quit is not visible to the primary thread"
+    );
+    assert!(
+        queued_for(&state, worker).len() == 1,
+        "the quit lands on the calling thread's queue"
+    );
+
+    // Primary: a non-matching window filter and a non-matching range still
+    // must not surface a foreign thread's WM_QUIT.
+    state.kernel.threads.activate(PRIMARY_THREAD_ID);
+    write_regs(&mut engine, msg_va, 0xDEAD, 0x0700, 0x0800, STACK_TOP);
+    assert_return_value!(
+        user32::handle_peek_message_a(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        0
+    );
+
+    // The owner thread's GetMessage sees it despite both filters.
+    state.kernel.threads.activate(worker);
+    write_regs(&mut engine, msg_va, 0xDEAD, 0x0700, 0x0800, STACK_TOP);
+    let r = user32::handle_get_message_a(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("worker GetMessageA");
+    assert_eq!(r.return_value, 0, "GetMessage reports WM_QUIT as FALSE");
+    let mut b = [0_u8; 4];
+    engine
+        .mem_read(msg_va + 8, &mut b)
+        .expect("read MSG.message");
+    assert_eq!(u32::from_le_bytes(b), 0x12, "WM_QUIT bypassed the filters");
+    engine
+        .mem_read(msg_va + 16, &mut b)
+        .expect("read MSG.wParam");
+    assert_eq!(u32::from_le_bytes(b), 0x2A, "the quit exit code is intact");
 }

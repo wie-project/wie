@@ -688,6 +688,7 @@ mod common_dialogs;
 mod d3d9_state_tests;
 mod d3d9_tests;
 mod d3d9_texture_tests;
+mod dinput_tests;
 mod dll_state_map;
 mod edit_core;
 mod edit_layout;

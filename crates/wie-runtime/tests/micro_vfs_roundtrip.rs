@@ -5,16 +5,10 @@
 //! - bottle `drive_c` = guest `C:\`
 //! - PE reads `D:\…`, copies to `C:\App\…`, writes modified file back to `D:\…`
 
-use std::path::{Path, PathBuf};
+mod common;
 
-fn micro_exe(name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("micro-exes/out");
-    path.push(name);
-    path.is_file().then_some(path)
-}
+use common::micro_exe;
+use std::path::{Path, PathBuf};
 
 fn fixture_utf8() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -42,8 +36,7 @@ fn assert_utf8_has_en_ru_cjk(text: &str, label: &str) {
 #[test]
 fn vfs_roundtrip_host_d_to_bottle_c_and_back() {
     let Some(pe) = micro_exe("vfs_roundtrip.exe") else {
-        eprintln!("skip: vfs_roundtrip.exe not built (make -C micro-exes vfs_roundtrip)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
 
     let pid = std::process::id();
@@ -129,8 +122,7 @@ fn vfs_roundtrip_host_d_to_bottle_c_and_back() {
 #[test]
 fn vfs_roundtrip_custom_paths_via_guest_flags() {
     let Some(pe) = micro_exe("vfs_roundtrip.exe") else {
-        eprintln!("skip: vfs_roundtrip.exe not built");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
 
     let pid = std::process::id();
@@ -193,8 +185,7 @@ fn vfs_roundtrip_optional_real_downloads() {
         return;
     }
     let Some(pe) = micro_exe("vfs_roundtrip.exe") else {
-        eprintln!("skip: vfs_roundtrip.exe not built");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
 
     let downloads = dirs_downloads().expect("HOME/Downloads");

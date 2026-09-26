@@ -5,26 +5,16 @@
 //!
 //! The micro creates no windows, so it needs no GUI_SUITE_LOCK serialization.
 //!
-//! Binary from `make -C micro-exes user32_char`. Skips if missing (no mingw).
+//! Binary from `make -C micro-exes user32_char`. A missing binary fails the test (see `tests/common/mod.rs`).
 
-use std::path::PathBuf;
+mod common;
 
-fn micro_exe(name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("micro-exes/out");
-    path.push(name);
-    path.is_file().then_some(path)
-}
+use common::micro_exe;
 
 #[test]
 fn user32_notepad_gap_apis_roundtrip() {
     let Some(path) = micro_exe("user32_char.exe") else {
-        eprintln!(
-            "skip: micro-exes/out/user32_char.exe not built (run make -C micro-exes user32_char)"
-        );
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let summary = wie_runtime::run_micro_exe(&path, 256).expect("run_micro_exe");
     assert_eq!(

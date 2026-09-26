@@ -25,6 +25,24 @@
 static const wchar_t DIR_PATH[] = L"C:\\watch_test";
 static const wchar_t FILE_PATH[] = L"C:\\watch_test\\file.txt";
 
+/*
+ * Opt-in short mode: WIE_SHORT=1 in the guest environment (injected host-side
+ * through WIE_GUEST_ENV="WIE_SHORT=1") shortens the worker's pre-change
+ * settle delay below. When WIE_SHORT is absent the delay is the full 200 ms,
+ * so the default path is exactly the historical behaviour. Short mode only
+ * trims the *wait*; the assertion (WaitForSingleObject must report the
+ * change) is unchanged either way — WIE's directory-watch object queues
+ * pending records, so a change that lands before the wait is still latched.
+ */
+#define SETTLE_MS_DEFAULT 200
+#define SETTLE_MS_SHORT   50
+
+static int settle_ms(void) {
+    char buf[16];
+    DWORD n = GetEnvironmentVariableA("WIE_SHORT", buf, sizeof(buf));
+    return (n == 1 && buf[0] == '1') ? SETTLE_MS_SHORT : SETTLE_MS_DEFAULT;
+}
+
 static DWORD WINAPI create_file_worker(LPVOID param) {
     HANDLE file;
     DWORD written = 0;
@@ -32,7 +50,7 @@ static DWORD WINAPI create_file_worker(LPVOID param) {
 
     (void)param;
     /* Let the primary reach WaitForSingleObject before the change fires. */
-    Sleep(200);
+    Sleep((DWORD)settle_ms());
 
     file = CreateFileW(FILE_PATH, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                        FILE_ATTRIBUTE_NORMAL, NULL);

@@ -57,6 +57,50 @@ rust_2021_prelude_collisions = "deny"
 # in CI (`scripts/check.sh` invokes it without `-D warnings`). `#[allow]` /
 # `#[expect]` leniency belongs in test code only.
 
+# ---------------------------------------------------------------------------
+# Dev/test profile: dependencies optimized, our own crates instrumented.
+#
+# WHY THIS BLOCK EXISTS — do not delete it as redundant.
+#
+# `cargo test` / `cargo nextest run` use the `dev` profile. Before this block
+# existed, cargo's *defaults* applied to every crate in the graph, so
+# Cranelift, iced-x86, wgpu-core, naga, winit AND all of our own guest
+# emulation, JIT lowering and software rasterization compiled at
+# `opt-level=0`. The test suites then spent their wall clock inside the
+# emulator machinery — JIT block compilation, iced decode, guest memory
+# translation — instead of inside the assertions under test. Splitting the
+# profile fixes that: third-party code (which nobody is debugging, and which
+# is written to be fast) gets optimized, while the five workspace crates keep
+# the dev defaults.
+#
+# `package."*"` matches NON-workspace members ONLY. Cargo's per-package profile
+# lookup skips any id for which `ws.is_member(id)` holds, so `wie-pe`,
+# `wie-cpu`, `wie-winapi`, `wie-runtime` and `wie-cli` inherit the plain
+# `[profile.dev]` defaults and stay at `opt-level=0` with `debug-assertions`
+# and `overflow-checks` ON. Verified empirically, not assumed: with
+# `RUSTC_WRAPPER` capturing the real rustc argv under a clean target dir,
+# cargo passes NO `-Copt-level` / `-Cdebug-assertions` / `-Coverflow-checks`
+# for `wie_pe` while the same graph gains `-C opt-level=2` for the deps.
+# Keeping our crates instrumented is the point: the software page-permission
+# checks in `wie-cpu` and the guest address arithmetic in `wie-runtime` are
+# exactly where a debug assertion is worth its keep, and paying for them on
+# the test path is the whole trade we are making.
+#
+# Do NOT weaken `[profile.release]`: CONTRIBUTING.md pins the `long_loop`
+# regression budget against that fat-LTO build.
+# ---------------------------------------------------------------------------
+[profile.dev]
+# Intentionally empty. Listing nothing here is what keeps the workspace
+# crates at opt-level=0 with debug-assertions/overflow-checks enabled.
+[profile.dev.package."*"]
+# opt-level 2, not 3. For a dep tree this size (Cranelift + wgpu + naga) the
+# 2-vs-3 delta is small — LLVM's last big wins are mostly inlining-driven and
+# opt-level=2 already inlines across crates — while 3 roughly doubles
+# dep rebuild time, and dep rebuild time is what developers pay on every
+# `cargo build` that invalidates the graph. Revisit to 3 only with a
+# measurement behind it, not on a hunch.
+opt-level = 2
+
 [profile.release]
 lto = true
 codegen-units = 1

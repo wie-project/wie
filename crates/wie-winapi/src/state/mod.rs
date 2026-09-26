@@ -150,6 +150,8 @@ pub enum DllId {
     Wininet,
     /// WinHTTP handle table (`WINHTTP.dll` — SDL2 online-probe handles).
     Winhttp,
+    /// DirectInput8 COM objects + per-device reports (`dinput8.dll`).
+    DInput8,
 }
 
 impl DllId {
@@ -213,6 +215,7 @@ const fn dll_slot(id: DllId) -> (usize, &'static str) {
         DllId::Winmm => (12, "winmm"),
         DllId::Wininet => (13, "wininet"),
         DllId::Winhttp => (14, "winhttp"),
+        DllId::DInput8 => (15, "dinput8"),
     }
 }
 
@@ -532,6 +535,46 @@ impl WinApiState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Guest thread that owns `window_handle` — the queue its posted messages
+    /// land in. `None` when the window is unknown or was created without a
+    /// recorded owner (`WindowRecord::owner_tid == 0`), in which case posting
+    /// falls back to the calling thread's own queue.
+    #[must_use]
+    pub fn window_owner_tid(&self, window_handle: crate::handles::Hwnd) -> Option<u32> {
+        self.try_window_state()
+            .and_then(|ws| {
+                ws.windows
+                    .iter()
+                    .find(|window| window.handle == window_handle)
+            })
+            .map(|window| window.owner_tid)
+            .filter(|owner_tid| *owner_tid != 0)
+    }
+
+    /// Queue one message for the thread that owns `window_handle`, falling
+    /// back to the calling thread's own queue.
+    ///
+    /// The single guest-side posting entry point: the owner tid comes from the
+    /// window records (authoritative) and NOT from the queue's routing mirror,
+    /// which exists only for host posts that cannot take this lock.
+    pub fn post_message(
+        &mut self,
+        window_handle: crate::handles::Hwnd,
+        message: u32,
+        word_parameter: u64,
+        long_parameter: u64,
+    ) -> anyhow::Result<()> {
+        let current_tid = self.kernel.threads.current_tid();
+        let tid = self.window_owner_tid(window_handle).unwrap_or(current_tid);
+        self.lock_message_queue().push_to(
+            tid,
+            window_handle,
+            message,
+            word_parameter,
+            long_parameter,
+        )
+    }
+
     /// Point the message queue's wake hub at [`SyncState::wake_hub`].
     ///
     /// Called once at session init: after this, EVERY handler-side
@@ -700,6 +743,21 @@ impl WinApiState {
     /// Read-only access — returns `None` if the state was never initialised.
     pub fn try_present(&self) -> Option<&present::PresentState> {
         self.dll_states.get::<present::PresentState>(DllId::Present)
+    }
+
+    /// Mutable access to the DirectInput8 COM objects, per-device data
+    /// formats, and in-flight enumerations. Lazy: allocated on the first
+    /// `dinput8.dll` call.
+    pub fn dinput8(&mut self) -> &mut crate::dinput::DInputState {
+        self.dll_states
+            .get_or_init::<crate::dinput::DInputState>(DllId::DInput8)
+    }
+
+    /// Read-only DirectInput8 state — `None` before the DLL is initialised.
+    #[must_use]
+    pub fn try_dinput8(&self) -> Option<&crate::dinput::DInputState> {
+        self.dll_states
+            .get::<crate::dinput::DInputState>(DllId::DInput8)
     }
 
     /// Rebuild the presenter-side window mirror from the current window

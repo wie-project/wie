@@ -81,7 +81,7 @@ suites for trend visibility; whole-program timing stays with
 
 The README keeps the shortlist; the complete set lives here.
 
-> **Wave3 defaults (final gate):** padded surface pool + wgpu scratch, latest-wins coalescing/throttling (`drain_pending_publishes` + `retry_delay`), pre-reserve (Q4/C), size-class TLS, and CompactString are **default on** — steady zero-alloc with no env required. JIT direct register hand-off (`WIE_JIT_DIRECT_REGS`) is **still unbuilt** despite the "default on" wording in ADR-0002 (implementation status note added 2026-09-02 — zero call sites; see `docs/implementation-plan.md` Wave 3); D3D9 in-place pooled target (Q9/C) is default. 64 px pitch padding is implemented (ADR-0001 status note, 2026-09-02) — `WIE_SURFACE_PAD=0` opts out.
+> **Wave3 defaults (final gate):** padded surface pool + wgpu scratch, latest-wins coalescing/throttling (`drain_pending_publishes` + `retry_delay`), pre-reserve (Q4/C), size-class TLS, and CompactString are **default on** — steady zero-alloc with no env required. The JIT direct register hand-off (Q8/C) is **still unbuilt** despite the "default on" wording in ADR-0002 (implementation status note added 2026-09-02 — zero call sites; see `docs/implementation-plan.md` Wave 3) and its inert `WIE_JIT_DIRECT_REGS` env gate was **removed 2026-09-25**, so there is no knob for it; D3D9 in-place pooled target (Q9/C) is default. 64 px pitch padding is implemented (ADR-0001 status note, 2026-09-02) — `WIE_SURFACE_PAD=0` opts out. The experimental `WIE_JIT_TAILCHAIN` knob was removed the same day: Cranelift 0.133 rejects tail-call hops under every ABI convention these blocks use, so the shipped chain hop is the nested-call + `MAX_CHAIN_DEPTH` guard shape (ADR-0002 status note, `bcf3880`).
 
 | Variable | Effect |
 | --- | --- |
@@ -98,7 +98,6 @@ The README keeps the shortlist; the complete set lives here.
 | `WIE_JIT_OPT=speed\|speed_and_size\|none` | Cranelift opt_level (default **speed**) |
 | `WIE_JIT_HOTNESS_THRESHOLD` | **Experimental** fixed hotness threshold override (default **100**; clamped to `[1, 1_000_000]`) |
 | `WIE_JIT_WORKERS` | Background compile worker count (default ≈ `available_parallelism()/2`, clamped `[1, 4]`). More workers cut boot-time compile latency on multicore hosts; workers compete with guest threads for cores while active. |
-| `WIE_JIT_DIRECT_REGS=0` | **Wave3:** disable direct block-to-block register hand-off (Q8/C) — default **on**; set `0`/`false`/`off` to force `JitCtx` spill path for bisect/matrix |
 | `WIE_JIT_VERIFY=1` | Enable Cranelift IR verifier outside tests |
 | `WIE_JIT_CACHE` | Persistent JIT code-cache **ledger** (`$WIE_CACHE_DIR/jit`, else `$XDG_CACHE_HOME/wie/jit`). Records per-PE block metadata (`guest_va + FNV-1a of the exact guest bytes` → extent, insn count) plus negative entries for blocks that failed to compile. On warm boot known-good blocks skip the Hot visit-threshold warmup (immediate background compile); known-bad blocks skip re-decode entirely. Every consumption is hash-validated against current guest bytes — SMC/protect invalidations tombstone matching records. Default **on** (off in unit tests). `0`/`false`/`off` disables; any other value is treated as an explicit directory path. NOTE: this is a metadata ledger, NOT machine-code replay — raw Cranelift aarch64 restore is unsafe here (`is_pic=false` bakes per-run text-region addresses; no relocation export), so the ~3 ms/block tier-1 compile itself still runs on warm boots. |
 | `WIE_FIXED_CLOCK=1` | Freeze the guest clock table (deterministic runs) |
@@ -128,14 +127,14 @@ The README keeps the shortlist; the complete set lives here.
 | --- | --- | --- | --- |
 | `WIE_SURFACE_PAD` / padded pool | **64 px** row pitch (`padded_stride`, ADR-0001, implemented 2026-09) + reused wgpu scratch | `WIE_SURFACE_PAD=0` (unpadded, on-demand pack) | Q2/D |
 | present channel | **on** (`PresentChannel` latest-wins slot; `take_frame` is lock-free on the presenter side, ADR-0003) | none — always on | Wave 1a |
-| `WIE_PRESENT_COMMIT` | **on in GUI sessions** (Wave 2 slice 1, 2026-09: `IDirect3DDevice9::Present` hands the finished backbuffer to the `wie-present-commit` render thread — stretch + publish run off the big lock; headless/micro-suite keep the legacy in-handler path) | `WIE_PRESENT_COMMIT=0` (legacy in-handler present) | Wave 2 |
+| `WIE_CAPTURE_STREAM` | **on in GUI sessions** (Wave 2, 2026-09: `IDirect3DDevice9::Present` flushes the `wie-capture-stream` render thread — the **sole** GUI render-thread path, replay + RT/depth handback + publish all run off the big lock; headless/micro-suite keep the legacy in-handler path) | `WIE_CAPTURE_STREAM=0` (legacy in-handler present — also the headless/CI hash oracle) | Wave 2 |
 | present throttling / latest-wins | **on** (`drain_pending_publishes` + `retry_delay` coalesce) | `cfg(test)` skips (tests assert publish) | Q5/C |
 | pre-reserve / scratch reuse | **on** (capacity-retained `Vec`s, pooled `WgpuPresenter` scratch) | none — always on | Q4/C |
 | CompactString | **on** (inline small strings; see `compact_string` crate in `wie-winapi` where string-heavy) | `WIE_COMPACT_STRING=0` if gated | Q6/C |
 | size-class TLS | **on** (24 classes, TLS-pooled) | none — always on | TLS lane |
 | mimalloc | **feature** `mimalloc` (if enabled, host allocator) | default allocator if feature off | Q7/C |
 | D3D9 in-place | **on** (pooled `WindowSurface` slice as render target — no temp `Vec<u32>`) | `WIE_D3D9_INPLACE=0` if gated | Q9/C |
-| `WIE_JIT_DIRECT_REGS` | **NOT implemented** (ADR-0002 status note, 2026-09-02: zero call sites — tracked as Wave 3 in `docs/implementation-plan.md`; the variable does nothing) | — | Q8/C |
+| *(no variable)* direct register hand-off (Q8/C) | **NOT implemented** — no x19–x28 ABI exists, and the inert `WIE_JIT_DIRECT_REGS` env gate was removed 2026-09-25, so there is no opt-out either | — | Q8/C |
 
 > If a knob is not listed above, it is **not** a Wave3 gate — see the full table. All Wave3 paths are verified steady zero-alloc under `WIE_RUNTIME_PROFILE=1` without setting any of these.
 

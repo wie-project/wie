@@ -7,26 +7,16 @@
 //! needs no GUI_SUITE_LOCK serialization: the fake window system is host-side
 //! bookkeeping with no winit/present interaction in a headless run.
 //!
-//! Binary from `make -C micro-exes user32_enum`. Skips if missing (no mingw).
+//! Binary from `make -C micro-exes user32_enum`. A missing binary fails the test (see `tests/common/mod.rs`).
 
-use std::path::PathBuf;
+mod common;
 
-fn micro_exe(name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("micro-exes/out");
-    path.push(name);
-    path.is_file().then_some(path)
-}
+use common::micro_exe;
 
 #[test]
 fn user32_enum_find_caret_roundtrip() {
     let Some(path) = micro_exe("user32_enum.exe") else {
-        eprintln!(
-            "skip: micro-exes/out/user32_enum.exe not built (run make -C micro-exes user32_enum)"
-        );
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let summary = wie_runtime::run_micro_exe(&path, 256).expect("run_micro_exe");
     assert_eq!(

@@ -21,8 +21,25 @@
 
 #define WORKERS 4
 #define ITERS   512
+// Short mode: enough iterations to keep every worker's interlocked/CS/heap
+// path hot without paying the full 512x4 round-trip on every sweep.
+#define ITERS_SHORT 32
+
+// Opt-in short mode: WIE_SHORT=1 in the *guest* environment (the host injects
+// it via WIE_GUEST_ENV="WIE_SHORT=1") shrinks the per-worker iteration count.
+// With WIE_SHORT absent — every normal run, every current test — g_iters keeps
+// the ITERS value above and the fixture behaves exactly as before. WORKERS is
+// deliberately NOT scaled: the g_ready == WORKERS rendezvous and the
+// WORKERS * ITERS expectations depend on it.
+static int g_iters = ITERS;
 
 typedef LONG(WINAPI *PFN_Inc)(LONG volatile *);
+
+static int short_mode(void) {
+    char buf[16];
+    DWORD n = GetEnvironmentVariableA("WIE_SHORT", buf, sizeof(buf));
+    return n == 1 && buf[0] == '1';
+}
 
 static CRITICAL_SECTION g_cs;
 static volatile LONG g_atomic = 0;
@@ -45,7 +62,7 @@ static DWORD WINAPI worker(LPVOID param) {
     WaitForSingleObject(g_start_event, INFINITE);
 
     heap = GetProcessHeap();
-    for (i = 0; i < ITERS; i++) {
+    for (i = 0; i < g_iters; i++) {
         void *p;
 
         g_inc(&g_atomic);
@@ -71,7 +88,12 @@ void entry(void) {
     DWORD wait;
     int i;
     HMODULE k;
-    const LONG expect = (LONG)(WORKERS * ITERS);
+    LONG expect;
+
+    if (short_mode()) {
+        g_iters = ITERS_SHORT;
+    }
+    expect = (LONG)(WORKERS * g_iters);
 
     for (i = 0; i < WORKERS; i++) {
         g_slots[i] = 0;

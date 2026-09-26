@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Wave 2 Step 3 acceptance capture (docs/implementation-plan.md).
 # Runs gui_d3d9.exe in its continuous-present self-test mode (WIE_SELFTEST=2),
-# injected via WIE_GUEST_ENV, headless on a RELEASE build under
-# WIE_RUNTIME_PROFILE=1, ends the session with the SIGINT profile watchdog,
-# and checks the Wave 2 invariants from the profile report:
+# injected via WIE_GUEST_ENV, through the production GUI adapter on a RELEASE
+# build under WIE_RUNTIME_PROFILE=1, and ends the session with the SIGINT
+# profile watchdog. The hard invariants are:
 #
-#   1. emu thread ≤ 1 ms/frame   — emu_ms / frames_published
-#   2. commit_ms / capture_ms    — the render-thread share is reported
-#                                  separately from guest time
-#   3. guest CPU ≳ 90%           — cpu%≈ from the report
+#   1. production wie run --gui capture path
+#   2. capture_frames > 0 and capture_frames <= present_enqueued
+#   3. present_ms > 0
+#   4. handler_ms / present_enqueued <= 1 ms
+#   5. process CPU is informational
 #
 # Usage: ./scripts/acceptance-wave2.sh [duration_secs=40]
 #        WAVE2_BASELINE=1 also appends the report to docs/baselines/wave2-acceptance.txt
@@ -16,7 +17,6 @@
 # Wall-clock numbers: idle machine, release build only.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." pwd)"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLI="${CLI:-$ROOT/target/release/wie}"
 PE="$ROOT/micro-exes/out/gui_d3d9.exe"
@@ -35,26 +35,38 @@ if [[ ! -x "$CLI" ]]; then
 fi
 if [[ ! -f "$PE" ]]; then
   echo "building micro-exes…"
-  make -C "$ROOT/micro-exes" gui_d3d9 >/dev/null
+  make -C "$ROOT/micro-exes" out/gui_d3d9.exe >/dev/null
+  if [[ ! -f "$PE" ]]; then
+    echo "FAIL: make did not produce $PE" >&2
+    exit 1
+  fi
 fi
 
 # The report prints via tracing::error! / eprintln on HostInterrupt.
 export RUST_LOG="error"
-OUT="$(mktemp /tmp/wave2-acceptance.XXXXXX.txt)"
-trap 'rm -f "$OUT"' EXIT
+TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/wave2-acceptance.XXXXXX")"
+OUT="$TMP_ROOT/output.txt"
+BOTTLE="$TMP_ROOT/bottle"
+mkdir -p "$BOTTLE"
+trap 'rm -rf "$TMP_ROOT"' EXIT
 
 echo "=== Wave 2 acceptance: gui_d3d9 WIE_SELFTEST=2, ${SECS}s capture ===" >&2
+# Production `--gui` capture path must be the active one; the legacy
+# in-handler raster path is only reached with WIE_CAPTURE_STREAM=0.
+unset WIE_CAPTURE_STREAM
+
 status=0
 if command -v timeout >/dev/null 2>&1 && timeout --help 2>&1 | grep -q -- "--signal"; then
   set +e
   WIE_RUNTIME_PROFILE=1 WIE_GUEST_ENV="WIE_SELFTEST=2" \
-    timeout --signal=INT --kill-after=5s "${SECS}s" "$CLI" run "$PE" >"$OUT" 2>&1
+    timeout --signal=INT --kill-after=5s "${SECS}s" \
+    "$CLI" run --gui --root "$BOTTLE" "$PE" >"$OUT" 2>&1
   status=$?
   set -e
 else
   set +e
   WIE_RUNTIME_PROFILE=1 WIE_GUEST_ENV="WIE_SELFTEST=2" \
-    "$CLI" run "$PE" >"$OUT" 2>&1 &
+    "$CLI" run --gui --root "$BOTTLE" "$PE" >"$OUT" 2>&1 &
   pid=$!
   ( sleep "$SECS"; kill -INT "$pid" 2>/dev/null || true ) &
   watchdog=$!
@@ -63,11 +75,18 @@ else
   wait "$watchdog" 2>/dev/null || true
   set -e
 fi
-if [[ $status -ne 0 && $status -ne 130 && $status -ne 124 ]]; then
-  echo "warning: emulator exited with status $status (expected 0/124/130)" >&2
-fi
 
-report="$(grep -A100 "WIE_RUNTIME_PROFILE" "$OUT" || true)"
+case "$status" in
+  124|130)
+    ;;
+  *)
+    echo "FAIL: unexpected emulator status $status (expected 124 or 130)" >&2
+    tail -n 30 "$OUT" >&2 || true
+    exit 1
+    ;;
+esac
+
+report="$(grep -A200 "WIE_RUNTIME_PROFILE" "$OUT" || true)"
 if [[ -z "$report" ]]; then
   echo "FAIL: no WIE_RUNTIME_PROFILE report in the capture (SIGINT→profile handoff)" >&2
   tail -n 30 "$OUT" >&2 || true
@@ -76,59 +95,64 @@ fi
 echo "$report"
 
 # ---- invariants ----
-fail=0
-frames="$(sed -n 's/.*frames_published=\([0-9]*\).*/\1/p' <<<"$report" | tail -1)"
-emu_ms="$(sed -n 's/.*emu_ms=\([0-9.]*\).*/\1/p' <<<"$report" | tail -1)"
-cpu_pct="$(sed -n 's/.*cpu%≈\([0-9.]*\).*/\1/p' <<<"$report" | tail -1)"
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+frames_published="$(sed -n 's/.*frames_published=\([0-9]*\).*/\1/p' <<<"$report" | tail -1)"
+handler_ms="$(sed -n 's/.*handler_ms=\([0-9.]*\).*/\1/p' <<<"$report" | tail -1)"
+present_ms="$(sed -n 's/.*present_ms=\([0-9.]*\).*/\1/p' <<<"$report" | tail -1)"
+present_enqueued="$(sed -n 's/.*present_enqueued=\([0-9]*\).*/\1/p' <<<"$report" | tail -1)"
 capture_frames="$(sed -n 's/.*capture_frames=\([0-9]*\).*/\1/p' <<<"$report" | tail -1)"
-commit_frames="$(sed -n 's/.*commit_frames=\([0-9]*\).*/\1/p' <<<"$report" | tail -1)"
+cpu_pct="$(sed -n 's/.*cpu%≈\([0-9.]*\).*/\1/p' <<<"$report" | tail -1)"
 
-if [[ -z "$frames" || "$frames" -eq 0 ]]; then
-  echo "FAIL: frames_published missing/zero — no continuous frame stream" >&2
-  fail=1
-  frames="${frames:-0}"
+[[ -n "$handler_ms" ]] || fail "handler_ms missing from profile"
+[[ -n "$present_ms" ]] || fail "present_ms missing from profile"
+[[ -n "$present_enqueued" ]] || fail "present_enqueued missing from profile"
+[[ -n "$capture_frames" ]] || fail "capture_frames missing from profile"
+
+(( present_enqueued > 0 )) ||
+  fail "present_enqueued is zero — no D3D9 Present boundary was sampled"
+(( capture_frames > 0 )) ||
+  fail "capture_frames is zero — production capture thread published nothing"
+(( capture_frames <= present_enqueued )) ||
+  fail "capture_frames=${capture_frames} exceeds present_enqueued=${present_enqueued}"
+
+if ! python3 -c "import sys; sys.exit(0 if $present_ms > 0.0 else 1)"; then
+  fail "present_ms=${present_ms} — winit/wgpu consumed no frame"
 fi
 
-emu_per_frame=""
-if [[ -n "$emu_ms" && "$frames" -gt 0 ]]; then
-  emu_per_frame="$(python3 -c "print(f'{$emu_ms / $frames:.3f}')")"
-  ok="$(python3 -c "print(1 if $emu_ms / $frames <= 1.0 else 0)")"
-  if [[ "$ok" != "1" ]]; then
-    echo "FAIL: emu thread ${emu_per_frame} ms/frame > 1 ms/frame" >&2
-    fail=1
-  else
-    echo "PASS: emu thread ${emu_per_frame} ms/frame ≤ 1 ms/frame" >&2
-  fi
-fi
-
-if [[ -z "$capture_frames" || "$capture_frames" -eq 0 ]] && [[ -z "$commit_frames" || "$commit_frames" -eq 0 ]]; then
-  echo "FAIL: neither capture_frames nor commit_frames nonzero — the render \
-thread published nothing (render share not separated from guest time)" >&2
-  fail=1
+handler_per_present="$(python3 -c "print(f'{$handler_ms / $present_enqueued:.3f}')")"
+if python3 -c "import sys; sys.exit(0 if $handler_ms / $present_enqueued <= 1.0 else 1)"; then
+  echo "PASS: handler time ${handler_per_present} ms/Present ≤ 1 ms" >&2
 else
-  echo "PASS: render-thread counters present (capture_frames=${capture_frames:-0} \
-commit_frames=${commit_frames:-0})" >&2
+  fail "handler time ${handler_per_present} ms/Present > 1 ms"
 fi
 
+echo "PASS: capture_frames=${capture_frames} <= present_enqueued=${present_enqueued}" >&2
+echo "PASS: present_ms=${present_ms}" >&2
+echo "INFO: frames_published=${frames_published:-0} (GDI/GL/DIB counter, not the capture denominator)" >&2
 if [[ -n "$cpu_pct" ]]; then
-  ok="$(python3 -c "print(1 if $cpu_pct >= 90.0 else 0)")"
-  if [[ "$ok" != "1" ]]; then
-    echo "WARN: guest cpu%≈${cpu_pct}% < 90% (idle-machine requirement; not a hard failure)" >&2
-  else
-    echo "PASS: guest cpu%≈${cpu_pct}% ≥ 90%" >&2
-  fi
-else
-  echo "WARN: cpu%≈ not found in the report" >&2
+  echo "INFO: process cpu%≈${cpu_pct}% (not a guest-thread acceptance gate)" >&2
 fi
 
 if [[ "${WAVE2_BASELINE:-0}" == "1" ]]; then
+  mkdir -p "$OUTDIR"
   {
-    printf '%s | %ss | frames=%s | emu_ms/frame=%s | cpu%%=%s | capture_frames=%s | commit_frames=%s | ' \
-      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$SECS" "$frames" "${emu_per_frame:-?}" "${cpu_pct:-?}" "${capture_frames:-0}" "${commit_frames:-0}"
+    printf '%s | %ss | present_enqueued=%s | capture_frames=%s | frames_published=%s | handler_ms/present=%s | present_ms=%s | cpu%%=%s | ' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      "$SECS" \
+      "$present_enqueued" \
+      "$capture_frames" \
+      "${frames_published:-0}" \
+      "$handler_per_present" \
+      "$present_ms" \
+      "${cpu_pct:-unavailable}"
     tr '\n' ' ' <<<"$report" | sed 's/  */ /g'
     printf '\n'
   } >>"$BASELINE"
   echo "appended to $BASELINE" >&2
 fi
 
-exit "$fail"
+exit 0

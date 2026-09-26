@@ -209,7 +209,8 @@ fn synthesize_wm_paint_skips_hidden_invalidated_windows() {
         let queue = state.lock_message_queue();
         assert!(
             queue
-                .messages
+                .queues
+                .messages(PRIMARY_THREAD_ID)
                 .iter()
                 .all(|m| m.message != crate::user32::WinMsg::WM_PAINT.as_u32()
                     && m.message != crate::user32::WM_ERASEBKGND),

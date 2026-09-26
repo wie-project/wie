@@ -1,23 +1,17 @@
 //! Integration: freestanding HeapAlloc micro-PE reaches ExitProcess(0).
 //!
-//! Binary is produced by `make -C micro-exes` (mingw). If missing, the test is
-//! skipped so `cargo test` on machines without a cross toolchain still works.
+//! Binary is produced by `make -C micro-exes` (mingw). A missing binary fails
+//! the test unless `WIE_ALLOW_MISSING_GUESTS=1` is set (see
+//! `tests/common/mod.rs`).
 
-use std::path::PathBuf;
+mod common;
 
-fn heap_alloc_exe() -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop(); // crates/
-    path.pop(); // repo root
-    path.push("micro-exes/out/heap_alloc.exe");
-    path.is_file().then_some(path)
-}
+use common::micro_exe;
 
 #[test]
 fn micro_heap_alloc_exits_zero() {
-    let Some(path) = heap_alloc_exe() else {
-        eprintln!("skip: micro-exes/out/heap_alloc.exe not built (run make -C micro-exes)");
-        return;
+    let Some(path) = micro_exe("heap_alloc.exe") else {
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
 
     let summary = wie_runtime::run_micro_exe(&path, 256).expect("run_micro_exe");

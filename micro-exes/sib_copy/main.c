@@ -17,6 +17,22 @@
 #include <windows.h>
 
 #define HOT_ITERS 500
+// Short mode: every loop below exists to make its block JIT-hot; the actual
+// assertions run once outside the hot loops, so fewer repeats lose no
+// coverage.
+#define HOT_ITERS_SHORT 20
+
+// Opt-in short mode: WIE_SHORT=1 in the *guest* environment (injected host-side
+// through WIE_GUEST_ENV="WIE_SHORT=1"). Absent that variable g_hot keeps the
+// HOT_ITERS value above, so the default path is byte-for-byte the historical
+// behaviour. Short mode is opt-in only and never skips an assertion.
+static int g_hot = HOT_ITERS;
+
+static int short_mode(void) {
+  char buf[16];
+  DWORD n = GetEnvironmentVariableA("WIE_SHORT", buf, sizeof(buf));
+  return n == 1 && buf[0] == '1';
+}
 
 static unsigned char far_dst[256];
 static unsigned char near_buf[192];
@@ -138,8 +154,12 @@ void entry(void) {
   const char *v = "Vivisection";
   const char *k = "Knee-Deep In ZDoom";
 
+  if (short_mode()) {
+    g_hot = HOT_ITERS_SHORT;
+  }
+
   // Heat the block so the JIT compiles it (bug was invisible on iced).
-  for (int t = 0; t < HOT_ITERS; t++) {
+  for (int t = 0; t < g_hot; t++) {
     my_memset(far_dst, 0xAA, sizeof far_dst);
     crt_copy(far_dst, (const unsigned char *)g, 128);
     my_memset(near_buf, 0xAA, sizeof near_buf);
@@ -169,7 +189,7 @@ void entry(void) {
 
   // AH-store epilogue regression: every odd byte must come from AH, not a
   // duplicate of the preceding AL store. Drive hot so the JIT compiles it.
-  for (int t = 0; t < HOT_ITERS; t++) {
+  for (int t = 0; t < g_hot; t++) {
     my_memset(far_dst, 0xAA, sizeof far_dst);
     copy8_epilogue(far_dst, (const unsigned char *)"Vivisection");
   }
@@ -184,7 +204,7 @@ void entry(void) {
   {
     const unsigned char q[8] = {'%', '.', '2', 'f', '.', 0, 0x77, 0x88};
     const unsigned char exp[6] = {'%', '.', '2', 'f', '.', 0};
-    for (int t = 0; t < HOT_ITERS; t++)
+    for (int t = 0; t < g_hot; t++)
       copy8_epilogue(far_dst, q);
     my_memset(far_dst, 0xAA, sizeof far_dst);
     copy8_epilogue(far_dst, q);
@@ -195,7 +215,7 @@ void entry(void) {
 
   // High-byte register moves/extensions (hot loop for JIT compilation).
   const unsigned char seed = 'V';
-  for (int t = 0; t < HOT_ITERS; t++) {
+  for (int t = 0; t < g_hot; t++) {
     if (high_byte_regs(seed) != (unsigned)seed)
       ExitProcess(110);
     if (high_byte_movzx(seed) != (unsigned)seed)

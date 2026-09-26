@@ -32,8 +32,7 @@ use crate::helpers::{
 #[test]
 fn gui_d3d9_renders_clear_and_triangle() {
     let Some(path) = micro_exe("gui_d3d9.exe") else {
-        eprintln!("skip: micro-exes/out/gui_d3d9.exe not built (run make -C micro-exes gui_exes)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -185,8 +184,7 @@ fn gui_d3d9_renders_clear_and_triangle() {
 #[test]
 fn gl_quad_renders_clear_and_quads() {
     let Some(path) = micro_exe("gl_quad.exe") else {
-        eprintln!("skip: micro-exes/out/gl_quad.exe not built (run make -C micro-exes gl_quad)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -322,8 +320,7 @@ fn gl_quad_renders_clear_and_quads() {
 #[test]
 fn gui_blit_comprehensive_regression() {
     let Some(path) = micro_exe("gui_blit.exe") else {
-        eprintln!("skip: micro-exes/out/gui_blit.exe not built (run make -C micro-exes gui_exes)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -405,8 +402,7 @@ fn gui_blit_comprehensive_regression() {
 #[test]
 fn gui_menu_timer_commands_and_paint() {
     let Some(path) = micro_exe("gui_menu.exe") else {
-        eprintln!("skip: micro-exes/out/gui_menu.exe not built (run make -C micro-exes gui_exes)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -426,8 +422,7 @@ fn gui_menu_timer_commands_and_paint() {
 #[test]
 fn gui_text_renders_and_self_checks() {
     let Some(path) = micro_exe("gui_text.exe") else {
-        eprintln!("skip: micro-exes/out/gui_text.exe not built (run make -C micro-exes gui_exes)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -448,10 +443,7 @@ fn gui_text_renders_and_self_checks() {
 #[test]
 fn gui_dialog_modal_loop_and_end_dialog() {
     let Some(path) = micro_exe("gui_dialog.exe") else {
-        eprintln!(
-            "skip: micro-exes/out/gui_dialog.exe not built (run make -C micro-exes gui_exes)"
-        );
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -566,10 +558,7 @@ fn gui_dialog_modal_loop_and_end_dialog() {
 #[test]
 fn gui_dialog_shift_tab_moves_focus() {
     let Some(path) = micro_exe("gui_dialog.exe") else {
-        eprintln!(
-            "skip: micro-exes/out/gui_dialog.exe not built (run make -C micro-exes gui_exes)"
-        );
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -715,8 +704,7 @@ fn gui_dialog_shift_tab_moves_focus() {
 #[test]
 fn gui_demo_dialog_opens_on_click() {
     let Some(path) = micro_exe("gui_demo.exe") else {
-        eprintln!("skip: micro-exes/out/gui_demo.exe not built (run make -C micro-exes gui_exes)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -855,8 +843,7 @@ fn gui_demo_dialog_opens_on_click() {
 #[test]
 fn gui_demo_dialog_ok_click_closes_dialog() {
     let Some(path) = micro_exe("gui_demo.exe") else {
-        eprintln!("skip: micro-exes/out/gui_demo.exe not built (run make -C micro-exes gui_exes)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -977,8 +964,7 @@ fn gui_demo_dialog_ok_click_closes_dialog() {
 #[test]
 fn gl_quad_resize_keeps_quad_center_readback() {
     let Some(path) = micro_exe("gl_quad.exe") else {
-        eprintln!("skip: micro-exes/out/gl_quad.exe not built (run make -C micro-exes gl_quad)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();

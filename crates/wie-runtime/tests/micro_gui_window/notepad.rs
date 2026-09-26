@@ -16,10 +16,7 @@ use crate::helpers::{gui_suite_serialize, pump_until_windows_ready, real_exe};
 #[test]
 fn notepad_menu_command_reaches_the_guest_wndproc() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!(
-            "skip: real_exes/notepad.exe not present (fetch with ./scripts/fetch-rnotepad.sh)"
-        );
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -108,8 +105,7 @@ fn notepad_menu_command_reaches_the_guest_wndproc() {
 #[test]
 fn notepad_ignores_unknown_command_ids() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -154,8 +150,7 @@ fn notepad_ignores_unknown_command_ids() {
 #[test]
 fn notepad_menu_tree_is_stable_across_calls() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -217,8 +212,7 @@ fn notepad_menu_tree_is_stable_across_calls() {
 #[test]
 fn notepad_does_not_exit_while_idle() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -263,8 +257,7 @@ fn notepad_does_not_exit_while_idle() {
 #[test]
 fn notepad_file_new_window_does_not_stop_the_session() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -315,10 +308,7 @@ fn notepad_file_new_window_does_not_stop_the_session() {
 #[test]
 fn new_clears_edit_visibly_on_same_frame() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!(
-            "skip: real_exes/notepad.exe not present (fetch with ./scripts/fetch-rnotepad.sh)"
-        );
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -427,10 +417,7 @@ fn count_status_bar_face(frame: &wie_winapi::present::SurfaceFrame, rows: u32) -
 #[test]
 fn status_bar_toggle_off_removes_the_strip_with_no_further_input() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!(
-            "skip: real_exes/notepad.exe not present (fetch with ./scripts/fetch-rnotepad.sh)"
-        );
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -547,8 +534,7 @@ fn status_bar_toggle_off_removes_the_strip_with_no_further_input() {
 #[test]
 fn time_date_replace_all_clears_rows_below_the_date() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -651,8 +637,7 @@ fn time_date_replace_all_clears_rows_below_the_date() {
 #[test]
 fn new_resets_status_bar_line_col_to_one() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -751,8 +736,7 @@ fn new_resets_status_bar_line_col_to_one() {
 #[test]
 fn status_bar_toggle_wakes_with_its_publish() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;

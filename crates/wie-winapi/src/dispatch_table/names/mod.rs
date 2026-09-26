@@ -275,6 +275,7 @@ const USER32_DLL_EXPORTS: &[&str] = &[
     "createcaret",
     "createiconfromresource",
     "createiconindirect",
+    "defrawinputproc",
     "destroycaret",
     "dialogboxindirectparamw",
     "dialogboxparamw",
@@ -296,9 +297,12 @@ const USER32_DLL_EXPORTS: &[&str] = &[
     "getmessageextrainfo",
     "getmessagetime",
     "getpropw",
+    "getrawinputbuffer",
     "getrawinputdata",
     "getrawinputdeviceinfoa",
+    "getrawinputdeviceinfow",
     "getrawinputdevicelist",
+    "getregisteredrawinputdevices",
     "getupdaterect",
     "getwindowlongw",
     "hidecaret",
@@ -745,6 +749,14 @@ const DBGHELP_IMAGEHLP: &[&str] = &[
     "syminitializew",
     "symsetoptions",
 ];
+
+/// Soft-dispatched `dinput8.dll` exports (mirror of the `dispatch_*` fallback arms).
+///
+/// `dinput8.dll` exports exactly one callable name: `DirectInput8Create`
+/// (ordinal 1). Every other DirectInput entry point is a COM vtable slot
+/// dispatched through `FakeVa::Com` — see `crate::dinput`.
+const DINPUT8_DLL_EXPORTS: &[&str] = &["directinput8create"];
+
 /// Known WinAPI DLL libraries — handled by WIE's dense/soft dispatch, never
 /// loaded as guest modules.
 ///
@@ -790,6 +802,7 @@ pub fn is_winapi_library(library: &str) -> bool {
             | "ntdll.dll"
             | "opengl32.dll"
             | "winhttp.dll"
+            | "dinput8.dll"
     ) || lower.starts_with("libwinpthread")
         || lower.starts_with("libstdc++")
         || lower.starts_with("api-ms-win-")
@@ -830,6 +843,7 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
         "urlmon.dll" => crate::urlmon::is_export(n),
         "ntdll.dll" => crate::ntdll::is_export(n),
         "opengl32.dll" => crate::opengl32::is_export(n),
+        "dinput8.dll" => DINPUT8_DLL_EXPORTS.contains(&n),
         _ => false,
     }
 }

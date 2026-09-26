@@ -1,35 +1,15 @@
-//! Shared helpers for the GUI micro-tests: PE lookup, the suite-wide
-//! serialization lock, session driving, frame hashing, and the pump/wait/ink
-//! primitives the notepad and dialog tests build on.
+//! Shared helpers for the GUI micro-tests: PE lookup (re-exported from
+//! `tests/common`, which owns the "a missing guest PE is a failure" rule), the
+//! suite-wide serialization lock, session driving, frame hashing, and the
+//! pump/wait/ink primitives the notepad and dialog tests build on.
 //!
 //! Everything here is `pub(crate)`: the test binary is one crate and the
 //! sibling test modules (`controls`, `demo`, `dialogs`, `notepad`) call these
 //! across the mod tree.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// Locate a mingw-built micro PE under `micro-exes/out`. `None` when the
-/// binary is absent (the test skips).
-pub(crate) fn micro_exe(name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("micro-exes/out");
-    path.push(name);
-    path.is_file().then_some(path)
-}
-
-/// Locate a real (non-micro) guest binary under `real_exes/` — e.g. the
-/// RNotepad build fetched by `scripts/fetch-rnotepad.sh`. `None` when the
-/// binary is absent (gitignored; the test skips).
-pub(crate) fn real_exe(name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("real_exes");
-    path.push(name);
-    path.is_file().then_some(path)
-}
+pub(crate) use crate::common::{micro_exe, real_exe};
 
 /// Serializes the 7 GUI micro-tests so they run one at a time.
 ///

@@ -6,6 +6,24 @@
 //! (`RedrawRequested`) and resize (`Resized`/settle) accounting that share the
 //! dispatch. The trait impl in `super` delegates here, so the event path is
 //! behavior-identical to a single in-place handler.
+//!
+//! # Raw input (`WM_INPUT`)
+//!
+//! Each keyboard/mouse arm additionally feeds the RawInput lane
+//! ([`raw_input`]) and posts the `WM_INPUT` records come back as. The
+//! registration/exclusion filtering and the `RAWINPUT` encoding live in
+//! wie-winapi, which owns the state; this module only names the target windows
+//! and forwards the posts. **The records are SYNTHESIZED from the keyboard and
+//! mouse state WIE already tracks** — macOS exposes no raw HID stream and winit
+//! has no portable raw-input event, so WIE never sees a hardware report (see
+//! the `crate::user32::raw_input` module docs for the full list of deviations).
+//!
+//! Like every other message here, a `WM_INPUT` goes out through
+//! `GuestHandle::post_message`, which routes it to the queue of the thread that
+//! owns the window. Nothing on this path takes the big `WinApiState` lock: the
+//! window reads go through the presenter mirror ([`WieApp::mouse_target`] and
+//! friends) and the RawInput state has its own module-local mutex, because a
+//! guest thread holds the big lock for the whole of an API call.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,6 +32,10 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::WindowId;
 
+use wie_runtime::GuestHandle;
+use wie_winapi::user32::WinMsg;
+use wie_winapi::user32::raw_input::{self, RawInputPost, RawMouseButton, RawMouseReport};
+
 use super::{RESIZE_SETTLE_MS, WHEEL_DELTA, WieApp, wheel_notches};
 use crate::gui::input;
 
@@ -21,6 +43,27 @@ use crate::gui::input;
 // the frame as presented ONLY when it reached the screen (a skipped present
 // must stay retryable).
 use crate::gui::present_wgpu::PresentOutcome;
+
+/// `WM_INPUT` (winuser.h:1173) — the raw-input delivery message.
+const WM_INPUT: u32 = WinMsg::WM_INPUT.as_u32();
+
+/// The `WM_INPUT` posts the RawInput lane produced, sent to their windows.
+///
+/// The posts are already resolved: `wParam` carries `GET_RAWINPUT_CODE_WPARAM`
+/// and `lParam` the fake `HRAWINPUT` the guest hands to `GetRawInputData`.
+/// Empty whenever no window registered the class, which is the common case, so
+/// this is a no-op for a guest that never calls `RegisterRawInputDevices`.
+fn post_raw_input(handle: &GuestHandle, posts: Vec<RawInputPost>) {
+    for post in posts {
+        tracing::debug!(
+            target: "wiegui",
+            hwnd = post.hwnd,
+            wparam = post.wparam,
+            "WM_INPUT"
+        );
+        handle.post_message(post.hwnd, WM_INPUT, post.wparam, post.lparam);
+    }
+}
 
 /// The message for a left-button press: WM_LBUTTONDBLCLK when it lands on the
 /// SAME target window within the double-click time window AND the double-click
@@ -108,6 +151,30 @@ impl WieApp {
                     is_alt,
                     hwnd
                 );
+                let key_message = match (pressed, is_alt) {
+                    (true, true) => input::WM_SYSKEYDOWN,
+                    (true, false) => input::WM_KEYDOWN,
+                    (false, true) => input::WM_SYSKEYUP,
+                    (false, false) => input::WM_KEYUP,
+                };
+                // Raw input first: `RIDEV_EXCLUDE` (winuser.h:6468) asks for
+                // the legacy WM_KEY* messages of the keyboard class to be
+                // suppressed in favour of WM_INPUT, and the WM_CHARs translated
+                // from them go with them — so a registered-and-excluding guest
+                // sees WM_INPUT only. The lane does the registration filtering,
+                // so this is a no-op for a guest that never registered.
+                let posts = raw_input::post_raw_keyboard_event(
+                    hwnd,
+                    Some(event_hwnd),
+                    handle.focus_window(),
+                    vk,
+                    pressed,
+                    key_message,
+                );
+                post_raw_input(handle, posts);
+                if raw_input::is_legacy_keyboard_input_excluded(hwnd) {
+                    return;
+                }
                 if pressed {
                     handle.post_message(hwnd, input::WM_KEYDOWN, u64::from(vk), 0);
                     if let Some(ref text) = event.text {
@@ -326,21 +393,48 @@ impl WieApp {
                 let (target, rx, ry) =
                     self.mouse_target(handle, event_hwnd.unwrap_or(primary_hwnd), event_sf);
                 let lparam = input::make_lparam(rx, ry);
-                // MSG.pt must share lParam's CHILD-relative space: a guest
-                // reading MSG.pt (e.g. the wndproc's own hit-testing) would
-                // otherwise mix child-relative lParam with top-level-relative
-                // pt in one message and mis-map clicks on child windows (the
-                // EDIT caret landing on a huge char index). WM_DROPFILES is
-                // the exception: it targets the top-level window, where
-                // top-level-relative pt is the same space.
-                handle.post_message_at(
+                // Synthesized RAWMOUSE for the same event: a RELATIVE report
+                // carrying the movement since the previous report, which is the
+                // one encoding WIE can state exactly. `last_raw_cursor` is the
+                // last position this lane reported, so the first move after a
+                // window opens reports no movement (there was none to report).
+                let (dx, dy) = match self.last_raw_cursor {
+                    Some((px, py)) => (
+                        i32::from(rx).saturating_sub(px),
+                        i32::from(ry).saturating_sub(py),
+                    ),
+                    None => (0, 0),
+                };
+                self.last_raw_cursor = Some((i32::from(rx), i32::from(ry)));
+                let posts = raw_input::post_raw_mouse_event(
                     target,
-                    input::WM_MOUSEMOVE,
-                    u64::from(mk),
-                    lparam,
-                    i32::from(rx),
-                    i32::from(ry),
+                    event_hwnd,
+                    handle.focus_window(),
+                    RawMouseReport::Movement { dx, dy },
+                    u32::from(mk),
                 );
+                post_raw_input(handle, posts);
+                // `RIDEV_EXCLUDE` for the mouse class replaces WM_MOUSEMOVE
+                // with the WM_INPUT above. Only that message is suppressed —
+                // the GetCursorPos mirror below is a host read, not a guest
+                // message, and must keep running.
+                if !raw_input::is_legacy_mouse_input_excluded(target) {
+                    // MSG.pt must share lParam's CHILD-relative space: a guest
+                    // reading MSG.pt (e.g. the wndproc's own hit-testing) would
+                    // otherwise mix child-relative lParam with top-level-relative
+                    // pt in one message and mis-map clicks on child windows (the
+                    // EDIT caret landing on a huge char index). WM_DROPFILES is
+                    // the exception: it targets the top-level window, where
+                    // top-level-relative pt is the same space.
+                    handle.post_message_at(
+                        target,
+                        input::WM_MOUSEMOVE,
+                        u64::from(mk),
+                        lparam,
+                        i32::from(rx),
+                        i32::from(ry),
+                    );
+                }
                 // Mirror the cursor into guest-screen space for GetCursorPos
                 // (level-triggered read, no big lock): the event top-level's
                 // record origin plus the client-relative logical position. An
@@ -362,10 +456,12 @@ impl WieApp {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = matches!(state, winit::event::ElementState::Pressed);
                 // Track pressed buttons for MK_* flags in subsequent messages.
-                let bit = match button {
-                    winit::event::MouseButton::Left => input::MK_LBUTTON,
-                    winit::event::MouseButton::Right => input::MK_RBUTTON,
-                    winit::event::MouseButton::Middle => input::MK_MBUTTON,
+                let (bit, raw_button) = match button {
+                    winit::event::MouseButton::Left => (input::MK_LBUTTON, RawMouseButton::Left),
+                    winit::event::MouseButton::Right => (input::MK_RBUTTON, RawMouseButton::Right),
+                    winit::event::MouseButton::Middle => {
+                        (input::MK_MBUTTON, RawMouseButton::Middle)
+                    }
                     _ => return,
                 };
                 if pressed {
@@ -411,6 +507,24 @@ impl WieApp {
                     _ => return,
                 };
                 let mk = self.mk_flags();
+                // Synthesized RAWMOUSE for the same press/release, at the
+                // client-relative position the legacy lParam carries.
+                let posts = raw_input::post_raw_mouse_event(
+                    target,
+                    event_hwnd,
+                    handle.focus_window(),
+                    RawMouseReport::Button {
+                        button: raw_button,
+                        down: pressed,
+                        x: i32::from(rx),
+                        y: i32::from(ry),
+                    },
+                    u32::from(mk),
+                );
+                post_raw_input(handle, posts);
+                if raw_input::is_legacy_mouse_input_excluded(target) {
+                    return;
+                }
                 let lparam = input::make_lparam(rx, ry);
                 // MSG.pt in lParam's child-relative space (see CursorMoved).
                 handle.post_message_at(
@@ -456,27 +570,42 @@ impl WieApp {
                     Some(focus) => (focus, 0, 0),
                     None => self.mouse_target(handle, event_hwnd.unwrap_or(primary_hwnd), event_sf),
                 };
-                if notch_y != 0 {
+                // Synthesized RAWMOUSE per non-zero notch. `RIDEV_EXCLUDE` for
+                // the mouse class replaces the legacy WM_MOUSEWHEEL messages
+                // with these, so the two are gated by the same flag.
+                let excluded = raw_input::is_legacy_mouse_input_excluded(target);
+                for (horizontal, notches) in [(false, notch_y), (true, notch_x)] {
+                    if notches == 0 {
+                        continue;
+                    }
+                    let posts = raw_input::post_raw_mouse_event(
+                        target,
+                        event_hwnd,
+                        handle.focus_window(),
+                        RawMouseReport::Wheel {
+                            horizontal,
+                            notches,
+                            x: i32::from(rx),
+                            y: i32::from(ry),
+                        },
+                        u32::from(mk),
+                    );
+                    post_raw_input(handle, posts);
+                    if excluded {
+                        continue;
+                    }
                     // Whole notches re-emitted as a signed 120-unit delta
                     // (exact in i32; the u16 wrap carries the sign, which
                     // the guest reads back as i16).
-                    let delta = (notch_y as f32 * WHEEL_DELTA) as i32;
+                    let delta = (notches as f32 * WHEEL_DELTA) as i32;
                     let wparam = input::make_wparam(mk, delta as u16);
                     handle.post_message_at(
                         target,
-                        input::WM_MOUSEWHEEL,
-                        wparam,
-                        input::make_lparam(rx, ry),
-                        i32::from(rx),
-                        i32::from(ry),
-                    );
-                }
-                if notch_x != 0 {
-                    let delta = (notch_x as f32 * WHEEL_DELTA) as i32;
-                    let wparam = input::make_wparam(mk, delta as u16);
-                    handle.post_message_at(
-                        target,
-                        input::WM_MOUSEHWHEEL,
+                        if horizontal {
+                            input::WM_MOUSEHWHEEL
+                        } else {
+                            input::WM_MOUSEWHEEL
+                        },
                         wparam,
                         input::make_lparam(rx, ry),
                         i32::from(rx),
@@ -529,49 +658,6 @@ impl WieApp {
                 if let Some(rt) = self.windows.get_mut(&window_id) {
                     rt.scale_factor = scale_factor;
                     rt.window.request_redraw();
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                // Dead in practice (the early KeyboardInput arm above returns
-                // first) — kept in sync with it: keys go to the guest focus
-                // window, falling back to the event window.
-                let pressed = matches!(event.state, winit::event::ElementState::Pressed);
-                let vk = input::virt_key_from_physical(event.physical_key);
-                // Keep the guest keyboard-state table in sync with real input.
-                handle.set_key_state(vk, pressed);
-                let hwnd = handle
-                    .focus_window()
-                    .unwrap_or(event_hwnd.unwrap_or(primary_hwnd));
-                let is_alt = matches!(
-                    event.physical_key,
-                    winit::keyboard::PhysicalKey::Code(
-                        winit::keyboard::KeyCode::AltLeft | winit::keyboard::KeyCode::AltRight
-                    )
-                );
-                tracing::debug!(
-                    "keyboard vk={:#04x} pressed={} alt={} text={:?}",
-                    vk,
-                    pressed,
-                    is_alt,
-                    event.text
-                );
-                if pressed {
-                    handle.post_message(hwnd, input::WM_KEYDOWN, u64::from(vk), 0);
-                    // TranslateMessage in WIE doesn't generate WM_CHAR, so
-                    // we post it directly from the winit KeyEvent.text field.
-                    if let Some(ref text) = event.text {
-                        for c in text.chars() {
-                            handle.post_message(hwnd, input::WM_CHAR, u64::from(c as u32), 0);
-                        }
-                    }
-                    if is_alt {
-                        handle.post_message(hwnd, input::WM_SYSKEYDOWN, u64::from(vk), 0);
-                    }
-                } else {
-                    handle.post_message(hwnd, input::WM_KEYUP, u64::from(vk), 0);
-                    if is_alt {
-                        handle.post_message(hwnd, input::WM_SYSKEYUP, u64::from(vk), 0);
-                    }
                 }
             }
             WindowEvent::Focused(true) => {

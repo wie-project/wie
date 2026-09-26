@@ -44,8 +44,7 @@ const FIND_DLG_BTN_H: i32 = 26;
 #[test]
 fn replace_repaints_the_selection_without_a_second_input() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -192,8 +191,7 @@ fn replace_repaints_the_selection_without_a_second_input() {
 #[test]
 fn cancel_removes_dialog_pixels_from_owner_frame() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -307,8 +305,7 @@ fn cancel_removes_dialog_pixels_from_owner_frame() {
 #[test]
 fn replace_cancel_closes_dialog_in_one_click() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -440,8 +437,7 @@ fn replace_cancel_closes_dialog_in_one_click() {
 #[test]
 fn find_next_selects_the_match_under_the_guest_registered_message_id() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -559,8 +555,7 @@ fn find_next_selects_the_match_under_the_guest_registered_message_id() {
 #[test]
 fn find_dialog_reopens_after_cancel_close() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -845,8 +840,7 @@ fn find_dialog_face_stays_gray_through_find_next_click() {
         dy,
     }) = face_session_new(FIND_DLG_CY)
     else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
 
     let mut post_click_failures = 0_u32;
@@ -922,8 +916,7 @@ fn replace_dialog_face_stays_gray_through_replace_click() {
         dy,
     }) = face_session_new(FIND_DLG_CY_REPLACE)
     else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let dialog = face_dialog_open(&mut session, &handle, main, dx, dy, CMD_REPLACE);
     assert_ne!(dialog, 0, "replace dialog opens");
@@ -1010,8 +1003,7 @@ fn find_dialog_face_survives_selection_in_its_row_range() {
         dy,
     }) = face_session_new(FIND_DLG_CY)
     else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
 
     // Grow the document tall enough that line ~10 lands inside the dialog's
@@ -1241,18 +1233,15 @@ fn whole_word_probe(whole_word: bool) -> Option<u32> {
 #[test]
 fn whole_word_find_next_does_not_crash() {
     if real_exe("notepad.exe").is_none() {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     }
     let _suite = gui_suite_serialize();
 
     let Some(sub_left) = whole_word_probe(false) else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let Some(ww_left) = whole_word_probe(true) else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
 
     assert_ne!(sub_left, u32::MAX, "plain Find Next selects a match");

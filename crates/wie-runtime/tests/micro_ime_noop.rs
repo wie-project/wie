@@ -2,22 +2,14 @@
 //! "no IME" value (NULL context, closed status, successful release) so apps
 //! fall back to classic input.
 
-use std::path::PathBuf;
+mod common;
 
-fn micro_exe(name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("micro-exes/out");
-    path.push(name);
-    path.is_file().then_some(path)
-}
+use common::micro_exe;
 
 #[test]
 fn ime_noop_calls_return_benign_values() {
     let Some(pe) = micro_exe("ime_noop.exe") else {
-        eprintln!("skip: ime_noop.exe not built (run make -C micro-exes ime_noop)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let summary = wie_runtime::run_micro_exe(&pe, 256).expect("run_micro_exe");
     assert_eq!(

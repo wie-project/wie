@@ -10,7 +10,12 @@ use zerocopy::IntoBytes;
 /// Win32 `ERROR_INVALID_PARAMETER` (raw-input probes return it).
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
-/// Handles `USER32.dll!AttachThreadInput` — single input queue, always attached.
+/// Handles `USER32.dll!AttachThreadInput` — always TRUE, unconditionally.
+///
+/// Input queues ARE now per thread, but the queues carry no shared
+/// focus/capture/keyboard-lock state, so there is nothing to merge: key state
+/// already lives per window and focus is global. Returning TRUE keeps guests
+/// that depend on the attachment succeeding (SDL2 asserts it).
 pub fn handle_attach_thread_input(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let _attach_thread = ctx.engine.read_rcx()?;
     let _attach_to = ctx.engine.read_rdx()?;
@@ -265,41 +270,6 @@ pub fn handle_get_prop_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
         .unwrap_or(0);
     ctx.finish(value)
 }
-/// Handles `USER32.dll!GetRawInputData` — no raw-input devices; fails with
-/// `ERROR_INVALID_PARAMETER`.
-pub fn handle_get_raw_input_data(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let _input = ctx.engine.read_rcx()?;
-    let _command = ctx.engine.read_rdx()?;
-    let _data = ctx.engine.read_r8()?;
-    let _size_va = ctx.engine.read_r9()?;
-    ctx.state.process.last_error = ERROR_INVALID_PARAMETER;
-    ctx.finish(u64::from(u32::MAX)) // (UINT)-1
-}
-/// Handles `USER32.dll!GetRawInputDeviceInfoA` — no devices.
-pub fn handle_get_raw_input_device_info_a(
-    ctx: &mut HandlerContext<'_>,
-) -> Result<WinApiHandlerResult> {
-    let _device = ctx.engine.read_rcx()?;
-    let _command = ctx.engine.read_rdx()?;
-    let _data = ctx.engine.read_r8()?;
-    let _size_va = ctx.engine.read_r9()?;
-    ctx.state.process.last_error = ERROR_INVALID_PARAMETER;
-    ctx.finish(u64::from(u32::MAX))
-}
-/// Handles `USER32.dll!GetRawInputDeviceList` — zero devices; the count slot
-/// is written with 0.
-pub fn handle_get_raw_input_device_list(
-    ctx: &mut HandlerContext<'_>,
-) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let _list = engine.read_rcx()?;
-    let count_va = read_arg(engine, ArgReg::Rdx, "GetRawInputDeviceList")?;
-    let _size = engine.read_r8()?;
-    if count_va != 0 {
-        write_u32(engine, count_va, 0)?;
-    }
-    ctx.finish(0)
-}
 /// Handles `USER32.dll!GetUpdateRect` — no dirty region tracked; FALSE.
 pub fn handle_get_update_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let _hwnd = ctx.engine.read_rcx()?;
@@ -367,13 +337,38 @@ pub fn handle_msg_wait_for_multiple_objects(
 ) -> Result<WinApiHandlerResult> {
     crate::kernel32::handle_wait_for_multiple_objects(ctx)
 }
-/// Handles `USER32.dll!PostThreadMessageW` — TRUE for any thread id (messages
-/// to thread queues are not delivered, but the call succeeds).
+/// Handles `USER32.dll!PostThreadMessageW` — posts to the target thread's own
+/// message queue (`NULL` HWND: a thread message, so no window owner applies).
+///
+/// Returns FALSE when `tid` is not a live guest thread, matching Windows
+/// (`ERROR_INVALID_THREAD_ID`).
 pub fn handle_post_thread_message_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let _tid = ctx.engine.read_rcx()?;
-    let _msg = ctx.engine.read_rdx()?;
-    let _wparam = ctx.engine.read_r8()?;
-    let _lparam = ctx.engine.read_r9()?;
+    let engine = &mut *ctx.engine;
+    let state = &mut *ctx.state;
+    let thread_id = read_arg(engine, ArgReg::Rcx, "PostThreadMessageW")?;
+    let message_raw = read_arg(engine, ArgReg::Rdx, "PostThreadMessageW")?;
+    let word_parameter = read_arg(engine, ArgReg::R8, "PostThreadMessageW")?;
+    let long_parameter = read_arg(engine, ArgReg::R9, "PostThreadMessageW")?;
+
+    let message = u32::try_from(message_raw & u64::from(u32::MAX))
+        .context("PostThreadMessageW message does not fit u32")?;
+    let tid = u32::try_from(thread_id).unwrap_or(0);
+    if !state.kernel.threads.by_tid.contains_key(&tid) {
+        state.process.last_error = 1_857; // ERROR_INVALID_THREAD_ID
+        return ctx.finish(0);
+    }
+
+    // Per-thread queues make this a real route-to-queue push (it used to be a
+    // fake success that silently dropped the message). `push_to` stamps the
+    // message and broadcasts the `MessagePosted` wake token.
+    state.lock_message_queue().push_to(
+        tid,
+        crate::handles::Hwnd::NULL,
+        message,
+        word_parameter,
+        long_parameter,
+    )?;
+
     ctx.finish(1)
 }
 /// Handles `USER32.dll!PtInRect` — real point-in-rect test (right/bottom
@@ -410,16 +405,6 @@ pub fn handle_register_hot_key(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let _modifiers = ctx.engine.read_r8()?;
     let _vk = ctx.engine.read_r9()?;
     ctx.finish(1)
-}
-/// Handles `USER32.dll!RegisterRawInputDevices` — FALSE: WIE has no raw-input
-/// devices, so SDL2 falls back to the WM_MOUSE* bridge.
-pub fn handle_register_raw_input_devices(
-    ctx: &mut HandlerContext<'_>,
-) -> Result<WinApiHandlerResult> {
-    let _devices = ctx.engine.read_rcx()?;
-    let _count = ctx.engine.read_rdx()?;
-    let _size = ctx.engine.read_r8()?;
-    ctx.finish(0)
 }
 /// Handles `USER32.dll!RemovePropW`.
 pub fn handle_remove_prop_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {

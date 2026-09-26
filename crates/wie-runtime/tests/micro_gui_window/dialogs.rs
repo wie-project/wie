@@ -21,8 +21,7 @@ use crate::helpers::{
 #[test]
 fn notepad_file_open_builds_interactive_dialog() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -67,8 +66,7 @@ fn notepad_file_open_builds_interactive_dialog() {
 #[test]
 fn notepad_file_save_as_builds_interactive_dialog() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
 
@@ -120,8 +118,7 @@ fn notepad_file_save_as_builds_interactive_dialog() {
 #[test]
 fn notepad_font_dialog_survives_control_click() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -324,8 +321,7 @@ fn notepad_font_dialog_survives_control_click() {
 #[test]
 fn notepad_file_new_survives_with_typed_text() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -416,8 +412,7 @@ fn notepad_file_new_survives_with_typed_text() {
 #[test]
 fn notepad_file_dialog_paints_into_the_owner_surface() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
 
@@ -510,8 +505,7 @@ fn notepad_file_dialog_paints_into_the_owner_surface() {
 #[test]
 fn notepad_file_save_builds_interactive_dialog() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
 
@@ -559,8 +553,7 @@ fn notepad_file_save_builds_interactive_dialog() {
 #[test]
 fn notepad_file_dialog_close_then_first_exit_click_exits() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -688,8 +681,7 @@ fn notepad_file_dialog_close_then_first_exit_click_exits() {
 #[test]
 fn notepad_modal_dialog_exit_survives_run_windowed_pump() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -795,8 +787,7 @@ fn notepad_modal_dialog_exit_survives_run_windowed_pump() {
 #[test]
 fn notepad_font_dialog_ok_click_then_first_exit_exits() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -929,8 +920,7 @@ fn notepad_font_dialog_ok_click_then_first_exit_exits() {
 #[test]
 fn notepad_file_save_native_bridge_accept_completes_save_flow() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -1063,8 +1053,7 @@ fn notepad_file_save_native_bridge_accept_completes_save_flow() {
 #[test]
 fn notepad_file_open_native_bridge_accept_reads_picked_file() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -1194,8 +1183,7 @@ fn notepad_file_open_native_bridge_accept_reads_picked_file() {
 #[test]
 fn notepad_file_open_large_picked_file_loads_in_full() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -1317,8 +1305,7 @@ fn notepad_file_open_large_picked_file_loads_in_full() {
 #[test]
 fn notepad_file_save_then_open_roundtrips_content() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -1453,8 +1440,7 @@ fn notepad_file_save_then_open_roundtrips_content() {
 #[test]
 fn notepad_file_new_discard_clears_the_edit() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -1542,8 +1528,7 @@ fn notepad_file_new_discard_clears_the_edit() {
 #[test]
 fn notepad_file_new_yes_save_prompt_routes_to_save_dialog() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;

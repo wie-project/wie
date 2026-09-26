@@ -1,22 +1,14 @@
 //! Integration tests for console, pthread, and CRT convergence micro-exes.
 //!
-//! Binaries from `make -C micro-exes`. Skips if missing (no mingw).
+//! Binaries from `make -C micro-exes`. A missing binary fails the test (see `tests/common/mod.rs`).
 
-use std::path::PathBuf;
+mod common;
 
-fn micro_exe(name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("micro-exes/out");
-    path.push(name);
-    path.is_file().then_some(path)
-}
+use common::micro_exe;
 
 fn run_expect_zero(name: &str) {
     let Some(path) = micro_exe(name) else {
-        eprintln!("skip: micro-exes/out/{name} not built (run make -C micro-exes)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let summary = wie_runtime::run_micro_exe(&path, 256).expect("run_micro_exe");
     assert_eq!(

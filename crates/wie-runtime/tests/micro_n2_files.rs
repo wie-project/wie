@@ -1,25 +1,16 @@
 //! N2 micro-suite: bottle write/read + VFS volume helpers (freestanding PE64).
 
-use std::path::PathBuf;
+mod common;
 
-fn micro_exe(name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("micro-exes/out");
-    path.push(name);
-    path.is_file().then_some(path)
-}
+use common::micro_exe;
 
 #[test]
 fn n2_write_and_read_file_in_bottle() {
     let Some(write_pe) = micro_exe("write_file.exe") else {
-        eprintln!("skip: write_file.exe not built");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let Some(read_pe) = micro_exe("read_file.exe") else {
-        eprintln!("skip: read_file.exe not built");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
 
     let bottle = std::env::temp_dir().join(format!("wie-bottle-test-{}", std::process::id()));
@@ -64,8 +55,7 @@ fn n2_write_and_read_file_in_bottle() {
 #[test]
 fn n2_fresh_bottle_gets_the_full_default_skeleton() {
     let Some(write_pe) = micro_exe("write_file.exe") else {
-        eprintln!("skip: write_file.exe not built");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
 
     let bottle = std::env::temp_dir().join(format!("wie-skeleton-test-{}", std::process::id()));
@@ -91,8 +81,7 @@ fn n2_fresh_bottle_gets_the_full_default_skeleton() {
 #[test]
 fn n2_write_file_without_root_uses_the_global_bottle() {
     let Some(write_pe) = micro_exe("write_file.exe") else {
-        eprintln!("skip: write_file.exe not built");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
 
     // `None` root + `run_micro_exe_with_root` ignores WIE_ROOT, so this

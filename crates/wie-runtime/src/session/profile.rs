@@ -42,11 +42,7 @@ pub struct RuntimeProfile {
     blit_copy_ns_last: u128,
     present_ns: u128,
     present_ns_last: u128,
-    /// Wave 2: Present-commit render-thread counters (0 when commit mode is
-    /// off or frame timing is disabled).
-    commit_frames: u64,
-    commit_ns: u128,
-    commit_ns_last: u128,
+    present_enqueued: u64,
     /// Wave 2 slice 2: D3D9 capture render-thread counters (0 when the
     /// capture pipeline is off or frame timing is disabled).
     capture_frames: u64,
@@ -197,21 +193,10 @@ impl RuntimeProfile {
     pub fn present_ns_last(&self) -> u128 {
         self.present_ns_last
     }
-    /// Number of Present-commit frames published by the render thread (ns
-    /// gated; 0 when commit mode is off).
+    /// Number of accepted D3D9 Present handler entries.
     #[must_use]
-    pub fn commit_frames(&self) -> u64 {
-        self.commit_frames
-    }
-    /// Accumulated render-thread commit (stretch + publish) wall time (ns).
-    #[must_use]
-    pub fn commit_ns(&self) -> u128 {
-        self.commit_ns
-    }
-    /// Duration of the most recent render-thread commit (ns).
-    #[must_use]
-    pub fn commit_ns_last(&self) -> u128 {
-        self.commit_ns_last
+    pub fn present_enqueued(&self) -> u64 {
+        self.present_enqueued
     }
     /// Number of frames published by the D3D9 capture render thread (ns
     /// gated; 0 when the capture pipeline is off).
@@ -330,6 +315,75 @@ impl RuntimeProfile {
         self.jit = stats;
     }
 
+    /// Wave 4 instruction-coverage line — one line, always emitted whenever a
+    /// CPU stats snapshot exists, so headless (no present, no frames) runs
+    /// still report coverage.
+    ///
+    /// **Read `basis=block_entry_static` before quoting any of it.**
+    /// `jit_insns` is accumulated as `meta.insn_count` — the *static* decoded
+    /// length of a compiled block — once per block **entry**
+    /// (`wie_cpu::jit::pipeline::finish_compiled`), where `insn_count` is
+    /// `insns.len()` from the lowering step. A block that self-loops
+    /// internally therefore contributes its static length once, not once per
+    /// iteration: `micro-exes/long_loop` (100M-iteration `do`/`while`, ~3x10^8
+    /// retired instructions) reports `total=20`. The engine loop's per-step
+    /// `retired` value is that same static number, so it cannot repair the
+    /// count; a correct denominator needs a per-block trip count emitted by
+    /// the lowering step (`jit/lower/emit.rs`), which does not exist yet.
+    /// `iced_insns` by contrast is exact — one increment per interpreted step.
+    ///
+    /// So: the JIT/iced split is a **block-entry ratio**, exact for
+    /// straight-line code and for loops whose body is a separate (chained)
+    /// block, and an underestimate scaled by the trip factor of self-looping
+    /// blocks. It is good enough to *rank* ISA families by residue and
+    /// useless as a throughput figure. `block_entries` is the smell detector:
+    /// a real hot loop shows `insn_per_entry` in the single digits.
+    ///
+    /// `degraded` counts instructions the interpreter ran as partial no-ops
+    /// (unimplemented mnemonics — degrade-not-die), the one figure here that
+    /// is both exact and guest-visible. `stops_per_1k` is host API stops per
+    /// 1000 counted instructions.
+    ///
+    /// Zero-total and `None`-stats cases print zeros instead of dividing:
+    /// integer tenths of a percent, saturating (`u64` casts are denied by the
+    /// workspace lint set).
+    #[must_use]
+    pub fn insn_coverage_line(&self) -> String {
+        let degraded = wie_cpu::degraded_insn_count();
+        let (jit, iced, entries) = self.jit().map_or((0, 0, 0), |j| {
+            (j.exec.jit_insns, j.exec.iced_insns, j.exec.cache_hits)
+        });
+        let total = jit.saturating_add(iced);
+        format!(
+            "insn_coverage: total={total} jit={jit} iced={iced} jit_share_pct={}.{} \
+             degraded={degraded} degraded_pct={}.{} stops_per_1k={}.{} \
+             block_entries={entries} insn_per_entry={}.{} basis=block_entry_static",
+            tenths_pct(jit, total) / 10,
+            tenths_pct(jit, total) % 10,
+            tenths_pct(degraded, total) / 10,
+            tenths_pct(degraded, total) % 10,
+            tenths_per_1k(self.host_stops(), total) / 10,
+            tenths_per_1k(self.host_stops(), total) % 10,
+            tenths_ratio(total, entries) / 10,
+            tenths_ratio(total, entries) % 10,
+        )
+    }
+
+    /// The one-line warning that must travel with every
+    /// [`Self::insn_coverage_line`], so no consumer can read the coverage
+    /// numbers without seeing the two ways they undercount.
+    #[must_use]
+    pub fn insn_coverage_caveat_line() -> &'static str {
+        "insn_coverage_caveat: jit_insns is the STATIC block length counted per block \
+         ENTRY, not per dynamic instruction (micro-exes/long_loop: total=25 for ~3e8 retired) \
+         — a self-looping block undercounts by its trip count; on multithreaded guests the \
+         counters also miss worker-thread execution (micro-exes/cpp_threads interprets 26407 \
+         instructions but reports iced=45). Only `degraded`, and iced_insns on a single-thread \
+         guest, are exact. Use the jit/iced split to RANK ISA families, never as a throughput \
+         figure. A real denominator needs a per-block trip counter in the lowering step plus a \
+         cross-thread stats merge."
+    }
+
     /// Human-readable multi-line report for stderr / logs.
     #[must_use]
     pub fn report(&self) -> String {
@@ -434,14 +488,26 @@ impl RuntimeProfile {
                     p.never_marks
                 ));
             }
+            // Wave 4 instruction coverage. Deliberately outside the
+            // present/frames gate below: a headless micro run publishes no
+            // frames but still retires instructions, and coverage is the
+            // metric that decides which ISA family to lower next.
+            lines.push(self.insn_coverage_line());
+            lines.push(Self::insn_coverage_caveat_line().to_owned());
         }
-        if self.frames_published() > 0 || self.publish_ns_last() > 0 {
+        if self.present_enqueued() > 0
+            || self.frames_published() > 0
+            || self.publish_ns_last() > 0
+            || self.present_ns() > 0
+            || self.present_ns_last() > 0
+            || self.capture_frames() > 0
+        {
             lines.push(format!(
-                "frames_published={} publish_ms={:.3} publish_ms_last={:.3} \
+                "present_enqueued={} frames_published={} publish_ms={:.3} publish_ms_last={:.3} \
                  blit_copy_ms={:.3} blit_copy_ms_last={:.3} \
                  present_ms={:.3} present_ms_last={:.3} \
-                 commit_frames={} commit_ms={:.3} commit_ms_last={:.3} \
                  capture_frames={} capture_ms={:.3} capture_ms_last={:.3}",
+                self.present_enqueued(),
                 self.frames_published(),
                 self.publish_ns() as f64 / 1e6,
                 self.publish_ns_last() as f64 / 1e6,
@@ -449,9 +515,6 @@ impl RuntimeProfile {
                 self.blit_copy_ns_last() as f64 / 1e6,
                 self.present_ns() as f64 / 1e6,
                 self.present_ns_last() as f64 / 1e6,
-                self.commit_frames(),
-                self.commit_ns() as f64 / 1e6,
-                self.commit_ns_last() as f64 / 1e6,
                 self.capture_frames(),
                 self.capture_ns() as f64 / 1e6,
                 self.capture_ns_last() as f64 / 1e6,
@@ -502,6 +565,26 @@ impl RuntimeProfile {
         }
         lines.join("\n")
     }
+}
+
+/// `part` as tenths of a percent of `total` (integer math: the workspace
+/// denies `as_conversions` and clippy's `cast_precision_loss`). Zero total
+/// yields zero rather than a division by zero.
+fn tenths_pct(part: u64, total: u64) -> u64 {
+    part.saturating_mul(1000).checked_div(total).unwrap_or(0)
+}
+
+/// `count` per 1000 of `total`, in tenths (same integer-only rationale as
+/// [`tenths_pct`]; a zero `total` reports zero).
+fn tenths_per_1k(count: u64, total: u64) -> u64 {
+    count.saturating_mul(10_000).checked_div(total).unwrap_or(0)
+}
+
+/// `part` as tenths of a plain ratio (`part`/`total`), integer-only like the
+/// percent helper. Used for ratios that are not percentages, e.g. counted
+/// instructions per block entry.
+fn tenths_ratio(part: u64, total: u64) -> u64 {
+    part.saturating_mul(10).checked_div(total).unwrap_or(0)
 }
 
 impl super::RuntimeSession {
@@ -586,11 +669,9 @@ impl super::RuntimeSession {
         // Presenter-side present timing lives in the host channel (it is
         // written by the winit thread) — read it without the big lock.
         let (
+            present_enqueued,
             channel_present_ns,
             channel_present_ns_last,
-            commit_frames,
-            commit_ns,
-            commit_ns_last,
             capture_frames,
             capture_ns,
             capture_ns_last,
@@ -599,17 +680,15 @@ impl super::RuntimeSession {
                 .map(|p| {
                     let channel = p.channel_arc();
                     (
+                        channel.present_enqueued(),
                         channel.present_ns(),
                         channel.present_ns_last(),
-                        channel.commit_frames(),
-                        u128::from(channel.commit_ns()),
-                        u128::from(channel.commit_ns_last()),
                         channel.capture_frames(),
                         u128::from(channel.capture_ns()),
                         u128::from(channel.capture_ns_last()),
                     )
                 })
-                .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0))
+                .unwrap_or((0, 0, 0, 0, 0, 0))
         });
         let present = self.process.with_winapi_ref(|st| {
             st.try_present().map(|p| {
@@ -643,11 +722,9 @@ impl super::RuntimeSession {
         self.profile.publish_ns_last = publish_ns_last;
         self.profile.blit_copy_ns = blit_copy_ns;
         self.profile.blit_copy_ns_last = blit_copy_ns_last;
+        self.profile.present_enqueued = present_enqueued;
         self.profile.present_ns = channel_present_ns;
         self.profile.present_ns_last = channel_present_ns_last;
-        self.profile.commit_frames = commit_frames;
-        self.profile.commit_ns = commit_ns;
-        self.profile.commit_ns_last = commit_ns_last;
         self.profile.capture_frames = capture_frames;
         self.profile.capture_ns = capture_ns;
         self.profile.capture_ns_last = capture_ns_last;
@@ -742,6 +819,27 @@ mod tests {
         assert_eq!(profile.idle_residency_ns(), 1_500_000);
     }
 
+    #[test]
+    fn report_emits_all_present_path_counters_for_capture_only_session() {
+        let profile = RuntimeProfile {
+            present_enqueued: 9,
+            capture_frames: 7,
+            capture_ns: 3_000_000,
+            capture_ns_last: 500_000,
+            present_ns: 750_000,
+            present_ns_last: 125_000,
+            ..RuntimeProfile::default()
+        };
+
+        let report = profile.report();
+
+        assert!(report.contains("present_enqueued=9"), "{report}");
+        assert!(report.contains("frames_published=0"), "{report}");
+        assert!(report.contains("capture_frames=7"), "{report}");
+        assert!(report.contains("capture_ms=3.000"), "{report}");
+        assert!(report.contains("present_ms=0.750"), "{report}");
+    }
+
     /// A snapshot fold (the `sync_lock_wait_stats` shape) copies the
     /// lock-free atomics into the profile totals and maxima.
     #[test]
@@ -763,5 +861,128 @@ mod tests {
         assert_eq!(profile.guest_lock_wait_max_ns(), 3_000);
         assert_eq!(profile.presenter_lock_wait_ns(), 2_000);
         assert_eq!(profile.presenter_lock_wait_max_ns(), 2_000);
+    }
+
+    /// A headless session (no present, no published frames) still reports
+    /// instruction coverage: the line is emitted from the CPU-stats snapshot,
+    /// not from the present-gated block that also prints `degraded_insns=`.
+    #[test]
+    fn insn_coverage_line_emitted_for_headless_profile() {
+        let mut stats = wie_cpu::JitStats::default();
+        stats.exec.jit_insns = 900;
+        stats.exec.iced_insns = 100;
+        let profile = RuntimeProfile {
+            jit: Some(stats),
+            ..RuntimeProfile::default()
+        };
+
+        let report = profile.report();
+
+        assert!(report.contains("insn_coverage: total=1000"), "{report}");
+        assert!(report.contains("jit_share_pct=90.0"), "{report}");
+        // The present-gated block never ran, but coverage did.
+        assert!(!report.contains("present_enqueued="), "{report}");
+    }
+
+    /// No CPU stats (and, by extension, a zero total) must not divide by zero
+    /// and must not print a bogus line: the report omits it, while the getter
+    /// stays callable and zero-safe for callers that ask unconditionally.
+    #[test]
+    fn insn_coverage_line_omitted_without_cpu_stats() {
+        let profile = RuntimeProfile::default();
+
+        let report = profile.report();
+        assert!(!report.contains("insn_coverage"), "{report}");
+
+        let line = profile.insn_coverage_line();
+        assert!(line.contains("total=0"), "{line}");
+        assert!(line.contains("jit_share_pct=0.0"), "{line}");
+        assert!(line.contains("degraded_pct=0.0"), "{line}");
+        assert!(line.contains("stops_per_1k=0.0"), "{line}");
+    }
+
+    /// The arithmetic is integer tenths of a percent, taken straight from the
+    /// backend-parity `ExecStats` counters: 750/250 of 1000 retired
+    /// instructions with 100 host stops.
+    #[test]
+    fn insn_coverage_line_arithmetic_matches_exec_stats() {
+        let mut stats = wie_cpu::JitStats::default();
+        stats.exec.jit_insns = 750;
+        stats.exec.iced_insns = 250;
+        let profile = RuntimeProfile {
+            jit: Some(stats),
+            host_stops: 100,
+            ..RuntimeProfile::default()
+        };
+
+        let line = profile.insn_coverage_line();
+
+        assert!(line.contains("total=1000"), "{line}");
+        assert!(line.contains("jit=750"), "{line}");
+        assert!(line.contains("iced=250"), "{line}");
+        assert!(line.contains("jit_share_pct=75.0"), "{line}");
+        assert!(line.contains("stops_per_1k=100.0"), "{line}");
+        // `degraded` is a process-global counter, so only its derived percent
+        // is asserted (0 whenever the process degraded nothing).
+        let degraded = wie_cpu::degraded_insn_count();
+        let tenths = degraded.saturating_mul(1000) / 1000;
+        assert!(
+            line.contains(&format!(
+                "degraded={degraded} degraded_pct={}.{}",
+                tenths / 10,
+                tenths % 10
+            )),
+            "{line}"
+        );
+    }
+
+    /// Regression guard for the *known* denominator defects, so they can never
+    /// become silent again:
+    ///
+    /// 1. `jit_insns` is the static block length counted per block entry
+    ///    (`finish_compiled`), so `total` is NOT a dynamic instruction count.
+    /// 2. The snapshot covers one engine, so a multithreaded guest's
+    ///    worker-thread execution is missing entirely.
+    ///
+    /// The requested acceptance test — "a tight guest loop retires >10^7
+    /// instructions" — cannot pass until the lowering step publishes a
+    /// per-block trip count (`jit/lower/emit.rs`); today
+    /// `micro-exes/long_loop` reports `total=25` for ~3x10^8 retired
+    /// instructions. Until then the numbers must carry their own warning, and
+    /// `block_entries` / `insn_per_entry` must let a reader spot a
+    /// self-looping block instead of trusting the total.
+    ///
+    /// This is the in-scope half of the fix. When the emitter gains a trip
+    /// counter, replace this with the real threshold assertion.
+    #[test]
+    fn insn_coverage_line_is_labelled_and_exposes_its_undercount() {
+        // A self-looping block: one cache entry, 18 static instructions.
+        let mut stats = wie_cpu::JitStats::default();
+        stats.exec.jit_insns = 18;
+        stats.exec.iced_insns = 2;
+        stats.exec.cache_hits = 1;
+        let profile = RuntimeProfile {
+            jit: Some(stats),
+            ..RuntimeProfile::default()
+        };
+
+        let line = profile.insn_coverage_line();
+        let report = profile.report();
+
+        // The label is machine-greppable from the line itself.
+        assert!(line.contains("basis=block_entry_static"), "{line}");
+        // The smell detector: 20 counted instructions over 1 cache entry.
+        assert!(line.contains("block_entries=1"), "{line}");
+        assert!(line.contains("insn_per_entry=20.0"), "{line}");
+        // The caveat rides along with the numbers in the report, and names the
+        // concrete failing cases so the next reader does not have to find them.
+        assert!(report.contains("insn_coverage_caveat:"), "{report}");
+        assert!(report.contains("long_loop: total="), "{report}");
+        assert!(report.contains("cpp_threads"), "{report}");
+        // The caveat is emitted whenever the line is, never on its own.
+        assert_eq!(
+            report.contains("insn_coverage_caveat:"),
+            report.contains("insn_coverage: total=")
+        );
     }
 }

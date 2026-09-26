@@ -1,35 +1,88 @@
 #!/usr/bin/env bash
 # Run micro-EXE test gates by category. Exit non-zero on first failure.
-# Usage: ./run-micro-suite.sh [category] [--matrix]
+# Usage: ./run-micro-suite.sh [category] [--matrix] [--short]
+#        ./run-micro-suite.sh exe <name> [-- args...]   # one guest only
 #   category: all (default), cpp_exes, seh_exes, dll_tests, console_tests,
-#             pthread_tests
+#             pthread_tests, exe
+#   exe <name>: run a single guest from micro-exes/out (e.g. `exe long_loop`,
+#             `exe mt_contention 4 512 ff` — trailing words are passed
+#             straight to `wie run`). This is the same run_one() choke point
+#             the categories use, so a single-exe run is exactly what the
+#             category run would have done for that exe, minus staging
+#             special-cases (dll_* still get --app-dir).
 #   --matrix: additionally repeat the chosen category under alternate JIT
 #             backends (WIE_JIT_MEM=slow, WIE_JIT_MEM=pin, WIE_CPU=iced).
 #             Replaces the former scripts/check-jit-matrix.sh; use when
 #             touching memory lowering, chaining, or CPU dispatch.
+#   --short:  opt every fixture that supports it into its short work budget
+#             by exporting WIE_SHORT=1 into the GUEST environment (via
+#             WIE_GUEST_ENV). Fixtures that do not implement it ignore it,
+#             so this is safe for a whole category; the pass/fail rule and
+#             the assertions are unchanged. Env equivalent: WIE_SUITE_SHORT=1.
 #
 # The `all` category is DATA-DRIVEN: it runs every *.exe in micro-exes/out/
 # applying per-exe overrides from the tables below. A new micro exe is
 # therefore covered automatically — no list editing required.
 #
 # WIE_SKIP_LONG_LOOP=1 skips long_loop.exe (needed under WIE_CPU=iced, where
-# its 100M-iteration loop exceeds the slice budget).
+# its 100M-iteration loop exceeds the slice budget). Note `--short` achieves
+# the same wall-time relief without dropping the exe from the sweep.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLI="${CLI:-$ROOT/target/release/wie}"
 CPU="${WIE_CPU:-jit}"
 
+usage() { sed -n '2,29p' "$0"; }
+
 CATEGORY="all"
 MATRIX=0
-for arg in "$@"; do
-  case "$arg" in
+SHORT=0
+POS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --matrix) MATRIX=1 ;;
-    -h|--help)
-      sed -n '2,12p' "$0"; exit 0 ;;
-    *) CATEGORY="$arg" ;;
+    --short) SHORT=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "run-micro-suite: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *) POS+=("$1") ;;
   esac
+  shift
 done
+
+CATEGORY="${POS[0]:-all}"
+ONLY_EXE=""
+EXE_ARGS=()
+if [[ "$CATEGORY" == "exe" ]]; then
+  ONLY_EXE="${POS[1]:-}"
+  if [[ -z "$ONLY_EXE" ]]; then
+    echo "run-micro-suite: 'exe' needs a guest name, e.g. 'exe long_loop'" >&2
+    echo "available:" >&2
+    ls -1 "$ROOT/micro-exes/out"/*.exe 2>/dev/null | sed 's|.*/|  |; s|\.exe$||' >&2 || true
+    exit 2
+  fi
+  ONLY_EXE="${ONLY_EXE%.exe}"
+  EXE_ARGS=()
+  if [[ "${#POS[@]}" -gt 2 ]]; then
+    EXE_ARGS=("${POS[@]:2}")
+  fi
+elif [[ "${#POS[@]}" -gt 1 ]]; then
+  echo "run-micro-suite: unexpected extra arguments: ${POS[*]:1}" >&2
+  usage >&2
+  exit 2
+fi
+
+# Short mode is a GUEST-environment switch, so it travels through
+# WIE_GUEST_ENV (the runtime's injection hook) rather than the host env —
+# the guest env does not inherit the host's. Exported once, before run_suite,
+# so the --matrix re-invocations cannot append it twice.
+if [[ "$SHORT" == 1 || -n "${WIE_SUITE_SHORT:-}" ]]; then
+  case "${WIE_GUEST_ENV:-}" in
+    *WIE_SHORT=1*) : ;;
+    "") export WIE_GUEST_ENV="WIE_SHORT=1" ;;
+    *) export WIE_GUEST_ENV="WIE_SHORT=1;${WIE_GUEST_ENV}" ;;
+  esac
+fi
 
 # The per-run summary (path, events, exit) is a `wie::commands::run`-target
 # debug log; show it by default so the suite reports what each exe did.
@@ -60,8 +113,35 @@ run_suite() {
     run_one "$pe" --root "$root" "$@"
   }
 
-  # Build only the requested category
-  make -C "$ROOT/micro-exes" "${CATEGORY}"
+  # Build only what the chosen category runs. Most categories have a phony
+  # Makefile target of the same name; the two that do not map to their exe
+  # list here. Without this mapping `run-micro-suite.sh console_tests` died in
+  # make with "No rule to make target `console_tests'" before running a single
+  # guest, even though the category is documented in the usage header.
+  # (seh_exes is deliberately NOT mapped: micro-exes/seh/ holds only
+  # cpp_exceptions/, so neither seh_access_violation.exe nor seh_div_zero.exe
+  # has a source or a build rule. The category is dead in the Makefile and
+  # fails here exactly as it did before; reviving it needs new fixtures.)
+  local -a build_targets
+  case "$CATEGORY" in
+    console_tests) build_targets=("out/console_cells.exe") ;;
+    pthread_tests) build_targets=("out/pt_basic.exe" "out/pt_cond.exe") ;;
+    exe)
+      # The file rule if the Makefile has one, else the phony alias
+      # (e.g. `exe gl_quad` -> out/gl_quad.exe, `exe dir_watch` -> phony).
+      if ! make -C "$ROOT/micro-exes" "out/${ONLY_EXE}.exe" 2>/dev/null \
+        && ! make -C "$ROOT/micro-exes" "${ONLY_EXE}" 2>/dev/null; then
+        echo "run-micro-suite: no Makefile rule builds '${ONLY_EXE}' (tried" \
+          "out/${ONLY_EXE}.exe and ${ONLY_EXE})" >&2
+        exit 1
+      fi
+      build_targets=()
+      ;;
+    *) build_targets=("$CATEGORY") ;;
+  esac
+  if [[ "${#build_targets[@]}" -gt 0 ]]; then
+    make -C "$ROOT/micro-exes" "${build_targets[@]}"
+  fi
 
   OUT="$ROOT/micro-exes/out"
 
@@ -239,6 +319,40 @@ run_suite() {
 
   if [[ "$CATEGORY" == "all" ]]; then
     run_all_exes
+  fi
+
+  # Single-exe selector: the same run_one() choke point the categories use.
+  # An explicitly named exe is never filtered by SKIP_EXES (asking for one is
+  # the point) but a note is printed so a known-unrunnable guest is not a
+  # surprise.
+  if [[ "$CATEGORY" == "exe" ]]; then
+    if skipped "${ONLY_EXE}.exe"; then
+      echo "--- note: ${ONLY_EXE}.exe is in SKIP_EXES; running it anyway on explicit request ---"
+    fi
+    local target="$OUT/${ONLY_EXE}.exe"
+    if [[ ! -f "$target" ]]; then
+      echo "run-micro-suite: no such guest: $target" >&2
+      exit 1
+    fi
+    # Args: explicit trailing words win, else the sweep's EXTRA_ARGS entry for
+    # this exe (so `exe cli_args` behaves like the `all` sweep's cli_args run).
+    local -a args=()
+    if [[ "${#EXE_ARGS[@]}" -gt 0 ]]; then
+      args=("${EXE_ARGS[@]}")
+    else
+      local from_table
+      from_table="$(extra_args_for "${ONLY_EXE}.exe")"
+      [[ -n "$from_table" ]] && read -r -a args <<<"$from_table"
+    fi
+    # Same --app-dir staging the `all` sweep gives dll_* (they load their
+    # sibling *_funcs.dll by bare name).
+    if [[ "${ONLY_EXE}" == dll_* ]]; then
+      run_one "$target" --app-dir "$OUT" ${args[@]+"${args[@]}"}
+    elif [[ "${#args[@]}" -gt 0 ]]; then
+      run_one "$target" "${args[@]}"
+    else
+      run_one "$target"
+    fi
   fi
 
   if [[ "$CATEGORY" == "console_tests" ]]; then

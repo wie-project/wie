@@ -1,24 +1,16 @@
 //! DBGHELP symbol stub micro-exe (freestanding PE64).
 //!
-//! Binary from `make -C micro-exes dbghelp_stub`. Skips if missing (no mingw).
+//! Binary from `make -C micro-exes dbghelp_stub`. A missing binary fails the test (see `tests/common/mod.rs`).
 
-use std::path::PathBuf;
+mod common;
 
-fn micro_exe(name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("micro-exes/out");
-    path.push(name);
-    path.is_file().then_some(path)
-}
+use common::micro_exe;
 
 /// SymInitializeW succeeds, SymFromAddrW fails gracefully, SymCleanup succeeds.
 #[test]
 fn dbghelp_init_cleanup_roundtrip() {
     let Some(path) = micro_exe("dbghelp_stub.exe") else {
-        eprintln!("skip: micro-exes/out/dbghelp_stub.exe not built (run make -C micro-exes)");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let summary = wie_runtime::run_micro_exe(&path, 256).expect("run_micro_exe");
     assert_eq!(

@@ -8,8 +8,14 @@
 //! font/confirm/save dialog flows (`dialogs`), and the Edit → Go To
 //! line-jump flow (`goto`).
 
+// Shared with the single-file integration tests next door: the guest-PE
+// resolvers live in one place so the "missing fixture is a failure" rule
+// cannot drift per test file. `common` is not a test target of its own — a
+// `tests/<dir>/mod.rs` is only compiled when a target declares `mod common`.
+#[path = "../common/mod.rs"]
+mod common;
+
 mod capture;
-mod commit;
 mod controls;
 mod demo;
 mod dialogs;

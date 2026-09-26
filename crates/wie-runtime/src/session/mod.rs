@@ -303,17 +303,18 @@ impl RuntimeSession {
             .with_mut(|_, s| s.window_state().message_queue_idle_policy = policy);
     }
 
-    /// Adds one message to the persistent guest message queue.
+    /// Adds one message to the guest message queue of the thread that owns
+    /// the message's window (the primary thread's queue when the window is
+    /// unknown — the caller supplies no "current thread").
     pub fn post_message(&mut self, message: wie_winapi::QueuedWindowMessage) {
-        self.process
-            .message_queue_arc()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .messages
-            .push(message);
-        // Direct Vec push (the caller owns the full record shape) still owes
-        // parked threads their wake token — `queue.push` broadcasts on its
+        let hwnd = message.window_handle;
+        let queue_arc = self.process.message_queue_arc();
+        let mut queue = queue_arc.lock().unwrap_or_else(|e| e.into_inner());
+        let tid = queue.queues.resolve_tid(hwnd, queue.primary_tid);
+        // Direct push (the caller owns the full record shape) still owes
+        // parked threads their wake token — `queue.push_to` broadcasts on its
         // own; this path must do it explicitly.
+        queue.queues.push_message(tid, message);
         self.wake_hub.broadcast(wie_winapi::Wake::MessagePosted);
     }
 

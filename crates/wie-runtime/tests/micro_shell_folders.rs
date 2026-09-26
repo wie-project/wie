@@ -1,28 +1,18 @@
 //! SHELL32 micro-test: CSIDL folder mapping (SHGetSpecialFolderPathW),
 //! SHGetFileInfoW on a real guest file, and SHAddToRecentDocs no-crash.
 //!
-//! Binary from `make -C micro-exes shell_folders`. Skips if missing (no mingw).
+//! Binary from `make -C micro-exes shell_folders`. A missing binary fails the test (see `tests/common/mod.rs`).
 //! The micro runs under an override bottle (its SHGetFileInfoW target resolves
 //! inside `{root}/drive_c/Users/WIE/Documents`).
 
-use std::path::PathBuf;
+mod common;
 
-fn micro_exe(name: &str) -> Option<PathBuf> {
-    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
-    path.push("micro-exes/out");
-    path.push(name);
-    path.is_file().then_some(path)
-}
+use common::micro_exe;
 
 #[test]
 fn shell_folders_csidl_and_fileinfo_roundtrip() {
     let Some(path) = micro_exe("shell_folders.exe") else {
-        eprintln!(
-            "skip: micro-exes/out/shell_folders.exe not built (run make -C micro-exes shell_folders)"
-        );
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
 
     let pid = std::process::id();

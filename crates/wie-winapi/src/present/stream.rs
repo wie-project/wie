@@ -1,8 +1,7 @@
 //! The Wave 2 slice 2 capture render thread: consumes the D3D9 command
 //! stream flushed at each `Present` (`d3d9/capture.rs`), replays the ops
 //! into its OWN backbuffer + render-target/depth copies, and publishes the
-//! frame through the channel exactly like the commit path
-//! ([`super::commit`]) does.
+//! the frame through the channel.
 //!
 //! Ownership model: the emu thread never rasterizes on this path — handlers
 //! append self-contained ops to the per-device stream and `Present` moves
@@ -23,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::SurfaceFrame;
-use super::commit::blit_frame_into;
+use super::publish_tail::blit_frame_into;
 use crate::d3d9::capture::{CaptureFlush, CaptureHandback, ReplayTargets};
 
 /// The capture pipeline on the [`super::PresentChannel`]: the latest-wins
@@ -216,7 +215,7 @@ impl CapturePipeline {
 
 /// The join handle for the spawned capture render thread. Dropping it stops
 /// the thread (one-frame latency at most) and joins it, so a test or a guest
-/// teardown never leaks the thread (the `CommitterHandle` pattern).
+/// teardown never leaks the thread.
 pub struct CaptureStreamerHandle {
     channel: Arc<super::PresentChannel>,
     join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,

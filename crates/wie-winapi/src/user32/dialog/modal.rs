@@ -16,11 +16,10 @@ use anyhow::{Context, Result};
 use crate::OuterReturn;
 use crate::gdi32::{ArgReg, read_arg};
 use crate::user32::{
-    BS_DEFPUSHBUTTON, CreateWindowRequest, GuestCallbackRequest, HandlerContext,
-    QueuedWindowMessage, WM_INITDIALOG, WM_QUIT, WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP, WS_VISIBLE,
-    WinApiControlSignal, WinApiHandlerResult, WinApiState, WindowClassIdentifier,
-    controls::ControlClassKind, create_window_record, find_window, find_window_mut, read_u64,
-    window_client_size,
+    BS_DEFPUSHBUTTON, CreateWindowRequest, GuestCallbackRequest, HandlerContext, WM_INITDIALOG,
+    WM_QUIT, WS_CHILD, WS_CLIPCHILDREN, WS_TABSTOP, WS_VISIBLE, WinApiControlSignal,
+    WinApiHandlerResult, WinApiState, WindowClassIdentifier, controls::ControlClassKind,
+    create_window_record, find_window, find_window_mut, read_u64, window_client_size,
 };
 use wie_pe::resources::{DialogItemTemplate, DialogTemplate, ItemClass};
 
@@ -345,20 +344,12 @@ pub fn handle_end_dialog(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
             drop(engine.mem_write(result_va, &low.to_le_bytes()));
         }
 
-        // Post WM_QUIT — the modal stub's GetMessage loop exits on it.
+        // Post WM_QUIT — the modal stub's GetMessage loop exits on it. It
+        // goes to THIS thread's queue (the dialog's modal loop runs here).
         {
+            let tid = state.kernel.threads.current_tid();
             let mut queue = state.lock_message_queue();
-            let time = queue.next_message_time;
-            queue.next_message_time = time.wrapping_add(1);
-            queue.messages.push(QueuedWindowMessage {
-                window_handle: crate::handles::Hwnd::NULL,
-                message: WM_QUIT,
-                word_parameter: result,
-                long_parameter: 0,
-                time,
-                point_x: 0,
-                point_y: 0,
-            });
+            queue.push_to(tid, crate::handles::Hwnd::NULL, WM_QUIT, result, 0)?;
         }
 
         // Remove the dialog subtree (the per-site tail). The owner rerender

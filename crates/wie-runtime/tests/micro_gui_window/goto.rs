@@ -27,8 +27,7 @@ const GOTO_DLG_CY: i32 = 100;
 #[test]
 fn goto_dialog_resolves_edit_and_moves_the_caret() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -255,8 +254,7 @@ fn goto_dialog_resolves_edit_and_moves_the_caret() {
 #[test]
 fn goto_cancel_click_closes_dialog_on_first_click() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -575,8 +573,7 @@ fn goto_cancel_click_closes_dialog_on_first_click() {
 #[test]
 fn goto_prefill_caret_is_at_end_and_typing_appends() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     // Serialized suite: see GUI_SUITE_LOCK.
     let _suite = gui_suite_serialize();
@@ -834,8 +831,7 @@ fn run_goto_flow(
 #[test]
 fn goto_line_deep_keeps_rows_below_visible() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;
@@ -949,8 +945,7 @@ fn goto_line_deep_keeps_rows_below_visible() {
 #[test]
 fn goto_ignores_unknown_command_id() {
     let Some(path) = real_exe("notepad.exe") else {
-        eprintln!("skip: real_exes/notepad.exe not present");
-        return;
+        return; // fixture absent: already reported (see tests/common/mod.rs)
     };
     let _suite = gui_suite_serialize();
     use wie_runtime::EntryTraceTermination;

@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 use wie_winapi::{
-    ComMethod, D3d9Iface, FakeVa, WinApiId, WinApiTraits, decode_fake_va, encode_export,
+    ComIface, ComMethod, FakeVa, WinApiId, WinApiTraits, decode_fake_va, encode_export,
     encode_unresolved, resolve_winapi_id, winapi_id_export,
 };
 
@@ -228,9 +228,15 @@ pub(crate) fn resolve_fake_api_at(address: u64, soft: &SoftApiTable) -> Option<R
     }
 }
 
-fn resolve_com(iface: D3d9Iface, method: ComMethod) -> Option<ResolvedFakeApi> {
+/// Resolve a `kind=Com` fake VA to the `(library, method-name)` pair runtime
+/// dispatch routes it under.
+///
+/// The library comes from the interface sum, not from the method name: a
+/// `ComMethod` alone is ambiguous, because `QueryInterface` / `AddRef` /
+/// `Release` exist on every COM surface WIE implements.
+fn resolve_com(iface: ComIface, method: ComMethod) -> Option<ResolvedFakeApi> {
     let name = method.name(iface);
-    let library = "D3D9.dll";
+    let library = iface.library();
     let winapi_id = resolve_winapi_id(library, name.as_ref());
     let traits = winapi_id.map(WinApiId::traits).unwrap_or_default();
     Some(ResolvedFakeApi {
@@ -262,4 +268,156 @@ pub(crate) fn collect_stub_entries(
         }
     }
     out
+}
+
+/// DirectInput8 wiring tests.
+///
+/// These live here rather than next to the code they cover because
+/// `session/pump.rs` and `memory.rs` are off-limits to this change, and both
+/// facts worth pinning are properties of *this* file's name resolution plus
+/// `memory.rs`'s env pair. Two things must stay true:
+///
+/// 1. Every DirectInput COM vtable stop resolves to the `dinput8.dll` library
+///    with a readable trace name, so `dispatch_winapi` reaches
+///    `crate::dinput::dispatch_object_method` instead of bailing with
+///    "unsupported WinAPI call".
+/// 2. `SDL_DIRECTINPUT_ENABLED=0` must stay in the guest environment. It is the
+///    reason SDL2 never touches this new DirectInput path; flipping it would
+///    push SDL2 onto an unproven implementation, and it is invisible in a diff
+///    of the DirectInput code itself — hence the guard.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wie_winapi::fake_va::{DInput8Iface, DirectInput8Method, DirectInputDevice8Method};
+
+    use crate::memory::build_default_environment_strings_w;
+
+    /// Every modelled `IDirectInput8` / `IDirectInputDevice8` slot must resolve
+    /// to `dinput8.dll` with a name the dispatcher recognises. A COM stop that
+    /// resolved to the wrong library would silently become an
+    /// "unsupported WinAPI call" at run time.
+    #[test]
+    fn directinput_com_stops_resolve_to_the_dinput8_library() {
+        for slot in 0..DirectInput8Method::VTABLE_SLOTS {
+            let slot = u8::try_from(slot).expect("slot fits u8");
+            let method = ComMethod::decode(ComIface::DInput8(DInput8Iface::DirectInput8), slot);
+            let resolved = resolve_com(ComIface::DInput8(DInput8Iface::DirectInput8), method)
+                .expect("an IDirectInput8 stop must resolve");
+            assert_eq!(
+                resolved.library.as_ref(),
+                "dinput8.dll",
+                "IDirectInput8 slot {slot} must resolve under dinput8.dll"
+            );
+            assert!(
+                resolved.name.starts_with("IDirectInput8::"),
+                "IDirectInput8 slot {slot} trace name was {:?}",
+                resolved.name
+            );
+        }
+        for slot in 0..DirectInputDevice8Method::VTABLE_SLOTS {
+            let slot = u8::try_from(slot).expect("slot fits u8");
+            let method =
+                ComMethod::decode(ComIface::DInput8(DInput8Iface::DirectInputDevice8), slot);
+            let resolved = resolve_com(ComIface::DInput8(DInput8Iface::DirectInputDevice8), method)
+                .expect("an IDirectInputDevice8 stop must resolve");
+            assert_eq!(
+                resolved.library.as_ref(),
+                "dinput8.dll",
+                "IDirectInputDevice8 slot {slot} must resolve under dinput8.dll"
+            );
+            assert!(
+                resolved.name.starts_with("IDirectInputDevice8::"),
+                "IDirectInputDevice8 slot {slot} trace name was {:?}",
+                resolved.name
+            );
+        }
+    }
+
+    /// The export-name contract: `dinput8.dll` is a WinAPI library with
+    /// exactly one real export, and **no** COM vtable slot may be offered as a
+    /// dll export name.
+    ///
+    /// The slot names are derived from the real `ComMethod::name()` enums
+    /// rather than hand-listed, so this covers every slot WIE models instead of
+    /// whatever a list happened to contain. Getting it wrong in either
+    /// direction is a real bug: a slot reported as an export gets a soft
+    /// placeholder from the loader, and a real export reported as missing makes
+    /// a guest's `GetProcAddress` return NULL.
+    #[test]
+    fn the_served_directinput_methods_are_dispatchable_by_name() {
+        use wie_winapi::fake_va::{ComIface, ComMethod};
+
+        assert!(
+            wie_winapi::is_winapi_library("dinput8.dll"),
+            "dinput8.dll must be a WinAPI library or a guest importing it fails to load"
+        );
+        // The one real export does resolve, so both a static import and
+        // `GetProcAddress` land on a handler.
+        assert!(
+            wie_winapi::is_winapi_implemented("dinput8.dll", "DirectInput8Create"),
+            "DirectInput8Create must resolve to a real handler"
+        );
+        assert!(
+            !wie_winapi::is_winapi_implemented("dinput8.dll", "DllCanUnloadNow"),
+            "dinput8.dll exports exactly one name; anything else must not be claimed"
+        );
+
+        // No COM slot may be reachable as a dll export name.
+        for (iface, slots) in [
+            (
+                ComIface::DInput8(DInput8Iface::DirectInput8),
+                DirectInput8Method::VTABLE_SLOTS,
+            ),
+            (
+                ComIface::DInput8(DInput8Iface::DirectInputDevice8),
+                DirectInputDevice8Method::VTABLE_SLOTS,
+            ),
+        ] {
+            for slot in 0..slots {
+                let slot = u8::try_from(slot).expect("slot fits u8");
+                let name = ComMethod::decode(iface, slot).name(iface);
+                assert!(
+                    !wie_winapi::is_winapi_implemented("dinput8.dll", name.as_ref()),
+                    "{name} is a COM vtable slot, not a dll export; it must not be \
+                     reported as a resolvable export name"
+                );
+            }
+        }
+    }
+
+    /// `SDL_DIRECTINPUT_ENABLED=0` must stay in the guest environment block.
+    ///
+    /// SDL2 is the guest that motivated the DirectInput lane, and this hint is
+    /// the only thing keeping `SDL_InitSubSystem(SDL_INIT_VIDEO)` off the
+    /// DirectInput joystick driver. It is invisible in a diff of the DirectInput
+    /// code, so without this guard a well-meaning "let's try the new path"
+    /// commit could flip it silently.
+    #[test]
+    fn sdl_directinput_stays_disabled_in_the_guest_environment() {
+        let bytes = build_default_environment_strings_w()
+            .expect("the default environment block must build");
+        // The block is a run of NUL-terminated UTF-16 strings (dinput.h has
+        // nothing to do with it — this is the plain Win32 env block), so split
+        // on the NULs rather than stopping at the first one.
+        let mut entries: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for pair in bytes.chunks_exact(2) {
+            let mut raw = [0_u8; 2];
+            raw.copy_from_slice(pair);
+            match char::from_u32(u32::from(u16::from_le_bytes(raw))) {
+                Some('\0') if current.is_empty() => {}
+                Some('\0') => {
+                    entries.push(std::mem::take(&mut current));
+                }
+                Some(unit) => current.push(unit),
+                None => {}
+            }
+        }
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry == "SDL_DIRECTINPUT_ENABLED=0"),
+            "the default env block must keep SDL_DIRECTINPUT_ENABLED=0; got: {entries:?}"
+        );
+    }
 }

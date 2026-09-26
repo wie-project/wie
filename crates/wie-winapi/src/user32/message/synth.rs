@@ -43,6 +43,9 @@ fn window_matches_filter(
 
 /// Whether a queued message passes a GetMessage/PeekMessage filter.
 ///
+/// Callers only ever pass messages from ONE thread's sub-queue, so the
+/// thread-isolation half of the pump is decided by the container, not here.
+///
 /// `WM_QUIT` bypasses both the window filter and the message range entirely
 /// (Microsoft Learn: `GetMessage` / `PeekMessage` do not filter `WM_QUIT`) —
 /// a modal dialog's `GetMessage(dialog)` must still see the quit.
@@ -147,6 +150,10 @@ fn is_keyboard_message(message: u32) -> bool {
 /// target (Windows sends keyboard input to the focused window regardless of
 /// the window the key event was posted to).
 ///
+/// Only the CALLING thread's sub-queue is rewritten: the focus window belongs
+/// to the thread that pumped the input, and a peer thread's queue must keep
+/// its own targets.
+///
 /// Re-targeting only happens when a focus window is set AND it is a known
 /// window; with no focus the queue is untouched (existing behavior).
 pub(super) fn retarget_keyboard_messages(state: &mut WinApiState) {
@@ -154,8 +161,9 @@ pub(super) fn retarget_keyboard_messages(state: &mut WinApiState) {
     if focus == crate::handles::Hwnd::NULL || !is_known_window(state, focus.as_u64()) {
         return;
     }
+    let tid = state.kernel.threads.current_tid();
     let mut queue = state.lock_message_queue();
-    for message in &mut queue.messages {
+    for message in queue.queues.queue_for(tid).iter_mut() {
         if is_keyboard_message(message.message) && message.window_handle != focus {
             message.window_handle = focus;
         }
@@ -200,7 +208,8 @@ fn synthesize_wm_timer(
         return Ok(false);
     }
 
-    let mut queue = state.lock_message_queue();
+    // A timer fires into the queue of the thread that owns its window (a
+    // thread that never pumps would otherwise grow the queue unbounded).
     for (window_handle, timer_id) in fired {
         tracing::debug!(
             target: "wiegui",
@@ -208,7 +217,7 @@ fn synthesize_wm_timer(
             hwnd = window_handle.as_u64(),
             "WM_TIMER fired"
         );
-        queue.push(window_handle, WM_TIMER, timer_id, 0)?;
+        state.post_message(window_handle, WM_TIMER, timer_id, 0)?;
     }
     Ok(true)
 }
@@ -277,11 +286,12 @@ fn synthesize_wm_paint(
         window.invalidated = false;
     }
 
-    let mut queue = state.lock_message_queue();
+    // WM_PAINT / WM_ERASEBKGND go to the owning thread's queue, exactly like
+    // the timer synthesis above.
     if erase_background {
-        queue.push(hwnd, WM_ERASEBKGND, 0, 0)?;
+        state.post_message(hwnd, WM_ERASEBKGND, 0, 0)?;
     }
-    queue.push(hwnd, WM_PAINT, 0, 0)?;
+    state.post_message(hwnd, WM_PAINT, 0, 0)?;
     Ok(true)
 }
 

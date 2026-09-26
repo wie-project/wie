@@ -287,8 +287,14 @@ pub(super) fn lower_insn(
     xmm: &mut [Value; 32],
 ) -> Result<(), String> {
     match instr.mnemonic() {
-        // True no-ops: NOP/endbranch and the prefetch cache hints (no arch state).
+        // True no-ops: NOP/endbranch, PAUSE and the prefetch cache hints
+        // (no arch state). PAUSE (F3 90) is a pipeline hint: iced reports
+        // op_count == 0, empty used_registers/used_memory and
+        // rflags_modified() == 0, so dropping it is exact. See
+        // `jit::tests::pause_tests::pause_is_architecturally_a_noop`, which
+        // pins that contract against a future iced upgrade.
         Mnemonic::Nop
+        | Mnemonic::Pause
         | Mnemonic::Endbr64
         | Mnemonic::Endbr32
         | Mnemonic::Prefetchnta

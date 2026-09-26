@@ -102,7 +102,8 @@ fn test_translate_accelerator_w_posts_wm_command() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let posted = queue
-        .messages
+        .queues
+        .messages(PRIMARY_THREAD_ID)
         .iter()
         .find(|m: &&QueuedWindowMessage| m.message == crate::user32::WM_COMMAND)
         .expect("WM_COMMAND must be posted");
@@ -145,10 +146,9 @@ fn test_translate_accelerator_w_no_match_posts_nothing() {
     assert_eq!(translated, 0, "Ctrl-up must not translate");
     assert_eq!(
         state
-            .message_queue
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .messages
+            .lock_message_queue()
+            .queues
+            .messages(PRIMARY_THREAD_ID)
             .len(),
         0,
         "no WM_COMMAND may be posted"
@@ -189,7 +189,8 @@ fn test_translate_accelerator_w_plain_char() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let posted = queue
-        .messages
+        .queues
+        .messages(PRIMARY_THREAD_ID)
         .iter()
         .find(|m: &&QueuedWindowMessage| m.message == crate::user32::WM_COMMAND)
         .expect("WM_COMMAND must be posted");
@@ -231,7 +232,8 @@ fn test_translate_accelerator_a_mirrors_w() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let posted = queue
-        .messages
+        .queues
+        .messages(PRIMARY_THREAD_ID)
         .iter()
         .find(|m: &&QueuedWindowMessage| m.message == crate::user32::WM_COMMAND)
         .expect("WM_COMMAND must be posted");

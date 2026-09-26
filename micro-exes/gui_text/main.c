@@ -18,6 +18,21 @@
 #include <windows.h>
 
 #define TIMER_TICKS 5
+// Short mode: two ticks still give the window one paint cycle before the
+// quit (tick 1 paints, tick 2 destroys).
+#define TIMER_TICKS_SHORT 2
+
+// Opt-in short mode: WIE_SHORT=1 in the *guest* environment (injected host-side
+// through WIE_GUEST_ENV="WIE_SHORT=1") cuts the WM_TIMER budget. With WIE_SHORT
+// absent — every normal run and every existing test — g_ticks holds TIMER_TICKS
+// and the fixture is unchanged; short mode is opt-in only.
+static int g_ticks = TIMER_TICKS;
+
+static int short_mode(void) {
+    char buf[16];
+    DWORD n = GetEnvironmentVariableA("WIE_SHORT", buf, sizeof(buf));
+    return n == 1 && buf[0] == '1';
+}
 
 static HDC     g_dc;
 static HBITMAP g_dib;
@@ -142,7 +157,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_TIMER:
         g_timer_count++;
         InvalidateRect(hwnd, NULL, FALSE);
-        if (g_selftest && g_timer_count >= TIMER_TICKS) {
+        if (g_selftest && g_timer_count >= g_ticks) {
             DestroyWindow(hwnd);
         }
         return 0;
@@ -230,6 +245,10 @@ void entry(void) {
     g_frame_result = draw_text_frame();
     if (g_frame_result != 0) {
         ExitProcess(g_frame_result);
+    }
+
+    if (short_mode()) {
+        g_ticks = TIMER_TICKS_SHORT;
     }
 
     if (SetTimer(hwnd, 1, 50, NULL) == 0) {

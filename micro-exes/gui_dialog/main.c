@@ -21,6 +21,9 @@
 #include <windows.h>
 
 #define TIMER_TICKS 5
+// Short mode: two ticks still give the owner one paint cycle before the
+// auto-close ENTER is posted.
+#define TIMER_TICKS_SHORT 2
 #define IDC_DLG_STATIC 1001
 
 static HWND     g_dlg;
@@ -34,6 +37,20 @@ static HBITMAP  g_dib;
 static void    *g_bits;
 static int      g_width  = 1280;
 static int      g_height = 800;
+
+// Opt-in short mode: WIE_SHORT=1 in the *guest* environment (injected host-side
+// through WIE_GUEST_ENV="WIE_SHORT=1") cuts the WM_TIMER budget before the
+// auto-close ENTER is posted. With WIE_SHORT absent — every normal run and
+// every existing test — g_ticks holds TIMER_TICKS and the fixture is
+// unchanged; short mode is opt-in only. The WIE_DIALOG_HOSTDRIVEN=1 path
+// ignores the tick budget entirely (it is already tick-independent).
+static int g_ticks = TIMER_TICKS;
+
+static int short_mode(void) {
+    char buf[16];
+    DWORD n = GetEnvironmentVariableA("WIE_SHORT", buf, sizeof(buf));
+    return n == 1 && buf[0] == '1';
+}
 
 // Minimal string compare (freestanding: no CRT).
 static int eq_str(const char *a, const char *b) {
@@ -141,7 +158,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_TIMER:
         g_timer_count++;
         InvalidateRect(hwnd, NULL, FALSE);
-        if (g_selftest && !g_host_driven && g_dlg_open && g_dlg && g_timer_count >= TIMER_TICKS) {
+        if (g_selftest && !g_host_driven && g_dlg_open && g_dlg && g_timer_count >= g_ticks) {
             // The modal loop is running inside DialogBoxParam below: drive
             // the dialog headlessly. Posting VK_RETURN exercises IsDialogMessage
             // (Enter → WM_COMMAND(IDOK) → EndDialog(1)) in the in-guest stub
@@ -229,6 +246,10 @@ void entry(void) {
         }
     }
 
+    if (short_mode()) {
+        g_ticks = TIMER_TICKS_SHORT;
+    }
+
     if (SetTimer(hwnd, 1, 50, NULL) == 0) {
         ExitProcess(151);
     }
@@ -237,7 +258,8 @@ void entry(void) {
 
     // Open the modal dialog immediately (before the message loop) so the
     // headless --screenshot path captures it over the owner. The timer fires
-    // inside the modal loop and posts VK_RETURN to close it after TIMER_TICKS.
+    // inside the modal loop and posts VK_RETURN to close it once the tick
+    // budget (g_ticks) is spent.
     g_dlg_open = 1;
     INT_PTR result = DialogBoxParamA(inst, (LPCSTR)100, hwnd, DlgProc, 0);
     g_dlg_open = 0;
@@ -260,7 +282,7 @@ void entry(void) {
     // Interactive runs may close the dialog (Enter/Esc) before any ticks.
     // Host-driven runs close on the HOST's VK_RETURN (no auto-close timer),
     // so the tick count carries no signal.
-    if (g_selftest && !g_host_driven && g_timer_count < TIMER_TICKS) {
+    if (g_selftest && !g_host_driven && g_timer_count < g_ticks) {
         ExitProcess(152);
     }
 
