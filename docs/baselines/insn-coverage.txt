@@ -91,3 +91,100 @@ SUITE(jit)                   329608   99.2   2499         0       2648      374.
            2      0.0  Movzx
            2      0.0  Test
 
+# WIE instruction-coverage baseline — appended by scripts/coverage-report.sh
+# 2026-09-26T16:20:20Z | WIE_CPU=jit | exes=63 | total_insns=330453 | jit=327860 | iced=2593 | jit_share=99.2% | degraded=0 (0.0%) | host_stops=2658
+#
+# CAVEAT (verbatim from the runtime report): jit_insns is the STATIC block length counted per block ENTRY, not per dynamic instruction (micro-exes/long_loop: total=25 for ~3e8 retired) — a self-looping block undercounts by its trip count; on multithreaded guests the counters also miss worker-thread execution (micro-exes/cpp_threads interprets 26407 instructions but reports iced=45). Only `degraded`, and iced_insns on a single-thread guest, are exact. Use the jit/iced split to RANK ISA families, never as a throughput figure. A real denominator needs a per-block trip counter in the lowering step plus a cross-thread stats merge.
+# The jit/iced columns above are therefore BLOCK-ENTRY ratios, not dynamic
+# instruction counts. A row whose insn/entry is small has a self-looping
+# block and its total is an underestimate by that row's trip factor.
+# The two histograms below are exact (both count interpreted steps).
+#
+exe                     total_insns   jit%   iced  degraded host_stops insn/entry
+cli_args                        360   98.0      7         0         10       30.0
+comctl_toolbar                  561   92.1     44         0         36       40.0
+console_cells                   453   93.3     30         0         12       37.7
+console_hello                   475   93.2     32         0         16       36.5
+cpp_dtor                       1807   94.1    105         0         88       51.6
+cpp_multi_catch                1898   93.6    121         0         94       29.6
+cpp_threads                     579   92.2     45         0         30       44.5
+cpp_throw                      1759   94.1    103         0         84       46.2
+cpp_types                      1843   93.4    121         0         94       33.5
+cpu_fp                            3   66.6      1         0          2        3.0
+cpu_math                          3   66.6      1         0          2        3.0
+cpu_string                      100   98.0      2         0          2        5.8
+crt_hello                       455   93.6     29         0          4       26.7
+crypt_hash                      678   93.2     46         0         44       14.7
+cs_reenter                       33   60.6     13         0         14       33.0
+cs_two_threads                  483   58.5    200         0        272        3.8
+dbghelp_stub                    477   91.8     39         0         24       31.8
+dir_watch                       491   91.4     42         0         26       35.0
+dll_basic                        23   69.5      7         0          8       23.0
+dll_multi_dll                    49   75.5     12         0         14       49.0
+dll_not_found                     7   57.1      3         0          4        7.0
+dll_ordinal                      33   72.7      9         0         10       33.0
+dll_refcount                     26   73.0      7         0         10       26.0
+dll_static_import                29   72.4      8         0          6       29.0
+event_handshake                  44   79.5      9         0         14       44.0
+font_enum                      1695   97.9     35         0         18        4.1
+gdi_alpha                       605   93.2     41         0         32       35.5
+gdi_regions                     706   93.0     49         0         46       37.1
+gl_quad                        1356   77.1    310         0        412       26.5
+heap_alloc                       24   75.0      6         0          2        0.0
+heap_core                        53   83.0      9         0          2        0.0
+ime_noop                        467   92.2     36         0         24       35.9
+interlocked_basic               119   82.3     21         0         34      119.0
+istextunicode                   520   93.6     33         0         18       34.6
+long_loop                        25   88.0      3         0          4       25.0
+mbwc_lasterror                   48   79.1     10         0          6        9.6
+modules                          77   87.0     10         0         14       38.5
+msvcrt_gaps                     500   93.0     35         0         12       35.7
+mt_contention                  1143   85.3    167         0        322        5.8
+mt_stress                       169   81.6     31         0         48       14.0
+ole_clip                        638   89.8     65         0         74       45.5
+ole_com                         600   90.6     56         0         56       33.3
+process_ids                      27   66.6      9         0          2        6.7
+pt_basic                        454   93.3     30         0         14       37.8
+pt_cond                         446   93.0     31         0         16       34.3
+rand_test                       451   93.3     30         0         12       37.5
+read_file                        48   87.5      6         0          8       48.0
+reg_roundtrip                   563   91.4     48         0         44       46.9
+relative_path                    32   84.3      5         0          8       32.0
+rep_lengths                  301764   99.9      3         0          4        3.4
+setupapi_list                   471   92.1     37         0         24       33.6
+shell_folders                   578   91.5     49         0         46       38.5
+thread_create_join               37   81.0      7         0         10       37.0
+tls_basic                        48   68.7     15         0         20       48.0
+ucrt_coverage                  1040   90.7     96         0        124       19.2
+user32_char                     565   91.3     49         0         46       37.6
+user32_enum                     600   90.8     55         0         58       42.8
+version_query                    94   92.5      7         0         12       13.4
+vfs_roundtrip                   392   95.6     17         0         22       19.6
+winapi_heap                     111   82.8     19         0          2       55.5
+winmm_audio                     549   91.8     45         0         36       28.8
+write_file                       32   84.3      5         0          8       32.0
+ws2_echo                        737   89.5     77         0         98       52.6
+SUITE(jit)                   330453   99.2   2593         0       2658      375.3
+
+# suite-wide JIT iced-residue opcode histogram (sampled 1/64, 321 samples over 63 exes):
+         186     57.9  Call
+          65     20.2  Lea
+          64     19.9  Jmp
+           5      1.5  Mov
+           1      0.3  Movzx
+
+# suite-wide interpreter opcode mix (EXACT: 22258 interpreted instructions):
+       12596     56.5  Call
+        4960     22.2  Jmp
+        4236     19.0  Lea
+         345      1.5  Mov
+          47      0.2  Xor
+          31      0.1  Fninit
+          11      0.0  Movzx
+          10      0.0  Movsxd
+           8      0.0  And
+           5      0.0  Sub
+           4      0.0  Cdqe
+           4      0.0  Shr
+           1      0.0  Test
+

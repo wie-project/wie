@@ -21,6 +21,8 @@ One-page playbook for regressions after the foundational work and the **great cl
 | Stale code after patch / protect | Expect `FlushInstructionCache` / X-loss inv; bisect with `WIE_JIT_CHAIN=0` |
 | Idle guest burns 100% CPU (message wait) | `WIE_IDLE=park` (interactive `run --persistent` defaults to park) |
 | `Sleep(n)` ignored / too fast | Ensure not forced busy: `WIE_IDLE=park` or legacy `WIE_HOST_SLEEP=1` |
+| DirectInput guest sees no input / hangs | Expected: only a keyboard and a mouse exist. `EnumDevices` returns exactly two devices; `CreateDevice` for a joystick/gamepad/HID GUID fails with `DIERR_INVALIDPARAM` and `CreateEffect` with `DIERR_UNSUPPORTED` — that is the honest "absent", not a bug. **Mouse buttons and the wheel always read 0** (WIE tracks no button/scroll state), so a guest needing clicks must use the `WM_LBUTTONDOWN` path. `SDL_DIRECTINPUT_ENABLED=0` is deliberate and must stay: flipping it puts SDL2 on this shim. |
+| Guest gets no `WM_INPUT` | `RegisterRawInputDevices` must match the device class (usage page 1, usage 6 = keyboard / 2 = mouse); an unregistered window gets nothing by design. `RIDEV_EXCLUDE` suppresses the legacy `WM_KEY*`/`WM_MOUSE*` messages for that class. Payloads are synthesized from WIE's keyboard/cursor state, not true hardware raw input. |
 | Micros suddenly slow | Avoid `WIE_IDLE=park` on suite; default micro idle is **yield** |
 | Memory-heavy guest slow / high helpers | Profile with `WIE_JIT_MEM_TRACE=1`; expect pin hits on VA heaps; bisect `WIE_JIT_MEM=slow` |
 | String / SIMD wrong results | `WIE_STRING_BULK=0`, `WIE_STRING_INLINE=0`, `WIE_JIT_SIMD=0` |

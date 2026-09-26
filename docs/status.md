@@ -124,6 +124,9 @@ surface. Each pillar lists what it takes, why real apps need it, and the current
 - **Manifests / SxS activation contexts** — modern apps ship manifests; resolution may matter. 🟡
 - **`version.dll`** — landed (RNotepad dependency). ✅
 
+- **DirectInput8** (`dinput8.dll`, landed 2026-09-26): keyboard + mouse compatibility shim over the existing input state. Two devices, real guest COM vtables (11-slot `IDirectInput8`, 32-slot `IDirectInputDevice8`), `GetDeviceState` honouring the offsets the guest declared in its own `DIDATAFORMAT`. Joysticks, force feedback, HID, action maps and buffered event calls fail with a specific `HRESULT`. **Mouse button and wheel bytes are not populated** — the host input seam carries keyboard VKs and cursor position only. `SDL_DIRECTINPUT_ENABLED=0` stays.
+- **RawInput** (landed 2026-09-26): real API surface plus `WM_INPUT` delivery, replacing four fake stubs. Two views of one buffered input — a fake-`HRAWINPUT` map that is never consumed, and a FIFO that `GetRawInputBuffer` drains — so a drain cannot invalidate an `lParam` a guest still holds. Payloads are synthesized (macOS exposes no raw HID stream), and `GetRawInputBuffer` is process-wide rather than per-thread. Both deviations are documented at the module.
+
 The immediate next milestone is **Qt-class apps**: OpenGL, `CreateProcess`, winsock, and the
 OLE clipboard/drag-drop stack unlock real Qt5 GUI apps; audio + D3D9 completion + GPU offload
 then unlock games. Progress is tracked in the live log at `.slim/deepwork/gui-implementation.md`.
