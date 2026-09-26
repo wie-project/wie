@@ -17,6 +17,13 @@
 //!   `GetKeyboardState`, `IsDialogMessage`, EDIT Shift+Tab) drain the events
 //!   into `WindowState::keyboard_state` before reading — under the big lock
 //!   they already hold, so no new lock ordering is introduced.
+//! - **The mouse travels host → guest the same way**, in two pieces with two
+//!   different trigger semantics: `mouse_buttons` holds the host's currently
+//!   pressed `MK_*` mask as *level* state (a copy, never drained — a held
+//!   button must read down on every `GetDeviceState`), and `wheel_notches`
+//   accumulates *relative* movement that the DirectInput mouse report drains
+//!   on read. Both are written host-side through channel-only accessors, so an
+//!   input event still never takes the big lock.
 //! - **The menu-bar cache gate** (`menu_dirty`) mirrors the
 //!   `WindowState` flag so the per-Frame `window_menu_items` cache hit does
 //!   not take the big lock; a rebuild (dirty or focus move) still takes it.
@@ -64,6 +71,27 @@ pub(crate) struct WindowMirror {
     /// Read-current (copy), never drained: `GetCursorPos` is
     /// level-triggered and must report the same position on repeated calls.
     cursor_pos: Option<(i32, i32)>,
+    /// The host's currently pressed mouse buttons as Win32 `MK_*` bits
+    /// (`MK_LBUTTON` 0x0001, `MK_RBUTTON` 0x0002, `MK_MBUTTON` 0x0010,
+    /// `MK_XBUTTON1` 0x0020, `MK_XBUTTON2` 0x0040; the modifier bits
+    /// `MK_SHIFT` / `MK_CONTROL` are never pushed here — a button mask is
+    /// buttons).
+    ///
+    /// Level state, read-current (copy) and never drained, like
+    /// `cursor_pos`: `GetDeviceState` must report the same held button on
+    /// every read until the host pushes a newer mask. `0` before the first
+    /// push is the truthful "nothing pressed".
+    mouse_buttons: u16,
+    /// Pending wheel movement as whole notches, `(horizontal, vertical)`,
+    /// accumulated host → guest and drained by the DirectInput mouse report.
+    ///
+    /// Notches, not raw winit deltas: a `LineDelta` is already whole notches
+    /// and a trackpad `PixelDelta` only becomes a notch after the host's
+    /// own fractional accumulator (`WieApp::wheel_notches`) has seen enough of
+    /// it — pushing raw deltas would make `lZ` report a fraction of a notch
+    /// that no Windows mouse driver ever produces. Signed, because a
+    /// DirectInput `lZ` is relative and a down-scroll must read negative.
+    wheel_notches: (i32, i32),
 }
 
 impl WindowMirror {
@@ -118,5 +146,37 @@ impl WindowMirror {
     /// the same position until the host pushes a newer one).
     pub(crate) fn cursor_pos(&self) -> Option<(i32, i32)> {
         self.cursor_pos
+    }
+
+    /// Publish the host's pressed-mouse-button mask (Win32 `MK_*` bits — the
+    /// host never touches the big lock). The whole mask is replaced, not
+    /// merged: the host tracks the full set of held buttons, so a missing bit
+    /// is a release.
+    pub(crate) fn set_mouse_buttons(&mut self, mk: u16) {
+        self.mouse_buttons = mk;
+    }
+
+    /// Read the published mouse-button mask (a copy, NOT a drain — see
+    /// [`Self::mouse_buttons`]).
+    pub(crate) fn mouse_buttons(&self) -> u16 {
+        self.mouse_buttons
+    }
+
+    /// Accumulate wheel movement as whole notches (the host never touches the
+    /// big lock). Saturating so a pathological event stream cannot wrap a
+    /// `lZ` into the opposite direction.
+    pub(crate) fn add_wheel_notches(&mut self, horizontal: bool, notches: i32) {
+        if horizontal {
+            self.wheel_notches.0 = self.wheel_notches.0.saturating_add(notches);
+        } else {
+            self.wheel_notches.1 = self.wheel_notches.1.saturating_add(notches);
+        }
+    }
+
+    /// Drain the pending wheel notches — a relative axis has
+    /// consumed-on-read semantics, exactly like the DirectInput mouse's
+    /// `lX`/`lY` baseline, so a guest that reads twice sees the movement once.
+    pub(crate) fn drain_wheel_notches(&mut self) -> (i32, i32) {
+        std::mem::take(&mut self.wheel_notches)
     }
 }

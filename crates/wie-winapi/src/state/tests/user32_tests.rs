@@ -301,6 +301,200 @@ fn test_keyboard_state_shift_update_path() {
     );
 }
 
+/// The five mouse virtual-key slots resolve from the presenter mirror's live
+/// `MK_*` mask — the same single source of truth `GetDeviceState` reads — so a
+/// click cannot read "down" through DirectInput and "up" through `GetKeyState`.
+#[test]
+fn test_get_key_state_reports_mirrored_mouse_buttons() {
+    // Win32 `MK_*` bits (winuser.h).
+    const MK_LBUTTON: u16 = 0x0001;
+    // (VK code, MK bit) for all five mouse buttons.
+    const MOUSE: [(u64, u16); 5] = [
+        (0x01, MK_LBUTTON),
+        (0x02, 0x0002),
+        (0x04, 0x0010),
+        (0x05, 0x0020),
+        (0x06, 0x0040),
+    ];
+
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    // Nothing pressed: every mouse VK reads up.
+    for (vk, _) in MOUSE {
+        write_regs(&mut engine, vk, 0, 0, 0, STACK_TOP);
+        assert_return_value!(
+            user32::handle_get_key_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
+    }
+
+    // One host push per button, each read back through the public handler.
+    for (vk, mk) in MOUSE {
+        state.present().channel.push_mouse_buttons(mk);
+        write_regs(&mut engine, vk, 0, 0, 0, STACK_TOP);
+        assert_return_value!(
+            user32::handle_get_key_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            // 0x8000 and not 0x8001: the high-order bit is the pressed state,
+            // the low-order bit is the toggle state, and a mouse button has no
+            // toggle.
+            0x8000
+        );
+    }
+
+    // Release: the same slot reads up again, for every button.
+    state.present().channel.push_mouse_buttons(0);
+    for (vk, _) in MOUSE {
+        write_regs(&mut engine, vk, 0, 0, 0, STACK_TOP);
+        assert_return_value!(
+            user32::handle_get_key_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
+    }
+}
+
+/// `GetAsyncKeyState` reads the same five mouse slots from the mirror, with its
+/// own bit convention: `0x81` (high word down, "pressed since last call" set)
+/// while held, `0` once released.
+#[test]
+fn test_get_async_key_state_reports_mirrored_mouse_buttons() {
+    // (VK code, MK bit) for all five mouse buttons (winuser.h).
+    const MOUSE: [(u64, u16); 5] = [
+        (0x01, 0x0001), // VK_LBUTTON / MK_LBUTTON
+        (0x02, 0x0002), // VK_RBUTTON / MK_RBUTTON
+        (0x04, 0x0010), // VK_MBUTTON / MK_MBUTTON
+        (0x05, 0x0020), // VK_XBUTTON1 / MK_XBUTTON1
+        (0x06, 0x0040), // VK_XBUTTON2 / MK_XBUTTON2
+    ];
+
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+
+    for (vk, mk) in MOUSE {
+        state.present().channel.push_mouse_buttons(mk);
+        write_regs(&mut engine, vk, 0, 0, 0, STACK_TOP);
+        assert_return_value!(
+            user32::handle_get_async_key_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0x81
+        );
+    }
+
+    // Release: a mouse slot reads 0, unlike a real key's stale transition bit.
+    state.present().channel.push_mouse_buttons(0);
+    for (vk, _) in MOUSE {
+        write_regs(&mut engine, vk, 0, 0, 0, STACK_TOP);
+        assert_return_value!(
+            user32::handle_get_async_key_state(&mut HandlerContext::new(
+                &mut engine,
+                test_environment(),
+                &mut state
+            )),
+            0
+        );
+    }
+}
+
+/// `GetKeyboardState` projects the mirror's mouse mask into the five mouse
+/// rows of the returned array, and leaves every real key row alone: a mouse-only
+/// host event must not move `VK_SHIFT` or any other keyboard row.
+#[test]
+fn test_get_keyboard_state_projects_mouse_rows_and_keeps_key_rows() {
+    // (VK code, MK bit) for all five mouse buttons (winuser.h).
+    const MOUSE: [(usize, u16); 5] = [
+        (0x01, 0x0001), // VK_LBUTTON / MK_LBUTTON
+        (0x02, 0x0002), // VK_RBUTTON / MK_RBUTTON
+        (0x04, 0x0010), // VK_MBUTTON / MK_MBUTTON
+        (0x05, 0x0020), // VK_XBUTTON1 / MK_XBUTTON1
+        (0x06, 0x0040), // VK_XBUTTON2 / MK_XBUTTON2
+    ];
+    const VK_SHIFT: usize = 0x10;
+    const BUFFER_VA: u64 = 0x4000;
+
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // The host key seam, so `drain_key_writes` is exercised too.
+    state.window_state().keyboard_state.set(VK_SHIFT, 0x80);
+
+    let read_state = |engine: &mut IcedCpu, state: &mut WinApiState| -> [u8; 256] {
+        let mut buffer = [0_u8; 256];
+        write_regs(engine, BUFFER_VA, 0, 0, 0, STACK_TOP);
+        assert_return_value!(
+            user32::handle_get_keyboard_state(&mut HandlerContext::new(
+                engine,
+                test_environment(),
+                state
+            )),
+            1
+        );
+        engine
+            .mem_read(BUFFER_VA, &mut buffer)
+            .expect("read the GetKeyboardState buffer");
+        buffer
+    };
+
+    let baseline = read_state(&mut engine, &mut state);
+    for (vk, _) in MOUSE {
+        assert_eq!(baseline.get(vk), Some(&0), "a mouse row starts up");
+    }
+
+    // Left button down: the VK_LBUTTON row goes down, every other row is
+    // untouched — including the held Shift and the four still-up mouse rows.
+    state.present().channel.push_mouse_buttons(0x0001);
+    let pressed = read_state(&mut engine, &mut state);
+    assert_eq!(pressed.get(0x01), Some(&0x80), "VK_LBUTTON reads down");
+    assert_eq!(pressed.get(VK_SHIFT), Some(&0x80), "VK_SHIFT is unaffected");
+    for (vk, _) in MOUSE.iter().filter(|(vk, _)| *vk != 0x01) {
+        assert_eq!(pressed.get(*vk), Some(&0), "only the pressed row moved");
+    }
+    for vk in 0x07_usize..256 {
+        assert_eq!(
+            pressed.get(vk),
+            baseline.get(vk),
+            "a mouse-only change must not touch keyboard row {vk}"
+        );
+    }
+
+    // Middle button added, then everything released.
+    state.present().channel.push_mouse_buttons(0x0001 | 0x0010);
+    let both = read_state(&mut engine, &mut state);
+    assert_eq!(both.get(0x01), Some(&0x80), "VK_LBUTTON still down");
+    assert_eq!(
+        both.get(0x04),
+        Some(&0x80),
+        "VK_MBUTTON reads down from MK_MBUTTON 0x0010, not from bit 2"
+    );
+    state.present().channel.push_mouse_buttons(0);
+    let released = read_state(&mut engine, &mut state);
+    assert_eq!(
+        released, baseline,
+        "releasing every button restores the keyboard rows exactly"
+    );
+
+    // The array is a copy: the projection never writes the stored array, so the
+    // single-slot readers and this buffer cannot drift apart over time.
+    assert_eq!(
+        state.window_state().keyboard_state.get(0x01),
+        0,
+        "the mirror mask is derived per read, not stored in the array"
+    );
+}
+
 #[test]
 fn test_get_sys_color_highlight_is_not_bgr_swapped() {
     // COLOR_HIGHLIGHT (13) and COLOR_ACTIVECAPTION (2) are #0078D7 stored

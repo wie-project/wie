@@ -341,6 +341,43 @@ impl PresentChannel {
         self.window_mirror.lock().ok()?.cursor_pos()
     }
 
+    /// Publish the host's pressed-mouse-button mask (Win32 `MK_*` bits) —
+    /// channel-only, mirroring `push_key_write`; the host's
+    /// `set_mouse_buttons` never touches the big lock.
+    pub fn push_mouse_buttons(&self, mk: u16) {
+        self.window_mirror
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .set_mouse_buttons(mk);
+    }
+
+    /// Read the published mouse-button mask — a copy, NOT a drain (a held
+    /// button is level state). A poisoned mirror reads as `0` (nothing
+    /// pressed), like `mirror_windows`' fallback.
+    pub(crate) fn mouse_buttons(&self) -> u16 {
+        self.window_mirror
+            .lock()
+            .map_or(0, |mirror| mirror.mouse_buttons())
+    }
+
+    /// Accumulate wheel movement as whole notches (channel-only — the host's
+    /// `push_wheel_notches` never touches the big lock).
+    pub fn push_wheel_notches(&self, horizontal: bool, notches: i32) {
+        self.window_mirror
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add_wheel_notches(horizontal, notches);
+    }
+
+    /// Drain the pending wheel notches `(horizontal, vertical)` — the
+    /// DirectInput mouse report's relative `lZ` source, consumed on read.
+    pub(crate) fn drain_wheel_notches(&self) -> (i32, i32) {
+        self.window_mirror
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain_wheel_notches()
+    }
+
     /// Enable/disable the D3D9 command-capture pipeline (Wave 2 slice 2).
     /// Only call after the capture render thread spawned
     /// (`spawn_capture_streamer`), so every enqueued flush has a live

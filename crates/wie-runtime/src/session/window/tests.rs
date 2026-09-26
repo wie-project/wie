@@ -1226,3 +1226,117 @@ fn set_cursor_pos_without_the_big_lock_and_guest_reads_it() {
         assert_eq!(state.cursor_pos(), Some((-5, 300)), "the latest push wins");
     }
 }
+
+/// Win32 `MK_*` mouse-button bits (winuser.h) — the shape the host pushes.
+const MK_LBUTTON: u16 = 0x0001;
+const MK_RBUTTON: u16 = 0x0002;
+const MK_MBUTTON: u16 = 0x0010;
+
+/// `set_mouse_buttons` publishes the host's pressed-button bitmask onto the
+/// mirror — no big lock while the guest holds it — and the guest-side reader
+/// (the DirectInput mouse report path) copies the LEVEL state out under the
+/// big lock it already holds, exactly like `cursor_pos`: repeated reads report
+/// the same press, and the latest push wins.
+#[test]
+fn set_mouse_buttons_without_the_big_lock_and_guest_reads_it() {
+    let (handle, _a, _a_button) = handle_with_seeded_mirror();
+    {
+        let mut state = handle.state.lock().expect("lock state");
+        assert_eq!(
+            state.mouse_buttons(),
+            0,
+            "no button reads down before the host ever pushed one"
+        );
+    }
+    probe_without_big_lock(&handle, "set_mouse_buttons", move |h| {
+        h.set_mouse_buttons(MK_LBUTTON | MK_RBUTTON | MK_MBUTTON);
+    });
+    {
+        let mut state = handle.state.lock().expect("lock state");
+        assert_eq!(
+            state.mouse_buttons(),
+            MK_LBUTTON | MK_RBUTTON | MK_MBUTTON,
+            "all three pressed buttons reach the guest read"
+        );
+        assert_eq!(
+            state.mouse_buttons(),
+            MK_LBUTTON | MK_RBUTTON | MK_MBUTTON,
+            "button reads are non-destructive (no drain)"
+        );
+    }
+    // Releasing the middle button replaces the whole bitmask, so the report
+    // narrows to what is still held.
+    probe_without_big_lock(&handle, "set_mouse_buttons", move |h| {
+        h.set_mouse_buttons(MK_LBUTTON | MK_RBUTTON);
+    });
+    {
+        let mut state = handle.state.lock().expect("lock state");
+        assert_eq!(
+            state.mouse_buttons(),
+            MK_LBUTTON | MK_RBUTTON,
+            "the latest push wins: a released button clears"
+        );
+    }
+    probe_without_big_lock(&handle, "set_mouse_buttons", move |h| {
+        h.set_mouse_buttons(0);
+    });
+    {
+        let mut state = handle.state.lock().expect("lock state");
+        assert_eq!(
+            state.mouse_buttons(),
+            0,
+            "releasing the last button reports all-up again"
+        );
+    }
+}
+
+/// `push_wheel_notches` accumulates whole notches on the mirror — no big lock
+/// while the guest holds it — and the guest-side `GetDeviceState` reader
+/// drains them under the big lock it already holds. Relative movement, so
+/// drain semantics: two reads must not report the same notch twice, and
+/// vertical/horizontal movement is kept apart.
+#[test]
+fn push_wheel_notches_without_the_big_lock_and_guest_drains_them() {
+    let (handle, _a, _a_button) = handle_with_seeded_mirror();
+    {
+        let mut state = handle.state.lock().expect("lock state");
+        assert_eq!(
+            state.drain_wheel_notches(),
+            (0, 0),
+            "no wheel movement before the host pushed any"
+        );
+    }
+    // Two separate trackpad flicks of a whole notch each, and one
+    // horizontal notch, all while the guest holds the big lock.
+    probe_without_big_lock(&handle, "push_wheel_notches", move |h| {
+        h.push_wheel_notches(false, 1);
+        h.push_wheel_notches(false, 1);
+        h.push_wheel_notches(true, -1);
+    });
+    {
+        let mut state = handle.state.lock().expect("lock state");
+        assert_eq!(
+            state.drain_wheel_notches(),
+            (-1, 2),
+            "notches accumulate per axis, keeping the sign"
+        );
+        assert_eq!(
+            state.drain_wheel_notches(),
+            (0, 0),
+            "a relative axis is consumed on read"
+        );
+    }
+    // A single up-flick on a later event reads alone, so a guest polling in a
+    // loop sees one notch per event rather than a running total.
+    probe_without_big_lock(&handle, "push_wheel_notches", move |h| {
+        h.push_wheel_notches(false, -3);
+    });
+    {
+        let mut state = handle.state.lock().expect("lock state");
+        assert_eq!(
+            state.drain_wheel_notches(),
+            (0, -3),
+            "only the movement since the last read is reported"
+        );
+    }
+}

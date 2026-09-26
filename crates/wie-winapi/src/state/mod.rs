@@ -843,6 +843,29 @@ impl WinApiState {
     pub fn cursor_pos(&mut self) -> Option<(i32, i32)> {
         self.present().channel.cursor_pos()
     }
+
+    /// Read the host-pushed mouse-button mask (Win32 `MK_*` bits: `MK_LBUTTON`
+    /// 0x0001, `MK_RBUTTON` 0x0002, `MK_MBUTTON` 0x0010, `MK_XBUTTON1`
+    /// 0x0020, `MK_XBUTTON2` 0x0040) — called by the DirectInput mouse report
+    /// path under the big lock it already holds.
+    ///
+    /// Level state: a copy, NOT a drain, so a held button reads down on every
+    /// `GetDeviceState` until the host pushes a newer mask. `0` before the
+    /// first host push is the truthful "nothing pressed", not "unknown".
+    pub fn mouse_buttons(&mut self) -> u16 {
+        self.present().channel.mouse_buttons()
+    }
+
+    /// Drain the host's pending wheel movement as whole notches,
+    /// `(horizontal, vertical)` — called by the DirectInput mouse report path
+    /// under the big lock it already holds.
+    ///
+    /// Relative state, so a drain: `lZ` is a relative axis, and a guest that
+    /// polls `GetDeviceState` in a loop must see each notch once, not once per
+    /// poll. Positive is away from the user, negative toward.
+    pub fn drain_wheel_notches(&mut self) -> (i32, i32) {
+        self.present().channel.drain_wheel_notches()
+    }
 }
 
 /// Bundle of everything a WinAPI handler may need.

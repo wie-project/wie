@@ -45,16 +45,26 @@
 //!
 //! # Known gaps in the "real" set
 //!
-//! - **Mouse buttons always read up** (`DIMOUSESTATE::rgbButtons` is all
-//!   zero) and **the wheel always reads 0** (`lZ`). WIE's host input seam
-//!   (`GuestHandle::set_key_state` / `set_cursor_pos`) pushes *keyboard*
-//!   virtual keys and the *cursor position* only — there is no mouse-button or
-//!   scroll state anywhere in the runtime to read. The `DIDF_CDATAFORMAT`
-//!   mouse report is therefore half real: `lX`/`lY` are genuine per-report
-//!   deltas (see [`DInputDeviceRecord::last_cursor`]), the button and wheel
-//!   bytes are a truthful "nothing tracked" zero. A guest that needs mouse
-//!   clicks through DirectInput must go through the `WM_LBUTTONDOWN` path the
-//!   host already drives.
+//! - The `DIDF_CDATAFORMAT` mouse report is sourced from the presenter-side
+//!   window mirror, the same lock-free seam the keyboard and cursor use
+//!   ([`crate::present::window_mirror`]): `lX`/`lY` are genuine per-report
+//!   deltas (see [`DInputDeviceRecord::last_cursor`]), `rgbButtons` is the host's
+//!   live `MK_*` mask, and `lZ` is the wheel notches accumulated since the last
+//!   read (120 per notch, matching the `WM_MOUSEWHEEL` delta for the same host
+//!   event). Buttons are level state and re-report on every read; `lX`/`lY`/`lZ`
+//!   are relative and consumed on read.
+//! - Button state is reported whether or not the guest captured the mouse
+//!   (`SetCapture` routes *messages*; a DirectInput device reports the physical
+//!   device state, which Windows reports the same way either way).
+//! - `GetKeyState`/`GetAsyncKeyState`/`GetKeyboardState` read the same mirror:
+//!   their `VK_LBUTTON`..`VK_XBUTTON2` rows are projected from this module's
+//!   `MK_*` mask at read time, so the two APIs report one physical button
+//!   identically. See `MOUSE_BUTTON_SLOTS` and `crate::user32::input`.
+//! - `dwAxes` for the mouse is 3: `lX`, `lY` and the wheel as `lZ`, matching
+//!   WIE's own `c_dfDIMouse` and a real DirectInput wheel mouse.
+//! - A horizontal wheel notch is drained and dropped: `DIMOUSESTATE`/`2` has no
+//!   horizontal axis. `WM_MOUSEHWHEEL` and `RAWMOUSE`'s `usButtonFlags` still
+//!   carry it.
 //!
 //! # Locking
 //!
@@ -154,7 +164,8 @@ pub(crate) const DEVICES: [DInputDeviceClass; 2] =
 pub enum DInputDeviceClass {
     /// One keyboard: 256 key slots, no axes, 256 pseudo-buttons.
     Keyboard,
-    /// One mouse: 2 relative axes (X, Y), 4 buttons, no POV, no wheel data.
+    /// One mouse: 2 relative axes (X, Y), 4 buttons, no POV, and the wheel
+    /// (`lZ`, a third relative axis in the data format).
     Mouse,
 }
 
@@ -234,12 +245,21 @@ impl DInputDeviceClass {
         guid
     }
 
-    /// `DIDEVCAPS::dwAxes` WIE reports.
+    /// `DIDEVCAPS::dwAxes` WIE reports. The keyboard has no analog axes at
+    /// all; the mouse reports X, Y and the wheel as Z.
+    ///
+    /// The third axis is real, not aspirational: `get_device_state` fills `lZ`
+    /// from the host's wheel notches and WIE's own `c_dfDIMouse` object array
+    /// declares a Z entry at `dwOfs` 0x08, so a guest that sizes or walks its
+    /// report from this number now agrees with both. A real DirectInput wheel
+    /// mouse reports 3 as well, so this also matches what a guest sees on
+    /// Windows.
     pub(crate) const fn axes(self) -> u32 {
         match self {
             // A keyboard has no analog axes at all.
             Self::Keyboard => 0,
-            Self::Mouse => 2,
+            // lX, lY, lZ (the wheel).
+            Self::Mouse => 3,
         }
     }
 

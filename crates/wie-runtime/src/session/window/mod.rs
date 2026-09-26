@@ -414,6 +414,38 @@ impl GuestHandle {
         self.present_channel.push_cursor_pos(x, y);
     }
 
+    /// Publish the set of currently pressed mouse buttons as Win32 `MK_*`
+    /// bits (`MK_LBUTTON` 0x0001, `MK_RBUTTON` 0x0002, `MK_MBUTTON` 0x0010,
+    /// `MK_XBUTTON1` 0x0020, `MK_XBUTTON2` 0x0040) for the DirectInput mouse
+    /// report; modifier bits are NOT part of it.
+    ///
+    /// The whole mask is replaced on every call, so the host passes the set of
+    /// buttons it currently holds down (a bit that is missing is a release).
+    /// Same seam as [`Self::set_key_state`]: the mirror only, no big
+    /// `WinApiState` lock, because this runs per button event on the event-loop
+    /// thread while guest handlers hold that lock. The guest reader
+    /// (`WinApiState::mouse_buttons`, under the big lock it already holds)
+    /// copies the level state out — repeated reads report the same press,
+    /// which is what a polled `GetDeviceState` must do.
+    pub fn set_mouse_buttons(&self, mk: u16) {
+        self.present_channel.push_mouse_buttons(mk);
+    }
+
+    /// Accumulate wheel movement for the DirectInput mouse report's relative
+    /// `lZ`, in whole notches (positive = away from the user, negative =
+    /// toward), horizontally and vertically.
+    ///
+    /// Notches rather than raw host deltas, because the host has already
+    /// accumulated trackpad pixel deltas toward whole notches
+    /// (`WieApp::wheel_notches`): pushing raw deltas would let a guest see a
+    /// fraction of a notch, which no Windows mouse reports. Mirror-only like
+    /// [`Self::set_key_state`] — no big lock. The guest reader
+    /// (`WinApiState::drain_wheel_notches`) drains it under the big lock it
+    /// already holds, so a polled `lZ` is consumed on read.
+    pub fn push_wheel_notches(&self, horizontal: bool, notches: i32) {
+        self.present_channel.push_wheel_notches(horizontal, notches);
+    }
+
     /// Guest-logical screen origin of the top-level window owning `hwnd`
     /// (that record's `(x, y)`).
     ///

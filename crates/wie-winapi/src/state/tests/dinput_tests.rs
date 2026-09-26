@@ -1203,7 +1203,9 @@ fn get_capabilities_reports_the_real_shape() {
 
     for (class, axes, buttons) in [
         (DInputDeviceClass::Keyboard, 0_u32, 256_u32),
-        (DInputDeviceClass::Mouse, 2, 4),
+        // 3, not 2: X, Y and the wheel as Z — see
+        // `get_capabilities_counts_the_mouse_wheel_as_a_third_axis`.
+        (DInputDeviceClass::Mouse, 3, 4),
     ] {
         let device = create_device(&mut engine, &mut state, object, class);
         engine
@@ -1257,6 +1259,48 @@ fn get_capabilities_reports_the_real_shape() {
         ),
         0x8007_0057,
         "a too-small DIDEVCAPS is DIERR_INVALIDPARAM"
+    );
+}
+
+/// `DIDEVCAPS::dwAxes` counts the mouse wheel: 3 axes (`lX`, `lY`, and the wheel
+/// as `lZ`), which is what a real DirectInput wheel mouse reports and what
+/// WIE's own `c_dfDIMouse` declares. The number used to be 2 while `lZ` carried
+/// real wheel data, so a guest that sized its own report from `dwAxes`
+/// truncated the axis it was about to read.
+#[test]
+fn get_capabilities_counts_the_mouse_wheel_as_a_third_axis() {
+    let mut engine = dinput_test_engine();
+    let mut state = default_winapi_state();
+    let object = create_direct_input(&mut engine, &mut state);
+
+    let read_axes = |engine: &mut IcedCpu, state: &mut WinApiState, class| -> u32 {
+        let device = create_device(engine, state, object, class);
+        engine
+            .mem_write(0xC000, &44_u32.to_le_bytes())
+            .expect("size the DIDEVCAPS");
+        assert_eq!(
+            call_device(engine, state, device, 0xC000, 0, 0, "GetCapabilities"),
+            0,
+            "GetCapabilities: DI_OK"
+        );
+        let mut caps = [0_u8; 44];
+        engine
+            .mem_read(0xC000, &mut caps)
+            .expect("read the DIDEVCAPS");
+        let mut dw_axes = [0_u8; 4];
+        dw_axes.copy_from_slice(&caps[0x0C..0x10]);
+        u32::from_le_bytes(dw_axes)
+    };
+
+    assert_eq!(
+        read_axes(&mut engine, &mut state, DInputDeviceClass::Mouse),
+        3,
+        "dwAxes @0x0C must count lX, lY and the wheel's lZ"
+    );
+    assert_eq!(
+        read_axes(&mut engine, &mut state, DInputDeviceClass::Keyboard),
+        0,
+        "a keyboard still has no analog axes"
     );
 }
 
@@ -1375,5 +1419,360 @@ fn query_interface_answers_only_iid_iunknown() {
         u64::from_le_bytes(raw),
         0,
         "a failed QI must null the out-pointer"
+    );
+}
+
+/// The wheel is the MOUSE device's state: polling an unrelated device (the
+/// keyboard here) must not consume the movement the mouse report has not read
+/// yet, or a guest that polls both devices in a loop would lose every notch.
+#[test]
+fn get_device_state_keyboard_does_not_consume_the_mouse_wheel() {
+    let mut engine = dinput_test_engine();
+    let mut state = default_winapi_state();
+    let object = create_direct_input(&mut engine, &mut state);
+    let keyboard = create_device(&mut engine, &mut state, object, DInputDeviceClass::Keyboard);
+    let mouse = create_device(&mut engine, &mut state, object, DInputDeviceClass::Mouse);
+    write_keyboard_format(&mut engine, 256);
+    call_device(
+        &mut engine,
+        &mut state,
+        keyboard,
+        FORMAT_VA,
+        0,
+        0,
+        "SetDataFormat",
+    );
+    write_mouse_format(&mut engine);
+    call_device(
+        &mut engine,
+        &mut state,
+        mouse,
+        FORMAT_VA,
+        0,
+        0,
+        "SetDataFormat",
+    );
+
+    state.present().channel.push_wheel_notches(false, 1);
+    // The keyboard reports its own state...
+    assert_eq!(
+        call_device(
+            &mut engine,
+            &mut state,
+            keyboard,
+            1024,
+            0xC000,
+            0,
+            "GetDeviceState"
+        ),
+        0,
+        "DI_OK for the keyboard"
+    );
+    // ...and the wheel is still waiting for the mouse report that owns it.
+    assert_eq!(
+        call_device(
+            &mut engine,
+            &mut state,
+            mouse,
+            16,
+            0xC000,
+            0,
+            "GetDeviceState"
+        ),
+        0,
+        "DI_OK for the mouse"
+    );
+    assert_eq!(
+        read_mouse_z_and_buttons(&mut engine).0,
+        120,
+        "a keyboard report must not consume the mouse wheel"
+    );
+}
+
+/// One host button mask, two APIs: a press pushed through the presenter mirror
+/// must read *down* through DirectInput's `GetDeviceState` and through
+/// `GetKeyState` for all five mouse buttons, and up again on release.
+///
+/// This is the assertion that the two spellings of "which button is down" are
+/// one source of truth — the presenter mirror's `MK_*` mask — rather than a
+/// DirectInput button table plus a keyboard array that nobody writes. It used to
+/// pass only half: DirectInput saw the press, `GetKeyState` reported up.
+#[test]
+fn get_device_state_and_get_key_state_agree_on_every_mouse_button() {
+    // (rgbButtons slot, VK code, MK bit) for all five mouse buttons. The slot
+    // order and the MK bits come from WIE's one table (`MOUSE_BUTTON_SLOTS`),
+    // restated here so the test asserts the guest-visible agreement rather than
+    // the table itself.
+    const BUTTONS: [(usize, u64, u16); 5] = [
+        (0, 0x01, 0x0001), // VK_LBUTTON / MK_LBUTTON
+        (1, 0x02, 0x0002), // VK_RBUTTON / MK_RBUTTON
+        (2, 0x04, 0x0010), // VK_MBUTTON / MK_MBUTTON
+        (3, 0x05, 0x0020), // VK_XBUTTON1 / MK_XBUTTON1
+        (4, 0x06, 0x0040), // VK_XBUTTON2 / MK_XBUTTON2
+    ];
+
+    let mut engine = dinput_test_engine();
+    let mut state = default_winapi_state();
+    let object = create_direct_input(&mut engine, &mut state);
+    let device = create_device(&mut engine, &mut state, object, DInputDeviceClass::Mouse);
+    write_mouse_format(&mut engine);
+    declare_buttons2_upper_half(&mut engine);
+    assert_eq!(
+        call_device(
+            &mut engine,
+            &mut state,
+            device,
+            FORMAT_VA,
+            0,
+            0,
+            "SetDataFormat"
+        ),
+        0,
+        "SetDataFormat"
+    );
+
+    // One host push, two reads. `GetDeviceState` through the COM dispatch chain,
+    // `GetKeyState` through the USER32 handler — the two APIs a guest mixes.
+    let read_both = |engine: &mut IcedCpu, state: &mut WinApiState, vk: u64| -> ([u8; 8], u64) {
+        // cbData must cover the whole declared `dwDataSize` (six objects of
+        // 4 bytes), which is what a guest passing a `DIMOUSESTATE2`-sized
+        // buffer does.
+        assert_eq!(
+            call_device(engine, state, device, 6 * 4, 0xC000, 0, "GetDeviceState"),
+            0,
+            "DI_OK"
+        );
+        let dinput_buttons = read_mouse_buttons2(engine);
+        write_regs(engine, vk, 0, 0, 0, STACK_TOP);
+        let key_state = user32::handle_get_key_state(&mut HandlerContext::new(
+            engine,
+            test_environment(),
+            state,
+        ))
+        .expect("GetKeyState should dispatch")
+        .return_value;
+        (dinput_buttons, key_state)
+    };
+
+    // Nothing pressed: both APIs say up.
+    let (dinput_buttons, key_state) = read_both(&mut engine, &mut state, 0x01);
+    assert_eq!(dinput_buttons, [0_u8; 8], "an untouched mouse is all-up");
+    assert_eq!(key_state, 0, "VK_LBUTTON agrees: up");
+
+    // Each button in turn, alone: DirectInput's own slot and the VK the guest
+    // would poll must flip together.
+    for (slot, vk, mk) in BUTTONS {
+        state.present().channel.push_mouse_buttons(mk);
+        let (dinput_buttons, key_state) = read_both(&mut engine, &mut state, vk);
+        assert_eq!(
+            dinput_buttons.get(slot),
+            Some(&0x80),
+            "DirectInput rgbButtons[{slot}] reads down for MK {mk:#06x}"
+        );
+        assert_eq!(
+            key_state, 0x8000,
+            "GetKeyState(VK {vk:#04x}) reads down for the same MK {mk:#06x}"
+        );
+    }
+
+    // All five at once, then all released: still one answer, not two.
+    state
+        .present()
+        .channel
+        .push_mouse_buttons(0x0001 | 0x0002 | 0x0010 | 0x0020 | 0x0040);
+    let (dinput_buttons, key_state) = read_both(&mut engine, &mut state, 0x01);
+    assert_eq!(
+        &dinput_buttons[..5],
+        &[0x80, 0x80, 0x80, 0x80, 0x80],
+        "DirectInput reports all five down"
+    );
+    assert_eq!(key_state, 0x8000, "VK_LBUTTON reports down with the rest");
+
+    state.present().channel.push_mouse_buttons(0);
+    let (dinput_buttons, key_state) = read_both(&mut engine, &mut state, 0x01);
+    assert_eq!(dinput_buttons, [0_u8; 8], "release reaches DirectInput");
+    assert_eq!(key_state, 0, "release reaches GetKeyState too");
+}
+
+/// The mouse button and wheel bytes of one `DIDF_CDATAFORMAT` mouse report,
+/// read straight out of guest memory at the record offsets `write_mouse_format`
+/// declared: `lZ` is record 3 (`dwOfs` 0x08) and `rgbButtons` is record 4
+/// (`dwOfs` 0x0C, whose `dwData` low word is the guest-visible byte array).
+fn read_mouse_z_and_buttons(engine: &mut IcedCpu) -> (i32, [u8; 8]) {
+    const REPORT_VA: u64 = 0xC000;
+    let mut report = vec![0_u8; 5 * 24];
+    engine
+        .mem_read(REPORT_VA, &mut report)
+        .expect("read the mouse report");
+    let data_at = |record: usize| -> u32 {
+        let base = record * 24 + 0x04;
+        let mut raw = [0_u8; 4];
+        raw.copy_from_slice(&report[base..base + 4]);
+        u32::from_le_bytes(raw)
+    };
+    let z = i32::from_le_bytes(data_at(3).to_le_bytes());
+    let button_word = data_at(4).to_le_bytes();
+    let mut buttons = [0_u8; 8];
+    for (slot, byte) in buttons.iter_mut().zip(button_word) {
+        *slot = byte;
+    }
+    (z, buttons)
+}
+
+/// The eight `DIMOUSESTATE2::rgbButtons` bytes of one mouse report, read the
+/// way a guest reads them: one `DIDEVICEOBJECTDATA` DWORD per declared object
+/// (`dwData` at record offset 0x04), with a second button object at
+/// `dwOfs` 0x10 for the `DIMOUSESTATE2` upper half.
+///
+/// `read_mouse_z_and_buttons` only declares the 4-byte `DIMOUSESTATE` button
+/// field, so it cannot see the fifth button; a guest that wants `rgbButtons`
+/// in full declares the extra object itself, which is what
+/// `declare_buttons2_upper_half` does here.
+fn read_mouse_buttons2(engine: &mut IcedCpu) -> [u8; 8] {
+    const REPORT_VA: u64 = 0xC000;
+    let mut report = vec![0_u8; 6 * 24];
+    engine
+        .mem_read(REPORT_VA, &mut report)
+        .expect("read the mouse report");
+    let dw_data = |record: usize| -> [u8; 4] {
+        let base = record * 24 + 0x04;
+        let mut raw = [0_u8; 4];
+        raw.copy_from_slice(&report[base..base + 4]);
+        raw
+    };
+    let mut buttons = [0_u8; 8];
+    for (slot, byte) in buttons[..4].iter_mut().zip(dw_data(4)) {
+        *slot = byte;
+    }
+    for (slot, byte) in buttons[4..].iter_mut().zip(dw_data(5)) {
+        *slot = byte;
+    }
+    buttons
+}
+
+/// Add a sixth object to the mouse format: the `DIMOUSESTATE2` upper half of
+/// `rgbButtons` (`dwOfs` 0x10), so a report can be asked for the fifth button.
+///
+/// `with_typed_write` zero-fills before handing over the struct, so every
+/// `DIDATAFORMAT` field has to be restated here, not just the two that change.
+fn declare_buttons2_upper_half(engine: &mut IcedCpu) {
+    with_typed_write::<DiDataFormat, _, _>(engine, FORMAT_VA, |format| {
+        format.size = 32;
+        format.object_size = 4;
+        format.flags = 0x0000_0001; // DIDF_CDATAFORMAT
+        format.data_size = 6 * 4;
+        format.num_objects = 6;
+        format.objects = OBJECTS_VA;
+        Ok(())
+    })
+    .expect("widen the guest mouse DIDATAFORMAT");
+    let va = OBJECTS_VA + 5 * 24;
+    with_typed_write::<DiObjectDataFormat, _, _>(engine, va, |object| {
+        object.guid = 0;
+        object.offset = 0x10;
+        object.object_type = 0;
+        object.flags = 0;
+        Ok(())
+    })
+    .expect("declare the DIMOUSESTATE2 rgbButtons upper half");
+}
+
+/// A host mouse press/release and wheel movement must reach the mouse
+/// `GetDeviceState` report: `rgbButtons[0..4]` carry the `MK_*` mask the host
+/// pushed and `lZ` carries the wheel notches. Driven through the real dispatch
+/// chain, and — the contract that used to be documented as a gap — the state
+/// comes from the presenter-side window mirror, the same lock-free seam
+/// `set_key_state` uses, not from a second button table.
+#[test]
+fn get_device_state_mouse_reports_host_buttons_and_wheel() {
+    // Win32 `MK_*` bits (winuser.h).
+    const MK_LBUTTON: u16 = 0x0001;
+    const MK_MBUTTON: u16 = 0x0010;
+    const WHEEL_DELTA: i32 = 120;
+
+    let mut engine = dinput_test_engine();
+    let mut state = default_winapi_state();
+    let object = create_direct_input(&mut engine, &mut state);
+    let device = create_device(&mut engine, &mut state, object, DInputDeviceClass::Mouse);
+    write_mouse_format(&mut engine);
+    assert_eq!(
+        call_device(
+            &mut engine,
+            &mut state,
+            device,
+            FORMAT_VA,
+            0,
+            0,
+            "SetDataFormat"
+        ),
+        0,
+        "SetDataFormat"
+    );
+
+    // Nothing pressed, nothing scrolled: the honest all-up report.
+    let read = |engine: &mut IcedCpu, state: &mut WinApiState| -> (i32, [u8; 8]) {
+        assert_eq!(
+            call_device(engine, state, device, 16, 0xC000, 0, "GetDeviceState"),
+            0,
+            "DI_OK"
+        );
+        read_mouse_z_and_buttons(engine)
+    };
+
+    let (z, buttons) = read(&mut engine, &mut state);
+    assert_eq!(z, 0, "an untouched wheel reads 0");
+    assert_eq!(buttons, [0_u8; 8], "no button reads down before a press");
+
+    // Press the left button: the host pushes the MK_* mask through the mirror
+    // (channel-only, no big lock) exactly as the winit handler does.
+    state.present().channel.push_mouse_buttons(MK_LBUTTON);
+    let (z, buttons) = read(&mut engine, &mut state);
+    assert_eq!(
+        &buttons[..4],
+        &[0x80, 0, 0, 0],
+        "the left button reads 0x80 (down) at rgbButtons[0]"
+    );
+    assert_eq!(z, 0, "a press does not move the wheel");
+    // Buttons are LEVEL state, unlike the wheel: a second read with no new
+    // host event must still report the press.
+    let (_, buttons) = read(&mut engine, &mut state);
+    assert_eq!(
+        &buttons[..4],
+        &[0x80, 0, 0, 0],
+        "a polled button state is not consumed on read"
+    );
+
+    // Add the middle button, then release both.
+    state
+        .present()
+        .channel
+        .push_mouse_buttons(MK_LBUTTON | MK_MBUTTON);
+    let (_, buttons) = read(&mut engine, &mut state);
+    assert_eq!(
+        &buttons[..4],
+        &[0x80, 0, 0x80, 0],
+        "the middle button is rgbButtons[2], not the MK bit's low bit"
+    );
+    state.present().channel.push_mouse_buttons(0);
+    let (_, buttons) = read(&mut engine, &mut state);
+    assert_eq!(buttons, [0_u8; 8], "releasing every button reads all-up");
+
+    // Wheel: two whole notches down (negative) accumulate into one lZ, and the
+    // report consumes them — a polled lZ is relative, like lX/lY.
+    state.present().channel.push_wheel_notches(false, -1);
+    state.present().channel.push_wheel_notches(false, -1);
+    // A horizontal notch has no DIMOUSESTATE field, but it still arrives here
+    // and must not leak into lZ.
+    state.present().channel.push_wheel_notches(true, 5);
+    let (z, _) = read(&mut engine, &mut state);
+    assert_eq!(
+        z,
+        -2 * WHEEL_DELTA,
+        "two notches down accumulate into one lZ of -240, horizontal excluded"
+    );
+    let (z, _) = read(&mut engine, &mut state);
+    assert_eq!(
+        z, 0,
+        "lZ is consumed on read, so a poll loop sees each notch once"
     );
 }

@@ -4,6 +4,8 @@ use super::{
 };
 use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::{TrackMouseEvent, WinPoint};
+use crate::state::{MOUSE_BUTTON_SLOTS, WinApiState, mouse_button_bit};
+use std::ops::Deref;
 
 /// Handles `USER32.dll!GetAsyncKeyState`.
 pub fn handle_get_async_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -14,8 +16,7 @@ pub fn handle_get_async_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let virtual_key = usize::try_from(virtual_key_raw & 0xff).unwrap_or(0);
 
     // Bit 15: key is currently down.  Bit 0: key was pressed since last call.
-    state.drain_key_writes();
-    let key_state = state.window_state().keyboard_state.get(virtual_key);
+    let key_state = key_state_byte(state, virtual_key);
     let mut result = u64::from(key_state & 0x80);
     if result != 0 {
         result |= 1; // most-significant bit set → key down
@@ -161,18 +162,40 @@ pub fn handle_get_keyboard_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     let success = keyboard_state_va != 0;
 
     if success {
-        state.drain_key_writes();
-        write_guest_bytes(
-            engine,
-            keyboard_state_va,
-            &state.window_state().keyboard_state,
-        )
-        .context("failed to write GetKeyboardState buffer")?;
+        let key_state = key_state_bytes(state);
+        write_guest_bytes(engine, keyboard_state_va, &key_state)
+            .context("failed to write GetKeyboardState buffer")?;
     }
 
     let return_value = u64::from(success);
 
     ctx.finish(return_value)
+}
+/// The 256-byte array `GetKeyboardState` hands the guest: the stored keyboard
+/// rows, with the five mouse rows projected from the mirror's live `MK_*` mask.
+///
+/// Built as a copy so the stored array keeps exactly one meaning — real keys,
+/// as the host key seam and `SetKeyboardState` write it — and the guest's view
+/// of the mouse stays derived from the single host push (semantics documented
+/// on [`key_state_byte`]).
+fn key_state_bytes(state: &mut WinApiState) -> [u8; 256] {
+    state.drain_key_writes();
+
+    let mut array: [u8; 256] = state
+        .window_state()
+        .keyboard_state
+        .deref()
+        .try_into()
+        .unwrap_or([0_u8; 256]);
+    let mouse_buttons = state.mouse_buttons();
+    for (vk, bit, _) in MOUSE_BUTTON_SLOTS {
+        let slot = usize::from(vk);
+        let Some(byte) = array.get_mut(slot) else {
+            continue;
+        };
+        *byte = mouse_slot_byte(mouse_buttons, bit);
+    }
+    array
 }
 /// Handles `USER32.dll!GetKeyState`.
 pub fn handle_get_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -183,8 +206,7 @@ pub fn handle_get_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let virtual_key = usize::try_from(virtual_key_raw & 0xff)
         .context("GetKeyState virtual key does not fit usize")?;
 
-    state.drain_key_writes();
-    let key_state = state.window_state().keyboard_state.get(virtual_key);
+    let key_state = key_state_byte(state, virtual_key);
 
     // WinAPI uses the high bit of SHORT to indicate a pressed key.
     let return_value = if (key_state & 0x80) != 0 {
@@ -195,6 +217,58 @@ pub fn handle_get_key_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
 
     ctx.finish(return_value)
 }
+/// The Windows semantics WIE implements for the three key-state readers that
+/// carry mouse virtual-key slots — `GetKeyState`, `GetAsyncKeyState` and
+/// `GetKeyboardState` — written down because each of the three documents a
+/// different subset of the rule and none of them mentions the mouse.
+///
+/// **The array is the whole answer; the mask is never a per-thread copy.**
+/// `GetKeyboardState` returns a `PBYTE` a guest indexes by virtual-key code,
+/// and the mouse rows are ordinary rows of it. A guest polling a click with
+/// `kbd[VK_LBUTTON] & 0x80` inside its message loop is the common idiom, so
+/// those rows carry the live button state. Since the rows are projected from
+/// the mirror on every read and never stored, the array, the single-key readers
+/// and DirectInput's `GetDeviceState` cannot disagree: one host push, three
+/// consistent views.
+///
+/// **The foreground-thread zero rule is deliberately not implemented.** All
+/// three are documented to return zero when the calling thread is not the
+/// foreground thread (i.e. has no keyboard focus). WIE has one input focus for
+/// the whole guest — the winit window — and no per-thread keyboard state to
+/// report, so the "calling thread" part of the rule has nothing to read.
+/// Implementing the zero rule as "zero for any non-UI thread" would make a
+/// worker thread that polls `GetKeyState(VK_LBUTTON)` read up, which is the
+/// very divergence this projection removes, reintroduced under a new name. A
+/// guest whose click detection breaks once it moves that poll off its UI thread
+/// would break on real Windows too, where the same poll also requires the
+/// focus — so the deviation is a missing *liveness* check, not a wrong *state*
+/// report, and the state is the part that must be right.
+///
+/// **Toggle state stays 0 for mouse buttons.** `GetKeyState`'s low-order bit
+/// reports the toggle state of Caps/Num/Scroll lock; a mouse button has no
+/// toggle, so a held button is `0x8000` and never `0x8001`.
+fn key_state_byte(state: &mut WinApiState, virtual_key: usize) -> u8 {
+    // Host key writes reach the array first, so the two sources are read in
+    // exactly one place and neither reader can forget a step.
+    state.drain_key_writes();
+
+    // The five mouse slots are derived from the presenter mirror's live `MK_*`
+    // mask, never read out of the keyboard array: the host never wrote them, so
+    // the array could only report them permanently up. A guest that pressed
+    // `SetKeyboardState`'s mouse slots does not get a second voice either.
+    if let Some(bit) = u8::try_from(virtual_key).ok().and_then(mouse_button_bit) {
+        return mouse_slot_byte(state.mouse_buttons(), bit);
+    }
+
+    state.window_state().keyboard_state.get(virtual_key)
+}
+
+/// One keyboard-state byte for a mouse button, `0x80` down / `0` up, from the
+/// mirror's `MK_*` mask.
+fn mouse_slot_byte(mouse_buttons: u16, bit: u16) -> u8 {
+    if mouse_buttons & bit == 0 { 0 } else { 0x80 }
+}
+
 /// Handles `USER32.dll!MapVirtualKeyA`.
 pub fn handle_map_virtual_key_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;

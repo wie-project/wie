@@ -469,6 +469,14 @@ impl WieApp {
                 } else {
                     self.mouse_buttons &= !bit;
                 }
+                // Publish the held-button set for the DirectInput mouse
+                // report (`DIMOUSESTATE::rgbButtons`). The whole mask is
+                // replaced, so `self.mouse_buttons` is the complete set of
+                // buttons down right now; mirror-only, so this never takes the
+                // big guest lock. Done before the message posts so a guest
+                // that only polls DirectInput (no `WM_MOUSE*` at all) still
+                // sees the press.
+                handle.set_mouse_buttons(self.mouse_buttons);
                 // The target is resolved first so the double-click detection
                 // can require both presses on the same window (Windows tracks
                 // double-clicks per window). The slop is the EVENT window's
@@ -560,6 +568,13 @@ impl WieApp {
                 };
                 let notch_x = wheel_notches(&mut self.wheel_accum_x, delta_x);
                 let notch_y = wheel_notches(&mut self.wheel_accum_y, delta_y);
+                // Feed the DirectInput mouse report's relative `lZ` (mirror
+                // only, no big guest lock). Whole notches, not the raw host
+                // delta, so a trackpad flick that has not yet reached a notch
+                // reports nothing here instead of a fraction of a notch no
+                // Windows mouse produces. A zero notch pushes nothing.
+                handle.push_wheel_notches(false, notch_y);
+                handle.push_wheel_notches(true, notch_x);
                 let mk = self.mk_flags();
                 // WM_MOUSEWHEEL/HWHEEL go to the FOCUS window, not the window
                 // under the cursor (DefWindowProc then bubbles them up the

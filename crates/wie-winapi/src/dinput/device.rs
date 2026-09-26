@@ -21,6 +21,7 @@ use crate::guest_layout::{
     DiObjectDataFormat,
 };
 use crate::guest_memory::{read_u32, with_typed_read, with_typed_write};
+use crate::state::MOUSE_BUTTON_SLOTS;
 
 use crate::{HandlerContext, WinApiHandlerResult, WinApiState};
 
@@ -373,9 +374,12 @@ fn get_device_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
     if out_va == 0 {
         return ctx.finish(DIERR_INVALIDPARAM);
     }
-    if ctx.state.dinput8().device(this).is_none() {
+    // The class decides which live state this report owns, so it is read before
+    // anything is drained: only the MOUSE device has a wheel, and a keyboard
+    // report must not consume the movement the mouse report has not read yet.
+    let Some(class) = ctx.state.dinput8().device(this).map(|record| record.class) else {
         return ctx.finish(DIERR_NOTFOUND);
-    }
+    };
 
     // Snapshot every big-lock reader *before* taking the device record, so the
     // keyboard drain / cursor read and the record update are disjoint borrows.
@@ -388,6 +392,20 @@ fn get_device_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
         .try_into()
         .unwrap_or([0_u8; 256]);
     let cursor = state.cursor_pos();
+    // The mouse comes out of the presenter-side window mirror: the button mask
+    // is the host's level state (a copy, not a drain — a polled report must
+    // repeat a held button), the wheel is relative and therefore drained.
+    let (buttons, wheel_notches) = match class {
+        DInputDeviceClass::Keyboard => (0, 0),
+        DInputDeviceClass::Mouse => {
+            // The horizontal accumulator is drained and dropped:
+            // `DIMOUSESTATE`/`2` has no horizontal wheel axis, but leaving it
+            // queued would let a trackpad's sideways scroll grow the pending
+            // value without bound.
+            let (_, vertical) = state.drain_wheel_notches();
+            (state.mouse_buttons(), vertical)
+        }
+    };
 
     let record = state
         .dinput8()
@@ -406,7 +424,7 @@ fn get_device_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
         format.objects.len()
     };
 
-    let report = raw_report(record, &keyboard, cursor);
+    let report = raw_report(record, &keyboard, cursor, buttons, wheel_notches);
     let timestamp = u32::try_from(crate::kernel32::clock::tick_count_32()).unwrap_or(0);
     record.sequence = record.sequence.wrapping_add(1);
     let sequence = record.sequence;
@@ -472,11 +490,21 @@ fn word_at(report: &[u8], offset: u32) -> u32 {
 /// input seam only publishes an absolute cursor position, so the delta is
 /// differenced against this device's previous report and the baseline is
 /// advanced here — which is exactly the consumed-on-read semantics a
-/// relative axis has.
+/// relative axis has. `lZ` is relative for the same reason: the host's wheel
+/// notches since the last read are the movement, and reading consumes them.
+///
+/// `buttons` is the host's live `MK_*` mask, reported regardless of whether
+/// the guest captured the mouse: `SetCapture` routes *messages* (the
+/// `WM_MOUSE*` lane), while a DirectInput device reports the physical device
+/// state, which Windows reports the same way whether the pointer is captured
+/// or not. Gating the report on capture would make a captured drag (a real
+/// pattern in DirectInput apps) report every button up.
 fn raw_report(
     record: &mut DInputDeviceRecord,
     keyboard: &[u8; 256],
     cursor: Option<(i32, i32)>,
+    buttons: u16,
+    wheel_notches: i32,
 ) -> Vec<u8> {
     match record.class {
         DInputDeviceClass::Keyboard => {
@@ -500,31 +528,44 @@ fn raw_report(
             let state = DiMouseState2 {
                 x,
                 y,
-                // The wheel: WIE's host seam carries no scroll state.
-                z: 0,
-                buttons: mouse_buttons(keyboard),
+                z: wheel_notches.saturating_mul(WHEEL_DELTA),
+                buttons: mouse_buttons(buttons),
             };
             state.as_bytes().to_vec()
         }
     }
 }
 
-/// The mouse button bytes for a `DIMOUSESTATE` report.
+/// Win32 `WHEEL_DELTA` (winuser.h) — the per-notch distance of a mouse-wheel
+/// line delta, and therefore the unit a DirectInput mouse `lZ` reports: one
+/// notch is 120, matching the `WM_MOUSEWHEEL` delta WIE posts for the same
+/// host event. The host has already accumulated trackpad pixel deltas toward
+/// whole notches, so `notches` is an integer and `lZ` is always a multiple of
+/// 120 (a fraction of a notch is not something a Windows mouse reports).
+const WHEEL_DELTA: i32 = 120;
+
+/// The mouse button bytes for a `DIMOUSESTATE` report: one byte per
+/// `DIMOUSESTATE2::rgbButtons` slot, `0x80` down / `0` up.
 ///
-/// WIE's host input seam pushes keyboard virtual keys and the cursor position
-/// only — `VK_LBUTTON` (0x01) and friends are never written — so every button
-/// truthfully reads "up". Isolated in one function so the change that makes
-/// buttons real is a single obvious edit once the host seam carries button
-/// state.
-fn mouse_buttons(keyboard: &[u8; 256]) -> [u8; 8] {
+/// The source is the single host-side button mask the presenter mirror carries
+/// (`GuestHandle::set_mouse_buttons` → [`crate::state::WinApiState::mouse_buttons`]),
+/// the same seam the keyboard and cursor use. The keyboard-state array is
+/// deliberately *not* consulted: WIE's host never wrote `VK_LBUTTON` &
+/// friends, so reading button state out of it could only ever produce zeros —
+/// a second, permanently-wrong source of truth.
+///
+/// The `MK_*` bits and the `rgbButtons` slot order come from
+/// [`MOUSE_BUTTON_SLOTS`], the one table that also carries the `VK_*` codes
+/// `GetKeyState` / `GetAsyncKeyState` / `GetKeyboardState` project, so the two
+/// spellings of "which button is down" cannot drift apart.
+fn mouse_buttons(mk: u16) -> [u8; 8] {
     let mut buttons = [0_u8; 8];
-    // VK_LBUTTON 0x01, VK_RBUTTON 0x02, VK_MBUTTON 0x04, VK_XBUTTON1 0x05,
-    // VK_XBUTTON2 0x06.
-    const MOUSE_VKS: [usize; 5] = [0x01, 0x02, 0x04, 0x05, 0x06];
-    for (index, vk) in MOUSE_VKS.into_iter().enumerate() {
-        let down = keyboard.get(vk).copied().unwrap_or(0) & 0x80;
+    for (_, bit, index) in MOUSE_BUTTON_SLOTS {
+        if mk & bit == 0 {
+            continue;
+        }
         if let Some(slot) = buttons.get_mut(index) {
-            *slot = if down == 0 { 0 } else { 0x80 };
+            *slot = 0x80;
         }
     }
     buttons
