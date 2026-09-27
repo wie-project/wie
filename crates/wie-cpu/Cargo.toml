@@ -24,6 +24,12 @@ cranelift-codegen = "0.133"
 cranelift-jit = "0.133"
 cranelift-native = "0.133"
 cranelift-module = "0.133"
+# Already in the lock at 0.13.5 as a Cranelift transitive. Needed because
+# `cranelift_codegen::isa::Triple` and `CompiledCodeStencil` are not publicly
+# re-exported, and `TargetIsa::flags()` is the only in-module lever for a
+# per-compilation opt level (`cranelift_jit::JITModule` binds one `TargetIsa`
+# with no setter). See docs/superpowers/plans/2026-09-27-jit-compile-cost.md.
+target-lexicon = "0.13"
 
 [dev-dependencies]
 criterion.workspace = true
