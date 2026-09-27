@@ -14,13 +14,14 @@
 //! - Restored blocks cannot join the `FuncId`-keyed chain-table world without
 //!   going through the module, which defeats the purpose.
 //!
-//! The ledger therefore persists per-PE *metadata*: key =
-//! `(pe_hash, guest_va, fnv1a(guest bytes))`, value = `{guest_start,
-//! guest_end, insn_count, inv_gen, never}` (spec metadata minus machine-code
-//! bytes). On warm boot, [`JitShared::attach_pe_cache`] bulk-loads the file;
-//! every later consumption re-validates the CURRENT guest bytes against the
-//! recorded hash before acting on it, so any stale/SMC-diverged entry simply
-//! probes as absent and falls back to the normal cold path.
+//! The ledger therefore persists per-PE *metadata*: file key =
+//! `(pe_hash, opt_level)` (see [`jit_cache_key`]), in-file key =
+//! `(guest_va, fnv1a(guest bytes))`, value = `{guest_start, guest_end,
+//! insn_count, inv_gen, never}` (spec metadata minus machine-code bytes). On
+//! warm boot, [`JitShared::attach_pe_cache`] bulk-loads the file; every later
+//! consumption re-validates the CURRENT guest bytes against the recorded hash
+//! before acting on it, so any stale/SMC-diverged entry simply probes as
+//! absent and falls back to the normal cold path.
 //!
 //! Warm-boot savings (honest accounting): known-good blocks skip the Hot
 //! visit-threshold warmup entirely (immediate background compile), and
@@ -29,6 +30,7 @@
 //! requires either position-independent emit with serialized relocations or a
 //! real tier-0 emitter (see docs/RUNBOOK.md knob table note).
 
+use super::config::JitConfig;
 use crate::mem::GuestMemory;
 use std::fs;
 use std::io::Write as _;
@@ -41,7 +43,13 @@ use std::time::{Duration, Instant};
 /// File magic: `"WIEJITC"` + format byte + flag byte.
 const MAGIC: [u8; 8] = *b"WIEJITC\x01";
 /// Current on-disk format version.
-const FORMAT_VERSION: u32 = 1;
+///
+/// v2 adds `opt_level` to [`FileBody`] and folds it into the file key. v1 files
+/// were keyed by PE hash alone, so a `WIE_JIT_OPT=none` run and a
+/// `WIE_JIT_OPT=speed` run shared one ledger file and each consumed the other's
+/// entries. The bump deletes every such file rather than leaving it readable
+/// under a key that no longer matches.
+const FORMAT_VERSION: u32 = 2;
 
 /// Window hashed for `Never` (negative) entries: they lack an exact byte
 /// extent at record time, so both record and validate sides compare a fixed
@@ -72,9 +80,41 @@ pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// PE identity hash for the persistent JIT cache: plain FNV-1a over the image
 /// file bytes. Any byte-level change to the EXE produces a different file.
+///
+/// This is the *image* half of the cache key only; pair it with the Cranelift
+/// `opt_level` via [`jit_cache_key`] before trusting a persisted ledger.
 #[must_use]
 pub fn jit_cache_pe_hash(pe_file_bytes: &[u8]) -> u64 {
     fnv1a(pe_file_bytes)
+}
+
+/// Ledger identity for one `(PE image, Cranelift opt level)` pair — the whole
+/// on-disk key, and also the in-memory table key.
+///
+/// Opt level is part of the identity, not an incidental field, because both
+/// facts the ledger records are properties of the *compiler settings* that
+/// produced them:
+///
+/// - a `Ready` record means "these exact guest bytes compiled successfully",
+///   and Cranelift at `speed` / `speed_and_size` accepts and optimizes blocks
+///   that `none` rejects (and vice versa) — a `none`-run verdict must not be
+///   replayed as known-good for a `speed` run;
+/// - a `Never` record means "do not retry compiling these bytes", which is a
+///   much stronger claim at one opt level than at another.
+///
+/// Mixing (not concatenating) keeps the derivation a pure, total function of
+/// two integers-ish and makes the on-disk name a single hex word.
+#[must_use]
+pub(super) fn jit_cache_key(pe_hash: u64, opt_level: &str) -> u64 {
+    let mut h = pe_hash ^ FNV_OFFSET;
+    // Length-prefix so "speed" + trailing junk cannot alias "speedy".
+    h ^= u64::try_from(opt_level.len()).unwrap_or(0);
+    h = h.wrapping_mul(FNV_PRIME);
+    for &b in opt_level.as_bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
 }
 
 /// Hash the exact guest bytes in `[start, end)` from guest memory, page-chunked.
@@ -138,7 +178,12 @@ pub(super) struct LedgerProbe {
 struct FileBody {
     wie_version: String,
     format_version: u32,
-    pe_hash: u64,
+    /// [`jit_cache_key`] of this file: the ledger identity, not the bare PE hash.
+    key: u64,
+    /// The Cranelift `opt_level` the entries were compiled at. Redundant with
+    /// `key` by construction; stored so a key collision (or a hand-edited
+    /// file) is *detected* rather than silently served.
+    opt_level: String,
     entries: Vec<DiskEntry>,
 }
 
@@ -207,7 +252,7 @@ impl FlushState {
 
 /// Per-PE in-memory ledger tables (lock-free reads via papaya). The inner
 /// handle is shared through `Arc`: `papaya::HashMap::clone()` does NOT alias
-/// the same map.
+/// the same map. Keyed by [`jit_cache_key`], i.e. per `(PE, opt level)`.
 type PeTables = RwLock<ahash::HashMap<u64, Arc<papaya::HashMap<u64, LedgerRec>>>>;
 
 /// Process-wide persistent JIT cache handle. Constructed always (cheap even
@@ -217,9 +262,12 @@ type PeTables = RwLock<ahash::HashMap<u64, Arc<papaya::HashMap<u64, LedgerRec>>>
 pub(super) struct PersistentJitCache {
     enabled: bool,
     base_dir: PathBuf,
-    /// Active PE hash (0 == none attached yet).
-    active_pe: AtomicU64,
-    /// Load-once latch per attached PE.
+    /// Cranelift `opt_level` this process compiles at. Part of every ledger
+    /// key — see [`jit_cache_key`].
+    opt_level: &'static str,
+    /// Active ledger key ([`jit_cache_key`], so `0` still means "none").
+    active_key: AtomicU64,
+    /// Load-once latch per attached key.
     tables: PeTables,
     flush: Mutex<FlushState>,
 }
@@ -235,14 +283,19 @@ impl PersistentJitCache {
     /// - anything else → that value used as the cache directory.
     pub(super) fn new() -> Self {
         match resolve_config(std::env::var("WIE_JIT_CACHE").ok(), under_test_process()) {
-            Some(dir) => Self {
-                enabled: true,
-                base_dir: dir,
-                active_pe: AtomicU64::new(0),
-                tables: RwLock::new(ahash::HashMap::default()),
-                flush: Mutex::new(FlushState::new()),
-            },
+            Some(dir) => Self::enabled_with(dir, JitConfig::get().opt_level()),
             None => Self::disabled(),
+        }
+    }
+
+    fn enabled_with(dir: PathBuf, opt_level: &'static str) -> Self {
+        Self {
+            enabled: true,
+            base_dir: dir,
+            opt_level,
+            active_key: AtomicU64::new(0),
+            tables: RwLock::new(ahash::HashMap::default()),
+            flush: Mutex::new(FlushState::new()),
         }
     }
 
@@ -250,7 +303,8 @@ impl PersistentJitCache {
         Self {
             enabled: false,
             base_dir: PathBuf::new(),
-            active_pe: AtomicU64::new(0),
+            opt_level: JitConfig::get().opt_level(),
+            active_key: AtomicU64::new(0),
             tables: RwLock::new(ahash::HashMap::default()),
             flush: Mutex::new(FlushState::new()),
         }
@@ -258,64 +312,77 @@ impl PersistentJitCache {
 
     #[cfg(test)]
     fn with_base_dir(dir: PathBuf) -> Self {
-        Self {
-            enabled: true,
-            base_dir: dir,
-            active_pe: AtomicU64::new(0),
-            tables: RwLock::new(ahash::HashMap::default()),
-            flush: Mutex::new(FlushState::new()),
-        }
+        Self::enabled_with(dir, JitConfig::get().opt_level())
     }
 
-    fn file_path_for(&self, pe: u64) -> PathBuf {
-        self.base_dir.join(format!("{pe:016x}.bin"))
+    /// Test-only handle pinned to a specific opt level, so the keying can be
+    /// exercised for two levels inside one process.
+    #[cfg(test)]
+    fn with_base_dir_opt(dir: PathBuf, opt_level: &'static str) -> Self {
+        Self::enabled_with(dir, opt_level)
     }
 
-    /// Current attached PE hash (0 == none).
+    fn file_path_for(&self, key: u64) -> PathBuf {
+        self.base_dir.join(format!("{key:016x}.bin"))
+    }
+
+    /// Current attached ledger key ([`jit_cache_key`]; `0` == none).
+    ///
+    /// Named for its only caller, which only ever asks "is anything attached?"
+    /// — the value is the mixed key, not the bare PE hash.
     pub(super) fn active_pe(&self) -> u64 {
-        self.active_pe.load(Ordering::Acquire)
+        self.active_key.load(Ordering::Acquire)
     }
 
-    /// Attach + bulk-load the ledger for `pe_hash`. Idempotent per PE; errors
-    /// degrade to "no ledger" (warn-once), never propagate.
+    /// Attach + bulk-load the ledger for `pe_hash` at this process's opt
+    /// level. Idempotent per `(pe_hash, opt_level)`; errors degrade to "no
+    /// ledger" (warn-once), never propagate.
     pub(super) fn attach(&self, pe_hash: u64) {
         if !self.enabled || pe_hash == 0 {
             return;
         }
+        let key = jit_cache_key(pe_hash, self.opt_level);
         {
             let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
-            if tables.contains_key(&pe_hash) {
-                self.active_pe.store(pe_hash, Ordering::Release);
+            if tables.contains_key(&key) {
+                self.active_key.store(key, Ordering::Release);
                 return; // already loaded
             }
         }
-        let map = self.load_file(pe_hash);
+        let map = self.load_file(key);
         {
             let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
-            tables.entry(pe_hash).or_insert(Arc::new(map));
+            tables.entry(key).or_insert(Arc::new(map));
         }
-        self.active_pe.store(pe_hash, Ordering::Release);
-        tracing::debug!(pe = format_args!("{pe_hash:#x}"), "jit disk cache attached");
+        self.active_key.store(key, Ordering::Release);
+        tracing::debug!(
+            pe = format_args!("{pe_hash:#x}"),
+            opt = self.opt_level,
+            key = format_args!("{key:#x}"),
+            "jit disk cache attached"
+        );
     }
 
-    /// Read + version-validate `<pe>.bin`. A version/magic/WIE-version
+    /// Read + version-validate `<key>.bin`. A version/magic/WIE-version/opt-level
     /// mismatch DELETES the stale file and returns an empty map ("reset").
-    fn load_file(&self, pe: u64) -> papaya::HashMap<u64, LedgerRec> {
+    fn load_file(&self, key: u64) -> papaya::HashMap<u64, LedgerRec> {
         let empty = papaya::HashMap::new();
-        let path = self.file_path_for(pe);
+        let path = self.file_path_for(key);
         let body = match load_body(&path) {
             Ok(b) => b,
             Err(_) => return empty, // missing or unreadable: cold boot, keep quiet
         };
         if body.format_version != FORMAT_VERSION
             || body.wie_version != env!("CARGO_PKG_VERSION")
+            || body.key != key
+            || body.opt_level != self.opt_level
             || body.entries.len() > MAX_DISK_ENTRIES
         {
             // Version mismatch resets the file entirely (requirement). A
             // missing file is equivalent to reset.
             if fs::remove_file(&path).is_ok() {
                 tracing::info!(
-                    pe = format_args!("{pe:#x}"),
+                    key = format_args!("{key:#x}"),
                     "jit disk cache version mismatch — reset"
                 );
             }
@@ -345,12 +412,12 @@ impl PersistentJitCache {
     }
 
     fn active_table(&self) -> Option<Arc<papaya::HashMap<u64, LedgerRec>>> {
-        let pe = self.active_pe.load(Ordering::Acquire);
-        if pe == 0 {
+        let key = self.active_key.load(Ordering::Acquire);
+        if key == 0 {
             return None;
         }
         let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
-        tables.get(&pe).cloned()
+        tables.get(&key).cloned()
     }
 
     /// Byte-validated probe of the CURRENT guest bytes at `va`.
@@ -526,14 +593,14 @@ impl PersistentJitCache {
     }
 
     /// Serialize the active PE's table (+ buffered appends) to
-    /// `<dir>/<pe-hash>.bin` via temp-file rename. `force_fsync` also calls
+    /// `<dir>/<ledger-key>.bin` via temp-file rename. `force_fsync` also calls
     /// `sync_all` (the lazy-fsync policy keeps ordinary flushes unsynced).
     fn flush_now(&self, force_fsync: bool) {
         if !self.enabled {
             return;
         }
-        let pe = self.active_pe.load(Ordering::Acquire);
-        if pe == 0 {
+        let key = self.active_key.load(Ordering::Acquire);
+        if key == 0 {
             return;
         }
         let Some(table) = self.active_table() else {
@@ -573,10 +640,11 @@ impl PersistentJitCache {
         let body = FileBody {
             wie_version: env!("CARGO_PKG_VERSION").to_string(),
             format_version: FORMAT_VERSION,
-            pe_hash: pe,
+            key,
+            opt_level: self.opt_level.to_string(),
             entries: snapshot,
         };
-        let path = self.file_path_for(pe);
+        let path = self.file_path_for(key);
         let res = write_body(&path, &body).and_then(|()| {
             if force_fsync {
                 fs::File::open(&path)
@@ -796,12 +864,14 @@ mod tests {
     #[test]
     fn version_mismatch_resets_file() {
         let dir = scratch_dir("version-reset");
-        let path = dir.join(format!("{PE_A:016x}.bin"));
+        let opt = JitConfig::get().opt_level();
+        let path = dir.join(format!("{:016x}.bin", jit_cache_key(PE_A, opt)));
         // Hand-write a body claiming a different WIE version.
         let stale_body = FileBody {
             wie_version: "0.0.0-old".to_string(),
             format_version: FORMAT_VERSION,
-            pe_hash: PE_A,
+            key: jit_cache_key(PE_A, opt),
+            opt_level: opt.to_string(),
             entries: vec![DiskEntry {
                 va: VA1,
                 guest_end: VA1 + 16,
@@ -818,6 +888,120 @@ mod tests {
         cache.attach(PE_A);
         assert_eq!(cache.test_entries_len(), 0, "stale entries rejected");
         assert!(!path.exists(), "version-mismatch file deleted (reset)");
+    }
+
+    // --- opt-level-aware keying (correctness prerequisite for variable
+    // --- per-compilation opt levels) ----------------------------------------
+
+    #[test]
+    fn cache_key_varies_with_opt_level() {
+        // Pure-function half: the derived key must separate every opt level
+        // Cranelift accepts, and must be stable for a given one.
+        let keys: Vec<u64> = ["none", "speed", "speed_and_size"]
+            .iter()
+            .map(|o| jit_cache_key(PE_A, o))
+            .collect();
+        assert_ne!(keys[0], keys[1], "none vs speed must not collide");
+        assert_ne!(keys[1], keys[2], "speed vs speed_and_size must not collide");
+        assert_ne!(keys[0], keys[2], "none vs speed_and_size must not collide");
+        // Stable (no per-call randomness), and independent of the PE hash.
+        assert_eq!(jit_cache_key(PE_A, "none"), keys[0]);
+        assert_ne!(jit_cache_key(PE_A + 1, "none"), keys[0]);
+        // Length prefix: "speed" must not alias a longer string sharing a prefix.
+        assert_ne!(jit_cache_key(PE_A, "speedy"), keys[1]);
+    }
+
+    #[test]
+    fn artifact_from_one_opt_level_is_not_served_to_another() {
+        let dir = scratch_dir("opt-split");
+        let code = [0x90_u8; 64];
+        let bad = [0xCC_u8; 32];
+        let mem = test_memory(&[(&VA1, &code), (&(VA1 + 0x200), &bad)], REGION, 0x1000);
+
+        // Writer: a `WIE_JIT_OPT=none` process records one Ready and one Never.
+        {
+            let none = PersistentJitCache::with_base_dir_opt(dir.clone(), "none");
+            none.attach(PE_A);
+            none.record_ready(&mem, VA1, VA1 + 64, 9, 5);
+            none.record_never(&mem, VA1 + 0x200);
+            assert_eq!(none.test_entries_len(), 2);
+        }
+        // The `none` ledger must have landed on its OWN key-derived path, not
+        // on the bare PE hash, and no other file may exist.
+        let none_path = dir.join(format!("{:016x}.bin", jit_cache_key(PE_A, "none")));
+        assert!(none_path.exists(), "none ledger file present");
+        let speed_path = dir.join(format!("{:016x}.bin", jit_cache_key(PE_A, "speed")));
+        assert!(!speed_path.exists(), "no speed ledger file yet");
+        assert!(!dir.join(format!("{PE_A:016x}.bin")).exists());
+
+        // Reader: a `WIE_JIT_OPT=speed` process must see NOTHING.
+        {
+            let speed = PersistentJitCache::with_base_dir_opt(dir.clone(), "speed");
+            speed.attach(PE_A);
+            assert_eq!(
+                speed.test_entries_len(),
+                0,
+                "a none-compiled artifact must not be loaded by a speed run"
+            );
+            assert_eq!(speed.probe(&mem, VA1), None, "no cross-level probe hit");
+            assert!(speed.never_vas().is_empty(), "no cross-level Never seed");
+            // ... and it must not have clobbered the `none` ledger on drop.
+        }
+        assert!(none_path.exists(), "speed run left the none ledger alone");
+
+        // Reader at the SAME opt level still gets the hit (keying did not
+        // become so narrow that the cache stopped working).
+        {
+            let warm = PersistentJitCache::with_base_dir_opt(dir.clone(), "none");
+            warm.attach(PE_A);
+            assert_eq!(warm.test_entries_len(), 2);
+            let probe = warm.probe(&mem, VA1).expect("same-level known-good hit");
+            assert_eq!(probe.insn_count, 9);
+            assert!(warm.never_vas().contains(&(VA1 + 0x200)));
+        }
+        // Two opt levels, two files.
+        {
+            let speed = PersistentJitCache::with_base_dir_opt(dir.clone(), "speed");
+            speed.attach(PE_A);
+            speed.record_ready(&mem, VA1, VA1 + 64, 11, 5);
+        }
+        assert!(speed_path.exists(), "speed ledger written to its own key");
+        assert!(none_path.exists(), "none ledger still there");
+    }
+
+    #[test]
+    fn body_opt_level_mismatch_resets_even_when_key_matches() {
+        // Defense in depth: the key already encodes the opt level, so a
+        // mismatch here means a key collision or a hand-edited file. It must
+        // still be refused, not served.
+        let dir = scratch_dir("opt-body-mismatch");
+        let opt = JitConfig::get().opt_level();
+        let key = jit_cache_key(PE_A, opt);
+        let path = dir.join(format!("{key:016x}.bin"));
+        let lying = FileBody {
+            wie_version: env!("CARGO_PKG_VERSION").to_string(),
+            format_version: FORMAT_VERSION,
+            key,
+            opt_level: "speed_and_size".to_string(),
+            entries: vec![DiskEntry {
+                va: VA1,
+                guest_end: VA1 + 16,
+                bytes_hash: 42,
+                insn_count: 3,
+                inv_gen: 0,
+                never: false,
+            }],
+        };
+        write_body(&path, &lying).expect("seed lying file");
+
+        let cache = PersistentJitCache::with_base_dir(dir.clone());
+        cache.attach(PE_A);
+        assert_eq!(
+            cache.test_entries_len(),
+            0,
+            "opt-level mismatch in the body must be refused"
+        );
+        assert!(!path.exists(), "mismatched file deleted (reset)");
     }
 
     #[test]
