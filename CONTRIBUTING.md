@@ -6,7 +6,7 @@ If you want to help this project and offer your own improvements, corrections or
 
 1. **It should be checked that the Pre-PR Checklist is clean** (watch README). If there are clippy warnings, test errors, formatting problems - it is highly desirable to fix
 
-2. **Integration Suite** - You should make sure that after your changes that all test exe files pass tests and the speed of execution has not decreased. If something is broken - be sure to fix
+2. **Integration Suite** - You should make sure that after your changes that all test exe files pass tests and the speed of execution has not decreased. If something is broken - be sure to fix. The live `long_loop` pin lives in `docs/status.md` (currently **~0.40–0.55 s** release JIT; `WIE_JIT_OPT=speed` gives ~0.28–0.36 s). The default Cranelift `opt_level` is `none` — that pin moved up from ~0.25–0.30 s on 2026-09-27 because compile cost, not emitted-code quality, dominates real guests (7-Zip is ~1.5x faster cold / ~1.7x warm at `none`). Treat a jump in that pin as a real regression, and re-measure on a quiet host: interference only ever adds time, so compare best-of-N, not a single run.
 
 3. **unsafe** are allowed only in critical places (for example, wie-cpu). You should make sure that after your changes the code was the minimum number of unsafe code.
 

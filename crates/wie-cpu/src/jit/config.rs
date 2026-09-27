@@ -237,21 +237,13 @@ impl JitConfig {
             // dead worker.
             bg_wait_timeout: Duration::from_micros(env_u64("WIE_JIT_BG_TIMEOUT_US", 1_000)),
             // Cranelift `opt_level`: `speed` | `speed_and_size` | `none`.
-            // Default `speed` (hot guest blocks over code size).
-            opt_level: match std::env::var("WIE_JIT_OPT") {
-                Ok(v) if v.eq_ignore_ascii_case("none") || v == "0" => "none",
-                Ok(v)
-                    if v.eq_ignore_ascii_case("speed_and_size")
-                        || v.eq_ignore_ascii_case("size")
-                        || v.eq_ignore_ascii_case("speed-and-size") =>
-                {
-                    "speed_and_size"
-                }
-                Ok(v) if v.eq_ignore_ascii_case("speed") || v.eq_ignore_ascii_case("fast") => {
-                    "speed"
-                }
-                _ => "speed",
-            },
+            // Default `none`: compile cost, not emitted-code quality, is the
+            // binding constraint for real guests (7-Zip Extra `7za.exe i` is
+            // 2.4x faster and background compiles stop starving at
+            // `none`), while a pure-compute loop pays ~40% (0.49s -> 0.71s on
+            // `long_loop`). `WIE_JIT_OPT=speed` is the documented opt-out for
+            // compute-bound guests. Do not "fix" this back to `speed`.
+            opt_level: opt_level_from_env(std::env::var("WIE_JIT_OPT").ok()),
             // Emit Cranelift SIMD types for SSE (`WIE_JIT_SIMD=0` disables).
             simd_enabled: !matches!(
                 std::env::var("WIE_JIT_SIMD"),
@@ -371,7 +363,9 @@ impl JitConfig {
     }
 
     /// Cranelift `opt_level`: `speed` | `speed_and_size` | `none`.
-    /// Default `speed` (hot guest blocks over code size).
+    ///
+    /// Default `none`: see the measured trade-off on the field initializer in
+    /// [`JitConfig::from_env`]. `WIE_JIT_OPT=speed` opts back in.
     #[must_use]
     pub(super) fn opt_level(&self) -> &'static str {
         self.opt_level
@@ -473,5 +467,91 @@ fn env_u64(name: &str, default: u64) -> u64 {
     match std::env::var(name) {
         Ok(v) => v.parse::<u64>().unwrap_or(default),
         Err(_) => default,
+    }
+}
+
+/// Default Cranelift `opt_level`: compile cheap, pay for `speed` only where
+/// hotness earns it.
+const OPT_LEVEL_DEFAULT: &str = "none";
+
+/// Parse the Cranelift `opt_level` from a `WIE_JIT_OPT` value.
+///
+/// Split out of [`JitConfig::from_env`] so the whole decision table is
+/// unit-testable without mutating the process environment: [`JitConfig`] lives
+/// behind a process-wide `OnceLock`, so an in-test `set_var` could neither be
+/// undone nor observed, and `set_var` is `unsafe` under this crate's lint set
+/// anyway. Same rationale as `cache_persist::resolve_config`.
+///
+/// Unset, empty, and unrecognised values all take [`OPT_LEVEL_DEFAULT`].
+fn opt_level_from_env(raw: Option<String>) -> &'static str {
+    match raw {
+        Some(v) if v.eq_ignore_ascii_case("none") || v == "0" => "none",
+        Some(v)
+            if v.eq_ignore_ascii_case("speed_and_size")
+                || v.eq_ignore_ascii_case("size")
+                || v.eq_ignore_ascii_case("speed-and-size") =>
+        {
+            "speed_and_size"
+        }
+        Some(v) if v.eq_ignore_ascii_case("speed") || v.eq_ignore_ascii_case("fast") => "speed",
+        _ => OPT_LEVEL_DEFAULT,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::{OPT_LEVEL_DEFAULT, opt_level_from_env};
+
+    #[test]
+    fn opt_level_defaults_to_none() {
+        // The cheap-compile default is the load-bearing policy decision of
+        // this change; see the `from_env` comment for the measurements.
+        assert_eq!(OPT_LEVEL_DEFAULT, "none");
+        assert_eq!(opt_level_from_env(None), "none");
+    }
+
+    #[test]
+    fn opt_level_honours_explicit_values() {
+        for (raw, want) in [
+            ("none", "none"),
+            ("NONE", "none"),
+            ("None", "none"),
+            ("0", "none"),
+            ("speed", "speed"),
+            ("SPEED", "speed"),
+            ("fast", "speed"),
+            ("speed_and_size", "speed_and_size"),
+            ("SPEED_AND_SIZE", "speed_and_size"),
+            ("size", "speed_and_size"),
+            ("speed-and-size", "speed_and_size"),
+        ] {
+            assert_eq!(
+                opt_level_from_env(Some(raw.to_string())),
+                want,
+                "WIE_JIT_OPT={raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn opt_level_falls_back_to_none_on_junk() {
+        // Unknown / empty spellings must not silently re-enable `speed`.
+        for raw in ["", "  ", "turbo", "None ", "1", "nonee"] {
+            assert_eq!(
+                opt_level_from_env(Some(raw.to_string())),
+                "none",
+                "WIE_JIT_OPT={raw:?} must take the cheap-compile default"
+            );
+        }
+    }
+
+    #[test]
+    fn every_parsed_level_is_a_cranelift_opt_level() {
+        // Cranelift rejects an unknown string at `JitEngine::new` time, which
+        // would turn a typo into a hard startup failure rather than a default.
+        for want in ["none", "speed", "speed_and_size"] {
+            assert_eq!(opt_level_from_env(Some(want.to_string())), want);
+        }
     }
 }
