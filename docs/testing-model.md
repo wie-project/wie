@@ -68,25 +68,63 @@ used by every test that consumes a guest binary:
   developer without the mingw-w64 cross toolchain. It restores the old skip,
   after printing a `SKIPPED:` notice — the skip stays visible, it is just no
   longer the default. Never set it in CI.
-* **`real_exes/<name>` is optional but never silent.** Those binaries
-  (RNotepad, 7-Zip) are gitignored, fetched on demand with
-  `./scripts/fetch-rnotepad.sh` / `./scripts/fetch.sh 7za`, and large, so a
-  missing one skips — with a `SKIPPED:` line on stderr naming the path, so it
-  cannot be mistaken for a pass. The escape hatch does not apply to them: they
-  are never expected to be present.
+* **`real_exes/<name>` is also required.** RNotepad and 7-Zip are gitignored
+  and fetched on demand, but "fetched on demand" is not an excuse: a missing
+  real guest **fails** the test with the expected path and the
+  `./scripts/fetch.sh <app>` command. See below for why the skip was worse than
+  the failure.
 
 Consequence: any change that adds a guest-PE test must also be runnable after
-`make -C micro-exes`, and a red "missing guest fixture" message means the
-toolchain or the build step, not the emulator.
+`make -C micro-exes` and `./scripts/fetch.sh notepad`, and a red "missing guest
+fixture" message means the toolchain or the build/fetch step, not the emulator.
 
-**Known coverage hole, stated plainly:** 39 of the 52 tests in
-`micro_gui_window` drive RNotepad from `real_exes/`, which CI never fetches.
-They are green skips on every push, and under nextest the `SKIPPED:` line is
-captured output on a *passing* test, so the CI log shows a plain `PASS`. Only
-13 GUI tests — the ones holding the frame-hash guards for present/paint, D3D9
-and GL — actually execute in CI. Fetching RNotepad in CI would close this; it
-is not done yet because it means pulling a large proprietary binary into the
-push path.
+### Real guests: a skip that reported PASS
+
+`real_exe()` was the same class of bug one class up, and it was missed. It
+resolved `real_exes/notepad.exe` and, on a miss, printed a `SKIPPED:` notice on
+stderr and returned `None`; every caller was shaped
+`let Some(path) = real_exe("notepad.exe") else { return; };`. A test function
+that returns `()` is recorded as a **PASS** by both libtest and nextest — and
+nextest only surfaces a test's captured stderr when that test *fails*. So the
+notice was invisible in exactly the case it existed to report, and the module
+doc claimed the opposite ("so it can never be mistaken for a pass").
+
+Measured on `feat/dll-coverage` by renaming the fixture aside and restoring it:
+
+| | 39 notepad-backed GUI tests | `micro_gui_window` group |
+| --- | --- | --- |
+| fixture absent (old code) | **PASS in 0.018–0.077 s each, 0 work done** | 41.2 s |
+| fixture present | real work, 1.2–19.0 s each | 239.9 s, 52/52 pass, 0 skipped |
+
+The workspace test count was 1827 either way — the 39 were always *counted*,
+just vacuous. Any fresh clone, any CI runner and any contributor who had not run
+`./scripts/fetch.sh notepad` by hand got 1827/1827 green with a third of the
+GUI group doing nothing.
+
+The fix is the rule above: `real_exe()` returns `PathBuf` and panics with an
+actionable message naming the fetch target, and the `WIE_ALLOW_MISSING_GUESTS`
+escape hatch deliberately does *not* apply to it (honouring it there would
+reopen the same hole). Rust's libtest has no runtime `Err(Skipped)`, so the
+realistic alternatives were both rejected:
+
+* **Filter the notepad tests out of the default nextest profile** so they are
+  not counted. This makes the hole *invisible* rather than absent — the count
+  silently drops and a green suite again means "whatever was configured to
+  run". Bad trade: the whole point of the loud failure is that the default
+  configuration cannot under-report.
+* **Gate them behind an opt-in cargo feature.** Same objection, worse ergonomics
+  — and it is *not* a fix for a missing fixture, only a re-hiding of it: a
+  developer with the feature on and the fixture missing gets the same vacuous
+  pass.
+
+The atomicity requirement is the load-bearing part: a loud failure with no CI
+fetch would convert a false green into a broken build. So CI fetches notepad in
+a dedicated step before `cargo nextest run`
+(`.github/workflows/ci.yml`, "Fetch real guest fixtures"). That is cheap —
+RNotepad is MIT-licensed and **built from source** by `scripts/fetch.sh notepad`
+(git clone + cmake + the mingw-w64 cross toolchain CI already installs), not a
+large proprietary binary pulled into the push path. The old note here claiming
+otherwise was the reason the gap went unfixed.
 
 ## What a loaded runner does
 

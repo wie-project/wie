@@ -20,14 +20,20 @@
 //!   documented escape hatch — `WIE_ALLOW_MISSING_GUESTS=1` — for a developer
 //!   without the mingw-w64 cross toolchain; it restores the old skip, with a
 //!   notice on stderr, so the skip is still visible.
-//! * **`real_exes/<name>` (a real application) is optional.** Those binaries
-//!   are gitignored, fetched on demand (`./scripts/fetch.sh 7za`,
-//!   `./scripts/fetch-rnotepad.sh`) and heavy, so a missing one stays a skip —
-//!   but the resolver announces it on stderr so it can never be mistaken for a
-//!   pass.
+//! * **`real_exes/<name>` (a real application) is also required.** Those
+//!   binaries are gitignored and fetched on demand
+//!   (`./scripts/fetch.sh notepad`, `./scripts/fetch.sh 7za`), but an absent
+//!   one is still a **failure**, for the same reason: a test that quietly
+//!   returns `()` is recorded as a *pass* by libtest and nextest, and nextest
+//!   only prints a failing test's captured stderr — so a skip-notice is
+//!   invisible in exactly the case it exists to report. `real_exe` used to do
+//!   precisely that: with `real_exes/notepad.exe` absent, 39 GUI tests
+//!   "passed" in 0.02–0.08 s having executed nothing. CI now fetches notepad
+//!   (`.github/workflows/ci.yml`) so the loud failure has its prerequisite.
 //!
 //! `WIE_ALLOW_MISSING_GUESTS` intentionally does *not* apply to `real_exe`:
-//! those are never expected to be present.
+//! honouring it there would reintroduce exactly the silent-pass hole this
+//! function exists to close.
 
 #![allow(dead_code)] // each test binary links this module and uses part of it
 
@@ -90,21 +96,34 @@ pub(crate) fn micro_exe(name: &str) -> Option<PathBuf> {
 }
 
 /// Resolve a real (non-micro) guest binary under `real_exes/` — e.g. the
-/// RNotepad build fetched by `scripts/fetch-rnotepad.sh`.
+/// RNotepad build produced by `./scripts/fetch.sh notepad`.
 ///
-/// These are gitignored, fetched on demand and large, so an absent binary is a
-/// skip — reported on stderr so it is never mistaken for a pass. Override with
-/// [`ALLOW_MISSING_GUESTS`] never applies here.
-pub(crate) fn real_exe(name: &str) -> Option<PathBuf> {
+/// Required, exactly like [`micro_exe`]: an absent binary fails the test with
+/// the expected path and the fetch command. It is never a skip, and
+/// [`ALLOW_MISSING_GUESTS`] does not apply — a silent pass for a test that ran
+/// nothing is the failure mode this guards against, and a green suite that
+/// hides it is worse than a red one.
+///
+/// The fetch target is the file stem (`notepad.exe` → `notepad`), which is how
+/// `scripts/fetch.sh` names its apps.
+pub(crate) fn real_exe(name: &str) -> PathBuf {
     let path = real_exe_path(name);
     if path.is_file() {
-        return Some(path);
+        return path;
     }
-    eprintln!(
-        "SKIPPED: real guest fixture {} not present (fetched on demand; \
-         ./scripts/fetch.sh 7za, ./scripts/fetch-rnotepad.sh) — \
-         this test did NOT run",
+    let target = name.strip_suffix(".exe").unwrap_or(name);
+    panic!(
+        "missing real guest fixture: {}\n\
+         \n\
+         This test runs a real guest PE, so an absent fixture is a failure, not a\n\
+         skip — a silent return here is recorded as a PASS by nextest while the\n\
+         test executes nothing.\n\
+         Fetch the fixture with:\n\
+         \n    ./scripts/fetch.sh {target}\n\
+         \n\
+         (see `./scripts/fetch.sh --list` for the available apps; the binaries are\n\
+         gitignored, so this is required once per clone. CI fetches notepad in\n\
+         .github/workflows/ci.yml).",
         path.display()
     );
-    None
 }

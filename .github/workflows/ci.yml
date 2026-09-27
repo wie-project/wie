@@ -79,6 +79,28 @@ jobs:
       - name: Build guest fixtures
         run: make -C micro-exes
 
+      # Same reasoning, one class up: the ~39 GUI tests under
+      # crates/wie-runtime/tests/micro_gui_window/ run real_exes/notepad.exe
+      # (RNotepad). real_exes/ is gitignored, so on a clean runner the binary is
+      # simply absent — and a missing *real* guest is a test FAILURE, not a
+      # skip (crates/wie-runtime/tests/common/mod.rs). That rule exists because
+      # the alternative is worse than a red build: `real_exe()` used to return
+      # None, the test returned (), and nextest recorded a PASS for a test that
+      # executed nothing — 39 of them, in 0.02–0.08 s each. nextest only prints
+      # a FAILING test's captured stderr, so the skip notice was invisible in
+      # exactly the case it existed to report.
+      #
+      # So the fetch has to happen here, or the loud failure turns a false green
+      # into a broken build. Needs: git (preinstalled), cmake (preinstalled on
+      # macos runners) and the mingw-w64 cross toolchain installed above. The
+      # trailing `file` check is deliberate: a fetch that silently produced
+      # nothing would show up as ~39 identical fixture failures instead of one
+      # clear message here.
+      - name: Fetch real guest fixtures
+        run: |
+          ./scripts/fetch.sh notepad
+          file real_exes/notepad.exe
+
       - name: Tests
         run: cargo nextest run --workspace
 
