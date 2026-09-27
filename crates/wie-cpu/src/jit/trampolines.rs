@@ -185,14 +185,14 @@ fn tramp_return_imm32_dispatch(imm: u32) -> unsafe extern "C" fn(*mut JitCtx) {
 unsafe extern "C" fn tramp_ret(ctx: *mut JitCtx) {
     // SAFETY: live ctx for block duration.
     let ctx = unsafe { &mut *ctx };
-    mark_dirty(ctx, MicroStub::Ret.dirty_mask());
+    enter_stub(ctx, MicroStub::Ret);
     guest_ret(ctx);
     chain_tail(ctx);
 }
 
 unsafe extern "C" fn tramp_return_zero(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
-    mark_dirty(ctx, MicroStub::ReturnZero.dirty_mask());
+    enter_stub(ctx, MicroStub::ReturnZero);
     ctx.gpr[0] = 0;
     guest_ret(ctx);
     chain_tail(ctx);
@@ -200,7 +200,7 @@ unsafe extern "C" fn tramp_return_zero(ctx: *mut JitCtx) {
 
 unsafe extern "C" fn tramp_identity_rcx(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
-    mark_dirty(ctx, MicroStub::IdentityRcx.dirty_mask());
+    enter_stub(ctx, MicroStub::IdentityRcx);
     ctx.gpr[0] = ctx.gpr[1];
     guest_ret(ctx);
     chain_tail(ctx);
@@ -208,7 +208,7 @@ unsafe extern "C" fn tramp_identity_rcx(ctx: *mut JitCtx) {
 
 unsafe extern "C" fn tramp_return_imm_1(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
-    mark_dirty(ctx, MicroStub::ReturnImm32(1).dirty_mask());
+    enter_stub(ctx, MicroStub::ReturnImm32(1));
     ctx.gpr[0] = 1;
     guest_ret(ctx);
     chain_tail(ctx);
@@ -216,7 +216,7 @@ unsafe extern "C" fn tramp_return_imm_1(ctx: *mut JitCtx) {
 
 unsafe extern "C" fn tramp_return_imm_1234(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
-    mark_dirty(ctx, MicroStub::ReturnImm32(0x1234).dirty_mask());
+    enter_stub(ctx, MicroStub::ReturnImm32(0x1234));
     ctx.gpr[0] = 0x1234;
     guest_ret(ctx);
     chain_tail(ctx);
@@ -224,7 +224,7 @@ unsafe extern "C" fn tramp_return_imm_1234(ctx: *mut JitCtx) {
 
 unsafe extern "C" fn tramp_return_imm_5678(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
-    mark_dirty(ctx, MicroStub::ReturnImm32(0x5678).dirty_mask());
+    enter_stub(ctx, MicroStub::ReturnImm32(0x5678));
     ctx.gpr[0] = 0x5678;
     guest_ret(ctx);
     chain_tail(ctx);
@@ -232,7 +232,7 @@ unsafe extern "C" fn tramp_return_imm_5678(ctx: *mut JitCtx) {
 
 unsafe extern "C" fn tramp_return_imm_12345(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
-    mark_dirty(ctx, MicroStub::ReturnImm32(12_345).dirty_mask());
+    enter_stub(ctx, MicroStub::ReturnImm32(12_345));
     ctx.gpr[0] = 12_345;
     guest_ret(ctx);
     chain_tail(ctx);
@@ -240,7 +240,7 @@ unsafe extern "C" fn tramp_return_imm_12345(ctx: *mut JitCtx) {
 
 unsafe extern "C" fn tramp_return_imm_0409(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
-    mark_dirty(ctx, MicroStub::ReturnImm32(0x0409).dirty_mask());
+    enter_stub(ctx, MicroStub::ReturnImm32(0x0409));
     ctx.gpr[0] = 0x0409;
     guest_ret(ctx);
     chain_tail(ctx);
@@ -248,7 +248,7 @@ unsafe extern "C" fn tramp_return_imm_0409(ctx: *mut JitCtx) {
 
 unsafe extern "C" fn tramp_return_imm_437(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
-    mark_dirty(ctx, MicroStub::ReturnImm32(437).dirty_mask());
+    enter_stub(ctx, MicroStub::ReturnImm32(437));
     ctx.gpr[0] = 437;
     guest_ret(ctx);
     chain_tail(ctx);
@@ -256,7 +256,7 @@ unsafe extern "C" fn tramp_return_imm_437(ctx: *mut JitCtx) {
 
 unsafe extern "C" fn tramp_return_imm_1252(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
-    mark_dirty(ctx, MicroStub::ReturnImm32(1252).dirty_mask());
+    enter_stub(ctx, MicroStub::ReturnImm32(1252));
     ctx.gpr[0] = 1252;
     guest_ret(ctx);
     chain_tail(ctx);
@@ -265,7 +265,7 @@ unsafe extern "C" fn tramp_return_imm_1252(ctx: *mut JitCtx) {
 /// Fallback for rare imm32: re-decode guest code at entry RIP (ctx.rip before ret).
 unsafe extern "C" fn tramp_return_imm32_generic(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
-    mark_dirty(ctx, MicroStub::ReturnImm32(0).dirty_mask());
+    enter_stub(ctx, MicroStub::ReturnImm32(0));
     // Entry RIP was set by run_compiled; body is `b8 imm32 c3`.
     let entry = ctx.rip;
     let imm = tramp_load_u32(ctx, entry.wrapping_add(1));
@@ -279,7 +279,7 @@ unsafe extern "C" fn tramp_return_imm32_generic(ctx: *mut JitCtx) {
 
 unsafe extern "C" fn tramp_get_last_error(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
-    mark_dirty(ctx, MicroStub::GetLastError.dirty_mask());
+    enter_stub(ctx, MicroStub::GetLastError);
     // Resolve the LAST-ERROR slot against the engine's bound TEB page: a
     // worker's `gs:[0x68]` stub must read ITS TEB, not the primary's fixed VA.
     let last_error_va = ctx.gs_base.wrapping_add(TEB_LAST_ERROR_OFFSET);
@@ -294,7 +294,7 @@ unsafe extern "C" fn tramp_get_last_error(ctx: *mut JitCtx) {
 
 unsafe extern "C" fn tramp_set_last_error(ctx: *mut JitCtx) {
     let ctx = unsafe { &mut *ctx };
-    mark_dirty(ctx, MicroStub::SetLastError.dirty_mask());
+    enter_stub(ctx, MicroStub::SetLastError);
     let ecx = ctx.gpr[1] as u32;
     let last_error_va = ctx.gs_base.wrapping_add(TEB_LAST_ERROR_OFFSET);
     tramp_store_u32(ctx, last_error_va, ecx);
@@ -318,6 +318,20 @@ fn mark_dirty(ctx: &mut JitCtx, mask: u16) {
     } else {
         ctx.gpr_dirty_bits |= u64::from(mask);
     }
+}
+
+/// Book-keeping every micro-stub does on entry: dirty-mask the registers it
+/// clobbers, and charge its retired guest instructions to the run-wide
+/// accumulator the Cranelift blocks also fold into (`JitCtx::insn_acc`).
+///
+/// Without the charge a stub reached through a chain would contribute nothing
+/// to `jit_insns`, re-introducing the static-per-entry undercount for
+/// `GetLastError` / `SetLastError` — by far the hottest stubs in a call-heavy
+/// guest.
+#[inline]
+fn enter_stub(ctx: &mut JitCtx, stub: MicroStub) {
+    mark_dirty(ctx, stub.dirty_mask());
+    ctx.insn_acc = ctx.insn_acc.saturating_add(u64::from(stub.insn_count()));
 }
 
 /// Pop guest return address, update RSP / shadow, set RIP.

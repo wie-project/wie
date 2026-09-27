@@ -7,6 +7,7 @@ mod inv_gen_tests;
 mod pause_tests;
 mod strlen_repro;
 mod testb_high_byte;
+mod trip_tests;
 use super::*;
 use crate::exec::StepResult;
 use crate::mem::protect;

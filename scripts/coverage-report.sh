@@ -21,13 +21,17 @@
 # - `WIE_EXEC_TRACE=1` also prints the *unsampled* interpreter histogram
 #   (total = every interpreted step), which is the honest denominator for
 #   residue; the JIT one is sampled 1/64 and is used for shape, not volume.
-# - The `total_insns` / `jit%` columns are BLOCK-ENTRY ratios, not dynamic
-#   instruction counts: the runtime's `jit_insns` charges a compiled block's
-#   static length once per block entry, so a self-looping block undercounts by
-#   its trip factor. The report says so on every line, the `insn/entry`
-#   column exposes which rows are affected, and the opcode histogram below is
-#   exact (it samples interpreted steps). Use the histogram to rank ISA
-#   families; never quote `total` as throughput.
+# - The `total_insns` / `jit%` columns are DYNAMIC retired-instruction counts
+#   (`basis=dynamic_retired`): the lowering step emits a per-block trip counter
+#   so a self-looping block is charged once per trip, not once per entry, and
+#   guest worker-thread engines are merged into the profile. The one known
+#   undercount is a REP string helper charged 1 instruction instead of `rcx`
+#   iterations, so treat a `rep movs*`-dominated row as a lower bound.
+#   `insn/entry` is the smell detector, and it now reads the other way from
+#   before: HIGH = a hot self-loop retiring a lot per entry, LOW =
+#   call/edge-bound code. The opcode histograms below remain exact (they count
+#   interpreted steps) and are still how ISA families are ranked; cross-check a
+#   surprising row against `WIE_EXEC_TRACE=1` rather than reasoning about blocks.
 # - Non-zero guest exits abort the run. The single documented exception is
 #   long_loop.exe under `WIE_CPU=iced`, whose 100M-iteration loop blows the
 #   default `instruction_budget`; it is skipped, not tolerated silently.
@@ -323,9 +327,10 @@ CAVEAT="$(printf '%s\n' "$caveat_line" | sed 's/^insn_coverage_caveat: //')"
   echo "# $stamp | WIE_CPU=$CPU | exes=$n_exe | total_insns=$suite_total | jit=$suite_jit | iced=$suite_iced | jit_share=${suite_share}% | degraded=$suite_degraded (${suite_deg_pct}%) | host_stops=$suite_stops"
   echo "#"
   echo "# CAVEAT (verbatim from the runtime report): $CAVEAT"
-  echo "# The jit/iced columns above are therefore BLOCK-ENTRY ratios, not dynamic"
-  echo "# instruction counts. A row whose insn/entry is small has a self-looping"
-  echo "# block and its total is an underestimate by that row's trip factor."
+  echo "# The jit/iced columns above are DYNAMIC retired-instruction counts"
+  echo "# (basis=dynamic_retired), with guest worker-thread engines merged in."
+  echo "# The one known undercount is a REP string helper (1 instruction, not rcx"
+  echo "# iterations), so a rep movs*-dominated row is a lower bound."
   echo "# The two histograms below are exact (both count interpreted steps)."
   echo "#"
   printf '%-22s %12s %6s %6s %9s %10s %10s\n' exe total_insns jit% iced degraded host_stops insn/entry

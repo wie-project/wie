@@ -369,6 +369,17 @@ pub(super) struct JitCtx {
     /// time. Rust-side trampolines (`chain_tail`) compare the live generation
     /// against this snapshot with the same contract as the emitted guards.
     pub inv_gen_baked: u64,
+    /// Guest instructions **dynamically** retired by this `run_compiled`
+    /// (every block in the host chain, including chained successors and
+    /// hand-written micro-stubs).
+    ///
+    /// Written by generated code through [`OFF_INSN_ACC`]: each block seeds a
+    /// loop-carried counter with its static length, adds that length on every
+    /// self-loop back edge, and folds the result in here from the shared exit
+    /// block. Read once by `run_compiled` to charge `JitStats::exec.jit_insns`.
+    /// Chaining accumulates (never overwrites), so one dispatcher entry
+    /// accounts for the whole native chain.
+    pub insn_acc: u64,
 }
 
 /// Per-`run_compiled` mem helper resolution counters (appended after IR-stable layout).
@@ -432,6 +443,8 @@ pub(super) const OFF_STICKY_GEN: i32 = std::mem::offset_of!(JitCtx, sticky_gen) 
 pub(super) const OFF_CHAIN_DEPTH: i32 = std::mem::offset_of!(JitCtx, chain_depth) as i32;
 pub(super) const OFF_INV_GEN_PTR: i32 = std::mem::offset_of!(JitCtx, inv_gen_ptr) as i32;
 pub(super) const OFF_INV_GEN_BAKED: i32 = std::mem::offset_of!(JitCtx, inv_gen_baked) as i32;
+/// Dynamic retired-instruction accumulator (see [`JitCtx::insn_acc`]).
+pub(super) const OFF_INSN_ACC: i32 = std::mem::offset_of!(JitCtx, insn_acc) as i32;
 
 /// Max nested host frames for JIT block chaining.
 ///
@@ -466,6 +479,7 @@ const _: () = {
     assert!(std::mem::offset_of!(JitCtx, chain_depth) as i32 == OFF_CHAIN_DEPTH);
     assert!(std::mem::offset_of!(JitCtx, inv_gen_ptr) as i32 == OFF_INV_GEN_PTR);
     assert!(std::mem::offset_of!(JitCtx, inv_gen_baked) as i32 == OFF_INV_GEN_BAKED);
+    assert!(std::mem::offset_of!(JitCtx, insn_acc) as i32 == OFF_INSN_ACC);
     assert!(STICKY_WAYS > 0);
     assert!(std::mem::size_of::<MemPin>() == PIN_STRIDE as usize);
     assert!(std::mem::size_of::<XmmSlot>() == 16);
@@ -563,7 +577,8 @@ use analysis::{
     block_has_string, block_needs_flags, load_xmm_pair,
 };
 use emit::{
-    MemEnv, SuperStack, emit_block_wide_stack_guard, emit_body_and_term, term_chain_targets,
+    MemEnv, SuperStack, TripCounter, emit_block_wide_stack_guard, emit_body_and_term,
+    term_chain_targets,
 };
 use flags::{FlagState, flag_bit, iconst_u64, mask_width, select_flag};
 use gpr::{
@@ -687,6 +702,10 @@ pub(super) fn compile_block(
         bcx.seal_block(entry);
 
         let ctx_ptr = bcx.block_params(entry)[0];
+        // Dynamic retired-instruction accumulator (see `TripCounter`). Seeded
+        // with the block's static length; a self-loop bumps it per back edge
+        // and the exit block folds it into `JitCtx::insn_acc`.
+        let trip = TripCounter::declare(&mut bcx, u32::try_from(insns.len()).unwrap_or(0));
         let flags = MemFlagsData::trusted();
         // Guest data accesses (through pin bias / sticky ptr / super stack /
         // host_span I8X16) go through a distinct alias region so Cranelift's
@@ -1058,6 +1077,7 @@ pub(super) fn compile_block(
                     &mut xmm_vals,
                     &mut xmm_loaded,
                     &mut mem_env,
+                    trip,
                 )?;
                 for i in 0..16 {
                     exit_gpr_loaded[i] |= path_loaded[i];
@@ -1180,11 +1200,16 @@ pub(super) fn compile_block(
                 &mut xmm_vals,
                 &mut xmm_loaded,
                 &mut mem_env,
+                trip,
             )?;
             exit_gpr_loaded = gpr_loaded;
         }
 
         bcx.switch_to_block(exit);
+        // Dynamic instruction count for this block (and every block chained
+        // behind it, which fold into the same `JitCtx` slot). Must be folded
+        // before sealing `exit` so the SSA builder can add the join parameter.
+        trip.flush(&mut bcx, ctx_ptr, flags);
         bcx.seal_block(exit);
         let (exit_gpr, exit_rflags) = {
             let exit_params = bcx.block_params(exit);

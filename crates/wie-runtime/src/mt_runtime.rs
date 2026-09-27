@@ -149,6 +149,79 @@ pub(crate) fn mt_debug() -> bool {
     *ON.get_or_init(|| std::env::var_os("WIE_MT_DEBUG").is_some())
 }
 
+/// Process-wide registry of guest **worker** engine CPU-stat snapshots.
+///
+/// A guest worker owns its `Box<dyn CpuEngine>` and drops it on exit, so the
+/// session cannot read its counters back through [`ProcessResources`]. Without
+/// this registry every worker's `JitStats` died with its engine and
+/// `WIE_RUNTIME_PROFILE` reported the *primary* thread's work only — measured
+/// on `micro-exes/cpp_threads`: 46 reported instructions against the 180 the
+/// process-global interpreter counter had actually retired (~500x undercount on
+/// a heavier run).
+///
+/// Each worker publishes its **own** live snapshot into its own slot (never a
+/// delta, so publishing twice cannot double-count), and
+/// [`ProcessResources::aggregate_cpu_stats`] folds every slot into the primary
+/// engine's snapshot with [`wie_cpu::JitStats::merge_engine`].
+///
+/// ## Why a process global
+///
+/// [`ProcessResources`] is constructed by struct literal in
+/// `session/init.rs`, which this change must not touch, so the handle cannot
+/// live there. Slots are therefore keyed by the identity of the session's
+/// shared backend object (`JitShared` for JIT, `GuestMemory` for iced) and
+/// [`ProcessResources::aggregate_cpu_stats`] only merges slots whose key
+/// matches its own — two sessions in one process cannot read each other's
+/// numbers. Slots are never removed, so a worker may keep publishing for the
+/// whole session; their count is bounded by the number of workers ever spawned.
+static WORKER_CPU_SLOTS: std::sync::OnceLock<Mutex<Vec<WorkerCpuSlot>>> =
+    std::sync::OnceLock::new();
+
+/// One guest worker's published CPU counters.
+struct WorkerCpuSlot {
+    /// Session identity (see [`WORKER_CPU_SLOTS`]).
+    key: usize,
+    stats: Mutex<wie_cpu::JitStats>,
+}
+
+fn worker_cpu_slots() -> &'static Mutex<Vec<WorkerCpuSlot>> {
+    WORKER_CPU_SLOTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Handle a worker uses to publish its engine's counters.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkerCpuStats {
+    index: usize,
+}
+
+impl WorkerCpuStats {
+    /// Reserve a slot for a worker of the session identified by `key`
+    /// (see [`WORKER_CPU_SLOTS`]).
+    pub(crate) fn register(key: usize) -> Self {
+        let mut slots = lock(worker_cpu_slots());
+        slots.push(WorkerCpuSlot {
+            key,
+            stats: Mutex::new(wie_cpu::JitStats::default()),
+        });
+        Self {
+            index: slots.len().saturating_sub(1),
+        }
+    }
+
+    /// Publish this engine's current snapshot. Cheap enough for a quantum
+    /// boundary: a `JitStats` copy plus a few relaxed atomic loads, and one
+    /// uncontended mutex in the common case.
+    pub(crate) fn publish(&self, engine: &dyn CpuEngine) {
+        let Some(snapshot) = engine.cpu_stats() else {
+            return;
+        };
+        let slots = lock(worker_cpu_slots());
+        if let Some(slot) = slots.get(self.index) {
+            *lock(&slot.stats) = snapshot;
+        }
+    }
+}
+
 // ── Shared config ──────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -291,8 +364,59 @@ impl ProcessResources {
         f(&lock_wait(&self.shared_winapi, &self.lock_wait_stats))
     }
 
+    /// Execution counters reported by this session's guest **worker** engines —
+    /// the part of the coverage total the primary engine's own snapshot cannot
+    /// see.
+    ///
+    /// All-zero when no worker has published yet (single-threaded guest, or a
+    /// worker still inside its first quantum).
+    pub(crate) fn worker_cpu_stats(&self) -> wie_cpu::ExecStats {
+        let key = self.cpu_stats_key();
+        let slots = lock(worker_cpu_slots());
+        let mut out = wie_cpu::ExecStats::default();
+        for slot in slots.iter().filter(|s| s.key == key) {
+            let s = lock(&slot.stats);
+            out.jit_insns = out.jit_insns.saturating_add(s.exec.jit_insns);
+            out.iced_insns = out.iced_insns.saturating_add(s.exec.iced_insns);
+            out.cache_hits = out.cache_hits.saturating_add(s.exec.cache_hits);
+            out.code_invs = out.code_invs.saturating_add(s.exec.code_invs);
+        }
+        out
+    }
+
     pub(crate) fn layout(&self) -> &RuntimeMemoryLayout {
         &self.config.layout
+    }
+
+    /// Session identity used to key [`WORKER_CPU_SLOTS`]: the address of the
+    /// one shared backend object every engine in this session is built from.
+    pub(crate) fn cpu_stats_key(&self) -> usize {
+        if let Some(jit) = &self.shared_jit {
+            return std::ptr::from_ref(jit.as_ref()) as usize;
+        }
+        if let Some(mem) = &self.guest_mem {
+            return std::ptr::from_ref(mem.as_ref()) as usize;
+        }
+        0
+    }
+
+    /// CPU stats for the WHOLE process: the primary engine plus every guest
+    /// worker that has published a snapshot.
+    ///
+    /// `None` when the backend reports no stats at all (keeps the caller's
+    /// "profiling was never enabled" path intact). Shared-derived counters
+    /// (background compiles, chain-epoch bumps, compile timing) come from the
+    /// primary engine's snapshot exactly once — see
+    /// [`wie_cpu::JitStats::merge_engine`].
+    pub(crate) fn aggregate_cpu_stats(&mut self) -> Option<wie_cpu::JitStats> {
+        let mut agg = self.with_mut(|e, _| e.cpu_stats())?;
+        let key = self.cpu_stats_key();
+        let slots = lock(worker_cpu_slots());
+        for slot in slots.iter().filter(|s| s.key == key) {
+            let worker = lock(&slot.stats);
+            agg.merge_engine(&worker);
+        }
+        Some(agg)
     }
     pub(crate) fn primary_tid(&self) -> u32 {
         self.config.primary_tid.0
@@ -368,6 +492,7 @@ impl ProcessResources {
                 finish_tid(&st, spawn.tid, 1);
                 continue;
             };
+            let cpu_stats = WorkerCpuStats::register(self.cpu_stats_key());
             let mut engine: Box<dyn CpuEngine> = if let Some(ref jit) = shared_jit {
                 Box::new(JitCpu::new_shared(Arc::clone(jit)))
             } else if let Some(ref mem) = guest_mem {
@@ -408,7 +533,11 @@ impl ProcessResources {
             let handle = std::thread::Builder::new()
                 .name(format!("wie-guest-{}", spawn.tid))
                 .stack_size(STACK)
-                .spawn(move || worker_main(engine, winapi, heap, cfg, spawn.tid, stats, teb, pool));
+                .spawn(move || {
+                    worker_main(
+                        engine, winapi, heap, cfg, spawn.tid, stats, teb, pool, cpu_stats,
+                    )
+                });
             match handle {
                 Ok(handle) => {
                     tracing::debug!(
@@ -583,6 +712,7 @@ fn worker_main(
     lock_wait_stats: Arc<LockWaitStats>,
     teb: wie_cpu::PerThreadTeb,
     worker_teb_pool: Arc<Mutex<WorkerTebPool>>,
+    cpu_stats: WorkerCpuStats,
 ) {
     let engine = run_worker(
         engine,
@@ -592,7 +722,12 @@ fn worker_main(
         tid,
         lock_wait_stats,
         teb,
+        cpu_stats,
     );
+    // Last publish before the engine dies: this is what makes a *finished*
+    // worker's work visible to the session profile (the common case — a guest
+    // that joins its threads has no live worker left to publish).
+    cpu_stats.publish(engine.as_ref());
     // Engine is dead: its TEB page cannot be accessed anymore. Return the
     // page to the pool for the next worker (re-init zero-fills it).
     drop(engine);
@@ -607,6 +742,9 @@ fn worker_main(
 
 /// The worker's quantum loop; returns the engine so the caller can drop it
 /// before the TEB page is released.
+// The wide signature is a load-bearing worker-lifecycle helper: every resource
+// is per-worker and ownership moves onto the host thread.
+#[allow(clippy::too_many_arguments)]
 fn run_worker(
     mut engine: Box<dyn CpuEngine>,
     shared_winapi: Arc<Mutex<WinApiState>>,
@@ -615,6 +753,7 @@ fn run_worker(
     tid: u32,
     lock_wait_stats: Arc<LockWaitStats>,
     teb: wie_cpu::PerThreadTeb,
+    cpu_stats: WorkerCpuStats,
 ) -> Box<dyn CpuEngine> {
     if mt_debug() {
         tracing::error!("[mt] worker_main start tid={tid:#x} teb={:#x}", teb.va());
@@ -689,6 +828,10 @@ fn run_worker(
             Step::Next => {}
             Step::PureCompute => {
                 // Pure-compute quantum exhausted — yield so peers can run.
+                // Also a natural (and rare) publish point, so a worker that is
+                // still alive when the session finalizes its profile is not
+                // invisible to the coverage numbers.
+                cpu_stats.publish(core.engine());
                 std::thread::yield_now();
             }
             Step::Park(reason) => {
@@ -1074,5 +1217,112 @@ mod tests {
         assert_eq!(snap.guest_max_ns, 3_000);
         assert_eq!(snap.presenter_total_ns, 5_000);
         assert_eq!(snap.presenter_max_ns, 5_000);
+    }
+
+    /// The required acceptance test for the cross-engine merge: a
+    /// multithreaded guest's coverage total must account for its WORKER
+    /// threads.
+    ///
+    /// Before the merge, `cpu_stats` read the primary engine only, so every
+    /// worker engine's counters died with the worker: `cpp_threads` reported
+    /// `iced=46` while the process-global interpreter counter had retired 180
+    /// instructions (~500x undercount on a heavier run), and `mt_stress`
+    /// reported 32 against 14389.
+    ///
+    /// The identity asserted here is exact, not a threshold: the aggregate is
+    /// the primary engine's snapshot plus every published worker snapshot.
+    /// Before the fix the left side was the primary alone, so it was strictly
+    /// *less* than the worker sum and this test failed.
+    #[test]
+    fn cpp_threads_coverage_accounts_for_worker_engines() {
+        let Some(path) = micro_exe_fixture("cpp_threads.exe") else {
+            return; // fixture absent: reported by micro_exe_fixture
+        };
+        let mut session = crate::session::RuntimeSession::new_with_options(
+            &path,
+            wie_winapi::MessageQueueIdlePolicy::ExitOnIdle,
+            crate::DEFAULT_LAYOUT,
+            crate::SessionOptions::default(),
+        )
+        .expect("session");
+        // Arm the profile without the env var: `finalize_profile` only fills
+        // the CPU-stats snapshot when profiling is enabled.
+        session.enable_frame_timing();
+        let run = session.run_until_stop(4_096).expect("run to completion");
+        assert!(
+            matches!(
+                run.termination,
+                crate::EntryTraceTermination::ExitProcess { code: 0 }
+            ),
+            "cpp_threads must exit cleanly, got {:?}",
+            run.termination
+        );
+        session.finalize_profile(0, 0, 0);
+
+        let workers = session.worker_cpu_stats();
+        let primary = session
+            .primary_cpu_stats()
+            .expect("primary engine stats")
+            .exec;
+        let aggregate = session.cpu_stats().expect("aggregate stats").exec;
+
+        let worker_total = workers.jit_insns.saturating_add(workers.iced_insns);
+        assert!(
+            worker_total > 0,
+            "the guest's worker threads must have retired instructions"
+        );
+        let primary_total = primary.jit_insns.saturating_add(primary.iced_insns);
+        assert!(
+            primary_total < worker_total,
+            "the workers must dominate this guest, else the test proves nothing \
+             (primary={primary_total}, workers={worker_total})"
+        );
+        assert_eq!(
+            aggregate.jit_insns,
+            primary.jit_insns.saturating_add(workers.jit_insns),
+            "aggregate jit_insns must be the primary engine plus every worker"
+        );
+        assert_eq!(
+            aggregate.iced_insns,
+            primary.iced_insns.saturating_add(workers.iced_insns),
+            "aggregate iced_insns must be the primary engine plus every worker"
+        );
+        // The report the user actually reads must show the merged total.
+        let line = session.profile().insn_coverage_line();
+        assert!(
+            line.contains(&format!("iced={}", aggregate.iced_insns)),
+            "insn_coverage must report the merged count: {line}"
+        );
+    }
+
+    /// Resolve a `micro-exes/out` fixture.
+    ///
+    /// A missing guest PE is a FAILURE, not a skip (see
+    /// `crates/wie-runtime/tests/common/mod.rs` for the full policy): these
+    /// binaries are gitignored, so "not built" is the default state of a fresh
+    /// clone — exactly the state in which a coverage regression test must not
+    /// be allowed to pass. `WIE_ALLOW_MISSING_GUESTS=1` is the documented
+    /// escape hatch for a machine without the mingw-w64 cross toolchain.
+    fn micro_exe_fixture(name: &str) -> Option<std::path::PathBuf> {
+        let mut root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        root.pop(); // crates/
+        root.pop(); // repo root
+        let path = root.join("micro-exes/out").join(name);
+        if path.is_file() {
+            return Some(path);
+        }
+        if std::env::var_os("WIE_ALLOW_MISSING_GUESTS").is_some() {
+            eprintln!(
+                "SKIPPED: missing guest fixture {} (allowed by WIE_ALLOW_MISSING_GUESTS)",
+                path.display()
+            );
+            return None;
+        }
+        panic!(
+            "missing guest fixture: {}\n\n\
+             Build it with `make -C micro-exes`, or set WIE_ALLOW_MISSING_GUESTS=1 \
+             to skip.",
+            path.display()
+        );
     }
 }

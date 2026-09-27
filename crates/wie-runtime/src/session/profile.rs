@@ -319,25 +319,28 @@ impl RuntimeProfile {
     /// CPU stats snapshot exists, so headless (no present, no frames) runs
     /// still report coverage.
     ///
-    /// **Read `basis=block_entry_static` before quoting any of it.**
-    /// `jit_insns` is accumulated as `meta.insn_count` — the *static* decoded
-    /// length of a compiled block — once per block **entry**
-    /// (`wie_cpu::jit::pipeline::finish_compiled`), where `insn_count` is
-    /// `insns.len()` from the lowering step. A block that self-loops
-    /// internally therefore contributes its static length once, not once per
-    /// iteration: `micro-exes/long_loop` (100M-iteration `do`/`while`, ~3x10^8
-    /// retired instructions) reports `total=20`. The engine loop's per-step
-    /// `retired` value is that same static number, so it cannot repair the
-    /// count; a correct denominator needs a per-block trip count emitted by
-    /// the lowering step (`jit/lower/emit.rs`), which does not exist yet.
-    /// `iced_insns` by contrast is exact — one increment per interpreted step.
+    /// The denominator is a **dynamic retired-instruction count**:
     ///
-    /// So: the JIT/iced split is a **block-entry ratio**, exact for
-    /// straight-line code and for loops whose body is a separate (chained)
-    /// block, and an underestimate scaled by the trip factor of self-looping
-    /// blocks. It is good enough to *rank* ISA families by residue and
-    /// useless as a throughput figure. `block_entries` is the smell detector:
-    /// a real hot loop shows `insn_per_entry` in the single digits.
+    /// - `iced_insns` — one increment per interpreted step. Exact.
+    /// - `jit_insns` — what the compiled code reported through
+    ///   `JitCtx::insn_acc` (see `wie_cpu::jit::lower::emit::TripCounter`).
+    ///   Every block seeds a loop-carried counter with its static length and
+    ///   adds that length on each self-loop back edge, so a self-looping block
+    ///   is charged once per *trip* instead of once per *entry* (which
+    ///   undercounted `long_loop` by its whole trip factor: `total=25` for
+    ///   ~3x10^8 retired instructions). Exact for GPR/branch blocks; chained
+    ///   successors and micro-stubs fold into the same run-wide accumulator.
+    /// - The snapshot is the **whole process**: `cpu_stats` is merged across
+    ///   the primary engine and every guest worker engine
+    ///   (`ProcessResources::aggregate_cpu_stats`), so a multithreaded guest's
+    ///   worker-thread execution is no longer missing (`cpp_threads` used to
+    ///   report 46 interpreted instructions against 180 actually retired).
+    ///
+    /// Remaining known imprecision, deliberately not hidden: a REP string
+    /// helper is charged one instruction, not `rcx` iterations, because the
+    /// bulk host helper does not report its iteration count. So: use this line
+    /// to RANK ISA families and to compare runs, and treat a row dominated by
+    /// `rep movs*` as a lower bound.
     ///
     /// `degraded` counts instructions the interpreter ran as partial no-ops
     /// (unimplemented mnemonics — degrade-not-die), the one figure here that
@@ -357,7 +360,7 @@ impl RuntimeProfile {
         format!(
             "insn_coverage: total={total} jit={jit} iced={iced} jit_share_pct={}.{} \
              degraded={degraded} degraded_pct={}.{} stops_per_1k={}.{} \
-             block_entries={entries} insn_per_entry={}.{} basis=block_entry_static",
+             block_entries={entries} insn_per_entry={}.{} basis=dynamic_retired",
             tenths_pct(jit, total) / 10,
             tenths_pct(jit, total) % 10,
             tenths_pct(degraded, total) / 10,
@@ -371,17 +374,16 @@ impl RuntimeProfile {
 
     /// The one-line warning that must travel with every
     /// [`Self::insn_coverage_line`], so no consumer can read the coverage
-    /// numbers without seeing the two ways they undercount.
+    /// numbers without seeing the one way they still undercount.
     #[must_use]
     pub fn insn_coverage_caveat_line() -> &'static str {
-        "insn_coverage_caveat: jit_insns is the STATIC block length counted per block \
-         ENTRY, not per dynamic instruction (micro-exes/long_loop: total=25 for ~3e8 retired) \
-         — a self-looping block undercounts by its trip count; on multithreaded guests the \
-         counters also miss worker-thread execution (micro-exes/cpp_threads interprets 26407 \
-         instructions but reports iced=45). Only `degraded`, and iced_insns on a single-thread \
-         guest, are exact. Use the jit/iced split to RANK ISA families, never as a throughput \
-         figure. A real denominator needs a per-block trip counter in the lowering step plus a \
-         cross-thread stats merge."
+        "insn_coverage_caveat: total/jit/iced are DYNAMIC retired-instruction counts \
+         (a compiled block charges one count per self-loop trip, and worker-thread \
+         engines are merged in), so unlike the old block-entry ratio they scale with \
+         how long the guest ran. The one remaining undercount is REP string helpers: \
+         a `rep movs*` is charged ONE instruction, not rcx iterations, because the bulk \
+         host helper does not report its count. `degraded` is exact everywhere. Use the \
+         jit/iced split to RANK ISA families and to compare runs."
     }
 
     /// Human-readable multi-line report for stderr / logs.
@@ -605,6 +607,34 @@ impl super::RuntimeSession {
         self.profile_enabled
     }
 
+    /// CPU/JIT stats for the WHOLE process: the primary engine plus every
+    /// guest worker engine that published a snapshot.
+    ///
+    /// This is what the coverage metric is built from. Reading the primary
+    /// engine alone (what `cpu_stats` used to do) silently dropped every
+    /// worker thread's retired instructions.
+    #[must_use]
+    pub fn cpu_stats(&mut self) -> Option<wie_cpu::JitStats> {
+        self.process.aggregate_cpu_stats()
+    }
+
+    /// Stats from the **primary engine only** — the coverage figure a
+    /// single-threaded guest reports, and the one that misses worker threads.
+    ///
+    /// Exposed so a consumer (or a regression test) can see exactly what the
+    /// cross-engine merge adds; see [`Self::worker_insn_count`].
+    #[must_use]
+    pub fn primary_cpu_stats(&mut self) -> Option<wie_cpu::JitStats> {
+        self.process.with_mut(|e, _| e.cpu_stats())
+    }
+
+    /// Execution counters reported by this session's guest **worker** threads.
+    /// All-zero for a single-threaded guest.
+    #[must_use]
+    pub fn worker_cpu_stats(&self) -> wie_cpu::ExecStats {
+        self.process.worker_cpu_stats()
+    }
+
     /// Snapshot JIT/CPU stats + optional wall/CPU deltas into the profile.
     ///
     /// Called by micro runners after `run_until_stop` when profiling is enabled.
@@ -614,7 +644,11 @@ impl super::RuntimeSession {
             self.profile.wall_ns = wall_ns;
             self.profile.cpu_user_us = cpu_user_us;
             self.profile.cpu_sys_us = cpu_sys_us;
-            self.profile.jit = self.process.with_mut(|e, _| e.cpu_stats());
+            // Whole-process counters: the primary engine plus every guest
+            // worker that published a snapshot (see
+            // `ProcessResources::aggregate_cpu_stats`). Reading the primary
+            // engine alone silently dropped every worker thread's work.
+            self.profile.jit = self.process.aggregate_cpu_stats();
             self.profile.mem_backend = self
                 .process
                 .with_mut(|e, _| e.mem_backend_name().to_owned());
@@ -624,7 +658,7 @@ impl super::RuntimeSession {
         // Mem helper path breakdown (`WIE_JIT_MEM_TRACE=1` or `WIE_EXEC_TRACE=1`).
         if let Some(ref j) = self.profile.jit {
             wie_cpu::dump_mem_path_stats(j);
-        } else if let Some(j) = self.process.with_mut(|e, _| e.cpu_stats()) {
+        } else if let Some(j) = self.process.aggregate_cpu_stats() {
             wie_cpu::dump_mem_path_stats(&j);
         }
     }
@@ -736,7 +770,7 @@ impl super::RuntimeSession {
         }
         let (iced, jit) = self
             .process
-            .with_mut(|e, _| e.cpu_stats())
+            .aggregate_cpu_stats()
             .map_or((0, 0), |s| (s.exec.iced_insns, s.exec.jit_insns));
         let iced_delta = iced.saturating_sub(self.frame_last_iced);
         let jit_delta = jit.saturating_sub(self.frame_last_jit);
@@ -936,29 +970,22 @@ mod tests {
         );
     }
 
-    /// Regression guard for the *known* denominator defects, so they can never
-    /// become silent again:
+    /// The coverage line is now a **dynamic retired-instruction** count, so a
+    /// self-looping block is charged once per trip and a multithreaded guest's
+    /// worker engines are folded in. This pins the machine-greppable basis
+    /// marker and the arithmetic that goes with it, using the exact numbers a
+    /// tight loop produces: one compiled block entry that retires 4
+    /// instructions per trip for 1000 trips.
     ///
-    /// 1. `jit_insns` is the static block length counted per block entry
-    ///    (`finish_compiled`), so `total` is NOT a dynamic instruction count.
-    /// 2. The snapshot covers one engine, so a multithreaded guest's
-    ///    worker-thread execution is missing entirely.
-    ///
-    /// The requested acceptance test — "a tight guest loop retires >10^7
-    /// instructions" — cannot pass until the lowering step publishes a
-    /// per-block trip count (`jit/lower/emit.rs`); today
-    /// `micro-exes/long_loop` reports `total=25` for ~3x10^8 retired
-    /// instructions. Until then the numbers must carry their own warning, and
-    /// `block_entries` / `insn_per_entry` must let a reader spot a
-    /// self-looping block instead of trusting the total.
-    ///
-    /// This is the in-scope half of the fix. When the emitter gains a trip
-    /// counter, replace this with the real threshold assertion.
+    /// Before the fix the same run reported `total=2` with
+    /// `basis=block_entry_static` (the block's static length, once per entry),
+    /// which is what made `long_loop` read `total=25` for ~3x10^8 retired
+    /// instructions.
     #[test]
-    fn insn_coverage_line_is_labelled_and_exposes_its_undercount() {
-        // A self-looping block: one cache entry, 18 static instructions.
+    fn insn_coverage_line_reports_dynamic_counts() {
         let mut stats = wie_cpu::JitStats::default();
-        stats.exec.jit_insns = 18;
+        // 4,000 = 1,000 trips x a 4-instruction self-loop body.
+        stats.exec.jit_insns = 4_000;
         stats.exec.iced_insns = 2;
         stats.exec.cache_hits = 1;
         let profile = RuntimeProfile {
@@ -967,19 +994,49 @@ mod tests {
         };
 
         let line = profile.insn_coverage_line();
-        let report = profile.report();
 
-        // The label is machine-greppable from the line itself.
-        assert!(line.contains("basis=block_entry_static"), "{line}");
-        // The smell detector: 20 counted instructions over 1 cache entry.
+        assert!(line.contains("total=4002"), "{line}");
+        assert!(line.contains("jit=4000"), "{line}");
+        assert!(line.contains("basis=dynamic_retired"), "{line}");
+        assert!(
+            !line.contains("basis=block_entry_static"),
+            "the old block-entry basis must be gone: {line}"
+        );
+        // 4000/4002 is 99.9% — a real ratio now, not a block-entry ratio.
+        assert!(line.contains("jit_share_pct=99.9"), "{line}");
+        // The smell detector survives: one dispatcher entry, 4002 instructions.
         assert!(line.contains("block_entries=1"), "{line}");
-        assert!(line.contains("insn_per_entry=20.0"), "{line}");
-        // The caveat rides along with the numbers in the report, and names the
-        // concrete failing cases so the next reader does not have to find them.
+        assert!(line.contains("insn_per_entry=4002.0"), "{line}");
+    }
+
+    /// The caveat now names the one remaining undercount (REP string helpers)
+    /// and no longer advertises the two fixed defects. It must still ride along
+    /// with the numbers in the report, and it must be emitted whenever the
+    /// coverage line is, never on its own.
+    #[test]
+    fn insn_coverage_caveat_names_only_the_live_defect() {
+        let mut stats = wie_cpu::JitStats::default();
+        stats.exec.jit_insns = 4_000;
+        stats.exec.iced_insns = 2;
+        let profile = RuntimeProfile {
+            jit: Some(stats),
+            ..RuntimeProfile::default()
+        };
+
+        let report = profile.report();
+        let caveat = RuntimeProfile::insn_coverage_caveat_line();
+
         assert!(report.contains("insn_coverage_caveat:"), "{report}");
-        assert!(report.contains("long_loop: total="), "{report}");
-        assert!(report.contains("cpp_threads"), "{report}");
-        // The caveat is emitted whenever the line is, never on its own.
+        // Still a warning, now about the one thing that can still undercount.
+        assert!(caveat.contains("REP string helpers"), "{caveat}");
+        assert!(report.contains("REP string helpers"), "{report}");
+        // The two fixed defects must not be advertised any more: a stale
+        // caveat is worse than none because it hides real regressions.
+        assert!(!caveat.contains("block_entry_static"), "{caveat}");
+        assert!(!caveat.contains("block ENTRY"), "{caveat}");
+        assert!(!caveat.contains("worker-thread execution"), "{caveat}");
+        assert!(!caveat.contains("long_loop"), "{caveat}");
+        // Emitted whenever the line is, never on its own.
         assert_eq!(
             report.contains("insn_coverage_caveat:"),
             report.contains("insn_coverage: total=")

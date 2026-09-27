@@ -9,8 +9,8 @@ use super::mem::call_load;
 use super::string::lower_string;
 use super::{
     EDGE_IC_SLOTS, MAX_CHAIN_DEPTH, OFF_CHAIN_DEPTH, OFF_EDGE_IC_FN, OFF_EDGE_IC_VA, OFF_FAULT,
-    OFF_INV_GEN_PTR, OFF_RIP, OFF_SHADOW_RET, OFF_SHADOW_SP, SHADOW_DEPTH, TLB_PROT_R, TLB_PROT_W,
-    flag_cond, flag_cond_fs, lower_term,
+    OFF_INSN_ACC, OFF_INV_GEN_PTR, OFF_RIP, OFF_SHADOW_RET, OFF_SHADOW_SP, SHADOW_DEPTH,
+    TLB_PROT_R, TLB_PROT_W, flag_cond, flag_cond_fs, lower_term,
 };
 
 use super::super::block::{BlockStackPinPlan, BlockTerm, DecodedInsn, is_string_op};
@@ -29,6 +29,69 @@ pub(super) fn term_chain_targets(t: BlockTerm) -> Vec<u64> {
             taken, not_taken, ..
         } => vec![taken, not_taken],
         BlockTerm::Ret => vec![],
+    }
+}
+
+/// Loop-carried count of guest instructions **dynamically** retired by one
+/// block (plus, through [`Self::flush`], by every block chained behind it).
+///
+/// `JitStats::exec.jit_insns` used to charge a compiled block its *static*
+/// decoded length once per block **entry**, so a self-looping block
+/// undercounted by its trip factor — `micro-exes/long_loop` reported
+/// `total=25` for ~3x10^8 retired instructions. This counter is the fix: the
+/// block seeds it with its static length, adds the same length on every back
+/// edge, and the shared exit block folds the result into
+/// [`super::JitCtx::insn_acc`], which `run_compiled` charges.
+///
+/// Why it is cheap enough for the hot path:
+///
+/// - Only a **self-loop** pays inside the loop, and it pays exactly one
+///   register `add` per trip. The value is a Cranelift *variable*, so the SSA
+///   builder threads it through the loop header as a block parameter and the
+///   register allocator keeps it in a register — no load/store per iteration
+///   (the same reason the self-loop path already passes live GPRs and flags as
+///   SSA values instead of round-tripping `JitCtx`).
+/// - Non-loop blocks emit no per-instruction work at all: the seeded constant
+///   is folded into the exit block's single load-add-store, next to the 16 GPR
+///   stores that block already performs.
+///
+/// Exactness: a self-loop block is straight-line from its entry to its
+/// terminator (the decoder stops at the first terminator), so every body
+/// instruction retires on every trip and `trips * insn_count` is the exact
+/// dynamic count. `insn_count` includes the terminator.
+#[derive(Clone, Copy)]
+pub(super) struct TripCounter {
+    var: Variable,
+    step: i64,
+}
+
+impl TripCounter {
+    /// Seed the counter with the block's static length (call in the entry
+    /// block, before any other block is entered).
+    pub(super) fn declare(bcx: &mut FunctionBuilder<'_>, insn_count: u32) -> Self {
+        let step = i64::from(insn_count);
+        let var = bcx.declare_var(types::I64);
+        let seed = bcx.ins().iconst(types::I64, step);
+        bcx.def_var(var, seed);
+        Self { var, step }
+    }
+
+    /// Charge one more trip. Emitted **only** on a self-loop back edge.
+    pub(super) fn bump(&self, bcx: &mut FunctionBuilder<'_>) {
+        let cur = bcx.use_var(self.var);
+        let next = bcx.ins().iadd_imm(cur, self.step);
+        bcx.def_var(self.var, next);
+    }
+
+    /// Fold this block's count into the run-wide accumulator. Call once, in
+    /// the shared exit block, *before* sealing it (`use_var` needs the block
+    /// unsealed so the SSA builder can add the join parameter).
+    pub(super) fn flush(&self, bcx: &mut FunctionBuilder<'_>, ctx_ptr: Value, flags: MemFlagsData) {
+        let acc_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_INSN_ACC));
+        let prev = bcx.ins().load(types::I64, flags, acc_ptr, 0);
+        let mine = bcx.use_var(self.var);
+        let total = bcx.ins().iadd(prev, mine);
+        bcx.ins().store(flags, total, acc_ptr, 0);
     }
 }
 
@@ -351,11 +414,15 @@ pub(super) fn lower_self_loop_term(
     block_sig_ref: SigRef,
     inv_guard: bool,
     inv_gen_baked: u64,
+    trip: TripCounter,
 ) -> Result<bool, String> {
     match term {
         BlockTerm::Jmp { target } if target == start_rip => {
             // Stay in native SSA — pass live regs as header params (no store/reload).
             let args = loop_header_args(gpr, live, rflags, pass_flags);
+            // Charge this trip before jumping back: the block body retires
+            // `insn_count` instructions again on the next iteration.
+            trip.bump(bcx);
             if inv_guard {
                 // Guarded backedge: on generation mismatch, flush SSA state
                 // (regs + RIP = start_rip) and return to the dispatcher; the
@@ -398,6 +465,7 @@ pub(super) fn lower_self_loop_term(
                 bcx.seal_block(blk);
                 if va == start_rip {
                     let args = loop_header_args(gpr, live, rflags, pass_flags);
+                    trip.bump(bcx);
                     if inv_guard {
                         // Same guarded backedge for jcc edges that re-enter
                         // this block.
@@ -759,6 +827,7 @@ pub(super) fn emit_body_and_term(
     xmm_vals: &mut [Value; 32],
     xmm_loaded: &mut [bool; 16],
     mem_env: &mut MemEnv,
+    trip: TripCounter,
 ) -> Result<(), String> {
     let mut pending = PendingFlags::None;
     let mut string_exit_rip: Option<Value> = None;
@@ -874,6 +943,7 @@ pub(super) fn emit_body_and_term(
                 block_sig_ref,
                 inv_guard,
                 inv_gen_baked,
+                trip,
             )?;
         } else {
             if let BlockTerm::Call { return_ip, .. } = t {

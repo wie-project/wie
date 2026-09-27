@@ -1094,19 +1094,14 @@ impl JitCpu {
         entry_rip: u64,
         meta: CompiledRunMeta,
     ) -> (StepResult, usize) {
-        if let Some(inv) = self.run_compiled(entry_rip, meta) {
-            (StepResult::InvalidMemory(inv), 0)
-        } else {
-            self.stats.exec.jit_insns = self
-                .stats
-                .exec
-                .jit_insns
-                .saturating_add(u64::from(meta.insn_count));
-            self.shared.record_guest_insns(u64::from(meta.insn_count));
-            (
-                StepResult::Continue,
-                usize::try_from(meta.insn_count).unwrap_or(1),
-            )
+        let (fault, dynamic_insns) = self.run_compiled(entry_rip, meta);
+        // `dynamic_insns` was already charged to `jit_insns` / `guest_insns` by
+        // `run_compiled`; carry it out as the step's retired count so the
+        // engine loop's instruction budget counts real work, not block entries.
+        let retired = usize::try_from(dynamic_insns).unwrap_or(usize::MAX);
+        match fault {
+            Some(inv) => (StepResult::InvalidMemory(inv), retired),
+            None => (StepResult::Continue, retired),
         }
     }
 
@@ -1124,8 +1119,17 @@ impl JitCpu {
     ///   into `self.thread` from `JitCtx` on return; pending code writes are
     ///   drained (SMC invalidation) before returning.
     ///
-    /// Returns `Some(InvalidMem)` when a host mem helper faulted.
-    fn run_compiled(&mut self, entry_rip: u64, meta: CompiledRunMeta) -> Option<exec::InvalidMem> {
+    /// Returns `(Some(InvalidMem), dynamic_insns)` when a host mem helper
+    /// faulted, else `(None, dynamic_insns)`. `dynamic_insns` is what the
+    /// native frame (this block plus every chained successor and micro-stub)
+    /// retired, read from `JitCtx::insn_acc` and already charged to
+    /// `jit_insns` / `guest_insns` here.
+    #[allow(clippy::type_complexity)]
+    fn run_compiled(
+        &mut self,
+        entry_rip: u64,
+        meta: CompiledRunMeta,
+    ) -> (Option<exec::InvalidMem>, u64) {
         // Refresh pins only when GuestMemory generation changes (map/protect/free).
         // Rebuilding VAD-ranked pins every block was measurable on 7za.
         let mem_gen = self.shared.mem_gen.load(Ordering::Acquire);
@@ -1238,12 +1242,21 @@ impl JitCpu {
             // sends control back to this dispatcher (purge + fresh decode).
             inv_gen_ptr: std::ptr::from_ref(&self.shared.invalidate_gen),
             inv_gen_baked: meta.inv_gen,
+            // Blocks (and chained successors / micro-stubs) fold their dynamic
+            // instruction count in here; read back below.
+            insn_acc: 0,
         };
         drop(mem_guard); // GuestMemory read lock already released; compiled block runs on TLB/pins.
         // SAFETY: func is a finalized Cranelift block; TLB/pins resolve to stable mmap pointers.
         unsafe {
             (meta.func)(std::ptr::from_mut(&mut ctx));
         }
+        // Charge what the native frame ACTUALLY retired, not the block's static
+        // length: a self-looping block bumps the emitted trip counter once per
+        // back edge, so this is exact (see `lower::emit::TripCounter`).
+        let dynamic_insns = ctx.insn_acc;
+        self.stats.exec.jit_insns = self.stats.exec.jit_insns.saturating_add(dynamic_insns);
+        self.shared.record_guest_insns(dynamic_insns);
         self.stats.mem.load_calls = self.stats.mem.load_calls.saturating_add(ctx.load_calls);
         self.stats.mem.store_calls = self.stats.mem.store_calls.saturating_add(ctx.store_calls);
         {
@@ -1346,7 +1359,7 @@ impl JitCpu {
         };
         // Safe point: drop Ready blocks overlapping any stores from this block.
         self.drain_pending_code_writes();
-        fault
+        (fault, dynamic_insns)
     }
 
     pub(super) fn invalidate_tlb(&mut self) {
@@ -1378,10 +1391,13 @@ impl JitCpu {
 }
 
 /// Snapshot of a Ready block needed to run it without holding a cache borrow.
+///
+/// Deliberately carries no instruction count: the retired count is read back
+/// from `JitCtx::insn_acc` after the native frame returns, which is the only
+/// source that knows how many times the block actually looped.
 #[derive(Clone, Copy)]
 pub(super) struct CompiledRunMeta {
     func: unsafe extern "C" fn(*mut JitCtx),
-    insn_count: u32,
     /// Invalidate-generation baked into the block's guards (also compared by
     /// Rust-side trampolines via `JitCtx::inv_gen_baked`).
     inv_gen: u64,
@@ -1391,7 +1407,6 @@ impl From<&CompiledBlock> for CompiledRunMeta {
     fn from(c: &CompiledBlock) -> Self {
         Self {
             func: c.func,
-            insn_count: c.insn_count,
             inv_gen: c.inv_gen,
         }
     }

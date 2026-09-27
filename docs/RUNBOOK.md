@@ -62,6 +62,29 @@ WIE_JIT_OPCODE_HISTO=1 WIE_RUNTIME_PROFILE=1 ./target/release/wie run real_exes/
 sleep 15 && kill -INT %1   # histogram lands at the end of the profile dump
 ```
 
+### Reading `insn_coverage`
+
+`insn_coverage: total=… jit=… iced=… basis=dynamic_retired` is a **dynamic
+retired-instruction** count, not the block-entry ratio it used to be: a compiled
+block charges one count per self-loop trip, and guest worker-thread engines are
+merged in. `long_loop` legitimately reports ~1.1e9; `cpp_threads`' `iced`
+matches the exact `WIE_EXEC_TRACE` interpreter count to the instruction. Use it
+to rank ISA families and to compare runs.
+
+The one known undercount is a REP string helper (1 instruction instead of `rcx`
+iterations), so treat a `rep movs*`-dominated row as a lower bound.
+`insn_per_entry` is the smell detector: **high** = a hot self-loop (one entry
+retiring a lot), **low** = call/edge-bound code. When a number looks wrong,
+cross-check against the exact per-instruction counter rather than reasoning
+about blocks:
+
+```bash
+WIE_RUNTIME_PROFILE=1 WIE_EXEC_TRACE=1 ./target/release/wie run micro-exes/out/cpp_threads.exe 2>&1 \
+  | grep -E 'insn_coverage:|iced-interp mnemonic counts'
+# insn_coverage: … iced=187 …
+# --- iced-interp mnemonic counts (total=187) ---   ← must match
+```
+
 ## Benchmarks & regression gate
 
 Criterion suites live in `crates/wie-cpu/benches/jit_hot_paths.rs`

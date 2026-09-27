@@ -188,3 +188,105 @@ SUITE(jit)                   330453   99.2   2593         0       2658      375.
            4      0.0  Shr
            1      0.0  Test
 
+# WIE instruction-coverage baseline — appended by scripts/coverage-report.sh
+# 2026-09-26T20:06:01Z | WIE_CPU=jit | exes=5 | total_insns=1100061230 | jit=1100042380 | iced=18850 | jit_share=99.9% | degraded=0 (0.0%) | host_stops=508
+#
+# CAVEAT (verbatim from the runtime report): total/jit/iced are DYNAMIC retired-instruction counts (a compiled block charges one count per self-loop trip, and worker-thread engines are merged in), so unlike the old block-entry ratio they scale with how long the guest ran. The one remaining undercount is REP string helpers: a `rep movs*` is charged ONE instruction, not rcx iterations, because the bulk host helper does not report its count. `degraded` is exact everywhere. Use the jit/iced split to RANK ISA families and to compare runs.
+# The jit/iced columns above are therefore BLOCK-ENTRY ratios, not dynamic
+# instruction counts. A row whose insn/entry is small has a self-looping
+# block and its total is an underestimate by that row's trip factor.
+# The two histograms below are exact (both count interpreted steps).
+#
+exe                     total_insns   jit%   iced  degraded host_stops insn/entry
+long_loop                1100000014   99.9      3         0          4 1100000014.0
+cpp_threads                    2560   92.6    187         0         30        0.3
+mt_stress                     41886   65.6  14384         0         48        4.9
+pt_basic                      14471   72.1   4032         0         14        3.6
+gl_quad                        2299   89.3    244         0        412       47.8
+SUITE(jit)               1100061230   99.9  18850         0        508  5296904.9
+
+# suite-wide JIT iced-residue opcode histogram (sampled 1/64, 320 samples over 5 exes):
+         186     58.1  Call
+          65     20.3  Jmp
+          65     20.3  Lea
+           4      1.2  Mov
+
+# suite-wide interpreter opcode mix (EXACT: 22198 interpreted instructions):
+       12599     56.7  Call
+        4960     22.3  Jmp
+        4222     19.0  Lea
+         330      1.4  Mov
+          47      0.2  Xor
+          31      0.1  Fninit
+           5      0.0  Sub
+           2      0.0  Push
+           1      0.0  Movzx
+           1      0.0  Test
+
+# WIE instruction-coverage baseline — appended by scripts/coverage-report.sh
+# 2026-09-27T02:21:34Z | WIE_CPU=iced | exes=3 | total_insns=67612 | jit=0 | iced=67612 | jit_share=0.0% | degraded=0 (0.0%) | host_stops=476
+#
+# CAVEAT (verbatim from the runtime report): total/jit/iced are DYNAMIC retired-instruction counts (a compiled block charges one count per self-loop trip, and worker-thread engines are merged in), so unlike the old block-entry ratio they scale with how long the guest ran. The one remaining undercount is REP string helpers: a `rep movs*` is charged ONE instruction, not rcx iterations, because the bulk host helper does not report its count. `degraded` is exact everywhere. Use the jit/iced split to RANK ISA families and to compare runs.
+# The jit/iced columns above are therefore BLOCK-ENTRY ratios, not dynamic
+# instruction counts. A row whose insn/entry is small has a self-looping
+# block and its total is an underestimate by that row's trip factor.
+# The two histograms below are exact (both count interpreted steps).
+#
+exe                     total_insns   jit%   iced  degraded host_stops insn/entry
+pt_basic                      18493    0.0  18493         0         22        0.0
+mt_stress                     45398    0.0  45398         0         48        0.0
+gl_quad                        3721    0.0   3721         0        406        0.0
+SUITE(iced)                   67612    0.0  67612         0        476        0.0
+
+# suite-wide JIT iced-residue opcode histogram (sampled 1/64, 31 samples over 3 exes):
+          25     80.6  Call
+           3      9.6  Jmp
+           2      6.4  Mov
+           1      3.2  Lea
+
+# suite-wide interpreter opcode mix (EXACT: 71152 interpreted instructions):
+       16665     23.4  Call
+       13916     19.5  Mov
+       10634     14.9  Lea
+        6416      9.0  Add
+        4980      6.9  Jmp
+        4189      5.8  Xor
+        2278      3.2  Cmp
+        2269      3.1  Je
+        2247      3.1  Test
+        2187      3.0  Jne
+        2060      2.8  Sub
+        2048      2.8  Jg
+         376      0.5  Movzx
+         157      0.2  Movsxd
+         127      0.1  And
+          74      0.1  Push
+          69      0.0  Ret
+          62      0.0  Shr
+          60      0.0  Movss
+          55      0.0  Nop
+          36      0.0  Pxor
+          33      0.0  Cdqe
+          31      0.0  Fninit
+          26      0.0  Cvtsi2ss
+          26      0.0  Cvttss2si
+          26      0.0  Divss
+          26      0.0  Imul
+          25      0.0  Pop
+          12      0.0  Movaps
+           8      0.0  Jle
+           7      0.0  Ja
+           5      0.0  Or
+           4      0.0  Jae
+           3      0.0  Js
+           3      0.0  Shl
+           2      0.0  Movsd
+           2      0.0  Sar
+           2      0.0  Setne
+           1      0.0  Cmpxchg
+           1      0.0  Jb
+           1      0.0  Jbe
+           1      0.0  Movapd
+           1      0.0  Sbb
+           1      0.0  Xchg
+
