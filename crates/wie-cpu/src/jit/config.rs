@@ -10,6 +10,7 @@
     private_interfaces // JitShared/PerThreadJitState expose crate-private types
 )]
 
+use super::tier::TIER_BUDGET_DEFAULT;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -80,6 +81,8 @@ pub(super) struct JitConfig {
     bg_enabled: bool,
     bg_wait_timeout: Duration,
     opt_level: &'static str,
+    tier_enabled: bool,
+    tier_budget: usize,
     simd_enabled: bool,
     tlb_neon_enabled: bool,
     string_inline_enabled: bool,
@@ -250,6 +253,12 @@ impl JitConfig {
             // `speed`; hot-block tier-up is the intended recovery and is not
             // implemented yet.
             opt_level: opt_level_from_env(std::env::var("WIE_JIT_OPT").ok()),
+            // Per-block opt-level tier-up (`WIE_JIT_TIER`, default on; `0`
+            // restores the pre-tiering behaviour exactly — one module, one
+            // opt level, every block at the base level).
+            tier_enabled: tier_enabled_from_env(std::env::var("WIE_JIT_TIER").ok()),
+            // Cap on tier-up decisions per run (`WIE_JIT_TIER_BUDGET`).
+            tier_budget: tier_budget_from_env(std::env::var("WIE_JIT_TIER_BUDGET").ok()),
             // Emit Cranelift SIMD types for SSE (`WIE_JIT_SIMD=0` disables).
             simd_enabled: !matches!(
                 std::env::var("WIE_JIT_SIMD"),
@@ -375,6 +384,25 @@ impl JitConfig {
     #[must_use]
     pub(super) fn opt_level(&self) -> &'static str {
         self.opt_level
+    }
+
+    /// Per-block opt-level tier-up (`WIE_JIT_TIER`, default on).
+    ///
+    /// This is the bisect switch for the whole tiering mechanism: `0` builds
+    /// one Cranelift module at the base opt level and makes every block a
+    /// `OptTier::Base` decision, which is byte-for-byte the pre-tiering
+    /// behaviour.
+    #[must_use]
+    pub(super) fn tier_enabled(&self) -> bool {
+        self.tier_enabled
+    }
+
+    /// Cap on tier-up decisions per run (`WIE_JIT_TIER_BUDGET`, default
+    /// [`TIER_BUDGET_DEFAULT`]). Consumed at decision time, so a pathological
+    /// guest cannot spend the run's compile budget re-establishing `speed`.
+    #[must_use]
+    pub(super) fn tier_budget(&self) -> usize {
+        self.tier_budget
     }
 
     /// Emit Cranelift SIMD types for SSE (`WIE_JIT_SIMD=0` disables).
@@ -504,10 +532,38 @@ fn opt_level_from_env(raw: Option<String>) -> &'static str {
     }
 }
 
+/// Parse the per-block tier-up switch from a `WIE_JIT_TIER` value.
+///
+/// Default on: tiering is the mechanism that recovers the compute-bound case
+/// the cheap-compile default gives up. Only the explicit off-spellings
+/// (`0` / `false` / `off` / `no`) disable it — the bisect switch, so an
+/// unrecognised value must NOT silently disable a feature whose absence looks
+/// like a 38% perf regression.
+fn tier_enabled_from_env(raw: Option<String>) -> bool {
+    !matches!(raw, Some(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("no"))
+}
+
+/// Ceiling on [`TIER_BUDGET_DEFAULT`]; an override above it is clamped.
+const TIER_BUDGET_MAX: usize = 65_536;
+
+/// Parse the per-run tier-up budget from a `WIE_JIT_TIER_BUDGET` value.
+///
+/// Absent or unparsable → [`TIER_BUDGET_DEFAULT`]. `0` is a legal value and
+/// disables tiering (no block may consume budget, so none tiers up) — that is
+/// the difference between "off, and here is the evidence" and the `WIE_JIT_TIER`
+/// switch itself, which is the off-switch for the *mechanism*.
+fn tier_budget_from_env(raw: Option<String>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(TIER_BUDGET_DEFAULT)
+        .min(TIER_BUDGET_MAX)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{OPT_LEVEL_DEFAULT, opt_level_from_env};
+    use super::{
+        OPT_LEVEL_DEFAULT, opt_level_from_env, tier_budget_from_env, tier_enabled_from_env,
+    };
 
     #[test]
     fn opt_level_defaults_to_none() {
@@ -559,5 +615,44 @@ mod tests {
         for want in ["none", "speed", "speed_and_size"] {
             assert_eq!(opt_level_from_env(Some(want.to_string())), want);
         }
+    }
+
+    /// `WIE_JIT_TIER=0` must be the bisect switch: it restores the
+    /// pre-tiering behaviour exactly, so it has to be reachable by every
+    /// off-spelling a bisect might use.
+    #[test]
+    fn tier_switch_defaults_on_and_only_explicit_off_disables() {
+        assert!(tier_enabled_from_env(None), "default is on");
+        assert!(tier_enabled_from_env(Some(String::new())));
+        assert!(tier_enabled_from_env(Some("1".into())));
+        assert!(tier_enabled_from_env(Some("true".into())));
+        assert!(
+            tier_enabled_from_env(Some("turbo".into())),
+            "junk must not disable"
+        );
+        for off in ["0", "false", "FALSE", "off", "OFF", "no", "No"] {
+            assert!(
+                !tier_enabled_from_env(Some(off.into())),
+                "WIE_JIT_TIER={off}"
+            );
+        }
+    }
+
+    /// A zero budget is a legal "tier nothing" setting; junk takes the default
+    /// rather than silently meaning zero.
+    #[test]
+    fn tier_budget_parses_zero_default_and_junk() {
+        assert_eq!(tier_budget_from_env(None), super::TIER_BUDGET_DEFAULT);
+        assert_eq!(tier_budget_from_env(Some("0".into())), 0);
+        assert_eq!(tier_budget_from_env(Some("8".into())), 8);
+        assert_eq!(
+            tier_budget_from_env(Some("junk".into())),
+            super::TIER_BUDGET_DEFAULT
+        );
+        // Clamped, never wrapped.
+        assert_eq!(
+            tier_budget_from_env(Some("999999999".into())),
+            super::TIER_BUDGET_MAX
+        );
     }
 }

@@ -111,6 +111,15 @@ pub struct JitProfile {
     /// Persistent-ledger warm hits (`WIE_JIT_CACHE`): known-good blocks that
     /// skipped the Hot visit-threshold warmup and compiled immediately.
     pub warm_ledger_hits: u64,
+    /// Blocks compiled at the tier-up opt level (self-loops that earned it).
+    /// Shared-derived (folded from the one [`JitShared`], see
+    /// [`SHARED_DERIVED_STATS`](super::SHARED_DERIVED_STATS)).
+    pub tier_compiles: u64,
+    /// Tier compiles the verifier/codegen rejected, retried at the base level.
+    /// Shared-derived.
+    pub tier_rejects: u64,
+    /// Tier-up budget still unspent when the snapshot was taken. Shared-derived.
+    pub tier_budget_left: u64,
 }
 
 /// Lock-free accumulator for background-compile timing. The worker thread

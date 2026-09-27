@@ -75,6 +75,9 @@ pub fn jit_profile_report_lines(s: &JitStats) -> Vec<String> {
     if let Some(line) = chain_stats_line(s) {
         out.push(line);
     }
+    if let Some(line) = tier_line(s) {
+        out.push(line);
+    }
     if JitConfig::get().opcode_hist_enabled() {
         out.extend(opcode_histogram_lines());
     }
@@ -97,6 +100,22 @@ fn chain_stats_line(s: &JitStats) -> Option<String> {
     Some(format!(
         "[wie] jit_chain: epoch_bumps={} resyncs={} avg_width={width} inline_inserts={} code_invs={}",
         s.chain.epoch_bumps, s.chain.resyncs, s.chain.inline_inserts, s.exec.code_invs
+    ))
+}
+
+/// Opt-level tier-up ledger as one report line: how many blocks earned `speed`
+/// (self-loops), how many tier compiles the verifier rejected, and how much of
+/// the run's budget is left. Reported separately from `compile_us` so the win
+/// stays attributable to per-compile cost rather than to the tier-up count.
+///
+/// `None` when no block tiered up and nothing was rejected.
+fn tier_line(s: &JitStats) -> Option<String> {
+    if s.profile.tier_compiles == 0 && s.profile.tier_rejects == 0 {
+        return None;
+    }
+    Some(format!(
+        "[wie] jit_tier: tier_compiles={} tier_rejects={} budget_left={}",
+        s.profile.tier_compiles, s.profile.tier_rejects, s.profile.tier_budget_left
     ))
 }
 

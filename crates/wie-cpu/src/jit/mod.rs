@@ -35,7 +35,6 @@ mod trampolines;
 pub use cache_persist::jit_cache_pe_hash;
 /// Dump mem-path histogram / profile report lines (`WIE_JIT_MEM_TRACE=1` …).
 pub use diag::{dump_mem_path_stats, jit_profile_report_lines};
-pub(crate) use engine::JitEngine;
 pub use fast_api::{FastApiKind, JitFastPathConfig, JitHeapLayout};
 pub use profile::{BgCompileProfile, JitProfile, PROFILE_BUCKETS, TimeBuckets};
 pub use shared::{JitShared, PerThreadJitState};
@@ -273,12 +272,15 @@ pub struct JitStats {
 /// [`JitStats::merge_engine`] skips exactly these; the process-wide fold
 /// therefore starts from one engine's complete snapshot (which carries the
 /// shared part exactly once) and merges the rest per-thread.
-const SHARED_DERIVED_STATS: [&str; 5] = [
+const SHARED_DERIVED_STATS: [&str; 8] = [
     "bg.compiles",
     "bg.workers",
     "chain.epoch_bumps",
     "profile.compile_us",
     "profile.compile_by_insns",
+    "profile.tier_compiles",
+    "profile.tier_rejects",
+    "profile.tier_budget_left",
 ];
 
 impl JitStats {
@@ -300,7 +302,7 @@ impl JitStats {
     pub fn merge_engine(&mut self, other: &JitStats) {
         // Tripwire: every field listed here must be skipped below, and any
         // field `JitCpu::stats` starts folding from `JitShared` must be listed.
-        debug_assert_eq!(SHARED_DERIVED_STATS.len(), 5, "shared-derived set changed");
+        debug_assert_eq!(SHARED_DERIVED_STATS.len(), 8, "shared-derived set changed");
         let add = |a: &mut u64, b: u64| *a = a.saturating_add(b);
         let max = |a: &mut u64, b: u64| *a = (*a).max(b);
 
@@ -372,6 +374,7 @@ impl JitStats {
             &mut self.profile.warm_ledger_hits,
             other.profile.warm_ledger_hits,
         );
+        // profile tier fields are shared-derived (the one TierPlan): skipped
     }
 }
 
@@ -464,6 +467,9 @@ mod stats_merge_tests {
         agg.profile.compile_us = 900;
         agg.profile.compile_by_insns.record(1, 100);
         agg.profile.compile_by_insns.record(1, 200);
+        agg.profile.tier_compiles = 3;
+        agg.profile.tier_rejects = 1;
+        agg.profile.tier_budget_left = 61;
 
         // A second engine's snapshot of the SAME shared state.
         let mut other = JitStats::default();
@@ -473,6 +479,9 @@ mod stats_merge_tests {
         other.profile.compile_us = 900;
         other.profile.compile_by_insns.record(1, 100);
         other.profile.compile_by_insns.record(1, 200);
+        other.profile.tier_compiles = 3;
+        other.profile.tier_rejects = 1;
+        other.profile.tier_budget_left = 61;
 
         agg.merge_engine(&other);
 
@@ -482,12 +491,18 @@ mod stats_merge_tests {
         assert_eq!(agg.profile.compile_us, 900, "compile_us is shared");
         assert_eq!(agg.profile.compile_by_insns.count(0), 2);
         assert_eq!(agg.profile.compile_by_insns.total_us(0), 300);
+        assert_eq!(agg.profile.tier_compiles, 3, "tier_compiles is shared");
+        assert_eq!(agg.profile.tier_rejects, 1, "tier_rejects is shared");
+        assert_eq!(
+            agg.profile.tier_budget_left, 61,
+            "tier_budget_left is shared"
+        );
 
         // The list is the contract; assert it names what the test just proved.
         for field in SHARED_DERIVED_STATS {
             assert!(!field.is_empty());
         }
-        assert_eq!(SHARED_DERIVED_STATS.len(), 5);
+        assert_eq!(SHARED_DERIVED_STATS.len(), 8);
     }
 }
 

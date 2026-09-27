@@ -145,6 +145,12 @@ impl JitCpu {
             .compile_us
             .saturating_add(bg.compile_us.load(Ordering::Relaxed));
         bg.fold_into(&mut s.profile.compile_by_insns);
+        // Tier-up ledger lives on the one `JitShared` (one decision per VA), so
+        // it is read — never summed — into every engine's snapshot.
+        let tier = self.shared.tier_counters();
+        s.profile.tier_compiles = tier.tier_ups;
+        s.profile.tier_rejects = tier.tier_rejects;
+        s.profile.tier_budget_left = u64::try_from(tier.budget_left).unwrap_or(u64::MAX);
         s
     }
 
