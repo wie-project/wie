@@ -29,6 +29,7 @@ mod lower;
 mod pipeline;
 mod profile;
 mod shared;
+mod tier;
 mod trampolines;
 
 pub use cache_persist::jit_cache_pe_hash;
