@@ -278,8 +278,19 @@ impl JitConfig {
             ),
             // Background worker-pool size (`WIE_JIT_WORKERS`).
             jit_workers: jit_workers_from_env(),
-            // Cranelift IR verifier (`WIE_JIT_VERIFIER`, default on).
-            verifier_enabled: verifier_enabled_from_env(std::env::var("WIE_JIT_VERIFIER").ok()),
+            // Cranelift IR verifier (`WIE_JIT_VERIFIER`). Profile-dependent
+            // default: ON in debug builds (the per-function CLIF check is the
+            // only thing that makes an ill-typed lowering fail loudly instead
+            // of miscompiling silently, and nextest runs the dev profile, so CI
+            // keeps that guard), OFF in release (measured -37% 7-Zip boot
+            // wall-clock, compile work bit-identical). An explicit value wins
+            // in both profiles in both directions. Caveat: nothing in the repo
+            // records the verifier ever firing, so "the suite is green with it
+            // off" means *no known bug is masked*, not *it is redundant* — and it
+            // never checked x86 semantics, which is the JIT-vs-iced
+            // differential's job, not its.
+            verifier_enabled: verifier_enabled_from_env(std::env::var("WIE_JIT_VERIFIER").ok())
+                .unwrap_or(cfg!(debug_assertions)),
         }
     }
 
@@ -435,12 +446,23 @@ impl JitConfig {
     }
 
     /// Whether Cranelift runs its per-function IR verifier
-    /// (`WIE_JIT_VERIFIER`, default on).
+    /// (`WIE_JIT_VERIFIER`; default `cfg!(debug_assertions)` — on in debug,
+    /// off in release).
     ///
-    /// Default on: the verifier is the only thing that turns a lowering bug
-    /// into a diagnosable error instead of miscompiled host code. The knob
-    /// exists so the cost is *measurable* in one build (interleaved A/B), not
-    /// because the default is in doubt.
+    /// The verifier is the per-function CLIF check (SSA/dominance, type
+    /// correctness, use-before-def, operand constraints) and is the only thing
+    /// that turns a lowering bug into a diagnosable error instead of wrong host
+    /// code. It never checked x86 *semantics*: the JIT-vs-iced differential is
+    /// the semantic gate, so its cost buys type/SSA safety, not correctness of
+    /// the lowering's meaning. Defaulting it to `debug_assertions` keeps that
+    /// net over the dev-profile test suite (so `cargo nextest` — the profile CI
+    /// uses — compiles with the verifier on) while not charging release
+    /// guests for it. An explicit `WIE_JIT_VERIFIER=1` in a release build
+    /// re-arms it for diagnosis.
+    ///
+    /// Honest caveat, unchanged by that default: nothing in this repo records
+    /// the verifier ever firing, so a green suite with it off means *no known
+    /// bug is masked*, **not** that the verifier is redundant.
     #[must_use]
     pub(crate) fn verifier_enabled(&self) -> bool {
         self.verifier_enabled
@@ -575,13 +597,34 @@ fn tier_budget_from_env(raw: Option<String>) -> usize {
 
 /// Parse the Cranelift IR-verifier switch from a `WIE_JIT_VERIFIER` value.
 ///
-/// Default **on**: the verifier runs per compiled function and is the only
-/// check that a bad lowering fails loudly instead of emitting wrong host code.
-/// Same shape as [`tier_enabled_from_env`] — only the explicit off-spellings
-/// (`0` / `false` / `off` / `no`) disable it, so a typo cannot silently drop
-/// the safety net that defaults are supposed to keep.
-fn verifier_enabled_from_env(raw: Option<String>) -> bool {
-    !matches!(raw, Some(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("no"))
+/// Returns the **explicit** choice only; unset, empty and unrecognised values
+/// are `None` so the caller can apply the profile default
+/// (`cfg!(debug_assertions)`) instead of baking one build's answer into the
+/// parser. Both directions are spellable in both profiles on purpose: `0` in a
+/// debug build is how you stop paying the verifier's cost while bisecting a JIT
+/// bug, and `1` in a release build is the confirmation path for a suspected
+/// miscompile. Pure, for the same reason as [`tier_enabled_from_env`] and
+/// [`opt_level_from_env`] — no `set_var`, so the whole table is unit-testable.
+fn verifier_enabled_from_env(raw: Option<String>) -> Option<bool> {
+    match raw {
+        Some(v)
+            if v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no") =>
+        {
+            Some(false)
+        }
+        Some(v)
+            if v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("yes") =>
+        {
+            Some(true)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -683,24 +726,65 @@ mod tests {
         );
     }
 
-    /// The verifier default is the load-bearing policy of this knob: turning
-    /// Cranelift's per-function IR check off is a safety decision, so it must
-    /// be taken explicitly, by every off-spelling a bisect might use.
+    /// The verifier default is **profile-dependent**, so the test is too: it
+    /// asserts the mapping and the profile default separately rather than
+    /// baking in one build's answer. `nextest` runs the dev profile, so CI
+    /// compiles with the verifier on; release builds run it off.
     #[test]
-    fn verifier_switch_defaults_on_and_only_explicit_off_disables() {
-        assert!(verifier_enabled_from_env(None), "default is on");
-        assert!(verifier_enabled_from_env(Some(String::new())));
-        assert!(verifier_enabled_from_env(Some("1".into())));
-        assert!(verifier_enabled_from_env(Some("true".into())));
-        assert!(verifier_enabled_from_env(Some("on".into())));
-        assert!(
-            verifier_enabled_from_env(Some("turbo".into())),
-            "junk must not disable the verifier"
-        );
+    fn verifier_switch_defaults_to_profile_and_explicit_values_win() {
+        let profile = cfg!(debug_assertions);
+
+        // Unset, empty, whitespace and unrecognised junk mean "no explicit
+        // choice" (`None`, for the caller to default) — never a silent
+        // disable, which is the one failure mode that matters here.
+        for raw in [
+            None,
+            Some(String::new()),
+            Some("  ".into()),
+            Some("turbo".into()),
+            Some("offe".into()),
+            Some("none".into()),
+        ] {
+            assert_eq!(
+                verifier_enabled_from_env(raw.clone()),
+                None,
+                "WIE_JIT_VERIFIER={raw:?} must not be read as an explicit choice"
+            );
+            // …and the call site's collapse of that `None` is the profile
+            // default, in whichever profile this test was compiled under.
+            assert_eq!(
+                verifier_enabled_from_env(raw.clone()).unwrap_or(cfg!(debug_assertions)),
+                profile,
+                "WIE_JIT_VERIFIER={raw:?} must fall back to the profile default \
+                 (debug_assertions={profile})"
+            );
+        }
+
+        // Every off-spelling disables it in *any* profile — including a debug
+        // build, which is where you turn it off while bisecting a JIT bug.
         for off in ["0", "false", "FALSE", "off", "OFF", "no", "No"] {
+            assert_eq!(
+                verifier_enabled_from_env(Some(off.into())),
+                Some(false),
+                "WIE_JIT_VERIFIER={off} must disable the verifier regardless of profile"
+            );
             assert!(
-                !verifier_enabled_from_env(Some(off.into())),
-                "WIE_JIT_VERIFIER={off}"
+                !verifier_enabled_from_env(Some(off.into())).unwrap_or(cfg!(debug_assertions)),
+                "WIE_JIT_VERIFIER={off} must override the profile default"
+            );
+        }
+
+        // …and every on-spelling arms it in *any* profile, including release:
+        // this is the confirmation path for a suspected miscompile.
+        for on in ["1", "true", "TRUE", "on", "ON", "yes", "Yes"] {
+            assert_eq!(
+                verifier_enabled_from_env(Some(on.into())),
+                Some(true),
+                "WIE_JIT_VERIFIER={on} must arm the verifier regardless of profile"
+            );
+            assert!(
+                verifier_enabled_from_env(Some(on.into())).unwrap_or(cfg!(debug_assertions)),
+                "WIE_JIT_VERIFIER={on} must override the profile default"
             );
         }
     }

@@ -151,11 +151,17 @@ impl IsaEngine {
         flag_builder
             .set("opt_level", opt_level)
             .map_err(|e| e.to_string())?;
-        // Cranelift IR verifier (`WIE_JIT_VERIFIER`, default on). It runs per
-        // compiled function and is the only thing that turns a bad lowering
-        // into a diagnosable error instead of miscompiled host code, so the
-        // knob exists to make that cost *measurable* in one build (interleaved
-        // A/B), not to invite a change of default.
+        // Cranelift IR verifier (`WIE_JIT_VERIFIER`; default
+        // `cfg!(debug_assertions)` — on in debug, off in release). It runs per
+        // compiled function and checks CLIF SSA/dominance, types, use-before-def
+        // and operand constraints, so it is the only thing that turns a
+        // lowering bug into a diagnosable error instead of wrong host code. It
+        // never checked x86 *semantics* — the JIT-vs-iced differential is that
+        // gate. Profile default: dev-profile `nextest` compiles with it on
+        // (CI keeps the guard) while release guests do not pay the measured
+        // -37% boot cost; `WIE_JIT_VERIFIER=1` re-arms it in a release build.
+        // Nothing in the repo records it ever firing, so the release default
+        // means "no known bug is masked", not "it is redundant".
         flag_builder
             .set(
                 "enable_verifier",
