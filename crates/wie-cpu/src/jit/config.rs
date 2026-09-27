@@ -238,11 +238,17 @@ impl JitConfig {
             bg_wait_timeout: Duration::from_micros(env_u64("WIE_JIT_BG_TIMEOUT_US", 1_000)),
             // Cranelift `opt_level`: `speed` | `speed_and_size` | `none`.
             // Default `none`: compile cost, not emitted-code quality, is the
-            // binding constraint for real guests (7-Zip Extra `7za.exe i` is
-            // 2.4x faster and background compiles stop starving at
-            // `none`), while a pure-compute loop pays ~40% (0.49s -> 0.71s on
-            // `long_loop`). `WIE_JIT_OPT=speed` is the documented opt-out for
-            // compute-bound guests. Do not "fix" this back to `speed`.
+            // binding constraint for real guests. 7-Zip Extra `7za.exe i`
+            // improves 1.46x cold-ledger / 1.74x warm-ledger, and the
+            // foreground `eager` compile count is UNCHANGED at 987 — the win is
+            // per-compile cost, not fewer compiles. Background compiles are NOT
+            // starved at `speed`: `bg_hit` is 0 on a cold ledger in both arms,
+            // and 739 -> 849 (median) warm, i.e. ~15%, not 0 -> 751. The price
+            // is compute-bound steady state: `long_loop` regresses ~38%
+            // (0.300s -> 0.415s median). `WIE_JIT_OPT=speed` is the documented
+            // opt-out for compute-bound guests. Do not "fix" this back to
+            // `speed`; hot-block tier-up is the intended recovery and is not
+            // implemented yet.
             opt_level: opt_level_from_env(std::env::var("WIE_JIT_OPT").ok()),
             // Emit Cranelift SIMD types for SSE (`WIE_JIT_SIMD=0` disables).
             simd_enabled: !matches!(
