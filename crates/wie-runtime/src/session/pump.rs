@@ -156,6 +156,7 @@ impl<'a> SessionPumpHooks<'a> {
             if winapi_state.kernel.threads.active.tid != self.primary_tid {
                 winapi_state.kernel.threads.activate(self.primary_tid);
             }
+            wie_winapi::thread::bind_current_tid(self.primary_tid);
             finish(winapi_state, bridge, outcome);
         });
         Step::Next
@@ -211,6 +212,7 @@ impl<'a> SessionPumpHooks<'a> {
             if st.kernel.threads.active.tid != primary_tid {
                 st.kernel.threads.activate(primary_tid);
             }
+            wie_winapi::thread::bind_current_tid(primary_tid);
             st.absorb_guest_last_error(engine);
             st.publish_last_error_to_guest(engine);
         });
@@ -1249,6 +1251,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                                 if winapi_state.kernel.threads.active.tid != self.primary_tid {
                                     winapi_state.kernel.threads.activate(self.primary_tid);
                                 }
+                                wie_winapi::thread::bind_current_tid(self.primary_tid);
                                 winapi_state
                                     .window_state()
                                     .set_child_spawn_result(h_process, h_thread, pid, tid)
@@ -1465,6 +1468,7 @@ impl super::RuntimeSession {
                             self.process.with_mut(|_eng, st| {
                                 st.kernel.threads.activate(primary_tid);
                             });
+                            wie_winapi::thread::bind_current_tid(primary_tid);
                             // Do not charge API index again — undo increment.
                             *hooks.next_api_index = hooks.next_api_index.saturating_sub(1);
                         }
@@ -1565,6 +1569,7 @@ impl super::RuntimeSession {
                             if !timer_wake {
                                 self.process.with_mut(|eng, st| {
                                     st.kernel.threads.activate(primary_tid);
+                                    wie_winapi::thread::bind_current_tid(primary_tid);
                                     let _ =
                                         eng.return_from_win64_api(u64::from(result)).map_err(|e| {
                                             tracing::error!(
@@ -1694,6 +1699,7 @@ impl super::RuntimeSession {
                                 park_residency_ns.saturating_add(t0.elapsed().as_nanos());
                             self.process.with_mut(|eng, st| {
                                 st.kernel.threads.activate(primary_tid);
+                                wie_winapi::thread::bind_current_tid(primary_tid);
                                 let _ = eng.return_from_win64_api(u64::from(result)).map_err(|e| {
                                     tracing::error!("guest stack corrupted on wait park: {e}")
                                 });

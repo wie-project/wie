@@ -660,6 +660,7 @@ impl QuantumHooks for WorkerHooks {
             }
             core.with_locked(|_, st| {
                 st.kernel.threads.activate(self.tid);
+                wie_winapi::thread::bind_current_tid(self.tid);
                 if let Some(pt) = st.pthread().by_tid.get(&self.tid).copied()
                     && let Some(thread) = st.pthread().threads.get_mut(&pt)
                 {
