@@ -1241,21 +1241,36 @@ pub(super) fn lower_xadd(
     Ok(())
 }
 
-/// Lower CmpXchg (compare and exchange):
-/// Compare dst with accumulator (AL/AX/EAX/RAX). If equal, dst = src, else accumulator = dst.
-/// Sets ZF based on the comparison. Flushes pending flags before operation.
+/// The `CMPXCHG` accumulator for an operand width: AX / EAX / RAX.
 ///
-/// **Known wrong for the register-destination form** (`cmpxchg r32, r32`; no
-/// memory, so nothing to do with atomicity). `lower/mod.rs` builds `entry_gpr`
-/// as a literal `iconst 0` and only *loads* the registers its liveness set
-/// marks live; reading `gpr[0]` directly here bypasses `read_gpr`, which is
-/// what records the read. When RAX is not otherwise live the comparison is
-/// therefore against `0`: with EAX=7/ECX=0/EDX=7 the block exchanges (ECX
-/// becomes 7) when it must not, and with EAX=0/ECX=7 it must set ZF and does
-/// not (the RFLAGS carrier is likewise never loaded or stored back). The
-/// interpreter gets both cases right. Reading the accumulator through
-/// `read_gpr_logical` is the first half of the fix; the RFLAGS liveness
-/// contract needs its own look.
+/// `CMPXCHG r/m, r` compares the destination against the accumulator, which iced
+/// does not expose as an operand — it is an implicit architectural operand, so
+/// the lowerer has to name the register itself. There is no 8-bit `CMPXCHG` in
+/// the ISA (the sub-word RMWs are `CMPXCHG8B`/`CMPXCHG16B`), which is why this
+/// has no `8` arm: `0F B1 /r` without REX/0x66 decodes as the 32-bit form.
+pub(super) fn accumulator_register(bits: u32) -> Result<Register, String> {
+    match bits {
+        16 => Ok(Register::AX),
+        32 => Ok(Register::EAX),
+        64 => Ok(Register::RAX),
+        other => Err(format!("cmpxchg accumulator bits {other}")),
+    }
+}
+
+/// Lower CmpXchg (compare and exchange):
+/// Compare dst with accumulator (AX/EAX/RAX). If equal, dst = src, else accumulator = dst.
+/// Sets the flags of `CMP acc, dst`. Flushes pending flags before operation.
+///
+/// The accumulator reaches this function through [`read_gpr`], like every other
+/// register read here. That is what makes the *width* explicit, and it is why
+/// the missing live-in bit is so easy to miss: `CmpXchg` names its accumulator
+/// nowhere in its operand list, so `mark_insn_gprs` cannot mark RAX live for a
+/// block whose only accumulator user is this instruction, and a register that is
+/// not live stays the `iconst 0` placeholder in `entry_gpr` — the block then
+/// compares against 0, and on the 16-bit form merges the write-back into that
+/// placeholder and zeroes the upper bits of RAX. The live-in set is completed by
+/// `implicit_operand_completion` in `lower/mod.rs`, which is the actual fix;
+/// naming the accumulator here is what keeps the two in step.
 pub(super) fn lower_cmpxchg(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
@@ -1271,7 +1286,10 @@ pub(super) fn lower_cmpxchg(
     // then narrow to the compare/store width like the memory operand.
     let src_raw = store_value_from_gpr(bcx, instr.op_register(1), gpr)?;
     let src_val = mask_width(bcx, src_raw, bits);
-    let acc_val = mask_width(bcx, gpr[0], bits); // RAX/EAX/AX/AL
+    // The accumulator, at the operand's width: AX/EAX/RAX all live in the RAX
+    // slot, so `read_gpr` normalises the width-to-register mapping here.
+    let acc_reg = accumulator_register(bits)?;
+    let acc_val = mask_width(bcx, read_gpr(gpr, acc_reg)?, bits);
 
     // Compare dst with acc: ZF = (dst == acc)
     let eq = bcx.ins().icmp(IntCC::Equal, dst_val, acc_val);
@@ -1282,17 +1300,28 @@ pub(super) fn lower_cmpxchg(
     // Write to dst
     write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, new_dst, bits)?;
 
-    // Write to accumulator (RAX) when not equal
-    let old_rax = gpr[0];
+    // Write the accumulator when not equal. The write goes through the
+    // *narrow* accumulator register, not a hardcoded RAX: `CMPXCHG r/m16, r16`
+    // writes only AX and must leave bits 16..63 of RAX alone, and `write_gpr`
+    // performs exactly that merge for a 16-bit target (while zero-extending the
+    // upper half on the 32-bit form, as x86 requires). `old_acc` is the full
+    // 64-bit slot value so the equal branch can put every bit back untouched.
+    let old_acc = read_gpr(gpr, acc_reg)?;
     let ext_dst = sext_to_i64(bcx, dst_val, bits);
-    let new_rax = bcx.ins().select(eq, old_rax, ext_dst);
-    write_gpr(bcx, gpr, dirty, Register::RAX, new_rax)?;
+    let new_acc = bcx.ins().select(eq, old_acc, ext_dst);
+    write_gpr(bcx, gpr, dirty, acc_reg, new_acc)?;
 
-    // Set ZF based on comparison
-    let zf_on = select_flag(bcx, eq, Rflags::ZF);
-    *rflags = replace_flag(bcx, *rflags, Rflags::ZF, zf_on);
-    // Architectural: CF, OF, SF, AF, PF may be set based on the comparison but
-    // Intel docs mark them as undefined for CmpXchg.
+    // Set the flags of `CMP acc, dst` — the whole arithmetic set, not just ZF.
+    // x86 leaves CF/OF/SF/AF/PF *undefined* after CMPXCHG, but the interpreter
+    // (`exec_cmpxchg`) computes them as a full `set_sub_flags(acc, dest, ..)`, and
+    // a JIT block that disagrees with iced about guest flags is a wrong-code bug
+    // with no architectural excuse: real code does read RFLAGS after a CAS.
+    // `flags_sub(old, dst=acc, src=dest, ..)` is the same shape `lower_cmp` uses
+    // for `CMP`, and it clears only CF/ZF/SF/PF/OF/AF, so the other RFLAGS bits
+    // ride through untouched on both backends.
+    let res_raw = bcx.ins().isub(acc_val, dst_val);
+    let res = mask_width(bcx, res_raw, bits);
+    *rflags = flags_sub(bcx, *rflags, acc_val, dst_val, res, bits);
     Ok(())
 }
 

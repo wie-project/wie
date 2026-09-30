@@ -6,8 +6,8 @@ use crate::regs::{self, RegFile, Rflags};
 use iced_x86::{Instruction, OpKind, Register};
 
 use super::{
-    AccessType, ArithOp, BitOp, InvalidMem, StepExecError, effective_address, op_size_bytes, pop_n,
-    push_n, read_op, write_mem_value, write_op, write_op_sized,
+    ArithOp, BitOp, StepExecError, atomic_rmw, effective_address, op_size_bytes, pop_n, push_n,
+    read_mem_value, read_op, write_mem_value, write_op, write_op_sized,
 };
 
 pub(super) fn exec_mov(
@@ -458,6 +458,19 @@ pub(super) fn exec_bswap(regs: &mut RegFile, instr: &Instruction) -> Result<(), 
     Ok(())
 }
 
+/// The `BT`/`BTS`/`BTR`/`BTC` update as a pure function of the old value.
+///
+/// Pure because `atomic_rmw`'s closure may be re-run on another engine's value
+/// under contention, so it must not carry any state across the attempt.
+fn bit_update(old: u64, op: BitOp, mask: u64) -> u64 {
+    match op {
+        BitOp::Bt => old,
+        BitOp::Bts => old | mask,
+        BitOp::Btr => old & !mask,
+        BitOp::Btc => old ^ mask,
+    }
+}
+
 pub(super) fn exec_bit(
     mem: &GuestMemory,
     regs: &mut RegFile,
@@ -472,50 +485,69 @@ pub(super) fn exec_bit(
             let idx = (bit_offset as u32) % u32::try_from(bits).unwrap_or(64);
             let val = read_op(mem, regs, instr, 0)? & regs::size_mask(size);
             let mask = 1_u64 << idx;
-            let cf = (val & mask) != 0;
-            regs.set_flag(Rflags::CF, cf);
-            let new = match op {
-                BitOp::Bt => val,
-                BitOp::Bts => val | mask,
-                BitOp::Btr => val & !mask,
-                BitOp::Btc => val ^ mask,
-            };
+            regs.set_flag(Rflags::CF, (val & mask) != 0);
             if !matches!(op, BitOp::Bt) {
-                write_op(mem, regs, instr, 0, new)?;
+                write_op(mem, regs, instr, 0, bit_update(val, op, mask))?;
             }
         }
         OpKind::Memory => {
-            // Memory bit string: EA + signed(offset)/8, bit = offset & 7.
+            // x86 splits the two memory forms. The byte form is *byte granular*:
+            // the offset is a signed byte displacement and the bit is `offset % 8`.
+            // Every wider form addresses the operand itself and takes the bit
+            // modulo the operand width. Reading the wider forms byte-granularly
+            // sent `bts dword [rbx], 8` to `base + 1` bit 0 instead of `base`
+            // bit 8 — and the JIT's `lower_bit` has always masked the index to the
+            // operand width, so the two engines disagreed on the same bytes.
             let base = effective_address(regs, instr)?;
-            let off = bit_offset as i64;
-            let byte_delta = off.div_euclid(8);
-            let bit = u32::try_from(off.rem_euclid(8)).unwrap_or(0);
-            let addr = base.wrapping_add(byte_delta as u64);
-            let mut b = [0_u8; 1];
-            match mem.read(addr, &mut b) {
-                Ok(()) => {}
-                Err(e) => {
-                    drop(e);
-                    return Err(StepExecError::InvalidMemory(InvalidMem {
-                        access_type: AccessType::Read,
-                        address: addr,
-                        size: 1,
-                        value: 0,
-                    }));
-                }
-            }
-            let val = u64::from(b[0]);
+            let size = op_size_bytes(instr, 0)?;
+            let bits = u32::try_from(size).unwrap_or(1).saturating_mul(8);
+            let (addr, bit) = if bits == 8 {
+                let off = bit_offset as i64;
+                let byte_delta = off.div_euclid(8);
+                (
+                    base.wrapping_add(byte_delta as u64),
+                    u32::try_from(off.rem_euclid(8)).unwrap_or(0),
+                )
+            } else {
+                let mask = u64::from(bits);
+                (
+                    base,
+                    u32::try_from(bit_offset & mask.wrapping_sub(1)).unwrap_or(0),
+                )
+            };
             let mask = 1_u64 << bit;
-            let cf = (val & mask) != 0;
-            regs.set_flag(Rflags::CF, cf);
-            if !matches!(op, BitOp::Bt) {
-                let new = match op {
-                    BitOp::Bt => val,
-                    BitOp::Bts => val | mask,
-                    BitOp::Btr => val & !mask,
-                    BitOp::Btc => val ^ mask,
-                };
-                write_mem_value(mem, addr, new, 1)?;
+            let writes = !matches!(op, BitOp::Bt);
+
+            // `LOCK` turns a memory BTX into a read-modify-write on the operand:
+            // read it, update it and write it back as *one* unit, or two guest
+            // threads can both act on the same old value. `atomic_rmw` — added
+            // with XCHG/CMPXCHG — is exactly that, and reusing it rather than
+            // adding a mechanism is the point: it brings the same host SeqCst RMW
+            // where `host_span` can serve a naturally aligned 4/8-byte operand, the
+            // same 256-stripe host mutex where it cannot (byte and 16-bit forms, or
+            // an unaligned operand), and above all the same software
+            // page-permission oracle — `host_span(.., write=true)` runs the SPC and
+            // the per-page `allow_w` before a host pointer exists, and the fallback
+            // uses the ordinary checked `read_mem_value`/`write_mem_value`. No path
+            // here writes guest memory without that check.
+            //
+            // CF has to come from the RMW's own old value: a separate pre-load
+            // would reintroduce exactly the race this prevents. Plain `BT` never
+            // writes, so it is never an RMW (and x86 makes `LOCK` invalid on it),
+            // and an unlocked BTX needs no ordering, so both keep the plain
+            // load/store pair.
+            let locked = writes && instr.has_lock_prefix();
+            let val = if locked {
+                atomic_rmw(mem, addr, size, |old| bit_update(old, op, mask))?
+            } else {
+                read_mem_value(mem, addr, size)?
+            };
+            regs.set_flag(Rflags::CF, (val & mask) != 0);
+            // The locked path already stored the new operand inside `atomic_rmw`; a
+            // second, unordered store here would be a plain write racing the very
+            // RMW that was just taken.
+            if writes && !locked {
+                write_mem_value(mem, addr, bit_update(val, op, mask), size)?;
             }
         }
         other => {
