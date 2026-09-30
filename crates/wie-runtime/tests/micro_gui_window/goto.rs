@@ -19,6 +19,43 @@ use crate::helpers::{gui_suite_serialize, pump_until_windows_ready, real_exe};
 const GOTO_DLG_CX: i32 = 330;
 const GOTO_DLG_CY: i32 = 100;
 
+/// RNotepad's `CMD_GOTO` (real_exes/.rnotepad-src/notepad_res.h), the Edit →
+/// Go To... menu command.
+///
+/// The guest's menu titles come out in the HOST UI language (`lang.rs` mirrors
+/// `AppleLanguages[0]` into RT_MENU selection), so a German macOS gets
+/// "Gehe zu...". The command *id* is locale-independent, so every test here
+/// looks the command up by id rather than by its English spelling.
+const CMD_GOTO: u32 = 0x123;
+
+/// The guest's own Go To menu command, read out of the mirrored menu tree.
+///
+/// Proves the guest really declared the command (and that `window_menu_items`
+/// mirrors the tree the macOS bar renders) without asserting the localized
+/// title. Panics with the tree when the command is absent, so a regression
+/// names the failure instead of yielding a silent `0`.
+fn goto_command_id(handle: &wie_runtime::GuestHandle) -> u32 {
+    let tree = handle.window_menu_items();
+    let found = tree
+        .iter()
+        .flat_map(|top| top.children.iter())
+        .find(|child| child.id == CMD_GOTO);
+    match found {
+        Some(child) => {
+            assert!(
+                !child.title.trim().is_empty(),
+                "the Go To command must carry the localized title the macOS bar \
+                 renders (id {CMD_GOTO:#x} came back with an empty title)"
+            );
+            child.id
+        }
+        None => panic!(
+            "the Edit menu must contain a Go To command (id {CMD_GOTO:#x}); \
+             the mirrored tree is {tree:?}"
+        ),
+    }
+}
+
 /// Post `WM_COMMAND(CMD_GOTO)` to notepad's main window, then assert the
 /// whole flow: a Dialog window appears (not the synthesized fallback — it
 /// must carry the EDIT + OK/Cancel children from the RT_DIALOG template),
@@ -47,17 +84,9 @@ fn goto_dialog_resolves_edit_and_moves_the_caret() {
 
     let main = session.first_guest_window_handle().unwrap_or(0);
     assert_ne!(main, 0, "notepad main window exists");
-    let tree = handle.window_menu_items();
-    let goto_id = tree
-        .iter()
-        .flat_map(|top| top.children.iter())
-        .find(|child| child.title.to_lowercase().contains("go to"))
-        .map(|child| child.id)
-        .unwrap_or(0);
-    assert_ne!(
-        goto_id, 0,
-        "the Edit menu must contain a Go To command (host menu mirrors it)"
-    );
+    // The Go To command, found by id — the guest's menu title is localized to
+    // the host UI language (see `goto_command_id`).
+    let goto_id = goto_command_id(&handle);
 
     // The main EDIT (host-side multiline control).
     let main_edit = session
@@ -270,14 +299,7 @@ fn goto_cancel_click_closes_dialog_on_first_click() {
 
     let main = session.first_guest_window_handle().unwrap_or(0);
     assert_ne!(main, 0, "notepad main window exists");
-    let tree = handle.window_menu_items();
-    let goto_id = tree
-        .iter()
-        .flat_map(|top| top.children.iter())
-        .find(|child| child.title.to_lowercase().contains("go to"))
-        .map(|child| child.id)
-        .unwrap_or(0);
-    assert_ne!(goto_id, 0, "the Edit menu must contain a Go To command");
+    let goto_id = goto_command_id(&handle);
 
     // The live flow: the user TYPES in the main EDIT first, which leaves a
     // narrow pending row band (not a full repaint). After the modal close the
@@ -587,14 +609,7 @@ fn goto_prefill_caret_is_at_end_and_typing_appends() {
 
     let main = session.first_guest_window_handle().unwrap_or(0);
     assert_ne!(main, 0, "notepad main window exists");
-    let tree = handle.window_menu_items();
-    let goto_id = tree
-        .iter()
-        .flat_map(|top| top.children.iter())
-        .find(|child| child.title.to_lowercase().contains("go to"))
-        .map(|child| child.id)
-        .unwrap_or(0);
-    assert_ne!(goto_id, 0, "the Edit menu must contain a Go To command");
+    let goto_id = goto_command_id(&handle);
 
     let main_edit = session
         .guest_windows_snapshot()
@@ -841,14 +856,7 @@ fn goto_line_deep_keeps_rows_below_visible() {
 
     let main = session.first_guest_window_handle().unwrap_or(0);
     assert_ne!(main, 0, "notepad main window exists");
-    let tree = handle.window_menu_items();
-    let goto_id = tree
-        .iter()
-        .flat_map(|top| top.children.iter())
-        .find(|child| child.title.to_lowercase().contains("go to"))
-        .map(|child| child.id)
-        .unwrap_or(0);
-    assert_ne!(goto_id, 0, "the Edit menu must contain a Go To command");
+    let goto_id = goto_command_id(&handle);
 
     let main_edit = session
         .guest_windows_snapshot()

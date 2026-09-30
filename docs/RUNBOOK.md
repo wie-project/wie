@@ -35,6 +35,7 @@ One-page playbook for regressions after the foundational work and the **great cl
 | Tests fail with `missing guest fixture: …/micro-exes/out/*.exe` | Not an emulator bug — the untracked fixture is absent. `make -C micro-exes` (needs `brew install mingw-w64`) |
 | Tests fail with `missing real guest fixture: …/real_exes/notepad.exe` | Not an emulator bug — the untracked RNotepad build is absent. `./scripts/fetch.sh notepad` (`--list` for 7za / 2048 / doomretro) |
 | A test "passes" suspiciously fast (<0.1 s) in `micro_gui_window` | Vacuous-pass smell. It means the guest fixture was missing and the test returned early. Both fixture trees are gitignored; see [docs/TESTING.md](TESTING.md#prerequisites--the-guest-fixtures-must-exist) |
+| Guest menus / dialogs / strings come out in a language you did not ask for | Expected by design: WIE mirrors the HOST UI language into guest resource selection (`AppleLanguages[0]` on macOS), so a German macOS gets a German notepad. Pin it with `WIE_UI_LANGID=en-US` (or `LC_ALL`/`LANG`) — see the knob table. **Never assert on localized guest text in a test**: menu titles, accelerators and the status-bar Ln/Col string are all localized, so only command *ids* are locale-independent. |
 
 ## Regression matrix
 
@@ -149,6 +150,7 @@ The README keeps the shortlist; the complete set lives here.
 | `WIE_VFS_DOWNLOADS=1` | Optional live check against real macOS user dir |
 | `WIE_MT=0` | Disable guest worker spawn |
 | `WIE_MT_MAX_THREADS` | Cap on guest worker threads (default **64**) |
+| `WIE_UI_LANGID` | **Pin the guest UI language** (default: mirror the host). A Windows LANGID (`0x409`, `1033`) or a language tag (`en-US`, `de`, `fr_FR.UTF-8`); `C`/`POSIX` mean en-US. Consulted **before** `LC_ALL` / `LANG` / the macOS `AppleLanguages` probe, so it always wins. An unparseable or unknown-language value is **ignored**, never coerced to en-US, and falls through to the next source. Derived once per process, so set it before the first `GetUserDefaultUILanguage` / `LoadMenuW` / `LoadString*`. Use it in CI to make resource selection deterministic instead of depending on the runner's UI language. |
 | `RUST_LOG` | tracing filter (CLI defaults to `warn`) |
 
 ### Wave3 remaining knobs — sketch (all default **on**, no env required; `=0` opts out for matrix/bisect)
