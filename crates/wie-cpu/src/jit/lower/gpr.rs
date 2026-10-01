@@ -1152,21 +1152,26 @@ pub(super) fn lower_bit_test_op(
     let val_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
     let val = mask_width(bcx, val_raw, bits);
 
-    // Compute bit index from operand 1 (register or immediate).
+    // Compute bit index from operand 1 (register or immediate). The source is
+    // narrowed to 32 bits only to drop the garbage above the low bits we are
+    // about to mask; the width-specific mask is applied next.
     let bit_idx = if instr.op1_kind() == OpKind::Register {
         let idx_raw = read_gpr(gpr, instr.op_register(1))?;
-        mask_width(bcx, idx_raw, 32) // x86 masks to 5/6/7 bits depending on size
+        mask_width(bcx, idx_raw, 32)
     } else {
         let imm = read_imm(bcx, instr, 1);
         mask_width(bcx, imm, 32)
     };
 
-    // Mask bit index by operand size (x86: 5 bits for 32-bit, 6 for 64-bit).
-    let max_bits = if bits == 64 {
-        iconst_u64(bcx, 63)
-    } else {
-        iconst_u64(bcx, 31) // 32-bit: 5-bit mask
-    };
+    // Mask the bit index to the **operand width**: x86 takes `index mod operand
+    // size in bits`, so the mask is `bits - 1` — 3 bits for a byte, 4 for a word,
+    // 5 for a dword, 6 for a qword. This used to hardcode `31` for everything
+    // narrower than 64 bits, which is only right at 32: `bt ax, 20` must address
+    // bit 4 of AX, and the old mask left the shift at 20, so the JIT read CF from
+    // a zero-extended bit (always 0) and `bts`/`btr`/`btc` wrote bit 20 of the
+    // 64-bit slot instead of bit 4 of the word. The interpreter masked with
+    // `% bits` all along, so the two engines disagreed on the same bytes.
+    let max_bits = iconst_u64(bcx, u64::from(bits.saturating_sub(1)));
     let idx_masked = bcx.ins().band(bit_idx, max_bits);
 
     // Compute the bit value at `idx_masked` -> CF = (val >> idx_masked) & 1
