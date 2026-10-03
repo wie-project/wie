@@ -2,6 +2,7 @@
 //! (matrix multiply, clip→screen mapping).
 
 use super::{D3DFVF_DIFFUSE, D3DFVF_NORMAL, D3DFVF_SPECULAR, D3DFVF_XYZ, D3DFVF_XYZRHW};
+use crate::color::{pack_rgba, unpack_rgba};
 
 /// D3D9 4×4 matrix: column-major storage, row-vector convention (`v' = v·M`).
 pub type Mat4 = [f32; 16];
@@ -358,12 +359,15 @@ fn lerp_color(a: u32, b: u32, t: f32) -> u32 {
         let y = f32::from(y);
         (x + (y - x) * t).round() as u8
     };
-    let channel = |v: u32, shift: u32| u8::try_from((v >> shift) & 0xFF).unwrap_or(0);
-    let r = mix(channel(a, 16), channel(b, 16));
-    let g = mix(channel(a, 8), channel(b, 8));
-    let bl = mix(channel(a, 0), channel(b, 0));
-    let al = mix(channel(a, 24), channel(b, 24));
-    (u32::from(al) << 24) | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(bl)
+    let mix_channels = |a: [u8; 4], b: [u8; 4]| {
+        [
+            mix(a[0], b[0]),
+            mix(a[1], b[1]),
+            mix(a[2], b[2]),
+            mix(a[3], b[3]),
+        ]
+    };
+    pack_rgba(mix_channels(unpack_rgba(a), unpack_rgba(b)))
 }
 /// Map a clipped clip-space vertex through the viewport transform.
 ///

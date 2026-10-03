@@ -5,6 +5,7 @@ use super::operand::{
     comp, comp_opt, read_operand, read_operand_i32, read_three, read_two, write_operand,
 };
 use super::sample::{TextureStage, sample_texture};
+use crate::color::unpack_rgba_unit;
 use crate::d3d9_shader::{
     Operand, PS_CONST_COUNT, PS_INPUT_COUNT, PS_SAMPLER_COUNT, PS_TEMP_COUNT, PsInstruction, PsOp,
     RegType,
@@ -104,12 +105,7 @@ impl super::operand::ShaderRegisters for PsRegisters {
 /// Convert a `0xAARRGGBB` texel to the shader's `[r, g, b, a]` 0..1 float4.
 #[must_use]
 fn texel_to_float4(texel: u32) -> [f32; 4] {
-    [
-        f32::from(u8::try_from((texel >> 16) & 0xFF).unwrap_or(0)) / 255.0,
-        f32::from(u8::try_from((texel >> 8) & 0xFF).unwrap_or(0)) / 255.0,
-        f32::from(u8::try_from(texel & 0xFF).unwrap_or(0)) / 255.0,
-        f32::from(u8::try_from((texel >> 24) & 0xFF).unwrap_or(0)) / 255.0,
-    ]
+    unpack_rgba_unit(texel)
 }
 /// Convert a `0xAARRGGBB` diffuse color to the shader's `[r, g, b, a]` float4.
 #[must_use]

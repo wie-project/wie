@@ -53,6 +53,7 @@ pub use self::vs::{VsOutput, VsProgram, VsVertexInput, run_vertex_shader, vs_inp
 use self::blend::{blend_colors, blend_fragment, depth_test, edge_inside};
 use self::ps::color_to_float4;
 use self::sample::{eval_alpha_op, eval_color_op, sample_texture_mip, stage_arg};
+use crate::color::alpha_byte;
 
 /// `D3DFVF_XYZ`: untransformed position (3 floats).
 pub const D3DFVF_XYZ: u32 = 0x0002;
@@ -622,7 +623,7 @@ pub fn rasterize_triangle(
         && a.color == b.color
         && b.color == c.color;
     let flat_color = a.color & D3DCOLOR_RGB_MASK;
-    let flat_alpha = u8::try_from((a.color >> 24) & 0xFF).unwrap_or(0);
+    let flat_alpha = alpha_byte(a.color);
     // L3 vertex fog: the factor is computed per-vertex from the L1 stage's
     // screen-space z and interpolated across the triangle (Gouraud). Pixel
     // fog (`D3DRS_FOGTABLEMODE` non-NONE) takes precedence and computes the
@@ -745,10 +746,7 @@ pub fn rasterize_triangle(
                             let alpha = eval_alpha_op(stage.alpha_op, alpha_arg1, alpha_arg2);
                             (rgb, alpha)
                         }
-                        _ => (
-                            gcolor & D3DCOLOR_RGB_MASK,
-                            u8::try_from((gcolor >> 24) & 0xFF).unwrap_or(0),
-                        ),
+                        _ => (gcolor & D3DCOLOR_RGB_MASK, alpha_byte(gcolor)),
                     },
                 }
             };
@@ -1228,10 +1226,7 @@ fn shade_fragment(
                 let alpha_arg2 = stage_arg(stage.alpha_arg2, texel, gcolor);
                 (rgb, eval_alpha_op(stage.alpha_op, alpha_arg1, alpha_arg2))
             }
-            _ => (
-                gcolor & D3DCOLOR_RGB_MASK,
-                u8::try_from((gcolor >> 24) & 0xFF).unwrap_or(0),
-            ),
+            _ => (gcolor & D3DCOLOR_RGB_MASK, alpha_byte(gcolor)),
         },
     };
     // L3 alpha test, then fog, before the write (the triangle-path order).

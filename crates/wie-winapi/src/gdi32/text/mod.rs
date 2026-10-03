@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 
+use crate::color::unpack_rgb;
 use crate::gdi32::state::dc_resolved_font;
 use crate::gdi32::{ArgReg, FontEngine, FontKey, IRect, ResolvedFont, read_arg};
 use crate::guest_layout::Rect;
@@ -182,18 +183,12 @@ fn blend_pixel(dst: u32, fg: u32, alpha: u8) -> u32 {
         return fg & 0x00FF_FFFF;
     }
     let inv = 255_u32.saturating_sub(a);
-    let fr = (fg >> 16) & 0xFF;
-    let fg_g = (fg >> 8) & 0xFF;
-    let fb = fg & 0xFF;
-    let dr = (dst >> 16) & 0xFF;
-    let dg = (dst >> 8) & 0xFF;
-    let db = dst & 0xFF;
-    let r = fr.saturating_mul(a).saturating_add(dr.saturating_mul(inv)) >> 8;
-    let g = fg_g
-        .saturating_mul(a)
-        .saturating_add(dg.saturating_mul(inv))
-        >> 8;
-    let b = fb.saturating_mul(a).saturating_add(db.saturating_mul(inv)) >> 8;
+    let [fr, fg_g, fb, _] = unpack_rgb(fg);
+    let [dr, dg, db, _] = unpack_rgb(dst);
+    let channel = |f: u32, d: u32| f.saturating_mul(a).saturating_add(d.saturating_mul(inv)) >> 8;
+    let r = channel(fr, dr);
+    let g = channel(fg_g, dg);
+    let b = channel(fb, db);
     (r << 16) | (g << 8) | b
 }
 
@@ -220,9 +215,9 @@ fn blend_pixel(dst: u32, fg: u32, alpha: u8) -> u32 {
 /// property tests below.
 #[inline(never)]
 fn blend_row_surface(dst: &mut [u32], fg: u32, alphas: &[u8]) {
-    let fr = (fg >> 16) & 0xFF;
-    let fg_g = (fg >> 8) & 0xFF;
-    let fb = fg & 0xFF;
+    // Widened to u32 up front: the row math is u32 throughout, and the
+    // previous form kept the widened values in locals for exactly this reason.
+    let [fr, fg_g, fb, _] = unpack_rgb(fg);
     let opaque = fg & 0x00FF_FFFF;
     for (slot, &alpha) in dst.iter_mut().zip(alphas.iter()) {
         let a = u32::from(alpha);
@@ -230,9 +225,7 @@ fn blend_row_surface(dst: &mut [u32], fg: u32, alphas: &[u8]) {
             continue; // transparent — leave the pixel untouched
         }
         let inv = 255_u32.wrapping_sub(a);
-        let dr = (*slot >> 16) & 0xFF;
-        let dg = (*slot >> 8) & 0xFF;
-        let db = *slot & 0xFF;
+        let [dr, dg, db, _] = unpack_rgb(*slot);
         let r = (fr * a + dr * inv) >> 8;
         let g = (fg_g * a + dg * inv) >> 8;
         let b = (fb * a + db * inv) >> 8;
@@ -249,9 +242,7 @@ fn blend_row_surface(dst: &mut [u32], fg: u32, alphas: &[u8]) {
 /// read-modify-write (no intermediate row copy).
 fn blend_row_dib(buf: &mut [u8], fg: u32, alphas: &[u8]) {
     let n = alphas.len().min(buf.len() / 4);
-    let fr = (fg >> 16) & 0xFF;
-    let fg_g = (fg >> 8) & 0xFF;
-    let fb = fg & 0xFF;
+    let [fr, fg_g, fb, _] = unpack_rgb(fg);
     let opaque = fg & 0x00FF_FFFF;
     for (slot, &alpha) in buf[..n.saturating_mul(4)]
         .as_chunks_mut::<4>()
@@ -265,9 +256,7 @@ fn blend_row_dib(buf: &mut [u8], fg: u32, alphas: &[u8]) {
         }
         let inv = 255_u32.wrapping_sub(a);
         let existing = u32::from_le_bytes(*slot);
-        let dr = (existing >> 16) & 0xFF;
-        let dg = (existing >> 8) & 0xFF;
-        let db = existing & 0xFF;
+        let [dr, dg, db, _] = unpack_rgb(existing);
         let r = (fr * a + dr * inv) >> 8;
         let g = (fg_g * a + dg * inv) >> 8;
         let b = (fb * a + db * inv) >> 8;

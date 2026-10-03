@@ -51,7 +51,11 @@ const SBI_SIZE: u64 = 56;
 /// Every `ntdll.dll` export this module dispatches. Census oracle for
 /// `is_export`; must stay in sync with the match arms in [`dispatch_ntdll`]
 /// (enforced by `every_reported_export_dispatches`).
-const NTDL_EXPORTS: &[&str] = &[
+///
+/// `pub(crate)` so the cross-registry census guard (`dispatch_table`'s
+/// `census_tests`) and the ntdll oracle test consume THIS list rather than
+/// keeping a hand-copied twin that silently drifts.
+pub(crate) const NTDL_EXPORTS: &[&str] = &[
     "ntallocatevirtualmemory",
     "ntclose",
     "ntdelayexecution",

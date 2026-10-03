@@ -4,8 +4,8 @@
 
 use anyhow::Result;
 
-use super::button::invalidate_control_rect;
 use super::paint::fill_rect_clipped;
+use super::paint::invalidate_control_rect;
 use super::{
     COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, ControlClassKind, ControlState, Dimension, PaintCtx,
     PaintFont, WHEEL_DELTA, WHEEL_SCROLL_LINES, control_items, control_sel_index, control_state,

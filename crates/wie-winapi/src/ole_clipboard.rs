@@ -364,18 +364,10 @@ fn synthesize_idataobject(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WinApiState;
     use crate::dispatch_table::resolve_winapi_id;
     use crate::fake_va::FakeVa;
-    use crate::sync_obj::SyncState;
-    use crate::thread::ThreadState;
-    use crate::vfs::VolumeConfig;
-    use crate::{
-        DEFAULT_ENVIRONMENT, DllStateMap, FileIoState, HeapState, KernelState, ModuleState,
-        ProcessState, WinApiEnvironment, WinApiState,
-    };
-    use ahash::HashMap;
-    use ahash::HashMapExt;
-    use std::sync::{Arc, Mutex};
+    use crate::state::WinApiEnvironment;
     use wie_cpu::{CpuEngine, IcedCpu, RwxPerms};
 
     const STACK_VA: u64 = 0x100_0000;
@@ -415,78 +407,9 @@ mod tests {
     }
 
     fn winapi_state_default() -> WinApiState {
-        let heap = std::sync::Arc::new(std::sync::Mutex::new(crate::guest_heap::GuestHeap::new(
-            0x2000, 0x10000,
-        )));
-        heap.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .attach_guest_control(0x2000);
-        WinApiState {
-            display: crate::DisplayMetrics::default(),
-            heap_state: HeapState {
-                heap,
-                next_fls_index: 0,
-                fls_slots: Vec::new(),
-                guest_fls_table_va: 0,
-            },
-            file_io: FileIoState {
-                executable_file_size: 0,
-                executable_file_bytes: Arc::new(Vec::new()),
-                executable_file_cursor: 0,
-                next_find_handle: crate::FindFileHandle::from(0),
-                find_handles: Vec::new(),
-                host_file_mounts: Vec::new(),
-                virtual_files: Vec::new(),
-                open_files: HashMap::new(),
-                next_file_handle: crate::FileHandle::from(0),
-                next_resource_handle: crate::ResourceHandle::from(0),
-                resources: Vec::new(),
-                current_directory_wide: Vec::new(),
-                bottle_root: None,
-                volumes: VolumeConfig::default(),
-                guest_file_data_next: 0,
-                guest_io: None,
-                stdin_bytes: Vec::new(),
-                stdin_cursor: 0,
-                stdin_mode: crate::GuestStdinMode::InjectOnly,
-                ucrt_files: HashMap::new(),
-                ucrt_next_file_va: 0x0000_0000_6900_0000,
-                cached_streams: HashMap::new(),
-            },
-            process: ProcessState {
-                last_error: 0,
-                next_registry_key_handle: crate::RegistryKeyHandle::from(0),
-                registry_keys: Vec::new(),
-                main_module_file_name: String::new(),
-                main_module_path: String::new(),
-                main_module_host_dir: None,
-                error_mode: 0,
-                suspended_threads: HashMap::new(),
-                environment: DEFAULT_ENVIRONMENT
-                    .iter()
-                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                    .collect(),
-                main_module_dialogs: Vec::new(),
-                main_module_menus: Vec::new(),
-                main_module_strings: Vec::new(),
-                main_module_accelerators: Vec::new(),
-            },
-            kernel: KernelState {
-                threads: ThreadState::primary(),
-                sync: SyncState::new(),
-                seh_pending: HashMap::new(),
-            },
-            dll_states: DllStateMap::new(),
-            message_queue: Arc::new(Mutex::new(crate::present::MessageQueue::default())),
-            module_state: ModuleState {
-                loaded_modules: HashMap::new(),
-                import_resolver: None,
-                get_proc_address_cache: HashMap::new(),
-                next_module_handle: crate::ModuleHandle::from(
-                    crate::dll_loader::REAL_MODULE_HANDLE_BASE,
-                ),
-            },
-        }
+        // Same as the shared default except the guest heap's control block is
+        // seeded, so `GlobalAlloc`-shaped clipboard paths have a heap.
+        crate::state::tests::winapi_state_default_with_bump_heap()
     }
 
     fn write_regs(cpu: &mut IcedCpu, rcx: u64, rdx: u64, r8: u64, r9: u64) {

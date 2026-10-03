@@ -66,7 +66,15 @@ fn rax_low_i32(rax: u64) -> i32 {
     i32::from_le_bytes(u32::try_from(rax & 0xffff_ffff).unwrap_or(0).to_le_bytes())
 }
 
-fn default_winapi_state() -> WinApiState {
+/// [`winapi_state_default`] plus a seeded guest-heap control block at
+/// `0x2000`, so handlers that reach the heap take their real path instead of
+/// the un-seeded early return.
+///
+/// This is the second of the two *genuine* variants the four duplicated
+/// fixtures had drifted into (the first is `version.rs`, which seeds
+/// `main_module_file_name`/`main_module_path`). Everything else that used to
+/// carry its own copy now derives from one of these two.
+pub(crate) fn winapi_state_default_with_bump_heap() -> WinApiState {
     // Simplified default with a bump heap covering [0x2000, 0x10000).
     let heap = std::sync::Arc::new(std::sync::Mutex::new(GuestHeap::new(0x2000, 0x10000)));
     heap.lock()
@@ -82,8 +90,23 @@ fn default_winapi_state() -> WinApiState {
     }
 }
 
-fn winapi_state_default() -> WinApiState {
-    // This must stay in sync with the fields of WinApiState.
+/// Local alias — the rest of this test tree (and its themed submodules) call
+/// the heap-seeded variant by this name.
+fn default_winapi_state() -> WinApiState {
+    winapi_state_default_with_bump_heap()
+}
+
+/// The shared default `WinApiState` for unit tests across the crate.
+///
+/// This is the ONE definition: every in-crate test fixture that needs a
+/// baseline state starts from this (previously four other files carried their
+/// own copy, and two of them had drifted — see `winapi_state_default_with_*`
+/// for the two genuine variants). Test-only, so it does not ship.
+///
+/// This must stay in sync with the fields of `WinApiState`; when a field is
+/// added here, a missing field is a compile error (the struct has no
+/// `..Default::default()` fallback here by design).
+pub(crate) fn winapi_state_default() -> WinApiState {
     // Only the heap is customised; everything else is default.
     WinApiState {
         display: crate::DisplayMetrics::default(),

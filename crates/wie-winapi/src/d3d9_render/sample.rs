@@ -5,6 +5,7 @@ use super::{
     D3DCOLOR_RGB_MASK, D3DTA_CURRENT, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_WRAP,
     D3DTEXF_LINEAR, D3DTOP_MODULATE, D3DTOP_SELECTARG2,
 };
+use crate::color::{alpha_byte, pack_rgba, unpack_rgba};
 
 /// Maximum number of mip levels a stage carries. A 4096² texture chains to 13
 /// levels, so 16 covers the whole range without the sampler sizing dynamically.
@@ -180,60 +181,31 @@ fn sample_level(
             let b = f32::from(b);
             (a + (b - a) * f).round() as u8
         };
-        let top = [
-            lerp_channel(
-                u8::try_from((t00 >> 16) & 0xFF).unwrap_or(0),
-                u8::try_from((t10 >> 16) & 0xFF).unwrap_or(0),
-                fx,
-            ),
-            lerp_channel(
-                u8::try_from((t00 >> 8) & 0xFF).unwrap_or(0),
-                u8::try_from((t10 >> 8) & 0xFF).unwrap_or(0),
-                fx,
-            ),
-            lerp_channel(
-                u8::try_from(t00 & 0xFF).unwrap_or(0),
-                u8::try_from(t10 & 0xFF).unwrap_or(0),
-                fx,
-            ),
-            lerp_channel(
-                u8::try_from((t00 >> 24) & 0xFF).unwrap_or(0),
-                u8::try_from((t10 >> 24) & 0xFF).unwrap_or(0),
-                fx,
-            ),
-        ];
-        let bottom = [
-            lerp_channel(
-                u8::try_from((t01 >> 16) & 0xFF).unwrap_or(0),
-                u8::try_from((t11 >> 16) & 0xFF).unwrap_or(0),
-                fx,
-            ),
-            lerp_channel(
-                u8::try_from((t01 >> 8) & 0xFF).unwrap_or(0),
-                u8::try_from((t11 >> 8) & 0xFF).unwrap_or(0),
-                fx,
-            ),
-            lerp_channel(
-                u8::try_from(t01 & 0xFF).unwrap_or(0),
-                u8::try_from(t11 & 0xFF).unwrap_or(0),
-                fx,
-            ),
-            lerp_channel(
-                u8::try_from((t01 >> 24) & 0xFF).unwrap_or(0),
-                u8::try_from((t11 >> 24) & 0xFF).unwrap_or(0),
-                fx,
-            ),
-        ];
+        // `lerp_channel` per channel over the two unpacked texels, in RGBA
+        // order (the unpack's own order).
+        let lerp_row = |lo: u32, hi: u32, f: f32| {
+            let [lr, lg, lb, la] = unpack_rgba(lo);
+            let [hr, hg, hb, ha] = unpack_rgba(hi);
+            [
+                lerp_channel(lr, hr, f),
+                lerp_channel(lg, hg, f),
+                lerp_channel(lb, hb, f),
+                lerp_channel(la, ha, f),
+            ]
+        };
+        let top = lerp_row(t00, t10, fx);
+        let bottom = lerp_row(t01, t11, fx);
         let mix = |a: u8, b: u8| {
             let a = f32::from(a);
             let b = f32::from(b);
             (a + (b - a) * fy).round() as u8
         };
-        let r = mix(top[0], bottom[0]);
-        let g = mix(top[1], bottom[1]);
-        let b = mix(top[2], bottom[2]);
-        let a = mix(top[3], bottom[3]);
-        (u32::from(a) << 24) | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+        pack_rgba([
+            mix(top[0], bottom[0]),
+            mix(top[1], bottom[1]),
+            mix(top[2], bottom[2]),
+            mix(top[3], bottom[3]),
+        ])
     } else {
         let x = point_index(u, view.width, stage.addr_u);
         let y = point_index(v, view.height, stage.addr_v);
@@ -333,16 +305,11 @@ pub(super) fn eval_color_op(op: u32, arg1: u32, arg2: u32) -> u32 {
     match op {
         D3DTOP_SELECTARG2 => arg2 & D3DCOLOR_RGB_MASK,
         D3DTOP_MODULATE => {
-            let r = (u32::from(u8::try_from((arg1 >> 16) & 0xFF).unwrap_or(0)))
-                .saturating_mul(u32::from(u8::try_from((arg2 >> 16) & 0xFF).unwrap_or(0)))
-                >> 8;
-            let g = (u32::from(u8::try_from((arg1 >> 8) & 0xFF).unwrap_or(0)))
-                .saturating_mul(u32::from(u8::try_from((arg2 >> 8) & 0xFF).unwrap_or(0)))
-                >> 8;
-            let b = (u32::from(u8::try_from(arg1 & 0xFF).unwrap_or(0)))
-                .saturating_mul(u32::from(u8::try_from(arg2 & 0xFF).unwrap_or(0)))
-                >> 8;
-            (r << 16) | (g << 8) | b
+            // Alpha byte dropped, so unpack RGB only.
+            let [ar, ag, ab, _] = unpack_rgba(arg1);
+            let [br, bg, bb, _] = unpack_rgba(arg2);
+            let channel = |a: u8, b: u8| u32::from(a).saturating_mul(u32::from(b)) >> 8;
+            (channel(ar, br) << 16) | (channel(ag, bg) << 8) | channel(ab, bb)
         }
         _ => arg1 & D3DCOLOR_RGB_MASK,
     }
@@ -353,8 +320,8 @@ pub(super) fn eval_color_op(op: u32, arg1: u32, arg2: u32) -> u32 {
 /// `SELECTARG1` (documented — the common subset policy).
 #[must_use]
 pub(super) fn eval_alpha_op(op: u32, arg1: u32, arg2: u32) -> u8 {
-    let a1 = u8::try_from((arg1 >> 24) & 0xFF).unwrap_or(0);
-    let a2 = u8::try_from((arg2 >> 24) & 0xFF).unwrap_or(0);
+    let a1 = alpha_byte(arg1);
+    let a2 = alpha_byte(arg2);
     match op {
         D3DTOP_SELECTARG2 => a2,
         D3DTOP_MODULATE => {

@@ -203,7 +203,7 @@ type ExportHandler = fn(&mut HandlerContext<'_>) -> Result<WinApiHandlerResult>;
 
 /// Every implemented `wininet.dll` export — the single source shared by
 /// [`dispatch_wininet`] and the census oracle [`is_export`].
-const WININET_EXPORTS: &[(&str, ExportHandler)] = &[
+pub(crate) const WININET_EXPORTS: &[(&str, ExportHandler)] = &[
     ("internetopenw", handle_internet_open_w),
     ("internetopena", handle_internet_open_a),
     ("internetclosehandle", handle_internet_close_handle),

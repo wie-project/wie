@@ -988,78 +988,18 @@ mod tests {
         }
     }
 
+    /// `version.dll` needs `main_module_file_name` / `main_module_path` seeded
+    /// (it reads them via `GetModuleFileName`), which the shared default does
+    /// not do — so this is the shared default plus those two fields.
     fn winapi_state_default() -> WinApiState {
-        use crate::dll_loader;
-        use crate::state::{DllStateMap, FileIoState, HeapState, KernelState, ModuleState};
-        use crate::sync_obj::SyncState;
-        use crate::thread::ThreadState;
-        use ahash::HashMap;
-        use ahash::HashMapExt;
-
+        let base = crate::state::tests::winapi_state_default();
         WinApiState {
-            display: crate::DisplayMetrics::default(),
-            heap_state: HeapState {
-                heap: std::sync::Arc::new(std::sync::Mutex::new(
-                    crate::guest_heap::GuestHeap::new(0x2000, 0x10000),
-                )),
-                next_fls_index: 0,
-                fls_slots: Vec::new(),
-                guest_fls_table_va: 0,
-            },
-            file_io: FileIoState {
-                executable_file_size: 0,
-                executable_file_bytes: std::sync::Arc::new(Vec::new()),
-                executable_file_cursor: 0,
-                next_find_handle: crate::FindFileHandle::from(0),
-                find_handles: Vec::new(),
-                host_file_mounts: Vec::new(),
-                virtual_files: Vec::new(),
-                open_files: HashMap::new(),
-                next_file_handle: crate::FileHandle::from(0),
-                next_resource_handle: crate::ResourceHandle::from(0),
-                resources: Vec::new(),
-                current_directory_wide: Vec::new(),
-                bottle_root: None,
-                volumes: crate::vfs::VolumeConfig::default(),
-                guest_file_data_next: 0,
-                guest_io: None,
-                stdin_bytes: Vec::new(),
-                stdin_cursor: 0,
-                stdin_mode: crate::GuestStdinMode::InjectOnly,
-                ucrt_files: HashMap::new(),
-                ucrt_next_file_va: 0x0000_0000_6900_0000,
-                cached_streams: HashMap::new(),
-            },
             process: ProcessState {
-                last_error: 0,
-                next_registry_key_handle: crate::RegistryKeyHandle::from(0),
-                registry_keys: Vec::new(),
                 main_module_file_name: "app.exe".to_owned(),
                 main_module_path: r"C:\app.exe".to_owned(),
-                main_module_host_dir: None,
-                error_mode: 0,
-                suspended_threads: HashMap::new(),
-                environment: Vec::new(),
-                main_module_dialogs: Vec::new(),
-                main_module_menus: Vec::new(),
-                main_module_strings: Vec::new(),
-                main_module_accelerators: Vec::new(),
+                ..base.process
             },
-            kernel: KernelState {
-                threads: ThreadState::primary(),
-                sync: SyncState::new(),
-                seh_pending: HashMap::new(),
-            },
-            dll_states: DllStateMap::new(),
-            message_queue: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::present::MessageQueue::default(),
-            )),
-            module_state: ModuleState {
-                loaded_modules: HashMap::new(),
-                import_resolver: None,
-                get_proc_address_cache: HashMap::new(),
-                next_module_handle: crate::ModuleHandle::from(dll_loader::REAL_MODULE_HANDLE_BASE),
-            },
+            ..base
         }
     }
 }

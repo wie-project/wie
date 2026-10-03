@@ -30,11 +30,28 @@ const HEAP_CTRL: u64 = 0x2000;
 // sync guard that needs private access to `NTDL_EXPORTS` plus the handler
 // smoke tests.
 
-/// Every reported export must dispatch to a handler (no is_export entry may
-/// dangle). All-zero registers keep every handler on a safe early path, and
-/// the guest-heap bump cursor is seeded so the heap forwards are safe too.
+/// Every reported export must dispatch to a handler (no `NTDL_EXPORTS` entry
+/// may dangle). All-zero registers keep every handler on a safe early path,
+/// and the guest-heap bump cursor is seeded so the heap forwards are safe too.
+///
+/// This also serves as the ntdll oracle contract that used to be duplicated
+/// out to `tests/api_sets.rs` as a hand-copied `NTDL_EXPORTS` twin; importing
+/// [`NTDL_EXPORTS`] here means the two can no longer drift.
 #[test]
 fn every_reported_export_dispatches() {
+    for name in NTDL_EXPORTS {
+        assert!(
+            super::is_export(name),
+            "{name} must be reported by is_export"
+        );
+        assert!(
+            crate::is_winapi_implemented("ntdll.dll", name),
+            "ntdll.dll!{name} must resolve through the dispatch oracle"
+        );
+    }
+    assert!(super::is_export("NtClose"));
+    assert!(crate::is_winapi_implemented("ntdll.dll", "NtClose"));
+
     let mut engine = test_engine();
     engine
         .mem_write(HEAP_CTRL, &HEAP_CTRL.to_le_bytes())
