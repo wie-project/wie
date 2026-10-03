@@ -15,7 +15,7 @@ use wie_winapi::{WinApiId, encode_alias};
 
 /// Guest `MultiByteToWideChar` helper placement for the single-byte path.
 #[derive(Debug, Clone)]
-pub struct GuestMbwcConfig {
+pub(crate) struct GuestMbwcConfig {
     /// Guest VA of the in-guest expand helper body.
     pub impl_va: u64,
     /// Hooked fake VA the helper jumps to for multi-byte pages.
@@ -24,7 +24,7 @@ pub struct GuestMbwcConfig {
 
 impl GuestMbwcConfig {
     #[must_use]
-    pub fn from_layout(layout: &RuntimeMemoryLayout) -> Self {
+    pub(crate) fn from_layout(layout: &RuntimeMemoryLayout) -> Self {
         Self {
             impl_va: layout.guest_mbwc_code.base,
             fallback_va: encode_alias(WinApiId::Kernel32Multibytetowidechar),
@@ -43,10 +43,7 @@ pub(crate) fn install_guest_mbwc(
 
     // Default OFF: per-character expand in Unicorn is slower wall-clock than one
     // host stop + bulk mem_write for WIE's CP_UTF8 traffic. Opt in with WIE_GUEST_MBWC=1.
-    let rewire = matches!(
-        std::env::var("WIE_GUEST_MBWC").as_deref(),
-        Ok("1" | "true" | "on" | "yes")
-    );
+    let rewire = crate::knobs::guest_mbwc_rewire();
     if rewire {
         crate::guest_rewire::FakeApiRewire {
             engine,

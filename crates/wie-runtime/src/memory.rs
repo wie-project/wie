@@ -386,7 +386,7 @@ impl RuntimeMemoryLayout {
     /// The caller re-validates the overridden layout via [`Self::validate`].
     #[must_use]
     pub fn with_env_overrides(mut self) -> Self {
-        if let Ok(raw) = std::env::var("WIE_PROCESS_HEAP_MB") {
+        if let Some(raw) = crate::knobs::process_heap_mb() {
             let trimmed = raw.trim();
             if !trimmed.is_empty() {
                 match trimmed.parse::<u64>() {
@@ -413,7 +413,7 @@ impl RuntimeMemoryLayout {
                 }
             }
         }
-        if let Ok(v) = std::env::var("WIE_NO_HOOK_SLICES") {
+        if let Some(v) = crate::knobs::no_hook_slice_limit() {
             match v.trim().parse::<usize>() {
                 Ok(n) if n > 0 => self.no_hook_slice_limit = n,
                 _ => tracing::warn!(
@@ -507,7 +507,7 @@ pub const PROCESS_HEAP_SIZE: usize = DEFAULT_LAYOUT.process_heap.size;
 /// and this is unset there, so CI is unaffected. A pair without `=` is
 /// dropped with a warning.
 fn apply_host_guest_env_overrides(environment: &mut Vec<(String, String)>) {
-    let Some(raw) = std::env::var_os("WIE_GUEST_ENV") else {
+    let Some(raw) = crate::knobs::guest_env_pairs() else {
         return;
     };
     let Some(raw) = raw.to_str() else {
@@ -607,12 +607,12 @@ pub(crate) fn default_winapi_state(
             next_resource_handle: wie_winapi::ResourceHandle::from(0x0000_0000_6300_0000),
             resources: Vec::new(),
             current_directory_wide: process.current_directory.encode_utf16().collect(),
-            bottle_root: wie_winapi::bottle_root_from_env(),
+            bottle_root: crate::knobs::bottle_root_from_env(),
             volumes: {
-                let bottle = wie_winapi::bottle_root_from_env();
-                let drive_d = wie_winapi::drive_d_from_env();
+                let bottle = crate::knobs::bottle_root_from_env();
+                let drive_d = crate::knobs::drive_d_root_from_env();
                 if let Some(ref root) = bottle {
-                    let _ = wie_winapi::seed_default_skeleton(root);
+                    drop(wie_winapi::seed_default_skeleton(root));
                 }
                 wie_winapi::VolumeConfig::from_parts(bottle, drive_d)
             },

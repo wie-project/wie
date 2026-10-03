@@ -40,5 +40,5 @@ fn shell_folders_csidl_and_fileinfo_roundtrip() {
     );
 
     // Cleanup the temp bottle.
-    let _ = std::fs::remove_dir_all(&bottle);
+    drop(std::fs::remove_dir_all(&bottle));
 }

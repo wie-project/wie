@@ -115,8 +115,8 @@ fn vfs_roundtrip_host_d_to_bottle_c_and_back() {
     // Original languages still present after modification.
     assert_utf8_has_en_ru_cjk(out_text, "host output");
 
-    let _ = std::fs::remove_dir_all(&bottle);
-    let _ = std::fs::remove_dir_all(&host_user);
+    drop(std::fs::remove_dir_all(&bottle));
+    drop(std::fs::remove_dir_all(&host_user));
 }
 
 #[test]
@@ -172,8 +172,8 @@ fn vfs_roundtrip_custom_paths_via_guest_flags() {
         "missing RU/CJK stamp: {out_text:?}"
     );
 
-    let _ = std::fs::remove_dir_all(&bottle);
-    let _ = std::fs::remove_dir_all(&host_user);
+    drop(std::fs::remove_dir_all(&bottle));
+    drop(std::fs::remove_dir_all(&host_user));
 }
 
 /// Optional live check against a real macOS user dir when WIE_VFS_DOWNLOADS=1.
@@ -237,9 +237,9 @@ fn vfs_roundtrip_optional_real_downloads() {
     assert!(std::str::from_utf8(&out).unwrap().contains("---WIE_VFS---"));
 
     // Cleanup Downloads artifacts.
-    let _ = std::fs::remove_file(&in_host);
-    let _ = std::fs::remove_file(&out_host);
-    let _ = std::fs::remove_dir_all(&bottle);
+    drop(std::fs::remove_file(&in_host));
+    drop(std::fs::remove_file(&out_host));
+    drop(std::fs::remove_dir_all(&bottle));
 }
 
 fn dirs_downloads() -> Option<PathBuf> {

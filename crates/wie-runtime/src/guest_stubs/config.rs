@@ -120,16 +120,16 @@ impl GuestStubConfig {
 }
 
 /// Metrics table length (SM_* indices fit in a byte for common queries).
-pub const METRICS_COUNT: usize = 256;
+pub(super) const METRICS_COUNT: usize = 256;
 /// SysColor table length (COLOR_* indices used by host handler).
-pub const COLOR_COUNT: usize = 32;
+pub(super) const COLOR_COUNT: usize = 32;
 /// Max UTF-16 code units stored for cwd (excluding NUL).
-pub const CWD_MAX_CHARS: usize = 260;
+pub(super) const CWD_MAX_CHARS: usize = 260;
 
 pub(super) const OFFSET_COLORS: u64 = 0x400;
 const OFFSET_CWD: u64 = 0x500;
 /// Bytes: u32 count + (CWD_MAX_CHARS+1) * u16
-pub const CWD_BLOB_SIZE: usize = 4 + (CWD_MAX_CHARS + 1) * 2;
+pub(super) const CWD_BLOB_SIZE: usize = 4 + (CWD_MAX_CHARS + 1) * 2;
 
 /// LANGID for en-US (Microsoft Learn primary language + sublanguage).
 pub(super) const LANG_EN_US: u32 = 0x0409;

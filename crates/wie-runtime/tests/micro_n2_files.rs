@@ -44,7 +44,7 @@ fn n2_write_and_read_file_in_bottle() {
     assert!(bottle.join("drive_c/Windows/System32").is_dir());
     assert!(bottle.join("drive_c/Users/WIE/AppData/Local/Temp").is_dir());
 
-    let _ = std::fs::remove_dir_all(&bottle);
+    drop(std::fs::remove_dir_all(&bottle));
 }
 
 /// The default Windows folder skeleton, end to end: a fresh bottle (explicit
@@ -72,7 +72,7 @@ fn n2_fresh_bottle_gets_the_full_default_skeleton() {
         );
     }
 
-    let _ = std::fs::remove_dir_all(&bottle);
+    drop(std::fs::remove_dir_all(&bottle));
 }
 
 /// The global-bottle policy, end to end through a real session: a file op
@@ -129,6 +129,6 @@ fn vfs_drive_d_maps_host_tree() {
         wie_winapi::vfs::DRIVE_FIXED
     );
 
-    let _ = std::fs::remove_dir_all(&bottle);
-    let _ = std::fs::remove_dir_all(&drive_d);
+    drop(std::fs::remove_dir_all(&bottle));
+    drop(std::fs::remove_dir_all(&drive_d));
 }

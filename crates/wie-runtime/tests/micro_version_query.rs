@@ -24,5 +24,5 @@ fn version_query_reads_its_own_version_resource() {
         summary.run.termination
     );
 
-    let _ = std::fs::remove_dir_all(&bottle);
+    drop(std::fs::remove_dir_all(&bottle));
 }

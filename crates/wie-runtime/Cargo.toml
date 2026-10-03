@@ -13,3 +13,6 @@ tracing.workspace = true
 wie-pe = { path = "../wie-pe" }
 wie-cpu = { path = "../wie-cpu" }
 wie-winapi = { path = "../wie-winapi" }
+
+[lints]
+workspace = true

@@ -10,3 +10,6 @@ anyhow.workspace = true
 goblin.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

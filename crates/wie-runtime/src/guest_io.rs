@@ -41,15 +41,15 @@ use anyhow::{Context, Result};
 use wie_winapi::{WinApiId, encode_alias};
 
 /// Maximum simultaneously accelerated open files.
-pub const GUEST_IO_MAX_SLOTS: usize = 128;
+pub(crate) const GUEST_IO_MAX_SLOTS: usize = 128;
 
 /// Bytes per slot in the guest-visible table.
 /// handle, data_va, size, cursor, flags — 5 × u64.
-pub const GUEST_IO_SLOT_SIZE: usize = 40;
+pub(crate) const GUEST_IO_SLOT_SIZE: usize = 40;
 
 /// Guest-side I/O services configuration (also stored on `WinApiState` via layout).
 #[derive(Debug, Clone)]
-pub struct GuestIoConfig {
+pub(crate) struct GuestIoConfig {
     /// Guest VA of the handle table (fixed-layout slots).
     pub table_va: u64,
     /// First byte of the guest helper code region.
@@ -74,7 +74,7 @@ pub struct GuestIoConfig {
 
 impl GuestIoConfig {
     #[must_use]
-    pub fn from_layout(layout: &RuntimeMemoryLayout) -> Self {
+    pub(crate) fn from_layout(layout: &RuntimeMemoryLayout) -> Self {
         let code_base = layout.guest_io_code.base;
         Self {
             table_va: layout.guest_io_table.base,
@@ -106,18 +106,18 @@ struct GuestIoRewire {
 fn guest_io_rewire() -> GuestIoRewire {
     // Wall/CPU default: host ReadFile; guest Seek+GetFileSize.
     // WIE_GUEST_IO=all|1 → guest Read too (hybrid large→host); =0 → all host.
-    match std::env::var("WIE_GUEST_IO") {
-        Ok(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => GuestIoRewire {
+    match crate::knobs::guest_io_mode() {
+        Some(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => GuestIoRewire {
             read: false,
             seek: false,
             size: false,
         },
-        Ok(v) if matches!(v.as_str(), "1" | "true" | "on" | "yes" | "all") => GuestIoRewire {
+        Some(v) if matches!(v.as_str(), "1" | "true" | "on" | "yes" | "all") => GuestIoRewire {
             read: true,
             seek: true,
             size: true,
         },
-        Ok(v) => {
+        Some(v) => {
             let lower = v.to_ascii_lowercase();
             let parts: Vec<_> = lower.split([',', '+']).map(str::trim).collect();
             GuestIoRewire {
@@ -126,7 +126,7 @@ fn guest_io_rewire() -> GuestIoRewire {
                 size: parts.iter().any(|p| *p == "size" || *p == "getfilesize"),
             }
         }
-        _ => GuestIoRewire {
+        None => GuestIoRewire {
             read: false,
             seek: true,
             size: true,

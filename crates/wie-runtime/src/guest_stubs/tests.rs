@@ -288,7 +288,7 @@ fn refresh_clock_table_writes_advancing_slots() {
 
     let read_slot = |engine: &mut dyn wie_cpu::CpuEngine, slot: u64| -> u64 {
         let mut buf = [0_u8; 8];
-        let _ = engine.mem_read(layout.clock_table.base.saturating_add(slot), &mut buf);
+        drop(engine.mem_read(layout.clock_table.base.saturating_add(slot), &mut buf));
         u64::from_le_bytes(buf)
     };
 

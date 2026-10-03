@@ -143,7 +143,7 @@ impl<'a> SessionPumpHooks<'a> {
     /// re-enters and consumes the pending write-back.
     fn dispatch_native_bridge<B, P>(
         &self,
-        core: &mut QuantumCore,
+        core: &mut QuantumCore<'_>,
         mut guard: MutexGuard<'_, WinApiState>,
         take_bridge: impl FnOnce(&mut WinApiState) -> Option<B>,
         invoke: impl FnOnce(Option<&B>) -> P,
@@ -206,7 +206,7 @@ impl<'a> SessionPumpHooks<'a> {
     /// slot first, then publish it back. Re-activates the primary like the
     /// bridge arms — a worker may have claimed `active` while the callback ran
     /// on the primary engine without the WinAPI lock.
-    fn publish_last_error_to_guest(&mut self, core: &mut QuantumCore) {
+    fn publish_last_error_to_guest(&mut self, core: &mut QuantumCore<'_>) {
         let primary_tid = self.primary_tid;
         core.with_locked(|engine, st| {
             if st.kernel.threads.active.tid != primary_tid {
@@ -243,7 +243,7 @@ impl<'a> SessionPumpHooks<'a> {
     /// ```
     fn begin_guest_callback(
         &mut self,
-        core: &mut QuantumCore,
+        core: &mut QuantumCore<'_>,
         request: GuestCallbackRequest,
         outer_library: Arc<str>,
         outer_name: Arc<str>,
@@ -277,7 +277,7 @@ impl<'a> SessionPumpHooks<'a> {
     #[allow(clippy::too_many_arguments)] // one arg per Win64 callback slot
     fn begin_guest_enum_callback(
         &mut self,
-        core: &mut QuantumCore,
+        core: &mut QuantumCore<'_>,
         request: GuestCallbackRequest,
         enumeration_id: u64,
         outer_library: Arc<str>,
@@ -311,7 +311,7 @@ impl<'a> SessionPumpHooks<'a> {
     /// Completes the most recent guest WndProc and returns from the outer host API.
     fn complete_guest_callback(
         &mut self,
-        core: &mut QuantumCore,
+        core: &mut QuantumCore<'_>,
     ) -> Result<GuestCallbackCompletion> {
         let pending = self
             .pending_callbacks
@@ -393,7 +393,7 @@ impl<'a> SessionPumpHooks<'a> {
 }
 
 impl QuantumHooks for SessionPumpHooks<'_> {
-    fn prepare_quantum(&mut self, core: &mut QuantumCore) -> Result<usize> {
+    fn prepare_quantum(&mut self, core: &mut QuantumCore<'_>) -> Result<usize> {
         let index = *self.next_api_index;
         *self.next_api_index = self
             .next_api_index
@@ -407,12 +407,15 @@ impl QuantumHooks for SessionPumpHooks<'_> {
         // so a guest busy-waiting on a constant never spins.
         if !wie_winapi::kernel32::clock::clock_is_fixed() {
             let clock_table_va = core.layout().clock_table.base;
-            let _ = crate::guest_stubs::refresh_clock_table(core.engine(), clock_table_va);
+            drop(crate::guest_stubs::refresh_clock_table(
+                core.engine(),
+                clock_table_va,
+            ));
         }
         Ok(index)
     }
 
-    fn prepare_first_quantum(&mut self, core: &mut QuantumCore) -> Result<()> {
+    fn prepare_first_quantum(&mut self, core: &mut QuantumCore<'_>) -> Result<()> {
         // Static-dependency DllMain(PROCESS_ATTACH) init phase: Windows calls
         // each static dep's DllMain in load order (dependencies first) BEFORE
         // the exe entry point. Runs once, on the first quantum, guarded by
@@ -434,7 +437,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
         Ok(())
     }
 
-    fn zero_rip_begin(&mut self, _core: &mut QuantumCore) -> Result<Option<u64>> {
+    fn zero_rip_begin(&mut self, _core: &mut QuantumCore<'_>) -> Result<Option<u64>> {
         if !*self.entry_reached {
             *self.entry_reached = true;
             tracing::info!(
@@ -448,7 +451,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
 
     fn claim_hook_locked(
         &mut self,
-        core: &mut QuantumCore,
+        core: &mut QuantumCore<'_>,
         _st: &mut WinApiState,
         address: u64,
     ) -> Result<Option<Step>> {
@@ -501,7 +504,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
 
     fn on_callback_return(
         &mut self,
-        core: &mut QuantumCore,
+        core: &mut QuantumCore<'_>,
         guard: MutexGuard<'_, WinApiState>,
         _address: u64,
         api_index: usize,
@@ -538,7 +541,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
 
     fn on_seh_continue(
         &mut self,
-        _core: &mut QuantumCore,
+        _core: &mut QuantumCore<'_>,
         api_index: usize,
         address: u64,
         return_value: u64,
@@ -556,7 +559,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
         });
     }
 
-    fn on_no_hook(&mut self, core: &mut QuantumCore, begin: u64) -> Result<Step> {
+    fn on_no_hook(&mut self, core: &mut QuantumCore<'_>, begin: u64) -> Result<Step> {
         let no_hook_limit = core.layout().no_hook_slice_limit;
         *self.no_hook_slices = self
             .no_hook_slices
@@ -603,7 +606,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
 
     fn on_run_error(
         &mut self,
-        core: &mut QuantumCore,
+        core: &mut QuantumCore<'_>,
         error: &CpuError,
         api_index: usize,
     ) -> Result<Step> {
@@ -636,18 +639,18 @@ impl QuantumHooks for SessionPumpHooks<'_> {
         self.profile_enabled
     }
 
-    fn on_emu_time(&mut self, _core: &mut QuantumCore, ns: u128) {
+    fn on_emu_time(&mut self, _core: &mut QuantumCore<'_>, ns: u128) {
         self.profile.add_emu_ns(ns);
     }
 
-    fn on_resolved(&mut self, _core: &mut QuantumCore, ns: u128) {
+    fn on_resolved(&mut self, _core: &mut QuantumCore<'_>, ns: u128) {
         self.profile.add_resolve_ns(ns);
         self.profile.inc_host_stops();
     }
 
     fn dispatch(
         &mut self,
-        core: &mut QuantumCore,
+        core: &mut QuantumCore<'_>,
         mut guard: MutexGuard<'_, WinApiState>,
         resolved: &ResolvedFakeApi,
         hook_address: u64,
@@ -1436,7 +1439,7 @@ impl super::RuntimeSession {
                     break 'outer;
                 }
                 Step::Park(reason) => {
-                    if crate::mt_runtime::mt_debug() {
+                    if crate::knobs::mt_debug() {
                         match reason {
                             HostParkReason::WaitObject { handle, timeout_ms } => {
                                 tracing::error!(
@@ -1476,7 +1479,7 @@ impl super::RuntimeSession {
                             // Detach waitable object, wait **outside** process
                             // locks so workers can ExitThread / SetEvent /
                             // CreateThread.
-                            let _ = self.process.drain_spawns();
+                            drop(self.process.drain_spawns());
                             let target = self.process.with_mut(|_, st| {
                                 wie_winapi::kernel32::resolve_wait_target(st, handle)
                             });
@@ -1504,7 +1507,7 @@ impl super::RuntimeSession {
                                                 result = wie_winapi::WAIT_OBJECT_0;
                                                 break;
                                             }
-                                            let _ = self.process.drain_spawns();
+                                            drop(self.process.drain_spawns());
                                             let dying = self
                                                 .process
                                                 .with_winapi_ref(|st| st.kernel.sync.process_dying);
@@ -1584,7 +1587,7 @@ impl super::RuntimeSession {
                             // Drain any pending CreateThread/pthread_create
                             // spawns so the worker can start executing guest
                             // code.
-                            let _ = self.process.drain_spawns();
+                            drop(self.process.drain_spawns());
                             // Event-driven pthread park (Painpoint 1): the
                             // handler queued a PtPark (queue + observed wake
                             // sequence + bounded slice). Block on the inbox
@@ -1613,7 +1616,7 @@ impl super::RuntimeSession {
                                         if dying {
                                             break;
                                         }
-                                        let _ = self.process.drain_spawns();
+                                        drop(self.process.drain_spawns());
                                         inbox.wait_bounded(
                                             Some(deadline),
                                             std::time::Duration::from_millis(50),
@@ -1632,7 +1635,7 @@ impl super::RuntimeSession {
                                 park_residency_ns.saturating_add(t0.elapsed().as_nanos());
                         }
                         HostParkReason::WaitMultiple => {
-                            let _ = self.process.drain_spawns();
+                            drop(self.process.drain_spawns());
                             let req = self
                                 .process
                                 .with_mut(|_, st| st.kernel.sync.multi_wait.remove(&primary_tid));
@@ -1663,7 +1666,7 @@ impl super::RuntimeSession {
                                                         result = code;
                                                         break;
                                                     }
-                                                    let _ = self.process.drain_spawns();
+                                                    drop(self.process.drain_spawns());
                                                     let dying =
                                                         self.process.with_winapi_ref(|st| {
                                                             st.kernel.sync.process_dying

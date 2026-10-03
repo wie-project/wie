@@ -227,7 +227,7 @@ impl RuntimeSession {
     pub fn set_bottle_root(&mut self, root: Option<std::path::PathBuf>) {
         self.process.with_mut(|_, s| {
             if let Some(ref r) = root {
-                let _ = wie_winapi::seed_default_skeleton(r);
+                drop(wie_winapi::seed_default_skeleton(r));
             }
             s.file_io.bottle_root = root.clone();
             s.file_io.volumes.bottle_root = root;
@@ -706,13 +706,10 @@ fn journal_api_return(
     // any subsequent call is a monomorphic branch on an atomic-loaded pointer
     // instead of a full getenv() + 7 wasted register reads (previously the
     // env lookup was per-call, followed by 8 register reads before the
-    // OpenOptions::open would bail on IO error).
-    use std::sync::OnceLock;
-    static JOURNAL_PATH: OnceLock<Option<String>> = OnceLock::new();
-    let Some(path) = JOURNAL_PATH
-        .get_or_init(|| std::env::var("WIE_API_JOURNAL").ok())
-        .as_deref()
-    else {
+    // OpenOptions::open would bail on IO error). The `OnceLock` itself moved to
+    // `crate::knobs::api_journal_path` so the knob's read set stays in one
+    // place; the caching decision is unchanged.
+    let Some(path) = crate::knobs::api_journal_path() else {
         return;
     };
     let rip = engine.read_rip().unwrap_or(0);
@@ -739,7 +736,7 @@ fn journal_api_return(
         .open(path)
     {
         use std::io::Write;
-        let _ = f.write_all(line.as_bytes());
+        drop(f.write_all(line.as_bytes()));
     }
 }
 

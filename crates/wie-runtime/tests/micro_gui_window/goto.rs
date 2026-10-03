@@ -208,9 +208,11 @@ fn goto_dialog_resolves_edit_and_moves_the_caret() {
         handle.post_message(edit_hwnd, WM_CHAR, u64::from(c as u32), 0);
     }
     for _ in 0..20 {
-        let _ = session
-            .run_until_stop(1_000_000)
-            .expect("run after typing line");
+        drop(
+            session
+                .run_until_stop(1_000_000)
+                .expect("run after typing line"),
+        );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     let typed = handle.control_text(edit_hwnd).unwrap_or_default();
@@ -370,9 +372,11 @@ fn goto_cancel_click_closes_dialog_on_first_click() {
     // close must force the edit's next paint to cover the whole client.
     handle.post_message(main_edit, WM_CHAR, u64::from('x' as u32), 0);
     for _ in 0..3 {
-        let _ = session
-            .run_until_stop(1_000_000)
-            .expect("run after band set");
+        drop(
+            session
+                .run_until_stop(1_000_000)
+                .expect("run after band set"),
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
@@ -462,7 +466,7 @@ fn goto_cancel_click_closes_dialog_on_first_click() {
             // Settle the repaint cycle: the owner must erase the dialog
             // region and repaint its controls before the frame is judged.
             for _ in 0..10 {
-                let _ = session.run_until_stop(1_000_000).expect("settle run");
+                drop(session.run_until_stop(1_000_000).expect("settle run"));
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             frame_face = frame_face_count(&session);
@@ -695,7 +699,7 @@ fn goto_prefill_caret_is_at_end_and_typing_appends() {
     // the front.
     handle.post_message(edit_hwnd, WM_CHAR, u64::from('5' as u32), 0);
     for _ in 0..20 {
-        let _ = session.run_until_stop(1_000_000).expect("run after typing");
+        drop(session.run_until_stop(1_000_000).expect("run after typing"));
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert_eq!(
@@ -779,9 +783,11 @@ fn run_goto_flow(
         handle.post_message(edit_hwnd, WM_CHAR, u64::from(c as u32), 0);
     }
     for _ in 0..20 {
-        let _ = session
-            .run_until_stop(1_000_000)
-            .expect("run after typing line");
+        drop(
+            session
+                .run_until_stop(1_000_000)
+                .expect("run after typing line"),
+        );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     let ok_hwnd = session

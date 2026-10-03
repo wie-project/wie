@@ -136,7 +136,7 @@ fn notepad_ignores_unknown_command_ids() {
     let handle = session.guest_handle();
 
     for _ in 0..300 {
-        let _ = session.run_until_stop(1_000_000).expect("run");
+        drop(session.run_until_stop(1_000_000).expect("run"));
         if session.first_guest_window_handle().is_some() {
             break;
         }
@@ -197,7 +197,7 @@ fn notepad_menu_tree_is_stable_across_calls() {
     let mut saw_content_change = false;
     for _ in 0..20 {
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let _ = session.run_until_stop(1_000_000).expect("run");
+        drop(session.run_until_stop(1_000_000).expect("run"));
         let next = handle.window_menu_items();
         if std::sync::Arc::ptr_eq(&first, &next) {
             saw_cache_hit = true;
@@ -601,9 +601,11 @@ fn time_date_replace_all_clears_rows_below_the_date() {
     // command's own pump cycles.
     handle.post_message(edit, EM_SETSEL, 0, u64::from(u32::MAX)); // (0, -1)
     for _ in 0..10 {
-        let _ = session
-            .run_until_stop(1_000_000)
-            .expect("run after select-all");
+        drop(
+            session
+                .run_until_stop(1_000_000)
+                .expect("run after select-all"),
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     handle.post_message(main, WM_COMMAND, u64::from(CMD_TIME_DATE), 0);

@@ -164,7 +164,7 @@ pub fn pe_identity_from_bytes(path: &Path, bytes: &[u8]) -> Result<PeIdentity> {
 }
 
 /// Extract loader identity from a pre-parsed PE without re-parsing.
-pub fn pe_identity_from_parsed(pe: &PE, path: &Path, _bytes: &[u8]) -> Result<PeIdentity> {
+pub fn pe_identity_from_parsed(pe: &PE<'_>, path: &Path, _bytes: &[u8]) -> Result<PeIdentity> {
     ensure_pe64(pe)?;
 
     let image_base = u64::try_from(pe.image_base).context("image base does not fit into u64")?;
@@ -196,7 +196,7 @@ pub fn pe_identity_from_parsed(pe: &PE, path: &Path, _bytes: &[u8]) -> Result<Pe
 }
 
 /// Ensure the image is PE64 (PE32+); PE32 is rejected by this crate.
-fn ensure_pe64(pe: &PE) -> Result<()> {
+fn ensure_pe64(pe: &PE<'_>) -> Result<()> {
     if !pe.is_64 {
         bail!("expected PE64 image, got PE32");
     }
@@ -385,7 +385,7 @@ pub fn pe_map_plan_from_bytes(bytes: &[u8]) -> Result<PeMapPlan> {
 }
 
 /// Private: build map plan from a pre-parsed PE (no re-parse).
-fn pe_map_plan_from_parsed(pe: &PE, bytes: &[u8]) -> Result<PeMapPlan> {
+fn pe_map_plan_from_parsed(pe: &PE<'_>, bytes: &[u8]) -> Result<PeMapPlan> {
     ensure_pe64(pe)?;
     let identity = pe_identity_from_parsed(pe, Path::new("<memory>"), bytes)?;
     let mut sections = Vec::with_capacity(pe.sections.len());
@@ -606,7 +606,7 @@ pub fn inspect_pe_imports_bytes(bytes: &[u8]) -> Result<Vec<PeImportSummary>> {
 }
 
 /// Private: parse imports from a pre-parsed PE (no re-parse).
-fn inspect_pe_imports_from_parsed(pe: &PE, bytes: &[u8]) -> Result<Vec<PeImportSummary>> {
+fn inspect_pe_imports_from_parsed(pe: &PE<'_>, bytes: &[u8]) -> Result<Vec<PeImportSummary>> {
     ensure_pe64(pe)?;
 
     let image_base = u64::try_from(pe.image_base).context("image base does not fit into u64")?;
@@ -926,7 +926,7 @@ where
 /// avoiding a redundant parse when the caller already parsed the PE bytes
 /// (e.g., to extract identity before mapping guest memory).
 pub fn load_pe_direct_from_parsed<F, W>(
-    pe: &PE,
+    pe: &PE<'_>,
     bytes: &[u8],
     image_base: u64,
     image_size: usize,
