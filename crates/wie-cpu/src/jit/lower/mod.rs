@@ -653,12 +653,27 @@ fn empty_chain_refs() -> &'static HashMap<u64, FuncRef> {
 ///   bits of RAX. It also *writes* ZF, so the flags carrier must be present.
 /// * `Xadd` writes flags on every form (like `Add`), so it needs the carrier
 ///   too.
+/// * `Div`/`Idiv` are **one**-operand encodings (`div ecx`) whose dividend is the
+///   implicit `EDX:EAX` pair and whose quotient/remainder land back in
+///   `EAX`/`EDX`. Neither register appears in the decode, so without this the
+///   block divided an `iconst 0` dividend: `div ecx` with EAX=100, ECX=7 gave
+///   EAX=14, EDX=2 on the interpreter and **EAX=0, EDX=0** on the JIT, with no
+///   fault and no diagnostic. `lower_div` reads both through `read_gpr`, so
+///   marking them live here is what makes the pair real.
 ///
 /// This only ever *adds* what an instruction genuinely reads or writes — it
 /// cannot make a live set wider than the ISA requires — so it does not trade
-/// JIT throughput for the fix. `CmpXchg` and `Xadd` are the complete list
-/// today; a new lowerer that consumes an implicit register must add its
-/// mnemonic here, or it will read an `iconst 0`.
+/// JIT throughput for the fix.
+///
+/// **This list is the second half of a decision that starts in `block.rs`.**
+/// `is_lowerable` decides that a mnemonic may be compiled; this function decides
+/// which registers that compilation is allowed to assume. Splitting one decision
+/// across two files is what let `CmpXchg` and `Div`/`Idiv` each ship silent
+/// wrong-code bugs: a mnemonic can be admitted here, lowered against an
+/// `iconst 0` placeholder, and produce garbage with no fault. `implicit_operand_tests`
+/// in `jit/tests` is the cross-file guard — it pins every mnemonic in this table
+/// against the interpreter, so admitting a new implicit-operand mnemonic without
+/// adding it here fails a test rather than a customer's guest.
 fn implicit_operand_completion(
     insns: &[DecodedInsn],
     live: &mut [bool; 16],
@@ -672,6 +687,13 @@ fn implicit_operand_completion(
             }
             Mnemonic::Xadd => {
                 *needs_flags = true; // CF/PF/AF/ZF/SF/OF, as `Add` does
+            }
+            // Dividend EDX:EAX in, quotient EAX / remainder EDX out. The 16-bit
+            // form narrows to DX:AX, which is the same two slots at a smaller
+            // width, so the live-in set is identical.
+            Mnemonic::Div | Mnemonic::Idiv => {
+                live[0] = true; // EAX/AX: low dividend, then quotient
+                live[2] = true; // EDX/DX: high dividend, then remainder
             }
             _ => {}
         }

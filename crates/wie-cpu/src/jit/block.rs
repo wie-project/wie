@@ -269,14 +269,16 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Or
         | Mnemonic::Cmp
         | Mnemonic::Test
-        | Mnemonic::Bt => alu_is_lowerable(instr),
+        | Mnemonic::Bt => alu_is_lowerable(instr) && mem_rmw_is_lowerable(instr),
         // BTS/BTR/BTC are read-modify-write against memory. They are NOT
         // implicitly locked, so only an explicit `LOCK` needs an atomic lowering
         // — see `mem_rmw_is_lowerable`, which is the one place that decides.
         Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
             alu_is_lowerable(instr) && mem_rmw_is_lowerable(instr)
         }
-        Mnemonic::Inc | Mnemonic::Dec | Mnemonic::Not | Mnemonic::Neg => unary_is_lowerable(instr),
+        Mnemonic::Inc | Mnemonic::Dec | Mnemonic::Not | Mnemonic::Neg => {
+            unary_is_lowerable(instr) && mem_rmw_is_lowerable(instr)
+        }
         Mnemonic::Imul => imul_is_lowerable(instr),
         // Integer div/idiv: 32-bit register or simple-mem divisor (v1).
         // 64-bit stays iced (128-bit RDX:RAX dividend needs i128 helpers).
@@ -302,7 +304,7 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Rol
         | Mnemonic::Ror
         | Mnemonic::Rcl
-        | Mnemonic::Rcr => shift_is_lowerable(instr),
+        | Mnemonic::Rcr => shift_is_lowerable(instr) && mem_rmw_is_lowerable(instr),
         // Xadd/Cmpxchg: same operand forms (dst reg/mem, src register). The two
         // differ in atomicity and only in that: `CMPXCHG`'s memory form is
         // implicitly locked on x86-64, `XADD`'s is not. Both decisions come from
@@ -902,7 +904,17 @@ fn mem_rmw_is_lowerable(instr: &Instruction) -> bool {
         return true; // register-only: no memory ordering to provide
     }
     // Explicit LOCK: iced *does* report this prefix byte faithfully, so it is the
-    // right test for the mnemonics that are not implicitly locked.
+    // right test for the mnemonics that are not implicitly locked — which is the
+    // ALU and unary groups, and the only `LOCK`-able forms left. (Not the
+    // shift/rotate group: Intel SDM Vol. 2D's LOCK-able set omits `SHL`/`SHR`/
+    // `SAR`/`ROL`/`ROR`/`RCL`/`RCR`, so iced reports every `F0`-prefixed encoding
+    // of them as `Code::INVALID` and no guest can emit one. `mem_rmw_is_lowerable`
+    // is still applied to them, which costs nothing and keeps a future decoder
+    // relaxation from admitting a non-atomic shift.) The interpreter executes the
+    // ALU/unary locked forms through `atomic_rmw` (`is_locked_mem_rmw` in `exec`),
+    // so refusing them here hands the guest a real atomic RMW instead of a
+    // non-atomic load plus store. A bare `add [rbx], eax` is unaffected: it is not
+    // implicitly locked and carries no prefix, so it still compiles.
     !(instr.has_lock_prefix() || mem_rmw_is_implicitly_locked(instr))
 }
 
