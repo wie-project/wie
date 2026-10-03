@@ -129,7 +129,7 @@ allow_warnings = true
 # alt-m = "job:my-job"
 c = "job:clippy-all" # comment this to have 'c' run clippy on only the default target
 f = "job:fmt"
-s = "job:check-file-sizes"
+s = "job:file-sizes"
 g = "job:nextest"
 w = "job:full-check"
 
@@ -139,8 +139,11 @@ w = "job:full-check"
 command = ["cargo", "fmt", "--all", "--check"]
 need_stdout = false
 
-[jobs.check-file-sizes]
-command = ["./scripts/check-file-sizes.sh"]
+[jobs.file-sizes]
+# Same check_file_sizes() function `full-check` runs, via the single entry
+# point. Kept as a separate job because bacon re-runs on every keystroke and the
+# full gate builds the workspace and runs 1,900 tests; this is the ~1s subset.
+command = ["./scripts/check.sh", "--only", "file-sizes"]
 need_stdout = true
 
 [jobs.full-check]

@@ -129,10 +129,11 @@ static int selftest_enabled(void) {
     char buf[16];
     DWORD n = GetEnvironmentVariableA("WIE_SELFTEST", buf, sizeof(buf));
     // Mode 1 = scripted self-test (auto-quits after TIMER_TICKS_MIN ticks).
-    // Mode 2 = continuous-present mode for the Wave 2 acceptance capture:
+    // Mode 2 = continuous-present mode for the acceptance capture:
     // every check still runs, but the WM_TIMER loop never quits, so the
     // session presents frames until the host's SIGINT profile watchdog ends
-    // it (see scripts/acceptance-wave2.sh).
+    // it (WIE_RUNTIME_PROFILE=1 ./target/release/wie run gui_d3d9.exe --gui,
+    // with the watchdog stopping the session; see docs/RUNBOOK.md).
     if (n == 1 && buf[0] >= '1' && buf[0] <= '2') {
         return buf[0] - '0';
     }

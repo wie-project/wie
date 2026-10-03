@@ -24,12 +24,15 @@
 //! terminating workload here ends by jumping to an `UNTIL` sentinel VA the
 //! host loop checks, or by a conditional back-edge whose count runs out.
 //!
-//! Regression workflow (scripts/bench-gate.sh):
+//! Regression workflow: compare criterion output across trees yourself —
+//! there is no automated threshold today. `docs/RUNBOOK.md` records that gap.
 //! ```text
-//!   ./scripts/bench-gate.sh save main          # on a known-good tree
+//!   cargo bench -p wie-cpu                 # on a known-good tree, save the numbers
 //!   ...make changes...
-//!   ./scripts/bench-gate.sh check main 10      # fail if median regressed >10%
+//!   cargo bench -p wie-cpu                 # compare medians by eye
 //! ```
+//! Note that criterion timings are only meaningful on a quiet host; a loaded
+//! machine inflates every measurement.
 
 use std::hint::black_box;
 
