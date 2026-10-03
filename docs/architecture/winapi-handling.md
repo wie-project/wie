@@ -52,7 +52,9 @@ Handler conventions:
 
 ## The dispatch table
 
-`WinApiId` is a dense `#[repr(u16)]` enum — 507 variants, discriminant = dispatch index. The file is **maintained by hand** (the old generator script is gone): adding an API means a variant, a dispatch arm, the handler in the right DLL module, and registration in the fake-VA registry. Two discriminant holes (109/110) mean `WINAPI_ID_COUNT` is derived from the last variant, not `EnumCount`.
+`WinApiId` is a dense `#[repr(u16)]` enum — 510 variants, discriminant = dispatch index. It is **not** maintained by hand: `dispatch_table/decl.rs` declares the whole surface once through the `winapi_ids!` macro, which emits the enum, the hot-path `dispatch_winapi_id` match, and the `(library, export, id)` name rows from a single row, with a compile-time assertion pinning the counts. Adding a dense API is one row plus the handler; fake-VA encoding is derived from the id via `encode_export`, so there is no fake-VA registration step. Two discriminant holes (109/110) mean `WINAPI_ID_COUNT` is derived from the last variant, not `EnumCount`.
+
+The **soft / string-dispatch** path is not single-source. Its export census is ~4 parallel hand-kept lists: the per-DLL name consts in `dispatch_table/names/mod.rs`, `is_winapi_library`, `PREPLANTED_SOFT_APIS`, `DYNAMIC_FAKE_APIS` (`dynamic_apis.rs`), and per-DLL `*_EXPORTS` in `urlmon.rs` / `wininet.rs` / `ntdll.rs` / `opengl32.rs`. Adding a soft API means the handler, its dispatch arm, and the relevant census list — missing the arm is a hard guest stop at `bail!("unsupported WinAPI call: …")`, missing only a census row degrades `wie inspect` output silently.
 
 `GetProcAddress`-resolvable APIs live in `dynamic_apis.rs`: `PREPLANTED_SOFT_APIS` are stable-index soft slots (order is ABI — append only). The `Interlocked*` family has **no handler at all** — it resolves entirely through soft slots.
 

@@ -11,7 +11,7 @@ contract, and where each tier runs.
 
 | Tier | Command | What it covers | Where it runs |
 | --- | --- | --- | --- |
-| **Fast lane** | `./scripts/test-fast.sh` | whole workspace suite minus the two slow groups (`gui`, `guest` — the `micro_*`, `clock_stub` and `idle_park_wake` test binaries) | inner dev loop, every save |
+| **Fast lane** | `cargo nextest run --profile fast` | whole workspace suite minus the two slow groups (`gui`, `guest` — the `micro_*`, `clock_stub` and `idle_park_wake` test binaries) | inner dev loop, every save |
 | **Full gate** | `./scripts/check.sh` | file sizes, `cargo fmt --all --check`, advisory clippy, the FULL `cargo nextest run --workspace` (slow groups included), `make -C micro-exes`, `scripts/run-micro-suite.sh` | **authoritative pre-PR gate** — locally and as the CI `check` job |
 | **Nightly axes** | `./scripts/run-micro-suite.sh all --matrix` (plus the slow groups by hand) | the same guests re-run under `WIE_JIT_MEM=slow`, `WIE_JIT_MEM=pin` and `WIE_CPU=iced`; the full ~70-exe data-driven sweep; the 40 s fixed-window GUI harnesses | not on the push path — run before touching memory lowering, JIT chaining or CPU dispatch, and the target for a future scheduled job |
 
@@ -183,7 +183,7 @@ mechanism and the table.
 
 `.github/workflows/ci.yml`, one job on `macos-latest`, in order: checkout →
 Rust → cargo cache → nextest → mingw-w64 (+ `--version` probes) →
-`cargo fmt --all --check` → `check-file-sizes.sh` → advisory clippy →
+`cargo fmt --all --check` → `./scripts/check.sh --only file-sizes` → advisory clippy →
 `make -C micro-exes` → `cargo nextest run --workspace` →
 `cargo build -p wie-cli --release` → `scripts/run-micro-suite.sh` for
 `console_tests`, `pthread_tests`, `cpp_exes`, `dll_tests`.
