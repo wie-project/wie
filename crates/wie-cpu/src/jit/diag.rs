@@ -190,18 +190,22 @@ fn dump_opcode_histogram() {
     }
 }
 
-/// Render the sampled iced-residue opcode histogram as report lines.
+/// Render the opcode-residue histogram as report lines.
 ///
 /// Buckets are keyed by the iced-x86 mnemonic discriminant; names are
 /// resolved through `Mnemonic::try_from`. Top 60 shown, like
-/// [`crate::exec::dump_iced_counters`], but sampled (every 64th step) so it
-/// can stay on for whole-session profiling. Empty when the gate is off or no
-/// samples were taken.
+/// [`crate::exec::dump_iced_counters`]. Two producers feed the same buckets
+/// with different sampling, so the header states both: iced residue is
+/// sampled (every [`pipeline::OPCODE_SAMPLE_EVERY`]th step) to stay on for
+/// whole-session profiling, while JIT rejections are counted once per block —
+/// a rejected block is compiled at most once per VA, so sampling there would
+/// hide the signal. Empty when the gate is off or no samples were taken.
 fn opcode_histogram_lines() -> Vec<String> {
     let samples = pipeline::OPCODE_SAMPLES.load(std::sync::atomic::Ordering::Relaxed);
     crate::exec::render_mnemonic_histogram(&pipeline::OPCODE_HISTO, true, |total| {
         format!(
-            "--- jit iced-residue opcode histogram (sampled 1/{}: {samples} samples, total={total}) ---",
+            "--- jit opcode-residue histogram (iced residue sampled 1/{}, \
+             jit rejections recorded per rejected block, {samples} iced samples, total={total}) ---",
             pipeline::OPCODE_SAMPLE_EVERY
         )
     })

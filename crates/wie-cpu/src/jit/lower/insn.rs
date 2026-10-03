@@ -29,9 +29,12 @@ use super::sse_fp::{
 use super::{SseBit, lower_cmov, lower_setcc, lower_shift_lazy};
 
 use crate::exec::{self};
+use crate::jit::config::JitConfig;
+use crate::jit::pipeline::OPCODE_HISTO;
 use crate::regs::Rflags;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, Mnemonic};
+use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy)]
 pub(super) enum ShiftKind {
@@ -834,6 +837,21 @@ pub(super) fn lower_insn(
             exec::SseCvtOp::Cvtss2sd,
             4,
         ),
-        other => Err(format!("not lowerable {other:?}")),
+        // Bucket JIT-unlowerable mnemonics into the SAME histogram the iced
+        // residue feeds, so one `WIE_JIT_OPCODE_HISTO=1` report shows both
+        // residues — a mnemonic the JIT can never lower is otherwise a silent
+        // permanent `mark_never` (pipeline `mark_never`), running at interpreter
+        // speed forever with no signal. Deliberately does NOT bump
+        // `OPCODE_SAMPLES`: that counter is the 1/64 denominator, and a
+        // rejected block is compiled at most once per VA, so sampling here
+        // would hide the signal it exists to surface.
+        other => {
+            if JitConfig::get().opcode_hist_enabled()
+                && let Some(bucket) = OPCODE_HISTO.get(other as usize)
+            {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(format!("not lowerable {other:?}"))
+        }
     }
 }
