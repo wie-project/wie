@@ -25,7 +25,7 @@ static REJECTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 pub(super) const BOOT_MODE_INSNS: u64 = 5_000_000;
 use super::config::{BG_QUEUE_CAP, JitConfig};
 use super::engine::JitEngine;
-use super::fast_api::FastApiKind;
+use super::fast_api::{FastApiKind, LargeFreeList};
 use super::gen_tlb::GenTlb;
 use super::lower::{
     self, CHAIN_SLOTS, CompiledBlock, MemPin, PIN_SLOTS, STICKY_WAYS, TLB_EMPTY, TLB_SETS,
@@ -331,6 +331,17 @@ pub struct JitShared {
     /// the worker lowers calls exactly like the inline path would. Shared as an
     /// `Arc<[_]>` so each background job pays a refcount bump, not a Vec clone.
     pub bg_fast_api: Mutex<Arc<[(u64, FastApiKind)]>>,
+    /// Guest heap layout for the UCRT `malloc`/`free` fast path, as
+    /// `[ctrl_va, base, end]` (see [`JitHeapLayout`](super::JitHeapLayout)).
+    ///
+    /// Written once by `JitCpu::configure_fast_path` at session init and read
+    /// by every `run_compiled` on every engine, so it is `AtomicU64` here even
+    /// though the per-frame copy on [`JitCtx`](super::lower::JitCtx) is a plain
+    /// `u64`: the copy needs no atomicity (the frame owns the context
+    /// exclusively), but the publish must not race a running frame. This is
+    /// also the reason the layout is per-`JitShared` (per session) rather than
+    /// a process global — see [`Self::bg_fast_api`] for the same pattern.
+    pub heap: [AtomicU64; 3],
     /// Lock-free background-compile timing (worker writes, per-thread
     /// snapshots read via [`super::JitCpu::stats`]).
     pub bg_compile: BgCompileProfile,
@@ -417,6 +428,7 @@ impl JitShared {
             chain_epoch_bumps: AtomicU64::new(0),
             bg_compiles: AtomicU64::new(0),
             bg_fast_api: Mutex::new(Arc::from(Vec::new())),
+            heap: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             bg_compile: BgCompileProfile::default(),
             bg_queue_depth: AtomicU64::new(0),
             tier_plan: Mutex::new(tier_plan),
@@ -1197,6 +1209,21 @@ pub struct PerThreadJitState {
     /// cell carries the threshold so a later timeout can double it for
     /// cooldown hysteresis). Owned by the thread; no synchronization needed.
     pub pending_promote_thr: u32,
+    /// Host-side large free list for the UCRT `malloc`/`free` fast path when
+    /// size > [`LARGE_THRESHOLD`](crate::guest_layout::LARGE_THRESHOLD), as
+    /// `(payload_va, size)` pairs.
+    ///
+    /// Per ENGINE, not per process. The guest control block only stores
+    /// size-class heads, so large blocks need a host list (the same role as
+    /// `GuestHeap::large_free` on the WinAPI path) — but a process-wide one is
+    /// wrong for two reasons: its VAs are heap-region relative, so a second
+    /// session's `configure_fast_path` would have to clear the first session's
+    /// live blocks, and clearing them re-bump-allocates memory that is still
+    /// handed out. Being per-engine also removes the `Mutex` from the
+    /// large-alloc/free path, which a `static` required. No `Sync` needed: the
+    /// list is reached only from this engine's own `run_compiled` frames, and
+    /// the engine is owned by exactly one host thread.
+    pub large_free: LargeFreeList,
 }
 
 // SAFETY: TLB/pin raw pointers are non-owning views of guest mmap arenas.
@@ -1233,6 +1260,7 @@ impl PerThreadJitState {
             shadow_ret: [0; lower::SHADOW_DEPTH],
             opcode_sample_i: 0,
             pending_promote_thr: 0,
+            large_free: LargeFreeList::new(),
         }
     }
 }

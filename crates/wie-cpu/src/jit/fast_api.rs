@@ -5,14 +5,13 @@
 //! loop (saves most of the CRT startup / `printf` path stops).
 
 use super::lower::JitCtx;
+use super::trampolines::ctx_mut;
 use crate::guest_layout::{
     CRT_FILE_STDERR as FILE_STDERR, CRT_FILE_STDIN as FILE_STDIN, CRT_FILE_STDOUT as FILE_STDOUT,
     HEAP_BLOCK_HEADER_SIZE, HEAP_CTRL_BUMP_OFFSET, HEAP_CTRL_HEAD_BASE, HEAP_CTRL_HEAD_STRIDE,
     HEAP_PAYLOAD_ALIGN, LARGE_THRESHOLD, SIZE_CLASSES,
 };
 use crate::mem::GuestMemory;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Which UCRT/CRT import to accelerate from JIT code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -86,38 +85,66 @@ pub struct JitFastPathConfig {
     pub pairs: Vec<(u64, FastApiKind)>,
 }
 
-// Process-wide heap layout for host helpers (set once per session).
-static HEAP_CTRL: AtomicU64 = AtomicU64::new(0);
-static HEAP_BASE: AtomicU64 = AtomicU64::new(0);
-static HEAP_END: AtomicU64 = AtomicU64::new(0);
-
 // FILE* cookies (`FILE_STDIN/OUT/ERR`) and size-class ladder
 // (`SIZE_CLASSES`/`LARGE_THRESHOLD`) are re-exported from
 // [`crate::guest_layout`], the shared home kept in lockstep with
 // `wie_winapi::ucrt` and `wie_winapi::guest_heap`.
+//
+// The guest heap *layout* and the large free list deliberately do NOT live in
+// process globals, unlike those constants: they are mutable per-session state,
+// and the consumers are per-guest-thread Cranelift import symbols. A `static`
+// made every engine in the process — including a second `RuntimeSession`'s —
+// read the last-installed layout and share one free list. They now live on
+// [`JitCtx`](super::lower::JitCtx) and
+// [`PerThreadJitState`](super::PerThreadJitState) respectively; see
+// [`JitCpu::configure_fast_path`](super::JitCpu::configure_fast_path) for the
+// publish.
 
-/// Host-side large free list for JIT `malloc`/`free` when size > [`LARGE_THRESHOLD`].
-/// Guest control block only stores size-class heads; large blocks need a host list
-/// (same role as `GuestHeap::large_free` on the WinAPI path).
-static LARGE_FREE: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+/// Host-side large free list for the UCRT `malloc`/`free` fast path when size
+/// > [`LARGE_THRESHOLD`], as `(payload_va, size)` pairs.
+///
+/// Guest control block only stores size-class heads; large blocks need a host
+/// list (same role as `GuestHeap::large_free` on the WinAPI path). One list per
+/// ENGINE, owned by [`PerThreadJitState`](super::PerThreadJitState) and reached
+/// from a running frame through [`JitCtx::large_free`] — so it outlives any one
+/// frame, needs no `Mutex`, and cannot be wiped by another session's init.
+pub(super) type LargeFreeList = Vec<(u64, u64)>;
 
-/// Install heap layout for JIT UCRT helpers (and optionally the VA map is kept on `JitCpu`).
-pub(super) fn install_heap_layout(heap: JitHeapLayout) {
-    HEAP_CTRL.store(heap.ctrl_va, Ordering::Relaxed);
-    HEAP_BASE.store(heap.base, Ordering::Relaxed);
-    HEAP_END.store(heap.end, Ordering::Relaxed);
-    // New session → discard stale large freelist entries (VAs are heap-region relative).
-    if let Ok(mut list) = LARGE_FREE.lock() {
-        list.clear();
+/// Heap layout for this engine's session, read from the running `JitCtx`.
+/// Strictly cheaper than the process statics it replaces: three plain loads
+/// from a struct already on the native stack, versus three `Relaxed` atomic
+/// loads of cache lines shared by every guest thread.
+#[inline]
+fn heap_layout(ctx: &JitCtx) -> JitHeapLayout {
+    JitHeapLayout {
+        ctrl_va: ctx.heap_ctrl_va,
+        base: ctx.heap_base,
+        end: ctx.heap_end,
     }
 }
 
-fn heap_layout() -> JitHeapLayout {
-    JitHeapLayout {
-        ctrl_va: HEAP_CTRL.load(Ordering::Relaxed),
-        base: HEAP_BASE.load(Ordering::Relaxed),
-        end: HEAP_END.load(Ordering::Relaxed),
-    }
+/// Borrow this engine's large free list for the duration of one native frame.
+///
+/// Takes the POINTER, not the context, and returns an unconstrained lifetime.
+/// That is deliberate: the caller already holds a `&mut GuestMemory` reborrowed
+/// from `ctx` via [`mem_mut`], and the two pointees are disjoint fields
+/// (`GuestMemory` vs `LargeFreeList`). Handing the pointer across keeps the
+/// borrow checker from having to see through the `*mut` indirection, so both
+/// can be live at once without a false alias — and it keeps the `unsafe` claim
+/// in one place, exactly as [`mem_mut`] does for `ctx.mem`.
+///
+/// The invariant this relies on: the pointer is always
+/// [`JitCtx::large_free`], set by `run_compiled` from `&mut self.thread`,
+/// which is not touched again until the frame returns. Both `wie_ucrt_malloc`
+/// and `wie_ucrt_free` read it out of their own context and pass it straight
+/// here, so no other value can reach this function.
+#[inline]
+fn large_free_mut<'a>(ptr: *mut LargeFreeList) -> &'a mut LargeFreeList {
+    // SAFETY: `ptr` is the running frame's own context field, installed by
+    // `run_compiled` from `&mut self.thread` and live and unaliased for the
+    // whole native frame — the same one claim `ctx_mut` makes for the context
+    // itself. The pointee is disjoint from the `ctx.mem` the caller holds.
+    unsafe { &mut *ptr }
 }
 
 fn mem_mut(ctx: &mut JitCtx) -> &mut GuestMemory {
@@ -187,11 +214,15 @@ fn find_large_fit(list: &[(u64, u64)], need: u64) -> Option<usize> {
     best.map(|(i, _)| i)
 }
 
-/// Large allocation: best-fit on host freelist, else bump (mirrors `GuestHeap`).
-fn large_alloc(mem: &mut GuestMemory, heap: &JitHeapLayout, rounded: u64) -> u64 {
-    if let Ok(mut list) = LARGE_FREE.lock()
-        && let Some(best_i) = find_large_fit(&list, rounded)
-    {
+/// Large allocation: best-fit on this engine's free list, else bump (mirrors
+/// `GuestHeap`).
+fn large_alloc(
+    mem: &mut GuestMemory,
+    list: &mut LargeFreeList,
+    heap: &JitHeapLayout,
+    rounded: u64,
+) -> u64 {
+    if let Some(best_i) = find_large_fit(list, rounded) {
         let (addr, size) = list.swap_remove(best_i);
         if size >= rounded.saturating_add(LARGE_THRESHOLD) {
             let residual_addr = addr.saturating_add(rounded);
@@ -206,26 +237,35 @@ fn large_alloc(mem: &mut GuestMemory, heap: &JitHeapLayout, rounded: u64) -> u64
     bump_alloc(mem, heap, rounded)
 }
 
+// SAFETY: the `wie_ucrt_*` helpers below are Cranelift import symbols, entered
+// only from `JitCpu::run_compiled`, which owns the `JitCtx` for the whole native
+// frame. The `unsafe { ctx_mut(ctx) }` in each body is that one claim, discharged
+// by `super::trampolines::ctx_mut` — the single place in the JIT that converts a
+// `*mut JitCtx` into a reference. `mem_mut` below derefs a *different* pointer
+// (`ctx.mem`) and keeps its own SAFETY comment.
+
 /// `malloc(size)` — freelist / bump via guest heap control block.
 pub(super) unsafe extern "C" fn wie_ucrt_malloc(ctx: *mut JitCtx, size: u64) -> u64 {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     if ctx.fault != 0 {
         return 0;
     }
     if size == 0 {
         return 0;
     }
-    let heap = heap_layout();
+    // Read the layout BEFORE `mem_mut` reborrows the context mutably.
+    let heap = heap_layout(ctx);
     if heap.ctrl_va == 0 || heap.base == 0 || heap.end <= heap.base {
         return 0;
     }
+    let large_free = ctx.large_free;
     let mem = mem_mut(ctx);
     let rounded = round_up_size(size);
     if rounded == 0 {
         return 0;
     }
     if rounded > LARGE_THRESHOLD {
-        return large_alloc(mem, &heap, rounded);
+        return large_alloc(mem, large_free_mut(large_free), &heap, rounded);
     }
     let class = size_class_index(rounded);
     let hva = head_va(heap.ctrl_va, class);
@@ -266,17 +306,19 @@ fn bump_alloc(mem: &mut GuestMemory, heap: &JitHeapLayout, rounded: u64) -> u64 
 
 /// `free(ptr)`.
 pub(super) unsafe extern "C" fn wie_ucrt_free(ctx: *mut JitCtx, ptr: u64) {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     if ctx.fault != 0 || ptr == 0 {
         return;
     }
-    let heap = heap_layout();
+    // Read the layout BEFORE `mem_mut` reborrows the context mutably.
+    let heap = heap_layout(ctx);
     if heap.ctrl_va == 0 {
         return;
     }
     if ptr < heap.base || ptr >= heap.end {
         return;
     }
+    let large_free = ctx.large_free;
     let mem = mem_mut(ctx);
     let Some(size) = read_u64(mem, ptr.wrapping_sub(HEAP_BLOCK_HEADER_SIZE)) else {
         return;
@@ -287,9 +329,7 @@ pub(super) unsafe extern "C" fn wie_ucrt_free(ctx: *mut JitCtx, ptr: u64) {
     // Poison header so double-free is a no-op (matches host free_coherent).
     let _ = write_u64(mem, ptr.wrapping_sub(HEAP_BLOCK_HEADER_SIZE), 0);
     if size > LARGE_THRESHOLD {
-        if let Ok(mut list) = LARGE_FREE.lock() {
-            list.push((ptr, size));
-        }
+        large_free_mut(large_free).push((ptr, size));
         return;
     }
     let class = size_class_index(size);
@@ -306,7 +346,7 @@ pub(super) unsafe extern "C" fn wie_ucrt_memcpy(
     src: u64,
     n: u64,
 ) -> u64 {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     if ctx.fault != 0 {
         return dest;
     }
@@ -345,7 +385,7 @@ pub(super) unsafe extern "C" fn wie_ucrt_memcpy(
 
 /// `strlen(s)`.
 pub(super) unsafe extern "C" fn wie_ucrt_strlen(ctx: *mut JitCtx, s: u64) -> u64 {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     if ctx.fault != 0 || s == 0 {
         return 0;
     }
@@ -393,7 +433,7 @@ pub(super) unsafe extern "C" fn wie_ucrt_fwrite(
     stream: u64,
 ) -> u64 {
     const MAX_FWRITE_OUTPUT: usize = 64 * 1024;
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     if ctx.fault != 0 {
         return 0;
     }
