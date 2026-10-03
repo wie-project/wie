@@ -11,7 +11,7 @@ use std::io::{self, Write};
 /// pitch is 64-padded, so it may exceed `width`); rows are read at that
 /// pitch and written packed. The `bitmap_file_header` + `bitmap_info_header`
 /// + pixel data are written directly to `writer`.
-pub fn write_bmp<W: Write>(
+pub(crate) fn write_bmp<W: Write>(
     mut writer: W,
     width: u32,
     height: u32,

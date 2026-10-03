@@ -11,6 +11,19 @@ license.workspace = true
 name = "wie"
 path = "src/main.rs"
 
+# The library target carries every reusable piece of the CLI (argument
+# definitions, run-entry dispatch, command implementations, GUI bridges) so
+# `tests/` can import them; `src/main.rs` is a thin shim over it.
+[lib]
+name = "wie_cli"
+path = "src/lib.rs"
+
+# Opt into the workspace rustc lints (see the root `[workspace.lints.rust]`).
+# `unsafe_code` is `deny`, so every AppKit FFI / `set_var` site in this crate
+# carries an explicit `#[expect(unsafe_code)]` with a `// SAFETY:` comment.
+[lints]
+workspace = true
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
@@ -20,13 +33,6 @@ tracing-subscriber.workspace = true
 wie-pe = { path = "../wie-pe" }
 wie-runtime = { path = "../wie-runtime" }
 wie-winapi = { path = "../wie-winapi" }
-
-# macOS-only policy: winit's default features enable the X11/Wayland backends
-# (Linux-only), which pull x11-dl, wayland-*, sctk, calloop, etc. into the
-# feature graph and lockfile. The macOS backend compiles unconditionally —
-# the only feature it needs is rwh_06 (raw-window-handle 0.6), which wgpu
-# requires to construct its surface from winit's Window.
-winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 
 # macOS application menu bar (guest window menu -> top bar). muda is a safe
 # wrapper over AppKit — no hand-written objc2 lives in this crate anymore.
@@ -43,6 +49,17 @@ winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 # own `util::cast_slice`; bytemuck is wgpu's own replacement and already in the
 # tree as a wgpu dependency).
 [target.'cfg(target_os = "macos")'.dependencies]
+# winit 0.30 selects exactly one platform backend behind a cargo feature.
+# default-features are the X11/Wayland backends (Linux-only) — enabling them
+# would pull x11-dl, wayland-*, sctk, calloop into the feature graph and
+# lockfile. The macOS backend, by contrast, is UNCONDITIONAL (not a feature),
+# so `["rwh_06"]` — which is only the raw-window-handle version wgpu needs to
+# build a surface from winit's Window — is enough here and nowhere else.
+# That is exactly why this entry must be target-gated rather than shared:
+# off-Apple, winit 0.30 finds no platform feature and fails its own build
+#     error: The platform you're compiling for is not supported by winit
+# The gate keeps it out of the non-Apple dependency graph entirely.
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 muda = { version = "0.19.3", default-features = false, features = [] }
 # Native alerts for MessageBoxA/W. default-features off: the defaults are
 # Linux-only extras (wayland + xdg-portal) that only pollute the lockfile and

@@ -59,7 +59,7 @@ fn require_bottle(bottles_dir: &Path, name: &str) -> Result<PathBuf> {
 /// the name and requires the bottle to exist (the same contract as the
 /// existing-bottle subcommands). The root then feeds the run entries exactly
 /// like an explicit `--root`.
-pub(crate) fn resolve_bottle_root(name: &str) -> Result<PathBuf> {
+pub fn resolve_bottle_root(name: &str) -> Result<PathBuf> {
     require_bottle(&bottles_dir(), name)
 }
 
@@ -204,7 +204,7 @@ const AMBIGUITY_LIST_LIMIT: usize = 8;
 ///
 /// No match is an error. Several matches are an ambiguity error listing the
 /// candidate guest paths and suggesting a full `C:\…` path.
-pub(crate) fn resolve_bottle_exe(bottle_root: &Path, arg: &Path) -> Result<PathBuf> {
+pub fn resolve_bottle_exe(bottle_root: &Path, arg: &Path) -> Result<PathBuf> {
     if arg.exists() {
         return Ok(arg.to_path_buf());
     }
@@ -350,7 +350,7 @@ fn bottle_name(bottle_root: &Path) -> String {
 }
 
 /// Entry point for `wie bottle …` (called from `main`).
-pub(crate) fn bottle(command: BottleCommand) -> Result<()> {
+pub fn bottle(command: BottleCommand) -> Result<()> {
     match command {
         BottleCommand::Create { name } => create(&bottles_dir(), &name)?,
         BottleCommand::List => {

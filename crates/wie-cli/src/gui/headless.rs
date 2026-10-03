@@ -29,30 +29,28 @@ pub fn run_screenshot(
     // FS policy: an exe outside the bottle runs from a drive_c copy first
     // (the guest identity's `C:\…` label then maps to a real bottle file,
     // and the staged folder is the process cwd). Only the exe is staged by
-    // default; `--app-dir` names a complete folder instead.
-    let volumes = crate::commands::resolve_volume_config(bottle_root, drive_d_root);
-    let staged = crate::commands::stage_run_source(
+    // default; `--app-dir` names a complete folder instead. The D: bridge is
+    // forwarded like every other entry: staging reads it, so the guest must
+    // see it too.
+    let prepared = crate::commands::prepare_run(
         path,
-        &volumes,
-        crate::commands::StageMode::from_run_entry(app_dir),
+        crate::commands::RunSetup {
+            bottle_root,
+            drive_d_root,
+            stage: crate::commands::StageMode::from_run_entry(app_dir),
+            guest_args,
+        },
     )?;
     let run_t0 = std::time::Instant::now();
+    // The session options carry the forwarded guest argv after the module
+    // name (same entries the GUI/micro entries thread through) so headless
+    // apps that need argv (e.g. Doom Retro's `-iwad`) can be driven by a
+    // screenshot, plus the staged folder's guest current directory.
     let mut session = RuntimeSession::new_with_options(
-        &staged.run_path,
+        &prepared.staged.run_path,
         wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
         wie_runtime::DEFAULT_LAYOUT.with_env_overrides(),
-        wie_runtime::SessionOptions {
-            current_directory: staged.guest_current_directory,
-            // Forward guest argv after the module name (same entries the
-            // GUI/micro entries thread through) so headless apps that need
-            // argv (e.g. Doom Retro's `-iwad`) can be driven by a screenshot.
-            guest_args: guest_args.to_vec(),
-            // The staged root must reach the session (same rationale as the
-            // console/persistent entries): the session would otherwise fall
-            // back to `WIE_ROOT` / the global bottle.
-            bottle_root: bottle_root.map(std::path::Path::to_path_buf),
-            ..wie_runtime::SessionOptions::default()
-        },
+        prepared.session_options,
     )?;
     let handle = session.guest_handle();
     let control = GuiControl::new();

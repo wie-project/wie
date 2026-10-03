@@ -15,7 +15,7 @@ impl TempDir {
     #[allow(clippy::expect_used)] // test scaffolding
     pub(crate) fn new(tag: &str) -> Self {
         let path = std::env::temp_dir().join(format!("wie-test-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
+        drop(std::fs::remove_dir_all(&path));
         std::fs::create_dir_all(&path).expect("create temp dir");
         Self(path)
     }
@@ -48,6 +48,6 @@ impl DerefMut for TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        drop(std::fs::remove_dir_all(&self.0));
     }
 }

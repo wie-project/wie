@@ -18,9 +18,10 @@
 //! the print handler seeds from it) — no host-side carrier needed.
 //!
 //! This module is the GUI integration point: it enables the interactive
-//! policies on the runtime session so [`super::app::run_gui_windowed`] shows
-//! the panels exactly when a real window is on screen, and — on macOS —
-//! registers the native bridges. Headless runs and `trace` keep the default
+//! policies on the runtime session so `gui::app::run_gui_windowed` (the
+//! macOS-only winit entry) shows the panels exactly when a real window is on
+//! screen, and — on macOS — registers the native bridges. Headless runs and
+//! `trace` keep the default
 //! [`wie_winapi::PrintDialogPolicy::Cancel`] / [`wie_winapi::PageSetupDialogPolicy::Cancel`]
 //! policies and never open a panel.
 //!
@@ -64,31 +65,38 @@ pub fn enable_interactive_print_dialogs(_session: &mut RuntimeSession) {}
 
 /// One retained `NSPrintInfo` in the id-table.
 ///
-/// objc2 marks `InteriorMutable` classes like `NSPrintInfo` as !Send to
-/// forbid lock-free cross-thread mutation, but the id-table MUST cross
-/// threads: the bridge inserts the user's `NSPrintInfo` on the main thread
-/// (inside [`objc2_foundation::run_on_main`]) and P3's EndDoc handoff consumes
-/// it later on the guest thread. The owning `Mutex` provides exactly the
-/// serialization objc2 requires, and objc2's `Retained` refcount is atomic
-/// (the Arc-like storage), so transferring the wrapper only moves the
-/// reference. Every dereference of the wrapped object happens while the
-/// owning mutex is held.
+/// objc2 marks `InteriorMutable` classes like `NSPrintInfo` as !Send to forbid
+/// lock-free cross-thread mutation, but the id-table MUST cross threads: the
+/// bridge inserts the user's `NSPrintInfo` on the main thread (inside
+/// [`objc2_foundation::run_on_main`]) and P3's EndDoc handoff consumes it later
+/// on the guest thread.
+///
+/// The guarantee that makes the transfer sound is **main-thread confinement,
+/// not the mutex**. Every construction, insertion, removal and dereference of
+/// the wrapped object happens inside a `run_on_main` closure, so the
+/// `NSPrintInfo` never actually leaves the main thread — it is *moved* between
+/// threads by the table, but only ever *touched* on the main thread. The
+/// `Mutex` serializes access to the table; it does **not** cover the object
+/// after it is removed. `run_native_print_job` removes the entry, releases the
+/// lock, and then dereferences `paperSize()` on the removed value, so a
+/// mutex-based argument would be false.
+///
+/// objc2's `Retained` refcount is atomic (Arc-like storage), so transferring the
+/// wrapper itself mutates nothing.
 #[cfg(target_os = "macos")]
 // The EndDoc handoff consumes this entry (table.remove by print_info_id); the
 // field is read there and written by the print-panel bridge.
-pub(crate) struct PrintInfoEntry(pub(crate) objc2::rc::Retained<objc2_app_kit::NSPrintInfo>);
-// SAFETY: see the type-level justification — the object is only ever touched
-// under the owning `Mutex<PrintInfoTable>`, and the `Retained` refcount is
-// atomic, so the transfer itself mutates nothing.
+pub struct PrintInfoEntry(pub objc2::rc::Retained<objc2_app_kit::NSPrintInfo>);
+// SAFETY: see the type-level justification. The object is only ever created,
+// stored, removed and dereferenced inside a `run_on_main` closure, so it never
+// leaves the main thread; `Retained`'s refcount is atomic, so the transfer
+// mutates nothing. There is deliberately no `Sync` impl: it is not required for
+// `Arc<Mutex<HashMap<u64, PrintInfoEntry>>>: Send` (only `Send` is), and it
+// would license `&PrintInfoEntry` being dereferenced off the main thread with
+// the compiler silent — which is exactly the thing this invariant forbids.
 #[cfg(target_os = "macos")]
 #[expect(unsafe_code)]
 unsafe impl Send for PrintInfoEntry {}
-
-// SAFETY: same as `Send`: every dereference is serialized by the owning
-// mutex, which is the synchronization the !Send marker demanded.
-#[cfg(target_os = "macos")]
-#[expect(unsafe_code)]
-unsafe impl Sync for PrintInfoEntry {}
 
 /// Host-side NSPrintInfo id-table: print-dialog id → the user's `NSPrintInfo`.
 ///

@@ -133,7 +133,7 @@ pub(super) fn show_unparented_ns_alert(caption: &str, text: &str, mb_type: u32) 
             // SAFETY: appends a button to the owned alert; the returned
             // Retained<NSButton> is dropped (the alert retains it).
             unsafe {
-                let _ = alert.addButtonWithTitle(&NSString::from_str(title));
+                drop(alert.addButtonWithTitle(&NSString::from_str(title)));
             }
         }
         // SAFETY: runModal on the main thread (we are inside run_on_main)
