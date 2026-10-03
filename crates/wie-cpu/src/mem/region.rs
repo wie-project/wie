@@ -1,7 +1,12 @@
 //! Software region registry for named guest VA ranges.
 //!
-//! Tracks stack, heap, image, fake API, TEB, etc. with permissions and an
-//! optional host base (filled once an mmap arena is attached).
+//! Tracks stack, heap, image, fake API, TEB, etc. as named layout ranges, with
+//! an optional host base (filled once an mmap arena is attached).
+//!
+//! A region carries **no permissions**. Windows page rights live in
+//! [`crate::mem::protect::PageProtect`] (via [`crate::mem::PageMap`]) and are
+//! enforced by [`crate::mem::GuestMemory`] on every access; nothing here is
+//! consulted.
 
 use crate::RwxPerms;
 
@@ -41,28 +46,30 @@ pub struct GuestRegion {
     pub base: u64,
     /// Size in bytes (page-aligned).
     pub size: usize,
-    /// Permission bits (`RwxPerms::ALL` etc.).
-    pub perms: RwxPerms,
     /// Optional host mapping base once an mmap arena is attached.
     pub host_base: Option<u64>,
 }
 
 impl GuestRegion {
     /// Construct a region without a host base.
+    ///
+    /// `_perms` is accepted and ignored: region permissions were never read by
+    /// any decision (see the module docs). It is kept so the callers in
+    /// `mem/tests.rs` and `wie-runtime` keep compiling; drop the parameter
+    /// once those are updated.
     #[must_use]
     pub fn new(
         name: impl Into<String>,
         kind: RegionKind,
         base: u64,
         size: usize,
-        perms: RwxPerms,
+        _perms: RwxPerms,
     ) -> Self {
         Self {
             name: name.into(),
             kind,
             base,
             size,
-            perms,
             host_base: None,
         }
     }

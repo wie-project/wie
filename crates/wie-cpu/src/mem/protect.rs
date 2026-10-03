@@ -134,6 +134,22 @@ impl PageProtect {
         self.rwx() & crate::perm::WRITE as u8 != 0
     }
 
+    /// Whether a store may be **soft-translated** onto a page with this
+    /// protection — the single definition of the W-on-X rule.
+    ///
+    /// Write is deliberately denied on executable pages: the TLB and the region
+    /// pins hand compiled guest code a raw host pointer, and a store through
+    /// one would silently self-modify code without passing the code-invalidation
+    /// drain in [`crate::mem::GuestMemory::write`]. Every caller that mints such
+    /// a fast pointer must use this, never [`Self::allows_write`].
+    ///
+    /// TLB fill and pin creation only — never on an executed access — so the
+    /// second test is free at run time.
+    #[must_use]
+    pub(crate) fn allow_write_for(self) -> bool {
+        self.allows_write() && !self.allows_execute()
+    }
+
     /// Whether instruction fetch is permitted (bit test on [`Self::rwx`]).
     #[must_use]
     pub fn allows_execute(self) -> bool {
@@ -294,6 +310,41 @@ mod tests {
                 assert_eq!(p.allows(kind), p.rwx() & bit != 0, "{p:?}.allows({kind:?})");
             }
         }
+    }
+
+    /// The W-on-X rule: every executable protection denies the soft-translated
+    /// write path, every non-executable one defers to [`PageProtect::allows_write`].
+    ///
+    /// Pinned here because two fast-pointer paths depend on it — the per-page
+    /// TLB (`mem::rw::page_protect_meta`) and whole-region pins
+    /// (`mem::map::region_pin`). They are now one call to
+    /// [`PageProtect::allow_write_for`]; this test pins the semantics that both
+    /// inherit, so a future "just use `allows_write()`" edit fails here.
+    #[test]
+    fn allow_write_for_denies_writes_on_executable_pages() {
+        let all = [
+            PageProtect::NoAccess,
+            PageProtect::ReadOnly,
+            PageProtect::ReadWrite,
+            PageProtect::Execute,
+            PageProtect::ExecuteRead,
+            PageProtect::ExecuteReadWrite,
+        ];
+        for p in all {
+            if p.allows_execute() {
+                assert!(!p.allow_write_for(), "{p:?} must deny W-on-X");
+            } else {
+                assert_eq!(
+                    p.allow_write_for(),
+                    p.allows_write(),
+                    "{p:?} non-execute must equal allows_write()"
+                );
+            }
+        }
+        // Spelled out, so the rule does not hide behind the loop above.
+        assert!(PageProtect::ExecuteReadWrite.allows_write());
+        assert!(!PageProtect::ExecuteReadWrite.allow_write_for());
+        assert!(PageProtect::ReadWrite.allow_write_for());
     }
 
     /// `rwx()` encodes each variant with the same bits as [`crate::perm`].

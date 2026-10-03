@@ -15,6 +15,31 @@ use crate::guest_layout::TEB_LAST_ERROR_OFFSET;
 use iced_x86::{Mnemonic, OpKind, Register};
 use std::sync::atomic::Ordering;
 
+/// Borrow the live [`JitCtx`] behind a raw host pointer.
+///
+/// This is the **single** place in the JIT that turns a `*mut JitCtx` into a
+/// reference: every micro-stub trampoline below, plus the `wie_ucrt_*` fast-API
+/// helpers in [`super::fast_api`], route through it, so the liveness invariant
+/// is stated once instead of at 17 sites (where it was previously written 5
+/// times and silently assumed 12 more).
+///
+/// # Safety
+///
+/// The caller must guarantee `raw` is non-null and points at a `JitCtx` that
+/// stays alive and is not otherwise borrowed for the whole lifetime `'a`.
+///
+/// That holds at every call site by the [`MicroStub::func`] / Cranelift-import
+/// contract: a stub or fast-API helper is only ever entered from
+/// `JitCpu::run_compiled`, which owns the `JitCtx` for the entire native frame
+/// and does not touch it until the frame returns. The `'a` is not derived from
+/// the raw pointer, so this function must not be used to extend a borrow past
+/// the owning frame.
+#[must_use]
+pub(super) unsafe fn ctx_mut<'a>(raw: *mut JitCtx) -> &'a mut JitCtx {
+    // SAFETY: delegated to the caller — see the `# Safety` contract above.
+    unsafe { &mut *raw }
+}
+
 /// Recognized micro-stub patterns that have a hand-written host trampoline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MicroStub {
@@ -181,17 +206,21 @@ fn tramp_return_imm32_dispatch(imm: u32) -> unsafe extern "C" fn(*mut JitCtx) {
 }
 
 // SAFETY: each trampoline is only invoked with a live `JitCtx` from `run_compiled`.
+// That invariant is stated once, on `ctx_mut` above; the `unsafe { ctx_mut(ctx) }`
+// call in each body below is exactly that one claim, not 13 restatements of it.
+// The remaining `unsafe` blocks below dereference *other* pointers
+// (`inv_gen_ptr`, `chain_slots`, a chain target, the guest-memory helpers) and
+// keep their own per-site SAFETY comments.
 
 unsafe extern "C" fn tramp_ret(ctx: *mut JitCtx) {
-    // SAFETY: live ctx for block duration.
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     enter_stub(ctx, MicroStub::Ret);
     guest_ret(ctx);
     chain_tail(ctx);
 }
 
 unsafe extern "C" fn tramp_return_zero(ctx: *mut JitCtx) {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     enter_stub(ctx, MicroStub::ReturnZero);
     ctx.gpr[0] = 0;
     guest_ret(ctx);
@@ -199,7 +228,7 @@ unsafe extern "C" fn tramp_return_zero(ctx: *mut JitCtx) {
 }
 
 unsafe extern "C" fn tramp_identity_rcx(ctx: *mut JitCtx) {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     enter_stub(ctx, MicroStub::IdentityRcx);
     ctx.gpr[0] = ctx.gpr[1];
     guest_ret(ctx);
@@ -207,7 +236,7 @@ unsafe extern "C" fn tramp_identity_rcx(ctx: *mut JitCtx) {
 }
 
 unsafe extern "C" fn tramp_return_imm_1(ctx: *mut JitCtx) {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     enter_stub(ctx, MicroStub::ReturnImm32(1));
     ctx.gpr[0] = 1;
     guest_ret(ctx);
@@ -215,7 +244,7 @@ unsafe extern "C" fn tramp_return_imm_1(ctx: *mut JitCtx) {
 }
 
 unsafe extern "C" fn tramp_return_imm_1234(ctx: *mut JitCtx) {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     enter_stub(ctx, MicroStub::ReturnImm32(0x1234));
     ctx.gpr[0] = 0x1234;
     guest_ret(ctx);
@@ -223,7 +252,7 @@ unsafe extern "C" fn tramp_return_imm_1234(ctx: *mut JitCtx) {
 }
 
 unsafe extern "C" fn tramp_return_imm_5678(ctx: *mut JitCtx) {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     enter_stub(ctx, MicroStub::ReturnImm32(0x5678));
     ctx.gpr[0] = 0x5678;
     guest_ret(ctx);
@@ -231,7 +260,7 @@ unsafe extern "C" fn tramp_return_imm_5678(ctx: *mut JitCtx) {
 }
 
 unsafe extern "C" fn tramp_return_imm_12345(ctx: *mut JitCtx) {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     enter_stub(ctx, MicroStub::ReturnImm32(12_345));
     ctx.gpr[0] = 12_345;
     guest_ret(ctx);
@@ -239,7 +268,7 @@ unsafe extern "C" fn tramp_return_imm_12345(ctx: *mut JitCtx) {
 }
 
 unsafe extern "C" fn tramp_return_imm_0409(ctx: *mut JitCtx) {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     enter_stub(ctx, MicroStub::ReturnImm32(0x0409));
     ctx.gpr[0] = 0x0409;
     guest_ret(ctx);
@@ -247,7 +276,7 @@ unsafe extern "C" fn tramp_return_imm_0409(ctx: *mut JitCtx) {
 }
 
 unsafe extern "C" fn tramp_return_imm_437(ctx: *mut JitCtx) {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     enter_stub(ctx, MicroStub::ReturnImm32(437));
     ctx.gpr[0] = 437;
     guest_ret(ctx);
@@ -255,7 +284,7 @@ unsafe extern "C" fn tramp_return_imm_437(ctx: *mut JitCtx) {
 }
 
 unsafe extern "C" fn tramp_return_imm_1252(ctx: *mut JitCtx) {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     enter_stub(ctx, MicroStub::ReturnImm32(1252));
     ctx.gpr[0] = 1252;
     guest_ret(ctx);
@@ -264,7 +293,7 @@ unsafe extern "C" fn tramp_return_imm_1252(ctx: *mut JitCtx) {
 
 /// Fallback for rare imm32: re-decode guest code at entry RIP (ctx.rip before ret).
 unsafe extern "C" fn tramp_return_imm32_generic(ctx: *mut JitCtx) {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     enter_stub(ctx, MicroStub::ReturnImm32(0));
     // Entry RIP was set by run_compiled; body is `b8 imm32 c3`.
     let entry = ctx.rip;
@@ -278,7 +307,7 @@ unsafe extern "C" fn tramp_return_imm32_generic(ctx: *mut JitCtx) {
 }
 
 unsafe extern "C" fn tramp_get_last_error(ctx: *mut JitCtx) {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     enter_stub(ctx, MicroStub::GetLastError);
     // Resolve the LAST-ERROR slot against the engine's bound TEB page: a
     // worker's `gs:[0x68]` stub must read ITS TEB, not the primary's fixed VA.
@@ -293,7 +322,7 @@ unsafe extern "C" fn tramp_get_last_error(ctx: *mut JitCtx) {
 }
 
 unsafe extern "C" fn tramp_set_last_error(ctx: *mut JitCtx) {
-    let ctx = unsafe { &mut *ctx };
+    let ctx = unsafe { ctx_mut(ctx) };
     enter_stub(ctx, MicroStub::SetLastError);
     let ecx = ctx.gpr[1] as u32;
     let last_error_va = ctx.gs_base.wrapping_add(TEB_LAST_ERROR_OFFSET);
@@ -393,7 +422,10 @@ fn chain_tail(ctx: &mut JitCtx) {
     // updating `gpr_dirty_bits` — force full host writeback for this session.
     ctx.gpr_dirty_bits = u64::from(ALL_DIRTY_BITS);
     ctx.chain_depth = ctx.chain_depth.saturating_add(1);
-    // SAFETY: pointer published by chain_table_insert from a finalized block.
+    // SAFETY: pointer published by chain_table_insert from a finalized block,
+    // so the transmuted `f` has this block's `extern "C" fn(*mut JitCtx)`
+    // signature; and the call itself passes the `JitCtx` that `ctx_mut` proved
+    // live for this frame, which `f` (a block or micro-stub) does not retain.
     let f: unsafe extern "C" fn(*mut JitCtx) =
         unsafe { std::mem::transmute(fn_ptr as usize as *const u8) };
     unsafe {
@@ -433,6 +465,8 @@ fn tramp_load_u32(ctx: &mut JitCtx, addr: u64) -> u32 {
 }
 
 fn tramp_store_u32(ctx: &mut JitCtx, addr: u64, value: u32) {
+    // SAFETY: ctx is live (borrowed from the trampoline frame); store helper
+    // matches the Cranelift host import and records any fault in `ctx`.
     unsafe {
         wie_jit_store(std::ptr::from_mut(ctx), addr, 4, u64::from(value), ctx.rip);
     }
