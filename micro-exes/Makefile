@@ -14,9 +14,9 @@ LDFLAGS  := -nostdlib -Wl,--subsystem,console -Wl,--entry,entry
 # Ordinary CRT-linked apps (independent-style): full toolchain defaults.
 CRT_CFLAGS := -O2
 
-.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths sib_copy mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps wininet_http gl_quad dir_watch ole_clip font_enum child_proc spawn_child mbwc_lasterror istextunicode
+.PHONY: all clean heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop chain_hops cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths sib_copy mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes dll_tests game_exes interactive_exes ucrt_coverage gui_exes print_bmp version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps wininet_http gl_quad dir_watch ole_clip font_enum child_proc spawn_child mbwc_lasterror istextunicode
 
-all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps wininet_http gl_quad dir_watch ole_clip font_enum child_proc spawn_child mbwc_lasterror istextunicode
+all: heap_alloc process_ids heap_core write_file read_file modules relative_path crt_hello long_loop chain_hops cpu_math cpu_string cpu_fp winapi_heap cli_args tls_basic cs_reenter thread_create_join cs_two_threads event_handshake interlocked_basic mt_stress vfs_roundtrip rep_lengths mt_contention console_hello console_cells pt_basic pt_cond rand_test snake cpp_exes game_exes interactive_exes dll_tests ucrt_coverage gui_exes version_query crypt_hash setupapi_list dbghelp_stub gdi_alpha ime_noop ws2_echo http_get ole_com shell_folders reg_roundtrip user32_enum user32_char gdi_regions comctl_toolbar winmm_audio msvcrt_gaps wininet_http gl_quad dir_watch ole_clip font_enum child_proc spawn_child mbwc_lasterror istextunicode
 
 $(OUT):
 	mkdir -p $(OUT)
@@ -30,6 +30,7 @@ modules: $(OUT)/modules.exe
 relative_path: $(OUT)/relative_path.exe
 crt_hello: $(OUT)/crt_hello.exe
 long_loop: $(OUT)/long_loop.exe
+chain_hops: $(OUT)/chain_hops.exe
 cpu_math: $(OUT)/cpu_math.exe
 cpu_string: $(OUT)/cpu_string.exe
 cpu_fp: $(OUT)/cpu_fp.exe
@@ -121,6 +122,10 @@ $(OUT)/rand_test.exe: rand_test/main.c | $(OUT)
 	@echo "built $@"
 
 $(OUT)/long_loop.exe: long_loop/main.c | $(OUT)
+	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
+	@echo "built $@"
+
+$(OUT)/chain_hops.exe: chain_hops/main.c | $(OUT)
 	$(MINGW_CC) $(CFLAGS) $(LDFLAGS) -o $@ $< -lkernel32
 	@echo "built $@"
 

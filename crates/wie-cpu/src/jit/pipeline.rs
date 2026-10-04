@@ -1265,6 +1265,10 @@ impl JitCpu {
             // Blocks (and chained successors / micro-stubs) fold their dynamic
             // instruction count in here; read back below.
             insn_acc: 0,
+            // Chain edges taken by this frame and the GPR stores they did.
+            // Folded into `stats.chain` below, like `insn_acc`.
+            chain_hops: 0,
+            chain_store_ops: 0,
             // UCRT malloc/free fast path: this session's heap layout, published
             // from the shared config at init. Plain copies — this frame owns the
             // context exclusively, so no atomicity is needed on the read side
@@ -1285,6 +1289,18 @@ impl JitCpu {
         let dynamic_insns = ctx.insn_acc;
         self.stats.exec.jit_insns = self.stats.exec.jit_insns.saturating_add(dynamic_insns);
         self.shared.record_guest_insns(dynamic_insns);
+        // Chain-edge accounting. Additive per frame: `chain_hops` counts native
+        // transfers to a compiled successor, `chain_store_ops` the GPR slots
+        // their writebacks touched. Never derived from block entries — a
+        // self-looping block takes zero chain hops no matter how many trips it
+        // retires, which is exactly what makes the pair a measurement of the
+        // chain-edge cost rather than of execution volume.
+        self.stats.chain.hops = self.stats.chain.hops.saturating_add(ctx.chain_hops);
+        self.stats.chain.store_ops = self
+            .stats
+            .chain
+            .store_ops
+            .saturating_add(ctx.chain_store_ops);
         self.stats.mem.load_calls = self.stats.mem.load_calls.saturating_add(ctx.load_calls);
         self.stats.mem.store_calls = self.stats.mem.store_calls.saturating_add(ctx.store_calls);
         {

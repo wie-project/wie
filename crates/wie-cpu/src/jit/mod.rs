@@ -184,7 +184,7 @@ pub struct PromoLedger {
 }
 
 /// Direct-chaining health: how often thread chain tables refresh and how
-/// wide each refresh is (G5).
+/// wide each refresh is (G5), plus the runtime chain-edge volume.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ChainStats {
     /// Chain-table resyncs on this thread (one per observed cache-epoch
@@ -198,6 +198,23 @@ pub struct ChainStats {
     /// Shared cache-epoch advances (installs + invalidations), merged from
     /// [`JitShared::chain_epoch_bumps`] by [`JitCpu::stats`].
     pub epoch_bumps: u64,
+    /// Chain edges actually taken: native transfers from one compiled block
+    /// into a compiled successor (direct ref, edge-IC hit or chain-table hit).
+    ///
+    /// Distinct from `resyncs` / `avg_width`, which describe the chain TABLE's
+    /// population and refresh rate, not its hit rate. Zero for a self-looping
+    /// hot block (`micro-exes/long_loop` retires ~10^9 instructions from one
+    /// block and never leaves it), so it isolates the per-edge handoff cost.
+    /// Hops out of hand-written micro-stub trampolines are not counted — a
+    /// lower bound.
+    pub hops: u64,
+    /// GPR slots stored by those [`Self::hops`] edges' `writeback_gprs`
+    /// (`store_ops / hops` = stores per hop, `hops == 0` → 0).
+    ///
+    /// Counts GPR slots only, not the `rflags` slot. This is the quantity the
+    /// store predicate controls, so it is the ceiling for any work that removes
+    /// redundant read-only live-in stores at a chain edge.
+    pub store_ops: u64,
 }
 
 /// Host helper mem-path breakdown for generated-code accesses.
@@ -328,6 +345,8 @@ impl JitStats {
         add(&mut self.chain.resyncs, other.chain.resyncs);
         add(&mut self.chain.resync_entries, other.chain.resync_entries);
         add(&mut self.chain.inline_inserts, other.chain.inline_inserts);
+        add(&mut self.chain.hops, other.chain.hops);
+        add(&mut self.chain.store_ops, other.chain.store_ops);
         // mem: counters add, gauges/peaks take the max
         add(&mut self.mem.load_calls, other.mem.load_calls);
         add(&mut self.mem.store_calls, other.mem.store_calls);

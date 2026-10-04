@@ -381,6 +381,26 @@ pub(super) struct JitCtx {
     /// Chaining accumulates (never overwrites), so one dispatcher entry
     /// accounts for the whole native chain.
     pub insn_acc: u64,
+    /// Chain edges actually taken by this `run_compiled` (a nested host call
+    /// into a compiled successor).
+    ///
+    /// Written by generated code through [`OFF_CHAIN_HOPS`] on the three
+    /// successor-call sites of `emit_chain_or_exit` (direct `FuncRef`, edge-IC
+    /// hit, chain-table hit). Chaining accumulates, never overwrites, so one
+    /// dispatcher entry accounts for the whole native chain.
+    ///
+    /// Scope: edges emitted by Cranelift lowering. A hop out of a hand-written
+    /// micro-stub trampoline goes through `trampolines::chain_tail` and is NOT
+    /// counted here, so this is a lower bound on total native transfers.
+    pub chain_hops: u64,
+    /// GPR stores those [`Self::chain_hops`] edges performed
+    /// (`emit_chain_or_exit` → `writeback_gprs`).
+    ///
+    /// The per-edge store count is a compile-time constant, so the emitted code
+    /// adds that constant here instead of counting stores at runtime. This is
+    /// the quantity the store-predicate narrowing targets, and the denominator
+    /// is [`Self::chain_hops`] — GPR slots only; the `rflags` slot is not a GPR.
+    pub chain_store_ops: u64,
     /// Guest heap control-block VA for the session running this block
     /// (`0` disables the UCRT `malloc`/`free` fast path entirely).
     ///
@@ -473,6 +493,10 @@ pub(super) const OFF_INV_GEN_PTR: i32 = std::mem::offset_of!(JitCtx, inv_gen_ptr
 pub(super) const OFF_INV_GEN_BAKED: i32 = std::mem::offset_of!(JitCtx, inv_gen_baked) as i32;
 /// Dynamic retired-instruction accumulator (see [`JitCtx::insn_acc`]).
 pub(super) const OFF_INSN_ACC: i32 = std::mem::offset_of!(JitCtx, insn_acc) as i32;
+/// Chain edges taken (see [`JitCtx::chain_hops`]).
+pub(super) const OFF_CHAIN_HOPS: i32 = std::mem::offset_of!(JitCtx, chain_hops) as i32;
+/// GPR stores performed by chain edges (see [`JitCtx::chain_store_ops`]).
+pub(super) const OFF_CHAIN_STORE_OPS: i32 = std::mem::offset_of!(JitCtx, chain_store_ops) as i32;
 
 /// Max nested host frames for JIT block chaining.
 ///
@@ -508,6 +532,12 @@ const _: () = {
     assert!(std::mem::offset_of!(JitCtx, inv_gen_ptr) as i32 == OFF_INV_GEN_PTR);
     assert!(std::mem::offset_of!(JitCtx, inv_gen_baked) as i32 == OFF_INV_GEN_BAKED);
     assert!(std::mem::offset_of!(JitCtx, insn_acc) as i32 == OFF_INSN_ACC);
+    assert!(std::mem::offset_of!(JitCtx, chain_hops) as i32 == OFF_CHAIN_HOPS);
+    assert!(std::mem::offset_of!(JitCtx, chain_store_ops) as i32 == OFF_CHAIN_STORE_OPS);
+    // The two chain counters must be adjacent 8-byte slots: both are read and
+    // written by the same emitted load-add-store pair on every chain edge, so
+    // they must land in one cache line together.
+    assert!(OFF_CHAIN_STORE_OPS == OFF_CHAIN_HOPS + 8);
     assert!(STICKY_WAYS > 0);
     assert!(std::mem::size_of::<MemPin>() == PIN_STRIDE as usize);
     assert!(std::mem::size_of::<XmmSlot>() == 16);
