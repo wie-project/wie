@@ -87,6 +87,9 @@ impl TripCounter {
     /// Fold this block's count into the run-wide accumulator. Call once, in
     /// the shared exit block, *before* sealing it (`use_var` needs the block
     /// unsealed so the SSA builder can add the join parameter).
+    ///
+    /// Every other departure from the function must go through
+    /// [`emit_block_exit_return`], which calls this on the way out.
     pub(super) fn flush(&self, bcx: &mut FunctionBuilder<'_>, ctx_ptr: Value, flags: MemFlagsData) {
         let acc_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_INSN_ACC));
         let prev = bcx.ins().load(types::I64, flags, acc_ptr, 0);
@@ -94,6 +97,38 @@ impl TripCounter {
         let total = bcx.ins().iadd(prev, mine);
         bcx.ins().store(flags, total, acc_ptr, 0);
     }
+}
+
+/// Leave the compiled block: fold this block's retired count into
+/// [`super::JitCtx::insn_acc`], then return to the host caller.
+///
+/// **This is the only correct way to end a Cranelift block from `emit.rs`.**
+/// A block has several exits — the shared `exit` block (which folds the count
+/// itself, then stores the exit GPRs), the chain-depth cap, the three
+/// post-transfer returns, and the invalidation-guard's stale arm — and all of
+/// them must charge the work this block actually retired. Reaching for
+/// `bcx.ins().return_(&[])` directly compiles and runs, but silently drops the
+/// count, because `TripCounter`'s total lives in an SSA variable that only
+/// `flush` reads.
+///
+/// The bug this exists to prevent: `flush` used to be emitted *only* in the
+/// shared `exit` block, so every block that transferred to a successor lost its
+/// count. Only the last block of each native chain was charged, which made
+/// `exec.jit_insns` report single digits for chain-heavy code (`insn_per_entry`
+/// 7.1 on a 7-Zip archive run) and made the profile useless for judging
+/// chain work.
+///
+/// Exactly one of these executes per block invocation, and exactly one
+/// `flush` runs per invocation, so the fold stays non-duplicating: the other
+/// exits (`exit`, and `miss_blk`'s jump into it) must NOT also flush.
+fn emit_block_exit_return(
+    bcx: &mut FunctionBuilder<'_>,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    trip: &TripCounter,
+) {
+    trip.flush(bcx, ctx_ptr, flags);
+    bcx.ins().return_(&[]);
 }
 
 /// The single source of truth for *which* GPRs `writeback_gprs` stores.
@@ -289,6 +324,7 @@ fn emit_inv_gen_check(
     ctx_ptr: Value,
     flags: MemFlagsData,
     inv_gen_baked: u64,
+    trip: &TripCounter,
     on_stale: impl FnOnce(&mut FunctionBuilder<'_>),
 ) -> Block {
     let ptr_slot = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_INV_GEN_PTR));
@@ -305,7 +341,7 @@ fn emit_inv_gen_check(
     on_stale(bcx);
     // RIP + GPRs flushed by `on_stale` (or already written by the caller):
     // pop back to the dispatcher like the depth-exceeded path.
-    bcx.ins().return_(&[]);
+    emit_block_exit_return(bcx, ctx_ptr, flags, trip);
 
     bcx.switch_to_block(cont_blk);
     bcx.seal_block(cont_blk);
@@ -336,6 +372,7 @@ pub(super) fn emit_chain_or_exit(
     block_sig_ref: SigRef,
     inv_guard: bool,
     inv_gen_baked: u64,
+    trip: &TripCounter,
 ) {
     let rip_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RIP));
     bcx.ins().store(flags, exit_rip, rip_ptr, 0);
@@ -356,7 +393,7 @@ pub(super) fn emit_chain_or_exit(
         // Cross-thread invalidation guard before touching any chain
         // machinery: RIP (= exit_rip) + GPRs are already flushed above, so a
         // mismatch just returns to the dispatcher for purge + re-decode.
-        let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, |_| {});
+        let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, trip, |_| {});
     }
 
     // Host-stack guard: each hop nests a C frame. Cap and re-enter from Rust.
@@ -373,7 +410,7 @@ pub(super) fn emit_chain_or_exit(
     bcx.switch_to_block(deep_blk);
     bcx.seal_block(deep_blk);
     // RIP + GPRs already written; pop back to the dispatcher.
-    bcx.ins().return_(&[]);
+    emit_block_exit_return(bcx, ctx_ptr, flags, trip);
 
     bcx.switch_to_block(chain_blk);
     bcx.seal_block(chain_blk);
@@ -388,7 +425,9 @@ pub(super) fn emit_chain_or_exit(
         emit_chain_hop_accounting(bcx, ctx_ptr, flags, store_ops);
         bcx.ins().call(f, &[ctx_ptr]);
         bcx.ins().store(flags, depth, depth_ptr, 0);
-        bcx.ins().return_(&[]);
+        // The callee wrote back the authoritative GPRs and charged its own
+        // count into `insn_acc`; only THIS block's count is still outstanding.
+        emit_block_exit_return(bcx, ctx_ptr, flags, trip);
         return;
     }
     // Monomorphic edge IC (data plane) before full chain-table helper.
@@ -421,7 +460,9 @@ pub(super) fn emit_chain_or_exit(
     emit_chain_hop_accounting(bcx, ctx_ptr, flags, store_ops);
     bcx.ins().call_indirect(block_sig_ref, ic_fn, &[ctx_ptr]);
     bcx.ins().store(flags, depth, depth_ptr, 0);
-    bcx.ins().return_(&[]);
+    // The callee wrote back the authoritative GPRs and charged its own
+    // count into `insn_acc`; only THIS block's count is still outstanding.
+    emit_block_exit_return(bcx, ctx_ptr, flags, trip);
 
     bcx.switch_to_block(ic_miss_blk);
     bcx.seal_block(ic_miss_blk);
@@ -437,7 +478,9 @@ pub(super) fn emit_chain_or_exit(
     emit_chain_hop_accounting(bcx, ctx_ptr, flags, store_ops);
     bcx.ins().call_indirect(block_sig_ref, fn_ptr, &[ctx_ptr]);
     bcx.ins().store(flags, depth, depth_ptr, 0);
-    bcx.ins().return_(&[]);
+    // The callee wrote back the authoritative GPRs and charged its own
+    // count into `insn_acc`; only THIS block's count is still outstanding.
+    emit_block_exit_return(bcx, ctx_ptr, flags, trip);
     bcx.switch_to_block(miss_blk);
     bcx.seal_block(miss_blk);
     // No nested call — restore depth before the ordinary exit path.
@@ -487,7 +530,7 @@ pub(super) fn lower_self_loop_term(
                 // Guarded backedge: on generation mismatch, flush SSA state
                 // (regs + RIP = start_rip) and return to the dispatcher; the
                 // next dispatch re-decodes the loop body from current bytes.
-                let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, |bcx| {
+                let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, &trip, |bcx| {
                     writeback_gprs(
                         bcx,
                         ctx_ptr,
@@ -529,22 +572,23 @@ pub(super) fn lower_self_loop_term(
                     if inv_guard {
                         // Same guarded backedge for jcc edges that re-enter
                         // this block.
-                        let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, |bcx| {
-                            writeback_gprs(
-                                bcx,
-                                ctx_ptr,
-                                flags,
-                                gpr,
-                                gpr_loaded,
-                                Some(gpr_dirty),
-                                rflags,
-                                rflags_ptr,
-                                true,
-                            );
-                            let rip_val = iconst_u64(bcx, start_rip);
-                            let rip_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RIP));
-                            bcx.ins().store(flags, rip_val, rip_ptr, 0);
-                        });
+                        let _ =
+                            emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, &trip, |bcx| {
+                                writeback_gprs(
+                                    bcx,
+                                    ctx_ptr,
+                                    flags,
+                                    gpr,
+                                    gpr_loaded,
+                                    Some(gpr_dirty),
+                                    rflags,
+                                    rflags_ptr,
+                                    true,
+                                );
+                                let rip_val = iconst_u64(bcx, start_rip);
+                                let rip_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RIP));
+                                bcx.ins().store(flags, rip_val, rip_ptr, 0);
+                            });
                     }
                     bcx.ins().jump(loop_header, &args);
                 } else {
@@ -566,6 +610,7 @@ pub(super) fn lower_self_loop_term(
                         block_sig_ref,
                         inv_guard,
                         inv_gen_baked,
+                        &trip,
                     );
                 }
             }
@@ -598,6 +643,7 @@ pub(super) fn lower_jcc_chain(
     block_sig_ref: SigRef,
     inv_guard: bool,
     inv_gen_baked: u64,
+    trip: &TripCounter,
 ) -> Result<bool, String> {
     let cond = match flag_state {
         Some(fs) => flag_cond_fs(bcx, fs, mnemonic)?,
@@ -627,6 +673,7 @@ pub(super) fn lower_jcc_chain(
             block_sig_ref,
             inv_guard,
             inv_gen_baked,
+            trip,
         );
     }
     Ok(true)
@@ -979,6 +1026,7 @@ pub(super) fn emit_body_and_term(
                 block_sig_ref,
                 inv_guard,
                 inv_gen_baked,
+                &trip,
             );
         } else if self_loop {
             let _ = lower_self_loop_term(
@@ -1053,6 +1101,7 @@ pub(super) fn emit_body_and_term(
                         block_sig_ref,
                         inv_guard,
                         inv_gen_baked,
+                        &trip,
                     )?;
                 }
                 BlockTerm::Jmp { target } | BlockTerm::Call { target, .. } => {
@@ -1073,6 +1122,7 @@ pub(super) fn emit_body_and_term(
                         block_sig_ref,
                         inv_guard,
                         inv_gen_baked,
+                        &trip,
                     );
                 }
                 BlockTerm::Ret => {
@@ -1093,6 +1143,7 @@ pub(super) fn emit_body_and_term(
                         block_sig_ref,
                         inv_guard,
                         inv_gen_baked,
+                        &trip,
                     );
                 }
             }
@@ -1115,6 +1166,7 @@ pub(super) fn emit_body_and_term(
             block_sig_ref,
             inv_guard,
             inv_gen_baked,
+            &trip,
         );
     } else {
         let exit_rip = iconst_u64(bcx, end_rip);
@@ -1135,6 +1187,7 @@ pub(super) fn emit_body_and_term(
             block_sig_ref,
             inv_guard,
             inv_gen_baked,
+            &trip,
         );
     }
     Ok(())

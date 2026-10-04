@@ -269,3 +269,159 @@ fn chain_counters_merge_across_engines() {
     assert_eq!(agg.chain.hops, 12, "hops must add across engines");
     assert_eq!(agg.chain.store_ops, 20, "store_ops must add across engines");
 }
+
+/// Guest instructions retired by one iteration of [`RING_CODE`]: block A is
+/// `add rax,rbx; jmp` (2) and block B is `add rax,rbx; dec rcx; jnz` (3).
+const RING_INSNS_PER_ITER: u64 = 5;
+
+/// Run [`RING_CODE`] for `iters` iterations on a fresh engine.
+fn run_ring(iters: u64) -> JitCpu {
+    let mut cpu = JitCpu::open_x86_64();
+    cpu.virtual_alloc(
+        HOP_BASE,
+        0x1000,
+        MEM_RESERVE | MEM_COMMIT,
+        protect::PAGE_EXECUTE_READWRITE,
+    )
+    .expect("alloc");
+    cpu.mem_write(HOP_BASE, &RING_CODE).expect("write ring");
+    cpu.thread.regs.set_gpr(1, iters);
+    cpu.thread.regs.set_gpr(3, 1); // rbx
+    cpu.write_rip(HOP_BASE).expect("rip");
+
+    let mut steps = 0_usize;
+    while cpu.thread.regs.rip < HOP_BASE.saturating_add(0x17) {
+        if cpu.step_one().is_err() {
+            break; // ud2 at the loop exit is the intended stop
+        }
+        steps = steps.saturating_add(1);
+        assert!(steps < 1_000_000, "ring failed to terminate");
+    }
+    cpu
+}
+
+/// Every guest instruction a chain retires must be charged, whichever side of
+/// the JIT/iced boundary executed it.
+///
+/// This is the regression test for the `insn_acc` undercount: `TripCounter`'s
+/// count was folded only from a block's shared `exit` block, so a block that
+/// transferred to a successor — through any of `emit_chain_or_exit`'s three
+/// call sites, or its depth-cap `return_` — dropped its retired count on the
+/// floor. Only the last block of each native chain was ever charged, which made
+/// `exec.jit_insns` (and the `insn_per_entry` ratio derived from it) report
+/// single-digit instruction counts for chain-heavy code.
+///
+/// Ground truth is exact: 5 instructions per iteration, and the two counters
+/// partition the work, so their sum must equal `5 * iters` with no slack. This
+/// ring crosses the `MAX_CHAIN_DEPTH` cap every ~48 hops, so it covers the
+/// depth-cap exit and all three post-call exits on every frame boundary.
+#[test]
+fn chained_blocks_retire_every_guest_instruction() {
+    const ITERS: u64 = 20_000;
+    let cpu = run_ring(ITERS);
+    assert_eq!(
+        cpu.thread.regs.gpr(1),
+        0,
+        "the ring must count rcx down to zero"
+    );
+
+    let s = cpu.stats();
+    let retired = s.exec.jit_insns.saturating_add(s.exec.iced_insns);
+    assert_eq!(
+        retired,
+        RING_INSNS_PER_ITER * ITERS,
+        "chain must charge every retired instruction: jit={} iced={} hops={} \
+         (expected {} = 5 insns x {ITERS} iterations)",
+        s.exec.jit_insns,
+        s.exec.iced_insns,
+        s.chain.hops,
+        RING_INSNS_PER_ITER * ITERS
+    );
+    // ...and the bulk of it must be on the compiled side specifically. A fix
+    // that accidentally moved the charge onto the interpreted path would pass
+    // the sum assertion above while still making `jit_insns` wrong.
+    assert!(
+        s.exec.jit_insns > retired / 2,
+        "the ring must run mostly compiled: jit={} of {retired}",
+        s.exec.jit_insns
+    );
+    // The chain-edge counters must stay consistent with the instruction count
+    // they are supposed to describe: this ring crosses exactly two edges per
+    // five retired instructions, once both blocks are compiled. Guards against a
+    // future fix that makes the two families of counter drift apart — they are
+    // accumulated at different points (before the transfer vs. on the way out
+    // of the block), and only one of them was ever affected by the flush bug.
+    let expected_hops = retired * 2 / 5;
+    let hops = s.chain.hops;
+    assert!(
+        expected_hops / 10 <= hops && hops <= expected_hops,
+        "chain_hops must track retired instructions: {hops} hops for \
+         {retired} retired (expected ~{expected_hops} = 2 edges per 5 insns)"
+    );
+}
+
+/// The cross-thread invalidation guard returns to the dispatcher from its own
+/// `stale_blk`, bypassing the shared `exit` block — a second exit path with
+/// the same undercount. Bumping `invalidate_gen` once the ring is chaining
+/// forces it.
+///
+/// Without a flush on that path, whichever block observed the stale generation
+/// silently lost its retired count. (The bump is raw rather than routed
+/// through `invalidate_code_range` on purpose: the cache keeps its `Ready`
+/// entries, so every later guard observation fires too and the ring advances
+/// one block per dispatcher step. That makes this path the *only* exit in the
+/// run, which is exactly what the assertion needs to isolate.)
+#[test]
+fn stale_generation_exit_still_retires_instructions() {
+    const ITERS: u64 = 20_000;
+
+    let mut cpu = JitCpu::open_x86_64();
+    cpu.virtual_alloc(
+        HOP_BASE,
+        0x1000,
+        MEM_RESERVE | MEM_COMMIT,
+        protect::PAGE_EXECUTE_READWRITE,
+    )
+    .expect("alloc");
+    cpu.mem_write(HOP_BASE, &RING_CODE).expect("write ring");
+    cpu.thread.regs.set_gpr(1, ITERS);
+    cpu.thread.regs.set_gpr(3, 1);
+    cpu.write_rip(HOP_BASE).expect("rip");
+
+    let mut bumped = false;
+    let mut steps = 0_usize;
+    while cpu.thread.regs.rip < HOP_BASE.saturating_add(0x17) {
+        if cpu.step_one().is_err() {
+            break;
+        }
+        steps = steps.saturating_add(1);
+        // Bump on the first observed chain hop: the blocks are compiled and
+        // chaining by then, so the guard is actually in the executed path.
+        if !bumped && cpu.stats().chain.hops > 0 {
+            cpu.shared
+                .invalidate_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            bumped = true;
+        }
+        assert!(steps < 1_000_000, "ring failed to terminate");
+    }
+    assert!(bumped, "the generation must have been bumped mid-run");
+    assert_eq!(
+        cpu.thread.regs.gpr(1),
+        0,
+        "the ring must still count rcx down to zero after the purge"
+    );
+
+    let s = cpu.stats();
+    let retired = s.exec.jit_insns.saturating_add(s.exec.iced_insns);
+    assert_eq!(
+        retired,
+        RING_INSNS_PER_ITER * ITERS,
+        "the stale-generation exit must charge its instructions like any \
+         other: jit={} iced={} hops={} (expected {})",
+        s.exec.jit_insns,
+        s.exec.iced_insns,
+        s.chain.hops,
+        RING_INSNS_PER_ITER * ITERS
+    );
+}
