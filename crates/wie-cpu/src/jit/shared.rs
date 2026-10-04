@@ -493,17 +493,20 @@ impl JitShared {
         jit_cache_pe_hash(pe_file_bytes)
     }
 
-    /// Warm-boot prewarm probe: ensure a `Ready` entry exists for `va`, and
-    /// report its instruction count if one now does.
+    /// Warm-boot prewarm probe: get a usable block for `va`, and report its
+    /// instruction count if one now exists.
     ///
-    /// **This may install a block as a side effect.** The restore half lives in
-    /// [`Self::restore_from_code_cache`], which is the honest name for it; this
-    /// method is only the seam the dispatcher calls, and the name it keeps is
-    /// the one on that call site (`pipeline.rs`), which is outside this change's
-    /// write scope — renaming it here would not compile. A restored block is
-    /// strictly better than a known-good one, so the code cache is consulted
-    /// first and the metadata ledger is the fallback.
-    pub(super) fn persist_probe(&self, mem: &GuestMemory, va: u64) -> Option<LedgerProbe> {
+    /// Consults the machine-code cache first and falls back to the metadata
+    /// ledger, because a *restored* block is strictly better than a merely
+    /// known-good one — the first is already-compiled code, the second only
+    /// skips the hotness warm-up and still pays the compile.
+    ///
+    /// **This may install a block as a side effect** (that is the restore half),
+    /// so the name says which cache it reaches for. The split out of
+    /// [`Self::restore_from_code_cache`] was originally forced by write scope —
+    /// the only call site lives in `pipeline.rs` — and completing the rename once
+    /// that file was in scope is what this name is for.
+    pub(super) fn restore_or_probe(&self, mem: &GuestMemory, va: u64) -> Option<LedgerProbe> {
         if let Some(restored) = self.restore_from_code_cache(mem, va) {
             return Some(LedgerProbe {
                 insn_count: restored.insn_count,
