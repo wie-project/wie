@@ -278,6 +278,94 @@ fn a_real_block_capture_references_only_named_host_imports() {
 }
 
 // ---------------------------------------------------------------------------
+// Deterministic flush
+// ---------------------------------------------------------------------------
+
+/// The regression this whole section exists for.
+///
+/// The flush used to live only in `CodeCache::drop`, so it ran only when the
+/// last `Arc<CodeCache>` went away. Measured over five runs each, that never
+/// happened for `crt_hello` and `write_file` (and only 1-in-5 for
+/// `shell_folders`): `Arc<JitShared>` was still at strong-count 1 inside
+/// `RuntimeSession::drop`, so the warm boot stayed permanently cold for real
+/// guests — including 7-Zip, the workload the lever exists for. Session teardown
+/// now calls `JitShared::finish_jit_caches()`.
+///
+/// This test reproduces that exact shape: the cache is still referenced when
+/// `finish()` is called, so nothing would flush it if the flush were still
+/// drop-only.
+#[test]
+fn finish_flushes_while_the_cache_is_still_referenced() {
+    let dir = scratch_dir("finish-while-alive");
+    let (mut cpu, cache) = engine_with_cache(&dir);
+    let _ = run_to_stop(&mut cpu);
+    await_ready(&cpu);
+    assert!(
+        cache.counters().snapshot().compiled >= 1,
+        "a blob was recorded"
+    );
+
+    // Every reference is still alive here — this is the shape that used to lose
+    // the cache. `sole_code_file` asserts the file appears anyway.
+    assert_eq!(
+        std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "code"))
+            .count(),
+        0,
+        "nothing may be on disk before the explicit flush"
+    );
+
+    // The exact call guest-session teardown makes.
+    cpu.shared.finish_jit_caches();
+
+    let path = sole_code_file(&dir);
+    let bytes = std::fs::read(&path).expect("flush wrote the file");
+    assert!(
+        bytes.len() > 64,
+        "the file has a payload, got {} bytes",
+        bytes.len()
+    );
+    assert_eq!(cache.counters().snapshot().summaries_reported, 1);
+}
+
+#[test]
+fn finish_is_idempotent_under_a_double_call() {
+    let dir = scratch_dir("finish-twice");
+    let (mut cpu, cache) = engine_with_cache(&dir);
+    let _ = run_to_stop(&mut cpu);
+    await_ready(&cpu);
+
+    // Session teardown flushes, then the last Arc drops and the backstop fires.
+    // Both run. The file must be written (not truncated), and the counters
+    // reported exactly once.
+    cpu.shared.finish_jit_caches();
+    let first = std::fs::read(sole_code_file(&dir)).expect("first flush wrote");
+    cpu.shared.finish_jit_caches();
+    drop(cpu.shared.code_cache_for_test());
+    let second = std::fs::read(sole_code_file(&dir)).expect("second flush kept the file");
+
+    assert_eq!(
+        first, second,
+        "a redundant flush must not truncate or corrupt the file"
+    );
+    assert_eq!(
+        cache.counters().snapshot().summaries_reported,
+        1,
+        "the counters must be reported exactly once"
+    );
+
+    // And the file is still loadable: a corrupt rewrite would show up as a
+    // refusal on the next process, which is what `record_and_reload` covers.
+    let (cpu2, cache2) = engine_with_cache(&dir);
+    let probe = force_probe(&cpu2).expect("the twice-flushed file still restores");
+    assert_eq!(probe.insn_count, 1 + 2, "sanity: same block as recorded");
+    assert_eq!(cache2.counters().snapshot().restored, 1);
+    assert_eq!(cache2.counters().snapshot().refused(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // Refusals — every one of these must fall back to compiling, never to garbage
 // ---------------------------------------------------------------------------
 

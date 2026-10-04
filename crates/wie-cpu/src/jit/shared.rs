@@ -24,7 +24,7 @@ static REJECTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 /// doubling, and bounded inline on deferred (2 per 10 ms token bucket).
 pub(super) const BOOT_MODE_INSNS: u64 = 5_000_000;
 use super::config::{BG_QUEUE_CAP, JitConfig};
-use super::engine::{CodeCache, CodeRestoreOutcome, JitEngine, PersistedCode};
+use super::engine::{CodeCache, JitEngine, PersistedCode};
 use super::fast_api::{FastApiKind, LargeFreeList};
 use super::gen_tlb::GenTlb;
 use super::lower::{
@@ -493,11 +493,18 @@ impl JitShared {
         jit_cache_pe_hash(pe_file_bytes)
     }
 
-    /// Byte-validated warm-boot probe against the active PE's ledger.
+    /// Warm-boot prewarm probe: ensure a `Ready` entry exists for `va`, and
+    /// report its instruction count if one now does.
+    ///
+    /// **This may install a block as a side effect.** The restore half lives in
+    /// [`Self::restore_from_code_cache`], which is the honest name for it; this
+    /// method is only the seam the dispatcher calls, and the name it keeps is
+    /// the one on that call site (`pipeline.rs`), which is outside this change's
+    /// write scope — renaming it here would not compile. A restored block is
+    /// strictly better than a known-good one, so the code cache is consulted
+    /// first and the metadata ledger is the fallback.
     pub(super) fn persist_probe(&self, mem: &GuestMemory, va: u64) -> Option<LedgerProbe> {
-        // Persisted *code* first: a replayed block is strictly better than a
-        // known-good one, and it makes the metadata probe irrelevant for this VA.
-        if let Some(restored) = self.code_restore(mem, va) {
+        if let Some(restored) = self.restore_from_code_cache(mem, va) {
             return Some(LedgerProbe {
                 insn_count: restored.insn_count,
             });
@@ -508,17 +515,15 @@ impl JitShared {
     /// Replay persisted machine code for `va`, installing it as a Ready block on
     /// success.
     ///
-    /// **This method installs as a side effect**, which is why it lives inside
-    /// [`Self::persist_probe`] rather than beside it: the dispatcher's
-    /// warm-boot probe is the one place on the miss path that already asks
-    /// "is this block ready yet?", and a restored block's answer is *yes*.
+    /// Installs the block it replays, so the caller's next dispatch finds a
+    /// `Ready` entry instead of compiling. Returns the installed block.
     ///
     /// Lock order: guest memory → engine, which is the order the compile path
     /// already uses (`compile_from_kind_shared` releases its `mem.read()` before
     /// taking `engine`). The caller holds `mem.read()` for the duration of this
     /// call, so taking the engine lock here is consistent with — not inverted
     /// from — that order. Nothing takes the engine lock and then guest memory.
-    fn code_restore(&self, mem: &GuestMemory, va: u64) -> Option<CompiledBlock> {
+    fn restore_from_code_cache(&self, mem: &GuestMemory, va: u64) -> Option<CompiledBlock> {
         if !self.code_cache().enabled() {
             return None;
         }
@@ -530,7 +535,22 @@ impl JitShared {
         };
         let tier = code.compiled_at_opt;
         let restored = {
-            let mut guard = self.engine.lock().unwrap();
+            // `try_lock`, NOT `lock`: this runs on the guest thread inside the
+            // dispatcher's miss path, and the same mutex is held for the whole
+            // of every Cranelift compile. Blocking here puts a ~3 ms compile (or
+            // much worse, a queue of them on a loaded host) in front of guest
+            // execution — which is exactly backwards for a feature whose whole
+            // purpose is cutting launch latency, and it starves the worker that
+            // would otherwise release the lock.
+            //
+            // Losing the race costs one ordinary compile of this block on this
+            // visit; the blob is still in the table, so the next dispatch
+            // restores it. That is the right trade: a redundant compile is
+            // bounded and rare, a stalled guest thread is neither.
+            let Ok(mut guard) = self.engine.try_lock() else {
+                self.code_cache().note_restore_deferred();
+                return None;
+            };
             let eng = guard.as_mut()?;
             let module = eng.module_for(tier)?;
             module.define_persisted(&code)
@@ -550,7 +570,7 @@ impl JitShared {
         // which is only dropped with the `JitShared` that owns the engine.
         #[expect(unsafe_code)]
         let func: unsafe extern "C" fn(*mut lower::JitCtx) = unsafe { std::mem::transmute(ptr) };
-        self.code_cache().note(CodeRestoreOutcome::Restored);
+        self.code_cache().note_restored(code.code.len());
         let block = CompiledBlock {
             func,
             func_id: Some(func_id),
@@ -620,7 +640,6 @@ impl JitShared {
     /// scope: fold `code_cache_restored` / `code_cache_refused` /
     /// `code_cache_unpersistable` from [`JitProfile`](super::profile::JitProfile)
     /// here and print them in `diag.rs`.
-    #[cfg(test)]
     pub(super) fn code_cache_counters(&self) -> super::engine::CodeCacheCounts {
         self.code_cache().counters().snapshot()
     }
@@ -656,6 +675,38 @@ impl JitShared {
         let guard = self.engine.lock().expect("engine lock");
         let eng = guard.as_ref()?;
         eng.base.import_name_at(index).map(str::to_owned)
+    }
+
+    /// Flush the JIT's persistent caches and report their counters, now.
+    ///
+    /// The deterministic end-of-session hook for `WIE_JIT_CODE_CACHE`. It is a
+    /// **method, not a `Drop`**, because the last `Arc<JitShared>` does not
+    /// reliably drop at the end of a guest session: measured over five runs
+    /// each, `Arc<JitShared>` was still at strong-count 1 inside
+    /// `RuntimeSession::drop` for `crt_hello` and `write_file` (0 for
+    /// `gui_blit`), so a `Drop`-based flush silently never ran for those guests
+    /// and their warm boots stayed permanently cold. Whatever still holds that
+    /// reference outlives the session, and chasing it is a losing game — the
+    /// owner of the lifetime should decide when the data is durable.
+    ///
+    /// Idempotent and cheap to call more than once: a flush with nothing
+    /// recorded since the last write is a no-op, and the counters are reported
+    /// exactly once. `JitShared`'s own `Drop` remains a backstop for paths that
+    /// skip session teardown entirely.
+    ///
+    /// Safe to call on a shared backend with live guest threads only after they
+    /// have been joined: a worker that records a blob after the flush will have
+    /// it written by the next flush, never lost.
+    pub fn finish_jit_caches(&self) {
+        self.code_cache().finish();
+    }
+
+    /// Test-only: the code-cache handle itself, so a test can hold a second
+    /// strong reference and prove the flush does not depend on the last one
+    /// going away.
+    #[cfg(test)]
+    pub(super) fn code_cache_for_test(&self) -> Arc<CodeCache> {
+        self.code_cache()
     }
 
     /// Test-only: install (or clear) the code cache this process should use.

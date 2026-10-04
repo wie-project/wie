@@ -289,7 +289,7 @@ pub struct JitStats {
 /// [`JitStats::merge_engine`] skips exactly these; the process-wide fold
 /// therefore starts from one engine's complete snapshot (which carries the
 /// shared part exactly once) and merges the rest per-thread.
-const SHARED_DERIVED_STATS: [&str; 8] = [
+const SHARED_DERIVED_STATS: [&str; 11] = [
     "bg.compiles",
     "bg.workers",
     "chain.epoch_bumps",
@@ -298,6 +298,9 @@ const SHARED_DERIVED_STATS: [&str; 8] = [
     "profile.tier_compiles",
     "profile.tier_rejects",
     "profile.tier_budget_left",
+    "profile.code_cache_restored",
+    "profile.code_cache_refused",
+    "profile.code_cache_unpersistable",
 ];
 
 impl JitStats {
@@ -319,7 +322,7 @@ impl JitStats {
     pub fn merge_engine(&mut self, other: &JitStats) {
         // Tripwire: every field listed here must be skipped below, and any
         // field `JitCpu::stats` starts folding from `JitShared` must be listed.
-        debug_assert_eq!(SHARED_DERIVED_STATS.len(), 8, "shared-derived set changed");
+        debug_assert_eq!(SHARED_DERIVED_STATS.len(), 11, "shared-derived set changed");
         let add = |a: &mut u64, b: u64| *a = a.saturating_add(b);
         let max = |a: &mut u64, b: u64| *a = (*a).max(b);
 
@@ -394,6 +397,8 @@ impl JitStats {
             other.profile.warm_ledger_hits,
         );
         // profile tier fields are shared-derived (the one TierPlan): skipped
+        // profile code-cache fields are shared-derived too (the one CodeCache,
+        // which restores outside any dispatch path): skipped
     }
 }
 
@@ -489,6 +494,9 @@ mod stats_merge_tests {
         agg.profile.tier_compiles = 3;
         agg.profile.tier_rejects = 1;
         agg.profile.tier_budget_left = 61;
+        agg.profile.code_cache_restored = 23;
+        agg.profile.code_cache_refused = 2;
+        agg.profile.code_cache_unpersistable = 40;
 
         // A second engine's snapshot of the SAME shared state.
         let mut other = JitStats::default();
@@ -501,6 +509,9 @@ mod stats_merge_tests {
         other.profile.tier_compiles = 3;
         other.profile.tier_rejects = 1;
         other.profile.tier_budget_left = 61;
+        other.profile.code_cache_restored = 23;
+        other.profile.code_cache_refused = 2;
+        other.profile.code_cache_unpersistable = 40;
 
         agg.merge_engine(&other);
 
@@ -516,12 +527,24 @@ mod stats_merge_tests {
             agg.profile.tier_budget_left, 61,
             "tier_budget_left is shared"
         );
+        assert_eq!(
+            agg.profile.code_cache_restored, 23,
+            "code_cache_restored is shared"
+        );
+        assert_eq!(
+            agg.profile.code_cache_refused, 2,
+            "code_cache_refused is shared"
+        );
+        assert_eq!(
+            agg.profile.code_cache_unpersistable, 40,
+            "code_cache_unpersistable is shared"
+        );
 
         // The list is the contract; assert it names what the test just proved.
         for field in SHARED_DERIVED_STATS {
             assert!(!field.is_empty());
         }
-        assert_eq!(SHARED_DERIVED_STATS.len(), 8);
+        assert_eq!(SHARED_DERIVED_STATS.len(), 11);
     }
 }
 
