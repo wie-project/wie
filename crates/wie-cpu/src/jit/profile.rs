@@ -111,6 +111,25 @@ pub struct JitProfile {
     /// Persistent-ledger warm hits (`WIE_JIT_CACHE`): known-good blocks that
     /// skipped the Hot visit-threshold warmup and compiled immediately.
     pub warm_ledger_hits: u64,
+    /// Blocks whose machine code was **replayed** from the on-disk code cache
+    /// (`WIE_JIT_CODE_CACHE`) instead of compiled. This is the whole point of
+    /// that knob and the only number that says whether it worked; the
+    /// denominator is `compile.compiles` for the same run.
+    ///
+    /// Shared-derived: folded from the one [`super::JitShared`] that owns the
+    /// cache, because the restore happens there and not on a guest thread's
+    /// dispatch path.
+    pub code_cache_restored: u64,
+    /// Blobs the code cache refused to replay, by reason:
+    /// `bytes-changed` + `generation-moved` + `file-mismatch` +
+    /// `unrelocatable-target` + `malformed`.
+    pub code_cache_refused: u64,
+    /// Blobs the code cache could not *write* — emitted code carrying a
+    /// relocation the format refuses to persist (today: a direct chain call), or
+    /// a capture that was already drained. Expected to be a large fraction of
+    /// all compiles on a warm-then-cold run and is **not** an error: chained
+    /// blocks are recompiled by design.
+    pub code_cache_unpersistable: u64,
     /// Blocks compiled at the tier-up opt level (self-loops that earned it).
     /// Shared-derived (folded from the one [`JitShared`], see
     /// [`SHARED_DERIVED_STATS`](super::SHARED_DERIVED_STATS)).

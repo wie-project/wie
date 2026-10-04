@@ -88,6 +88,7 @@ pub(super) struct JitConfig {
     string_inline_enabled: bool,
     jit_workers: usize,
     verifier_enabled: bool,
+    code_cache_enabled: bool,
 }
 
 /// Bounds of the background worker-pool size (`WIE_JIT_WORKERS`).
@@ -291,7 +292,72 @@ impl JitConfig {
             // differential's job, not its.
             verifier_enabled: verifier_enabled_from_env(std::env::var("WIE_JIT_VERIFIER").ok())
                 .unwrap_or(cfg!(debug_assertions)),
+            // Persist emitted machine code alongside the metadata ledger
+            // (`WIE_JIT_CODE_CACHE`). DEFAULT OFF, and it is the only knob in
+            // this file that is off by default rather than on: a restored block
+            // is *replayed host code*, so any hole in the capture/restore
+            // round-trip is a wrong-answer or branch-into-garbage bug rather
+            // than a slowdown. Everything it does has a cold fallback, so the
+            // opt-out is a pure correctness switch, not a perf switch.
+            code_cache_enabled: code_cache_enabled_from_env(
+                std::env::var("WIE_JIT_CODE_CACHE").ok(),
+            ),
         }
+    }
+
+    /// Whether persisted machine code may be restored (`WIE_JIT_CODE_CACHE`).
+    ///
+    /// Default **off**. `WIE_JIT_CACHE` (the metadata ledger) is independent and
+    /// stays on by default; this knob only governs the code half.
+    #[must_use]
+    pub(super) fn code_cache_enabled(&self) -> bool {
+        self.code_cache_enabled
+    }
+
+    /// Fingerprint of everything that changes the *emitted code* for the same
+    /// guest bytes — the identity a persisted code blob must match.
+    ///
+    /// The metadata ledger only ever records "these bytes compiled OK", which is
+    /// a claim about a compiler configuration but not about a byte layout. A
+    /// persisted code blob is a claim about the exact instructions emitted, so
+    /// it additionally needs every knob that changes lowering, plus the build
+    /// and target shape. `WIE_JIT_VERSION` guards the WIE version already;
+    /// this guards everything the version cannot see (a knob flip, a debug vs
+    /// release build, a different host).
+    ///
+    /// Deliberately a *separate* key component from
+    /// [`Self::opt_level`]: opt level is already folded into the ledger key, but
+    /// a knob flip must not invalidate a user's metadata ledger, and folding it
+    /// into the code-cache key instead keeps the two files independent.
+    #[must_use]
+    pub(super) fn emit_fingerprint(&self) -> u64 {
+        fn mix(h: u64, v: u64) -> u64 {
+            let h = h ^ v
+                .wrapping_add(0x9e37_79b9_7f4a_7c15)
+                .wrapping_add(h << 6)
+                .wrapping_add(h >> 2);
+            h.wrapping_mul(0x0000_0100_0000_01b3)
+        }
+        let mut h = 0xcbf2_9ce4_8422_2325_u64;
+        h = mix(h, self.opt_level.len() as u64);
+        for b in self.opt_level.as_bytes() {
+            h = mix(h, u64::from(*b));
+        }
+        // Lowering-shape knobs. Order is fixed; each contributes a distinct bit
+        // so no two knob combinations collide by construction.
+        h = mix(h, self.jit_mem_mode as u64);
+        h = mix(h, self.super_mode as u64);
+        h = mix(h, u64::from(self.chain_enabled));
+        h = mix(h, u64::from(self.ssa_flags_enabled));
+        h = mix(h, u64::from(self.simd_enabled));
+        h = mix(h, u64::from(self.string_inline_enabled));
+        h = mix(h, u64::from(self.verifier_enabled));
+        // Build + host shape. `cfg!` keeps this a compile-time constant, so a
+        // debug-built test process can never accept a release blob.
+        h = mix(h, u64::from(cfg!(debug_assertions)));
+        h = mix(h, std::mem::size_of::<usize>() as u64);
+        h = mix(h, u64::from(u8::MAX)); // fingerprint-format v1 marker
+        h
     }
 
     /// Hotness regime switch. Nonzero selects work-weighted promotion (the
@@ -625,6 +691,31 @@ fn verifier_enabled_from_env(raw: Option<String>) -> Option<bool> {
         }
         _ => None,
     }
+}
+
+/// Parse the persisted-machine-code switch from a `WIE_JIT_CODE_CACHE` value.
+///
+/// **Default off.** Opt-in rather than opt-out, unlike every other knob here:
+/// restoring persisted code replays host instructions captured by a previous
+/// process, so the failure mode of a bug in it is "guest executes the wrong
+/// thing" rather than "guest runs slower". Pure (no `set_var`) so the table is
+/// unit-testable, and it also refuses under `cfg(test)`/nextest for the same
+/// reason the ledger does — see [`super::cache_persist`]'s
+/// `under_test_process` note about processes sharing one on-disk file.
+fn code_cache_enabled_from_env(raw: Option<String>) -> bool {
+    // A test process never restores persisted code: the round-trip is exercised
+    // by an explicit, directory-scoped test instead of by the ambient cache.
+    if cfg!(test) || std::env::var_os("NEXTEST").is_some() {
+        return false;
+    }
+    matches!(
+        raw,
+        Some(v)
+            if v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("yes")
+    )
 }
 
 #[cfg(test)]

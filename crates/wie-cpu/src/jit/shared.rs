@@ -24,7 +24,7 @@ static REJECTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 /// doubling, and bounded inline on deferred (2 per 10 ms token bucket).
 pub(super) const BOOT_MODE_INSNS: u64 = 5_000_000;
 use super::config::{BG_QUEUE_CAP, JitConfig};
-use super::engine::JitEngine;
+use super::engine::{CodeCache, CodeRestoreOutcome, JitEngine, PersistedCode};
 use super::fast_api::{FastApiKind, LargeFreeList};
 use super::gen_tlb::GenTlb;
 use super::lower::{
@@ -364,6 +364,15 @@ pub struct JitShared {
     /// [`super::cache_persist`] for why this stores metadata rather than
     /// machine-code bytes.
     pub(super) persist: Arc<PersistentJitCache>,
+    /// Persisted machine code (`WIE_JIT_CODE_CACHE`), independent of
+    /// [`Self::persist`] and **inert unless explicitly enabled**.
+    pub(super) code_cache: Arc<CodeCache>,
+    /// Test-only injection point for an explicitly enabled cache.
+    /// `WIE_JIT_CODE_CACHE` is deliberately inert under `cfg(test)` (see
+    /// [`JitConfig::code_cache_enabled`]), so the round-trip test installs a
+    /// directory-scoped handle here instead of mutating the process environment.
+    #[cfg(test)]
+    code_cache_override: RwLock<Option<Arc<CodeCache>>>,
     /// Test-only latch forcing the background path on for this instance
     /// (env-independent, and per-`JitShared` so parallel unit tests cannot
     /// interfere with each other).
@@ -435,6 +444,9 @@ impl JitShared {
             guest_insns: AtomicU64::new(0),
             boot_inline_window: Mutex::new((Instant::now(), 0)),
             persist: Arc::new(PersistentJitCache::new()),
+            code_cache: Arc::new(CodeCache::new()),
+            #[cfg(test)]
+            code_cache_override: RwLock::new(None),
             #[cfg(test)]
             bg_force: AtomicBool::new(false),
         }
@@ -456,6 +468,15 @@ impl JitShared {
     /// cache is disabled (`WIE_JIT_CACHE=0`).
     pub fn attach_pe_cache(&self, pe_hash: u64) {
         self.persist.attach(pe_hash);
+        if self.code_cache().enabled() {
+            let opt = JitConfig::get().opt_level();
+            // The import list is a property of the live module, and it is part
+            // of the code file's identity, so attach cannot happen without it.
+            let mut guard = self.engine.lock().unwrap();
+            if let Some(eng) = guard.as_mut() {
+                self.code_cache().attach(pe_hash, opt, eng.base_mut());
+            }
+        }
         let cache = self.cache.pin();
         for va in self.persist.never_vas() {
             // Only from absence: a live Ready/Hot/Queued decision outranks it.
@@ -474,11 +495,181 @@ impl JitShared {
 
     /// Byte-validated warm-boot probe against the active PE's ledger.
     pub(super) fn persist_probe(&self, mem: &GuestMemory, va: u64) -> Option<LedgerProbe> {
+        // Persisted *code* first: a replayed block is strictly better than a
+        // known-good one, and it makes the metadata probe irrelevant for this VA.
+        if let Some(restored) = self.code_restore(mem, va) {
+            return Some(LedgerProbe {
+                insn_count: restored.insn_count,
+            });
+        }
         self.persist.probe(mem, va)
+    }
+
+    /// Replay persisted machine code for `va`, installing it as a Ready block on
+    /// success.
+    ///
+    /// **This method installs as a side effect**, which is why it lives inside
+    /// [`Self::persist_probe`] rather than beside it: the dispatcher's
+    /// warm-boot probe is the one place on the miss path that already asks
+    /// "is this block ready yet?", and a restored block's answer is *yes*.
+    ///
+    /// Lock order: guest memory → engine, which is the order the compile path
+    /// already uses (`compile_from_kind_shared` releases its `mem.read()` before
+    /// taking `engine`). The caller holds `mem.read()` for the duration of this
+    /// call, so taking the engine lock here is consistent with — not inverted
+    /// from — that order. Nothing takes the engine lock and then guest memory.
+    fn code_restore(&self, mem: &GuestMemory, va: u64) -> Option<CompiledBlock> {
+        if !self.code_cache().enabled() {
+            return None;
+        }
+        let live_gen = self.invalidate_gen.load(Ordering::Acquire);
+        let cache = self.code_cache();
+        let Some(code) = cache.probe(mem, va, live_gen) else {
+            cache.note(cache.classify_miss(mem, va, live_gen));
+            return None;
+        };
+        let tier = code.compiled_at_opt;
+        let restored = {
+            let mut guard = self.engine.lock().unwrap();
+            let eng = guard.as_mut()?;
+            let module = eng.module_for(tier)?;
+            module.define_persisted(&code)
+        };
+        let (func_id, ptr) = match restored {
+            Ok(v) => v,
+            Err(outcome) => {
+                self.code_cache().note(outcome);
+                return None;
+            }
+        };
+        // SAFETY: `define_persisted` returned a pointer from
+        // `JITModule::get_finalized_function`, i.e. the entry point of a blob
+        // cranelift-jit allocated in executable memory with the same
+        // `(ctx_ptr) -> ()` signature `lower::compile_block` produces. The
+        // module (and therefore the memory) outlives every `CompiledBlock`,
+        // which is only dropped with the `JitShared` that owns the engine.
+        #[expect(unsafe_code)]
+        let func: unsafe extern "C" fn(*mut lower::JitCtx) = unsafe { std::mem::transmute(ptr) };
+        self.code_cache().note(CodeRestoreOutcome::Restored);
+        let block = CompiledBlock {
+            func,
+            func_id: Some(func_id),
+            tier,
+            insn_count: code.insn_count,
+            guest_start: code.va,
+            guest_end: code.guest_end,
+            inv_gen: live_gen,
+        };
+        // Install through the normal path so `chain_ids`, `code_pages` and the
+        // Ready entry are all populated exactly as they would be for a compile.
+        self.insert_ready(va, block);
+        Some(block)
+    }
+
+    /// Persist one block's emitted code, when the capture for it was available.
+    ///
+    /// `try_lock` on purpose: this runs on the install path, which the compile
+    /// path may still hold the engine for on another thread. Skipping the blob
+    /// is a pure perf loss (the next run recompiles one block); blocking would
+    /// put a disk-format concern on the critical path of every block install.
+    fn record_code(&self, compiled: &CompiledBlock) {
+        if !self.code_cache().enabled() {
+            return;
+        }
+        let Some(func_id) = compiled.func_id else {
+            return;
+        };
+        let Ok(mut guard) = self.engine.try_lock() else {
+            return;
+        };
+        let captured = {
+            let Some(eng) = guard.as_mut() else {
+                return;
+            };
+            let Some(module) = eng.module_for(compiled.tier) else {
+                return;
+            };
+            module.take_captured(func_id)
+        };
+        let Some(captured) = captured else {
+            return;
+        };
+        let mem = self.mem.read().unwrap();
+        let Some(bytes_hash) =
+            super::cache_persist::hash_guest_range(&mem, compiled.guest_start, compiled.guest_end)
+        else {
+            return;
+        };
+        self.code_cache().record(PersistedCode {
+            va: compiled.guest_start,
+            guest_end: compiled.guest_end,
+            bytes_hash,
+            insn_count: compiled.insn_count,
+            inv_gen: compiled.inv_gen,
+            compiled_at_opt: compiled.tier,
+            align: captured.align,
+            code: captured.bytes,
+            relocs: captured.relocs,
+        });
+    }
+
+    /// Snapshot of the code-cache counters; see [`CodeCache`].
+    ///
+    /// The field-filling half of the profile dump. The printing half belongs to
+    /// `JitCpu::stats` in `pipeline.rs`, which is outside this change's write
+    /// scope: fold `code_cache_restored` / `code_cache_refused` /
+    /// `code_cache_unpersistable` from [`JitProfile`](super::profile::JitProfile)
+    /// here and print them in `diag.rs`.
+    #[cfg(test)]
+    pub(super) fn code_cache_counters(&self) -> super::engine::CodeCacheCounts {
+        self.code_cache().counters().snapshot()
+    }
+
+    /// One-line code-cache hit rate, or `None` when `WIE_JIT_CODE_CACHE` is off.
+    #[cfg(test)]
+    pub(super) fn code_cache_summary(&self) -> Option<String> {
+        self.code_cache().summary()
+    }
+
+    /// The code cache this process should use.
+    ///
+    /// An `Arc` clone rather than a borrow so the test override below can hand
+    /// back a handle that outlives the guard it came from. Cloning an `Arc` is
+    /// one atomic increment, and this is called at most once per block install
+    /// and once per dispatch-miss probe — never on a block execution.
+    fn code_cache(&self) -> Arc<CodeCache> {
+        #[cfg(test)]
+        if let Some(injected) = self
+            .code_cache_override
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return injected;
+        }
+        Arc::clone(&self.code_cache)
+    }
+
+    /// Test-only: name of host import declaration `index` in the live module.
+    #[cfg(test)]
+    pub(super) fn code_import_name(&self, index: u32) -> Option<String> {
+        let guard = self.engine.lock().expect("engine lock");
+        let eng = guard.as_ref()?;
+        eng.base.import_name_at(index).map(str::to_owned)
+    }
+
+    /// Test-only: install (or clear) the code cache this process should use.
+    #[cfg(test)]
+    pub(super) fn set_code_cache(&self, cache: Option<Arc<CodeCache>>) {
+        *self
+            .code_cache_override
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = cache;
     }
 
     /// Record one Ready install (`inline` and worker paths) into the ledger.
     pub(super) fn persist_record_ready(&self, compiled: &CompiledBlock) {
+        self.record_code(compiled);
         let mem = self.mem.read().unwrap();
         self.persist.record_ready(
             &mem,
@@ -502,6 +693,11 @@ impl JitShared {
     pub(super) fn persist_invalidate_range(&self, addr: u64, end: u64) {
         let len = usize::try_from(end.saturating_sub(addr)).unwrap_or(usize::MAX);
         self.persist.invalidate_range(addr, len);
+        // The code cache drops overlapping blobs eagerly rather than waiting
+        // for the byte-hash guard to catch them: the guard is the correctness
+        // net, but keeping a dead blob would make every later probe of that VA
+        // pay a failed hash for the rest of the process.
+        self.code_cache().invalidate_range(addr, end);
     }
 
     /// Ledger clear: `full = true` purges everything (guest-triggered full
@@ -511,9 +707,14 @@ impl JitShared {
         self.persist.clear_all(full);
     }
 
-    /// Whether persistence is both enabled AND attached to a PE.
+    /// Whether persistence is enabled AND attached to a PE.
+    ///
+    /// Either cache counts: the metadata ledger and the machine-code cache are
+    /// independently switchable, and the dispatcher's warm-boot probe is the one
+    /// seam that consults both. Gating on only the ledger would make
+    /// `WIE_JIT_CODE_CACHE` silently inert whenever `WIE_JIT_CACHE=0`.
     pub(super) fn persist_active(&self) -> bool {
-        self.persist.active_pe() != 0
+        self.persist.active_pe() != 0 || self.code_cache().attached()
     }
 
     /// Whether `rip` is currently `Queued` in the cache — a background
