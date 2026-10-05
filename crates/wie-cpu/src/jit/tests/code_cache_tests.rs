@@ -425,25 +425,6 @@ fn blob_is_refused_when_the_guest_bytes_change() {
 }
 
 #[test]
-fn blob_is_refused_once_the_invalidation_generation_moves() {
-    let dir = scratch_dir("invgen");
-    seed_one_blob(&dir);
-
-    let (cpu, cache) = engine_with_cache(&dir);
-    // `invalidate_gen` is per-process and starts at 0, and the emitted edge
-    // guard embeds the value observed at compile time. A blob carrying any
-    // other value would bail to the dispatcher on every edge.
-    cpu.shared.invalidate_gen.store(7, Ordering::Release);
-    assert!(
-        force_probe(&cpu).is_none(),
-        "a stale edge guard must not be replayed"
-    );
-    let c = counts(&cache);
-    assert_eq!(c.refused_generation_moved, 1, "got {c:?}");
-    assert_eq!(c.restored, 0);
-}
-
-#[test]
 fn blob_from_a_different_pe_is_not_reused() {
     let dir = scratch_dir("other-pe");
     seed_one_blob(&dir);
@@ -463,6 +444,291 @@ fn blob_from_a_different_pe_is_not_reused() {
         "a different PE must not inherit the blob"
     );
     assert_eq!(cache.counters().snapshot().restored, 0);
+}
+
+// ---------------------------------------------------------------------------
+// No generation literal in the emitted code
+// ---------------------------------------------------------------------------
+
+/// Guest region for the chain fixture (unique per test-file convention).
+const CHAIN_BASE: u64 = 0x10c0_0000;
+/// Iterations of the two-block ring.
+const CHAIN_ITERS: u64 = 64;
+
+/// Two distinct blocks joined by an unmerged `jmp`, so each iteration crosses
+/// two chain edges:
+///
+/// ```text
+/// A (+0x00): add rax,rbx ; jmp B            <- rbx is a read-only live-in
+/// B (+0x08): dec rcx ; jnz A ; nop
+/// stop(+0x0e): ud2
+/// ```
+///
+/// `jmp`'s target is deliberately not A's fallthrough (the three padding nops):
+/// the decoder folds a jump-to-next into a fallthrough and would merge A and B
+/// into one block, making `hops` vacuous.
+const CHAIN_CODE: [u8; 16] = [
+    0x48, 0x01, 0xd8, // +0x00 add rax,rbx
+    0xeb, 0x03, // +0x03 jmp +0x08
+    0x90, 0x90, 0x90, // +0x05 padding (must NOT be the jmp target)
+    0x48, 0xff, 0xc9, // +0x08 dec rcx
+    0x75, 0xf3, // +0x0b jnz +0x00
+    0x90, // +0x0d nop
+    0x0f, 0x0b, // +0x0e ud2 (loop-exit stop)
+];
+const CHAIN_STOP: u64 = CHAIN_BASE + 0x0e;
+
+/// An engine with the chain fixture mapped, a code cache injected + attached,
+/// and `rcx`/`rbx` seeded so the ring terminates with a known `rax`.
+fn engine_with_chain(dir: &Path) -> (JitCpu, Arc<CodeCache>) {
+    let (mut cpu, cache) = engine_with_cache(dir);
+    cpu.virtual_alloc(
+        CHAIN_BASE,
+        0x1000,
+        MEM_RESERVE | MEM_COMMIT,
+        protect::PAGE_EXECUTE_READWRITE,
+    )
+    .expect("alloc chain region");
+    cpu.mem_write(CHAIN_BASE, &CHAIN_CODE).expect("write chain");
+    cpu.thread.regs.set_gpr(1, CHAIN_ITERS); // rcx
+    cpu.thread.regs.set_gpr(3, 1); // rbx
+    (cpu, cache)
+}
+
+/// Persist one chain block's blob into `dir`, recorded under `inv_gen`.
+///
+/// **One block per engine, deliberately.** A block compiled while its successor
+/// is already in `chain_ids` emits a direct `FunctionOffset` host call, which
+/// this format refuses to persist (module docs on the relocation census). Two
+/// engines means neither block is `Ready` when the other compiles, so both edges
+/// go through the named-import lookup helper — which is replayable, and which is
+/// what makes the restored blocks able to chain at all.
+///
+/// Each engine reopens the file the previous one wrote, and a flush rewrites the
+/// whole table, so successive calls accumulate into one corpus file.
+fn seed_chain_blob(dir: &Path, inv_gen: u64, va: u64) {
+    let (mut cpu, cache) = engine_with_chain(dir);
+    cpu.shared.invalidate_gen.store(inv_gen, Ordering::Release);
+    cpu.precompile_at(va);
+    assert!(cpu.has_ready_at(va), "seed block {va:#x} must compile");
+    let c = counts(&cache);
+    assert_eq!(c.compiled, 1, "one blob recorded: {c:?}");
+    assert_eq!(
+        c.skipped_unpersistable, 0,
+        "the chain edge must stay a lookup call, not a direct one: {c:?}"
+    );
+    let blob = cache
+        .test_blob(va)
+        .unwrap_or_else(|| panic!("no blob at {va:#x}"));
+    assert_eq!(
+        blob.inv_gen, inv_gen,
+        "the recorded generation is a diagnostic, not a gate"
+    );
+    assert!(
+        blob.relocs
+            .iter()
+            .all(|r| matches!(r.name, ModuleRelocTarget::User { namespace: 0, .. })),
+        "every relocation must target a host import ({} relocs)",
+        blob.relocs.len()
+    );
+    cpu.shared.finish_jit_caches();
+    assert!(sole_code_file(dir).exists(), "blob file written");
+    drop((cpu, cache));
+}
+
+/// Persist both blocks of the chain under the same generation.
+fn seed_chain(dir: &Path, inv_gen: u64) {
+    seed_chain_blob(dir, inv_gen, CHAIN_BASE);
+    seed_chain_blob(dir, inv_gen, CHAIN_BASE + 0x08);
+}
+
+/// Restore both chain blocks into a fresh engine and link them into this
+/// thread's chain table, mirroring what one dispatch prologue does.
+fn restore_chain(cpu: &mut JitCpu) -> CodeCacheCounts {
+    for va in [CHAIN_BASE, CHAIN_BASE + 0x08] {
+        let mem = cpu.shared.mem.read().expect("mem lock");
+        assert!(
+            cpu.shared.restore_or_probe(&mem, va).is_some(),
+            "blob at {va:#x} must restore; counts={:?}",
+            counts_via_shared(cpu)
+        );
+    }
+    cpu.resync_chain_table(cpu.shared.cache_epoch.load(Ordering::Relaxed));
+    counts_via_shared(cpu)
+}
+
+/// Run the restored ring to its `ud2` and assert the guest-visible result.
+///
+/// `A` is the only `add`, and `rbx == 1`, so a correct run leaves
+/// `rax == CHAIN_ITERS` and `rcx == 0`.
+fn run_chain(cpu: &mut JitCpu) {
+    cpu.run_until_stop(CHAIN_BASE, CHAIN_STOP, 0, 100_000, 0, 0)
+        .expect("run restored chain");
+    assert_eq!(
+        cpu.thread.regs.rip, CHAIN_STOP,
+        "execution must reach the harness stop"
+    );
+    assert_eq!(cpu.thread.regs.gpr(1), 0, "rcx must count down to zero");
+    assert_eq!(
+        cpu.thread.regs.gpr(0),
+        CHAIN_ITERS,
+        "chained edges must carry register state (A adds rbx=1 per iteration)"
+    );
+}
+
+/// The test that replaces the deleted generation gate, and the one that fails
+/// if anyone re-introduces a baked `iconst` for the invalidation guard.
+///
+/// A blob recorded under generation 7 is restored by a process sitting at
+/// generation 0 — the exact mismatch the old gate refused — and then **chains**.
+/// Restoring is not the point; the `hops > 0` is. A blob whose emitted guard
+/// still carried generation 7 as an immediate would restore happily and then
+/// bail to the dispatcher at every single edge, so `hops` would be 0 and the
+/// guard would have silently become the chainability filter it was replaced by.
+#[test]
+fn a_blob_recorded_under_another_generation_restores_and_chains() {
+    let dir = scratch_dir("crossgen");
+    seed_chain(&dir, 7);
+
+    let (mut cpu, _cache) = engine_with_chain(&dir);
+    assert_eq!(
+        cpu.shared.invalidate_gen.load(Ordering::Acquire),
+        0,
+        "a fresh process starts at generation 0, so the blob's 7 is stale"
+    );
+
+    let c = restore_chain(&mut cpu);
+    assert_eq!(c.restored, 2, "both blobs must restore: {c:?}");
+    assert_eq!(
+        c.refused(),
+        0,
+        "a generation mismatch is no longer a refusal: {c:?}"
+    );
+    assert_eq!(c.compiled, 0, "nothing may fall back to compiling: {c:?}");
+
+    run_chain(&mut cpu);
+    assert!(
+        cpu.stats().chain.hops > 0,
+        "a restored blob recorded under another generation must still chain; \
+         hops == 0 means a per-block generation literal is baked into the code"
+    );
+}
+
+/// One corpus file holding blobs written under two different generations, both
+/// restored by a third process at yet another generation.
+///
+/// This is the shape real warm boots produce, and the shape the removed gate
+/// turned into a coin flip: before the change this is where `restored` and
+/// `refused(gen=…)` diverged run to run, because which blobs were admitted
+/// depended on whether the capturing process's counter happened to match. Here
+/// both must land, both must chain, and no refusal may be reported for
+/// generation at all.
+#[test]
+fn a_corpus_of_mixed_generation_blobs_restores_and_chains_completely() {
+    let dir = scratch_dir("mixedgen");
+
+    // Blob A at generation 0, in its own engine: a fresh `JitShared` cannot see
+    // B, so A's edge stays a lookup call rather than a direct one.
+    seed_chain(&dir, 0);
+    {
+        let (mut cpu, cache) = engine_with_chain(&dir);
+        // Re-open the file written above and add B under a bumped generation.
+        cpu.shared.invalidate_gen.fetch_add(7, Ordering::Release);
+        cpu.precompile_at(CHAIN_BASE + 0x08);
+        let c = counts(&cache);
+        assert_eq!(c.skipped_unpersistable, 0, "got {c:?}");
+        assert_eq!(
+            cache.test_blob(CHAIN_BASE + 0x08).map(|b| b.inv_gen),
+            Some(7),
+            "B is the blob from the later generation"
+        );
+        assert_eq!(
+            cache.test_blob(CHAIN_BASE).map(|b| b.inv_gen),
+            Some(0),
+            "A survives the rewrite from the earlier generation"
+        );
+        cpu.shared.finish_jit_caches();
+        drop((cpu, cache));
+    }
+
+    // Third process, generation 0 again, opens the single mixed file.
+    let (mut cpu, _cache) = engine_with_chain(&dir);
+    let c = restore_chain(&mut cpu);
+    assert_eq!(c.restored, 2, "both blobs must restore: {c:?}");
+    assert_eq!(c.refused(), 0, "no generation refusal may remain: {c:?}");
+
+    run_chain(&mut cpu);
+    assert!(
+        cpu.stats().chain.hops > 0,
+        "both mixed-generation blobs must chain, got {} hops",
+        cpu.stats().chain.hops
+    );
+}
+
+/// A restored block whose *frame* bake goes stale must fall back to the
+/// dispatcher, not chain on.
+///
+/// Invalidating an unrelated page leaves the chain fixture's own bytes and
+/// therefore its blob hash untouched, but bumps `invalidate_gen` — so the frame
+/// the restored entry runs under carries a stale bake even though every `Ready`
+/// block still matches its bytes. The emitted guard's job in that state is to
+/// exit to the dispatcher, which purges and re-syncs: correctness first,
+/// chaining second. This is the one direction the coarser frame-generation
+/// guard is allowed to move in, and it is why it cannot produce a wrong answer.
+///
+/// (If a future change re-stamps surviving `Ready` entries on invalidation, this
+/// test's `hops == 0` assertion is the thing to relax — that change is strictly
+/// better and would restore chaining for this case.)
+#[test]
+fn a_stale_frame_bake_after_an_unrelated_invalidation_exits_instead_of_chaining() {
+    let dir = scratch_dir("stalebake");
+    seed_chain(&dir, 0);
+
+    let (mut cpu, _cache) = engine_with_chain(&dir);
+    let c = restore_chain(&mut cpu);
+    assert_eq!(c.restored, 2, "both blobs must restore: {c:?}");
+
+    // A second, untouched page — the invalidation cannot overlap the fixture,
+    // so no `Ready` entry is dropped and the persisted hashes still match.
+    let other = CHAIN_BASE + 0x10_0000;
+    cpu.virtual_alloc(
+        other,
+        0x1000,
+        MEM_RESERVE | MEM_COMMIT,
+        protect::PAGE_EXECUTE_READWRITE,
+    )
+    .expect("alloc unrelated page");
+    cpu.mem_write(other, &[0x90, 0x90, 0x90, 0x90, 0x90])
+        .expect("write unrelated");
+    // Compiled so its address is a known code page: `invalidate_code_range`
+    // ignores a range no compiled block covers, and would not bump at all.
+    cpu.precompile_at(other);
+    assert!(cpu.has_ready_at(other), "unrelated block must compile");
+    cpu.invalidate_code_range(other, 4);
+    assert_ne!(
+        cpu.shared.invalidate_gen.load(Ordering::Acquire),
+        0,
+        "an unrelated invalidation still bumps the shared generation"
+    );
+    assert!(
+        cpu.has_ready_at(CHAIN_BASE),
+        "the fixture's own bytes are untouched, so its entry survives"
+    );
+
+    let resyncs_before = cpu.stats().chain.resyncs;
+    run_chain(&mut cpu);
+    assert!(
+        cpu.stats().chain.resyncs > resyncs_before,
+        "the dispatcher must observe the generation change and rebuild its \
+         chain table (resyncs {} -> {})",
+        resyncs_before,
+        cpu.stats().chain.resyncs
+    );
+    assert_eq!(
+        cpu.stats().chain.hops,
+        0,
+        "a stale frame bake must exit at every chain edge, never chain on"
+    );
 }
 
 /// Write one valid blob to `dir` by compiling the block once in a throwaway

@@ -412,6 +412,17 @@ impl JitCpu {
         // the decode could instead stamp a NEWER generation over
         // pre-invalidation bytes and hide a stale block forever.
         let inv_gen = self.shared.invalidate_gen.load(Ordering::Acquire);
+        // Purge on *observation*, here, before anything below can run compiled
+        // code. `run_until_stop` does the same on its own loop, but that covers
+        // only the path through it: the emitted invalidation guard and
+        // `chain_tail` reason that every `Ready` block is either chain-compatible
+        // or purged, and that argument holds only if a generation change is
+        // noticed before *every* dispatch. Reusing the value already loaded
+        // above makes that unconditional and costs one compare.
+        if inv_gen != self.seen_invalidate_gen {
+            self.seen_invalidate_gen = inv_gen;
+            self.invalidate_chain_and_shadow();
+        }
         if let Some(hook) = self.thread.hooks.as_ref()
             && hook.should_host_stop(rip)
         {

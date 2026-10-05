@@ -30,16 +30,55 @@
 //! against the live module's import list by name. Anything else is refused and
 //! recompiled. Refusing costs a compile; guessing costs a crash.
 //!
-//! # The non-obvious guard: `inv_gen`
+//! # The non-obvious invariant: no per-process value in the emitted code
 //!
-//! The emitted code is **not** a pure function of the guest bytes. Every edge
-//! out of a block embeds the `JitShared::invalidate_gen` value observed at
-//! compile time as an immediate, and compares it against the live counter before
-//! chaining (see `lower::emit::emit_inv_gen_check`). `invalidate_gen` is a
-//! per-process counter starting at zero, so a blob compiled in an earlier
-//! process whose generation had moved carries a stale immediate and would take
-//! the "code invalidated" exit on every edge — correct, but it would never
-//! chain. Restores are therefore gated on `record.inv_gen == live invalidate_gen`.
+//! Replaying host code is only meaningful if a blob's behaviour after restore
+//! depends on *this* process's state and nothing carried over from the one
+//! that emitted it. The design guarantees that by construction: **the emitted
+//! code contains no per-process value at all.** Every runtime input arrives
+//! either through [`JitCtx`](crate::jit::lower::JitCtx) — `pins`, `mem_ptr`,
+//! `chain_slots`, `inv_gen_ptr` — or through a relocation re-checked against
+//! the live module's import list by name. Cranelift emits no absolute address
+//! of its own (see the relocation table above), so a blob is a pure function
+//! of guest bytes plus the frame the host builds around it.
+//!
+//! This was not free. Every edge out of a block guards against cross-thread
+//! code invalidation by comparing the live `JitShared::invalidate_gen` against
+//! a bake (see `lower::emit::emit_inv_gen_check`). That bake used to be an
+//! **immediate constant**, per block, per compile — so a blob written by an
+//! earlier process carried *that* process's generation forever and bailed to
+//! the dispatcher at every chain edge. The obvious fix, restoring such blobs
+//! anyway, does not help: the guard would then fail at runtime on every edge.
+//! Restores were therefore gated on `record.inv_gen == live invalidate_gen`,
+//! which silently turned into a chainability filter — it admitted exactly those
+//! blobs whose baked constant happened to match, which is often but never
+//! reliably true.
+//!
+//! The bake now lives in [`JitCtx::inv_gen_baked`](crate::jit::lower::JitCtx),
+//! stamped per dispatcher entry, matching what `trampolines::chain_tail` has
+//! always done. So no gate is needed and none is applied: a restored blob's
+//! guard compares against *this* frame's generation.
+//!
+//! Why "adopt the live generation and chain" is correct rests on two
+//! enumerable facts, neither of which any hash covers:
+//!
+//! 1. `JitEngine::invalidate_code_range` drops every overlapping `Ready` entry
+//!    **before** the `Release` bump, so no surviving `Ready` entry's code can
+//!    disagree with its current guest bytes; the background worker likewise
+//!    refuses to install a block whose bytes moved mid-compile. The only two
+//!    writers of `invalidate_gen` are that bump and `clear_compiled`.
+//! 2. The dispatcher purges its chain table / edge IC / shadow stack whenever it
+//!    observes a generation change, and that check precedes every compiled-block
+//!    execution on the production path.
+//!
+//! Hence `guard passes` ⟺ `live == entry.gen` ⟺ no invalidation completed since
+//! the entry block compiled ⟹ every `Ready` block still matches its bytes.
+//!
+//! Note what deliberately does **not** cover this: the guest-byte FNV-1a hashes
+//! `[va, guest_end)` — the block's *own* bytes — while chaining reaches *other*
+//! blocks, which is the entire exposure; and the import fingerprint covers host
+//! addresses, which is orthogonal. Neither can see the reasoning above, so it
+//! stays written down here.
 //!
 //! # Everything else that can invalidate a blob
 //!
@@ -83,15 +122,24 @@ const MAGIC: [u8; 8] = *b"WIECODE\x01";
 
 /// On-disk format version.
 ///
-/// **v1 is the first version that carries machine code at all.** There is
-/// nothing to migrate from, so this is a fresh namespace with fresh filenames
+/// **v2** — the emitted invalidation guard reads its bake from `JitCtx` instead
+/// of carrying a per-block compile-time immediate (module docs on the
+/// no-per-process-value invariant), so a restored blob's chain edges behave
+/// identically to a freshly compiled one's. `DiskBlob`'s *layout* is unchanged
+/// by this, but the bump is mandatory: `JitConfig::emit_fingerprint` hashes
+/// config knobs and build shape, **not** emitter source, so a lowering change
+/// cannot move it. Without the bump, v1 blobs (per-block guards) and v2 blobs
+/// (frame guards) would coexist in one file with different exit semantics.
+///
+/// **v1** was the first version that carries machine code at all. There was
+/// nothing to migrate from, so that was a fresh namespace with fresh filenames
 /// (`.code` next to the ledger's `.bin`) rather than a bump of an existing
 /// format: a version conflict cannot be confused with a ledger reset, and a
 /// stale blob from any future format is deleted on sight.
 ///
 /// Bumping this invalidates every `.code` file, which is the correct behaviour:
 /// the blobs are only meaningful under the exact layout that produced them.
-const CODE_FORMAT_VERSION: u32 = 1;
+const CODE_FORMAT_VERSION: u32 = 2;
 
 /// Relocation kinds that may appear in a persisted blob, and their on-disk
 /// codes.
@@ -187,9 +235,6 @@ pub(crate) enum CodeRestoreOutcome {
     Absent,
     /// Guest bytes no longer hash to the recorded value (SMC, or a stale file).
     BytesChanged,
-    /// The recorded `inv_gen` is not this process's `invalidate_gen`, so the
-    /// edge guard baked into the code is stale (see module docs).
-    GenerationMoved,
     /// File-level identity mismatch: format, WIE version, PE, opt level, import
     /// list, or emitter fingerprint.
     FileMismatch,
@@ -213,7 +258,6 @@ impl CodeRestoreOutcome {
             Self::Restored => "restored",
             Self::Absent => "absent",
             Self::BytesChanged => "bytes-changed",
-            Self::GenerationMoved => "generation-moved",
             Self::FileMismatch => "file-mismatch",
             Self::UnrelocatableTarget => "unrelocatable-target",
             Self::Malformed => "malformed",
@@ -230,8 +274,14 @@ pub(crate) struct PersistedCode {
     pub guest_end: u64,
     pub bytes_hash: u64,
     pub insn_count: u32,
-    /// `JitShared::invalidate_gen` at capture time — the value the emitted edge
-    /// guard compares against (see module docs).
+    /// `JitShared::invalidate_gen` at capture time.
+    ///
+    /// Recorded, hashed into the blob's integrity check and **not** a restore
+    /// gate: the emitted edge guard compares the live generation against the
+    /// frame's `JitCtx::inv_gen_baked`, so a blob recorded under a different
+    /// generation is as replayable as one recorded under this one (module docs).
+    /// Kept because it is cheap, it is what a stale-file report needs, and
+    /// because dropping a field from `DiskBlob` would move the layout for no gain.
     pub inv_gen: u64,
     pub compiled_at_opt: OptTier,
     pub align: u64,
@@ -441,7 +491,6 @@ pub(crate) struct CodeCacheCounters {
     pub bytes_replayed: AtomicU64,
     pub probe_absent: AtomicU64,
     pub refused_bytes_changed: AtomicU64,
-    pub refused_generation_moved: AtomicU64,
     pub refused_file_mismatch: AtomicU64,
     pub refused_unrelocatable: AtomicU64,
     pub refused_malformed: AtomicU64,
@@ -477,7 +526,6 @@ impl CodeCacheCounters {
             bytes_replayed: g(&self.bytes_replayed),
             missing: g(&self.probe_absent),
             refused_bytes_changed: g(&self.refused_bytes_changed),
-            refused_generation_moved: g(&self.refused_generation_moved),
             refused_file_mismatch: g(&self.refused_file_mismatch),
             refused_unrelocatable: g(&self.refused_unrelocatable),
             refused_malformed: g(&self.refused_malformed),
@@ -496,7 +544,6 @@ impl CodeCacheCounters {
             }
             CodeRestoreOutcome::Absent => &self.probe_absent,
             CodeRestoreOutcome::BytesChanged => &self.refused_bytes_changed,
-            CodeRestoreOutcome::GenerationMoved => &self.refused_generation_moved,
             CodeRestoreOutcome::FileMismatch => &self.refused_file_mismatch,
             CodeRestoreOutcome::UnrelocatableTarget => &self.refused_unrelocatable,
             CodeRestoreOutcome::Malformed => &self.refused_malformed,
@@ -514,7 +561,6 @@ pub(crate) struct CodeCacheCounts {
     pub bytes_replayed: u64,
     pub missing: u64,
     pub refused_bytes_changed: u64,
-    pub refused_generation_moved: u64,
     pub refused_file_mismatch: u64,
     pub refused_unrelocatable: u64,
     pub refused_malformed: u64,
@@ -528,7 +574,6 @@ impl CodeCacheCounts {
     /// Every refusal, summed.
     pub(crate) fn refused(&self) -> u64 {
         self.refused_bytes_changed
-            .saturating_add(self.refused_generation_moved)
             .saturating_add(self.refused_file_mismatch)
             .saturating_add(self.refused_unrelocatable)
             .saturating_add(self.refused_malformed)
@@ -812,31 +857,22 @@ impl CodeCache {
         self.flush_tick();
     }
 
-    /// Byte-validated, generation-validated lookup.
+    /// Byte-validated lookup.
     ///
-    /// `live_inv_gen` is this process's `JitShared::invalidate_gen`; a mismatch
-    /// means the block's baked edge guard is stale (module docs).
-    pub(crate) fn probe(
-        &self,
-        mem: &GuestMemory,
-        va: u64,
-        live_inv_gen: u64,
-    ) -> Option<PersistedCode> {
+    /// There is deliberately no invalidation-generation check here. The
+    /// emitted guard reads its bake from the frame's `JitCtx`, not from a
+    /// compile-time literal, so a blob recorded under a different
+    /// `invalidate_gen` behaves exactly like a freshly compiled one (module docs
+    /// on the no-per-process-value invariant). A generation gate here would only
+    /// have re-imposed the chainability filter that invariant removed.
+    pub(crate) fn probe(&self, mem: &GuestMemory, va: u64) -> Option<PersistedCode> {
         let p = self.table()?.pin().get(&va).cloned()?;
-        if p.inv_gen != live_inv_gen {
-            return None;
-        }
         let hash = super::super::cache_persist::hash_guest_range(mem, va, p.guest_end)?;
         (hash == p.bytes_hash).then_some(p)
     }
 
     /// Classify a probe miss so the counters say *why* the cache is cold.
-    pub(crate) fn classify_miss(
-        &self,
-        mem: &GuestMemory,
-        va: u64,
-        live_inv_gen: u64,
-    ) -> CodeRestoreOutcome {
+    pub(crate) fn classify_miss(&self, mem: &GuestMemory, va: u64) -> CodeRestoreOutcome {
         let Some(identity) = *self.identity.read().unwrap_or_else(|e| e.into_inner()) else {
             return CodeRestoreOutcome::Absent;
         };
@@ -850,9 +886,6 @@ impl CodeCache {
         let Some(p) = p else {
             return CodeRestoreOutcome::Absent;
         };
-        if p.inv_gen != live_inv_gen {
-            return CodeRestoreOutcome::GenerationMoved;
-        }
         match super::super::cache_persist::hash_guest_range(mem, va, p.guest_end) {
             Some(h) if h == p.bytes_hash => CodeRestoreOutcome::Restored,
             _ => CodeRestoreOutcome::BytesChanged,
@@ -1056,13 +1089,12 @@ impl CodeCache {
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
         Some(format!(
             "restored={} compiled={} unpersistable={} \
-             refused(bytes={} gen={} file={} target={} malformed={}) missing={} \
+             refused(bytes={} file={} target={} malformed={}) missing={} \
              replayed={}",
             g(&c.restored),
             g(&c.compiled),
             g(&c.skipped_unpersistable),
             g(&c.refused_bytes_changed),
-            g(&c.refused_generation_moved),
             g(&c.refused_file_mismatch),
             g(&c.refused_unrelocatable),
             g(&c.refused_malformed),

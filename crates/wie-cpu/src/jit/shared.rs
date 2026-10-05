@@ -530,10 +530,14 @@ impl JitShared {
         if !self.code_cache().enabled() {
             return None;
         }
+        // The live generation is stamped onto the restored block (not compared
+        // against the blob's): the emitted guard reads it from the frame's
+        // `JitCtx`, so a blob recorded under any generation is equally
+        // replayable. See the `code_cache` module docs.
         let live_gen = self.invalidate_gen.load(Ordering::Acquire);
         let cache = self.code_cache();
-        let Some(code) = cache.probe(mem, va, live_gen) else {
-            cache.note(cache.classify_miss(mem, va, live_gen));
+        let Some(code) = cache.probe(mem, va) else {
+            cache.note(cache.classify_miss(mem, va));
             return None;
         };
         let tier = code.compiled_at_opt;
