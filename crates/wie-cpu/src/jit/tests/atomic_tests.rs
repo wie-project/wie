@@ -42,7 +42,7 @@ const XCHG_MEM_R16: [u8; 3] = [0x66, 0x87, 0x03];
 /// 64 KiB-aligned: MEM_RESERVE rounds both base and size to the Windows
 /// allocation granularity, and the code reservations below are rounded the same
 /// way, so the data page needs its own non-overlapping 64 KiB slot.
-const DATA_BASE: u64 = 0x4008_0000;
+pub(super) const DATA_BASE: u64 = 0x4008_0000;
 
 // The interpreter's decode cache is process-wide and thread-local, keyed by
 // (rip, mem_generation) — and every test CPU here starts at generation 0, so
@@ -56,20 +56,20 @@ const CODE_CMPXCHG: u64 = 0x4002_0000;
 /// Decode-only (never executed), so it only has to differ from the above.
 const CODE_DECODE_ONLY: u64 = 0x4003_0000;
 /// 32-bit lock word. Aligned, so `host_span` can hand out an `AtomicI32`.
-const LOCK_WORD: u64 = DATA_BASE;
+pub(super) const LOCK_WORD: u64 = DATA_BASE;
 /// One byte in, so no naturally-aligned host atomic exists — the locked
 /// fallback has to supply the mutual exclusion.
-const UNALIGNED_WORD: u64 = DATA_BASE + 1;
+pub(super) const UNALIGNED_WORD: u64 = DATA_BASE + 1;
 
 // ── Engine plumbing ─────────────────────────────────────────────────────
 
-enum Engine {
+pub(super) enum Engine {
     Iced(Box<IcedCpu>),
     Jit(Box<JitCpu>),
 }
 
 impl Engine {
-    fn cpu(&mut self) -> &mut dyn CpuEngine {
+    pub(super) fn cpu(&mut self) -> &mut dyn CpuEngine {
         match self {
             Self::Iced(c) => c.as_mut(),
             Self::Jit(c) => c.as_mut(),
@@ -77,7 +77,7 @@ impl Engine {
     }
 
     /// Execute enough to retire the single RMW under test.
-    fn run_rmw(&mut self) -> StepResultAlias {
+    pub(super) fn run_rmw(&mut self) -> StepResultAlias {
         match self {
             Self::Iced(c) => c.step_once_result().expect("iced step"),
             Self::Jit(c) => {
@@ -87,14 +87,14 @@ impl Engine {
         }
     }
 
-    fn set_state(&mut self, ctx: &ThreadContext) {
+    pub(super) fn set_state(&mut self, ctx: &ThreadContext) {
         self.cpu().restore_thread_context(ctx);
         // A real guest thread switch does the same TLB/chain drop; without it a
         // JIT engine would reuse the previous trial's translated pointers.
         self.cpu().on_thread_switch();
     }
 
-    fn rax(&mut self) -> u64 {
+    pub(super) fn rax(&mut self) -> u64 {
         self.cpu().read_rax().expect("read rax")
     }
 
@@ -105,7 +105,7 @@ impl Engine {
     }
 }
 
-fn open(backend: Backend) -> Engine {
+pub(super) fn open(backend: Backend) -> Engine {
     match backend {
         Backend::Iced => Engine::Iced(Box::new(IcedCpu::open_x86_64())),
         Backend::Jit => Engine::Jit(Box::new(JitCpu::open_x86_64())),
@@ -115,7 +115,7 @@ fn open(backend: Backend) -> Engine {
 /// A fresh per-thread engine over the *same* guest memory — the 1:1 model the
 /// runtime uses for guest threads (`IcedCpu::new_standalone_with_mem` /
 /// `JitCpu::new_shared`), and the reason two guest threads can race at all.
-fn open_worker(primary: &Engine) -> Engine {
+pub(super) fn open_worker(primary: &Engine) -> Engine {
     match primary {
         Engine::Iced(c) => Engine::Iced(Box::new(IcedCpu::new_standalone_with_mem(Arc::clone(
             c.guest_mem_arc(),
@@ -125,15 +125,15 @@ fn open_worker(primary: &Engine) -> Engine {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Backend {
+pub(super) enum Backend {
     Iced,
     Jit,
 }
 
-const BACKENDS: [Backend; 2] = [Backend::Iced, Backend::Jit];
+pub(super) const BACKENDS: [Backend; 2] = [Backend::Iced, Backend::Jit];
 
 /// Register file for one RMW: RIP at the code page, RBX pointing at the word.
-fn ctx(code_base: u64, word: u64, rax: u64, rcx: u64) -> ThreadContext {
+pub(super) fn ctx(code_base: u64, word: u64, rax: u64, rcx: u64) -> ThreadContext {
     let mut gpr = [0_u64; 16];
     gpr[0] = rax; // RAX — the XCHG source / the CMPXCHG accumulator
     gpr[1] = rcx; // RCX — the CMPXCHG source
@@ -148,7 +148,7 @@ fn ctx(code_base: u64, word: u64, rax: u64, rcx: u64) -> ThreadContext {
 /// Map code + data, then plant `op` at the code base with a `nop` filler and a
 /// `ud2` terminator (the filler reaches the 2-insn compile minimum; the `ud2`
 /// stops linear decode so the zero-filled tail cannot extend the block).
-fn plant(primary: &mut Engine, code_base: u64, op: &[u8], word: u64, initial: u32) {
+pub(super) fn plant(primary: &mut Engine, code_base: u64, op: &[u8], word: u64, initial: u32) {
     let cpu = primary.cpu();
     // One reservation (MEM_RESERVE wants a 64 KiB-aligned base) covering the
     // code page, then map the shared data page to plain RW:
@@ -178,13 +178,13 @@ fn plant(primary: &mut Engine, code_base: u64, op: &[u8], word: u64, initial: u3
         .expect("write lock word");
 }
 
-fn read_word(primary: &mut Engine, word: u64) -> u32 {
+pub(super) fn read_word(primary: &mut Engine, word: u64) -> u32 {
     let mut buf = [0_u8; 4];
     primary.cpu().mem_read(word, &mut buf).expect("read word");
     u32::from_le_bytes(buf)
 }
 
-fn write_word(primary: &mut Engine, word: u64, value: u32) {
+pub(super) fn write_word(primary: &mut Engine, word: u64, value: u32) {
     primary
         .cpu()
         .mem_write(word, &value.to_le_bytes())

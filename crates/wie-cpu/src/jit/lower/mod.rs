@@ -609,6 +609,48 @@ fn empty_chain_refs() -> &'static HashMap<u64, FuncRef> {
     EMPTY.get_or_init(HashMap::new)
 }
 
+/// Complete the live-in and flags sets for operands the decoder does not expose.
+///
+/// `analysis::mark_insn_gprs` derives liveness from a decoded instruction's
+/// *explicit* operands plus a hand-written list of implicit cases (RSP for
+/// push/pop/call/ret, RAX/RCX/RSI/RDI for string ops, RAX/RDX for the sign
+/// extensions). `block_needs_flags` is likewise a mnemonic list. Two RMW
+/// mnemonics read or write state neither list mentions, and both are lowered
+/// here, so the block was compiled against an `entry_gpr` full of
+/// `iconst 0` placeholders and without an RFLAGS carrier:
+///
+/// * `CmpXchg` compares its destination against the **implicit** accumulator
+///   (AX/EAX/RAX — the ISA has no 8-bit form). A block that does not otherwise
+///   touch RAX therefore compared against `0` and picked the wrong branch; on the
+///   16-bit form the write-back merged into the placeholder and zeroed the upper
+///   bits of RAX. It also *writes* ZF, so the flags carrier must be present.
+/// * `Xadd` writes flags on every form (like `Add`), so it needs the carrier
+///   too.
+///
+/// This only ever *adds* what an instruction genuinely reads or writes — it
+/// cannot make a live set wider than the ISA requires — so it does not trade
+/// JIT throughput for the fix. `CmpXchg` and `Xadd` are the complete list
+/// today; a new lowerer that consumes an implicit register must add its
+/// mnemonic here, or it will read an `iconst 0`.
+fn implicit_operand_completion(
+    insns: &[DecodedInsn],
+    live: &mut [bool; 16],
+    needs_flags: &mut bool,
+) {
+    for d in insns {
+        match d.instr.mnemonic() {
+            Mnemonic::Cmpxchg => {
+                live[0] = true; // RAX: the implicit accumulator
+                *needs_flags = true; // ZF
+            }
+            Mnemonic::Xadd => {
+                *needs_flags = true; // CF/PF/AF/ZF/SF/OF, as `Add` does
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Lower one block into `eng`'s module and finalize it.
 ///
 /// `chain` MUST contain only `FuncId`s declared by the SAME module `eng`
@@ -638,10 +680,11 @@ pub(super) fn compile_block(
     inv_gen_baked: u64,
     tier: OptTier,
 ) -> Result<CompiledBlock, String> {
-    let live = analyze_live_gprs(insns);
+    let mut live = analyze_live_gprs(insns);
     let live_xmm = analyze_live_xmm(insns);
     let def_xmm = analyze_def_xmm(insns);
-    let needs_flags = block_needs_flags(insns, term);
+    let mut needs_flags = block_needs_flags(insns, term);
+    implicit_operand_completion(insns, &mut live, &mut needs_flags);
     let has_fast_call = call_fast.is_some();
     let has_mem = block_has_mem(insns)
         || matches!(term, Some(BlockTerm::Call { .. } | BlockTerm::Ret))
