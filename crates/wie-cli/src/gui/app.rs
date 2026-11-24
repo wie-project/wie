@@ -619,6 +619,8 @@ struct WieApp {
     /// ([`WieEvent::HostInterrupt`]); read after `run_app` returns to exit
     /// with status 130.
     host_interrupt_exit: bool,
+    /// `--screenshot-on-frame`: dump the Nth published frame and stop.
+    capture: Option<crate::gui::capture::FrameCapture>,
 }
 
 impl ApplicationHandler<WieEvent> for WieApp {
@@ -867,6 +869,7 @@ pub fn run_gui_windowed(
     drive_d_root: Option<&std::path::Path>,
     app_dir: Option<&std::path::Path>,
     guest_args: &[String],
+    capture: Option<crate::gui::capture::FrameCapture>,
 ) -> Result<()> {
     // FS policy: an exe outside the bottle runs from a drive_c copy so the
     // guest identity's `C:\Program Files\{name}\{name}.exe` label maps back
@@ -1184,6 +1187,7 @@ pub fn run_gui_windowed(
         #[cfg(target_os = "macos")]
         last_menu_items: Arc::new(Vec::new()),
         host_interrupt_exit: false,
+        capture,
     };
 
     event_loop

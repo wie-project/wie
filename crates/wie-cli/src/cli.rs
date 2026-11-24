@@ -104,6 +104,19 @@ pub struct RunArgs {
     #[arg(long)]
     pub screenshot: Option<PathBuf>,
 
+    /// With `--gui` and `--screenshot`: capture at the Nth *published* frame
+    /// and exit, instead of the headless first-frame capture.
+    ///
+    /// `--screenshot` alone is headless and returns when the guest reaches
+    /// `WaitingForMessage` after its first paint. A game loop never does
+    /// (DOOM Retro runs forever), so a windowed guest needs the real window
+    /// path plus a frame index to stop at. The frame is 1-based and counted
+    /// per distinct published buffer, so two runs of the same build — one with
+    /// the acceleration lane on, one off — dump comparable pictures and the
+    /// two BMPs can be compared byte for byte.
+    #[arg(long, value_name = "N")]
+    pub screenshot_on_frame: Option<u64>,
+
     /// Drive a `--gui` guest with a scripted input file (lines: sleep
     /// <ms> | key <vk> [shift|ctrl] | type <text> | menu <id> | click
     /// <x> <y> | snapshot <file>). Requires --gui. The `WIE_INPUT_SCRIPT`
@@ -303,6 +316,7 @@ pub fn run_entry(
         console,
         gui,
         screenshot,
+        screenshot_on_frame,
         input_script,
     } = args;
     // Profiling Ctrl+C (`WIE_RUNTIME_PROFILE` armed): install the signal
@@ -313,6 +327,20 @@ pub fn run_entry(
     // load; behavior is untouched when profiling is off.
     if wie_runtime::host::profile_sigint_armed() {
         wie_runtime::host::ensure_hooks_installed();
+    }
+
+    // Frame-indexed capture is the windowed counterpart of `--screenshot`; it
+    // needs both halves (the window path, and a file to write).
+    if screenshot_on_frame.is_some() {
+        if !gui {
+            bail!("--screenshot-on-frame needs --gui (it captures from the windowed path)");
+        }
+        if screenshot.is_none() {
+            bail!("--screenshot-on-frame needs --screenshot <file.bmp> for the output path");
+        }
+        if screenshot_on_frame == Some(0) {
+            bail!("--screenshot-on-frame is 1-based; N must be at least 1");
+        }
     }
 
     // GUI/screenshot mode takes precedence over persistent/micro.
@@ -331,6 +359,9 @@ pub fn run_entry(
             #[cfg(target_os = "macos")]
             {
                 let script = gui::input_script::script_path(input_script.as_deref());
+                let capture = screenshot_on_frame
+                    .zip(screenshot.as_ref())
+                    .map(|(frame, out)| gui::capture::FrameCapture::new(out.clone(), frame));
                 return gui::app::run_gui_windowed(
                     path,
                     script,
@@ -338,6 +369,7 @@ pub fn run_entry(
                     drive_d.as_deref(),
                     app_dir.as_deref(),
                     &guest_args,
+                    capture,
                 );
             }
             #[cfg(not(target_os = "macos"))]

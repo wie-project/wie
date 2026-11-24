@@ -31,6 +31,8 @@
 //! - `SDL_FillRect` / `SDL_FillRects` — clipped, pattern-replicated fills.
 //! - `SDL_UpperBlit` (what `SDL_BlitSurface` is defined as) / `SDL_LowerBlit` —
 //!   `SDL_BlitCopy` and the palette-expanding `Blit1toN[Key]` cases.
+//! - `SDL_SoftStretch` — `SDL_BlitScaled`'s nearest-neighbour scaler, the
+//!   largest single consumer in the DOOM Retro profile; see [`stretch`].
 //!
 //! The palette-expanding case needs one thing SDL would have done first: a
 //! `SDL_LowerBlit` whose source palette was recoloured is a *stale mapping*, and
@@ -50,6 +52,7 @@
 pub(crate) mod blit;
 pub(crate) mod fill;
 pub(crate) mod palette;
+pub(crate) mod stretch;
 pub(crate) mod surface;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,9 +76,99 @@ pub(crate) const EXPORTS: &[&str] = &[
     "SDL_FillRects",
     "SDL_LockSurface",
     "SDL_LowerBlit",
+    "SDL_SoftStretch",
     "SDL_UnlockSurface",
     "SDL_UpperBlit",
 ];
+
+/// Whether serving `name` requires patching the module's *internal* copy too.
+///
+/// `SDL_SoftStretch` is the case this exists for, and it is not a special case
+/// in the mechanism — it is a fact about the guest: `SDL_PrivateLowerBlitScaled`
+/// calls `SDL_SoftStretch` by direct address (`callq 0x1800d8040`), never
+/// through the export's dynapi slot, so a slot-only interception provably never
+/// fires (measured: 0 calls while the module blitted 961 frames through the
+/// slot-intercepted `SDL_LowerBlit`). Any export whose module both exports and
+/// calls internally needs the same treatment; today that is one name.
+#[must_use]
+pub(crate) fn detours_its_internal_copy(name: &str) -> bool {
+    name.eq_ignore_ascii_case("SDL_SoftStretch")
+}
+
+/// Record every export of a freshly loaded module that needs an intra-module
+/// detour, whether or not the guest imports it.
+///
+/// This is the half that makes the detour possible at all: the export we must
+/// patch (`SDL_SoftStretch`) is one this guest never imports, so import
+/// resolution never mentions it — the module's own export table is the only
+/// place the name appears.
+pub(crate) fn record_module_detours(
+    engine: &mut dyn CpuEngine,
+    state: &mut crate::WinApiState,
+    library: &str,
+) {
+    if !crate::host_exports::enabled() {
+        return;
+    }
+    let Some(module) = state
+        .module_state
+        .loaded_modules
+        .get(&crate::dll_loader::normalize_dll_name(library))
+    else {
+        return;
+    };
+    let wanted: Vec<&'static str> = EXPORTS
+        .iter()
+        .copied()
+        .filter(|name| detours_its_internal_copy(name))
+        .filter(|name| module.get_export_va(name).is_some())
+        .collect();
+    // Copy what the closed loops need and let the borrow of `state` end here:
+    // both loops below need it mutably.
+    let (image_base, image_size) = (module.image_base, module.image_size);
+    for name in wanted {
+        if let Ok(Some(_)) = crate::host_exports::resolve_fake_va(engine, state, LIBRARY, name) {
+            tracing::debug!(name, "recorded an export for an intra-module detour");
+        }
+    }
+    // Entries the export table does not lead to. `SDL_SoftStretch`'s exported
+    // form is a dynapi thunk over a slot holding a *generated wrapper*, while
+    // the body SDL calls from inside itself — the one containing the scaled
+    // blit's inner loop — is a separate internal function that only an
+    // intra-module `callq` reaches. That address has to be named, and the
+    // prologue bytes are the guard that it still is the audited function.
+    for (name, rva, prologue) in INTERNAL_ENTRIES {
+        if !detours_its_internal_copy(name) {
+            continue;
+        }
+        let entry_va = image_base.saturating_add(u64::from(*rva));
+        if entry_va < image_base
+            || entry_va >= image_base.saturating_add(u64::try_from(image_size).unwrap_or(0))
+        {
+            continue;
+        }
+        crate::host_exports::set_internal_entry(state, LIBRARY, name, entry_va, *prologue);
+    }
+}
+
+/// Internal entries that no import table, export thunk or dispatch slot reaches.
+///
+/// `docs/architecture/scaled-blit-block-attribution.md` attributes 54.1 % of
+/// guest time to the loop at `SDL2.dll+0xd8fb0`, inside the nearest-neighbour
+/// scaler reached from `+0xd8040`. The exported `SDL_SoftStretch` is not that
+/// function: it is a dynapi thunk (`+0x1e5c0`) over a slot holding a generated
+/// wrapper (`+0x133d0`), so the audited body has to be named. Each entry is
+/// `(handler name, RVA, first 12 bytes)` — the bytes are checked before any
+/// patch is planted, so a build whose layout differs is refused rather than
+/// silently hooked. With `WIE_HOST_EXPORTS=0` nothing here runs at all.
+const INTERNAL_ENTRIES: &[(&str, u32, [u8; 12])] = &[(
+    "SDL_SoftStretch",
+    0xd8040,
+    // sub rsp, 0x38 ; mov dword [rsp+0x20], 0
+    [
+        0x48, 0x83, 0xec, 0x38, 0xc7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00,
+    ],
+)];
 
 /// Is `library!name` a guest-DLL export served here?
 #[must_use]
@@ -181,6 +274,11 @@ pub(super) enum Decline {
     NullArgument,
     /// A pending stretch (`SDL_COPY_NEAREST`).
     NearestPending,
+    /// `SDL_SoftStretch` was given two surfaces of different formats, which SDL
+    /// refuses with an error string.
+    StretchFormat,
+    /// A `SDL_SoftStretch` rect larger than the 65535 SDL allows.
+    StretchTooLarge,
     /// The rects ask for scaling: SDL would pick a `*Scale` blitter, whose
     /// fixed-point stepping this module does not reproduce.
     Scaled,
@@ -188,7 +286,7 @@ pub(super) enum Decline {
 
 impl Decline {
     /// Number of variants — the counter array length.
-    pub(super) const COUNT: usize = 13;
+    pub(super) const COUNT: usize = 15;
 
     /// Stable report label.
     #[must_use]
@@ -206,6 +304,8 @@ impl Decline {
             Self::SurfaceLocked => "surface_locked",
             Self::NullArgument => "null_argument",
             Self::NearestPending => "nearest_pending",
+            Self::StretchFormat => "stretch_format",
+            Self::StretchTooLarge => "stretch_too_large",
             Self::Scaled => "scaled",
         }
     }
@@ -215,6 +315,14 @@ impl Decline {
 /// as opposed to "the call was served and the guest's table happened to be
 /// fresh already". Reported only when nonzero.
 static TABLE_REBUILDS: AtomicU64 = AtomicU64::new(0);
+
+/// Stretches run in shadow mode (native result computed, guest result drawn).
+static SHADOWED: AtomicU64 = AtomicU64::new(0);
+
+/// Tally one shadowed stretch.
+pub(super) fn note_shadow_shadowed() {
+    ExportStats::bump(&SHADOWED);
+}
 
 /// Tally one in-place palette table rebuild.
 pub(super) fn note_table_rebuilt() {
@@ -296,6 +404,8 @@ pub fn report_lines() -> Vec<String> {
         Decline::NullArgument,
         Decline::NearestPending,
         Decline::Scaled,
+        Decline::StretchFormat,
+        Decline::StretchTooLarge,
     ]
     .into_iter()
     .filter(|reason| decline_count(*reason) > 0)
@@ -306,6 +416,29 @@ pub fn report_lines() -> Vec<String> {
             "sdl2_blit_declines: {} (the gate each refused blit failed)",
             reasons.join(" ")
         ));
+    }
+    if let Some(line) = stretch::shadow_report_line() {
+        lines.push(line);
+    } else if SHADOWED.load(Ordering::Relaxed) > 0 {
+        lines.push(format!(
+            "sdl2_stretch_shadow: {} stretches shadowed, none compared yet \
+             (the tally appears on the second call)",
+            SHADOWED.load(Ordering::Relaxed)
+        ));
+    }
+    // An intra-module caller never touches the dispatch slot, so "the export
+    // was served" says nothing about whether the module's own block is reached.
+    // These two numbers do: zero planted means the entry patch never went in,
+    // and a nonzero refused means it was offered a prologue it declined.
+    let (planted, refused, unresolved) = crate::host_exports::detour_tally();
+    if planted > 0 || refused > 0 || unresolved > 0 {
+        lines.push(format!(
+            "sdl2_intra_module_detours: {planted} planted, {refused} refused, {unresolved} unresolved \
+             (an internal direct call is intercepted only when planted)"
+        ));
+        if let Some(reason) = crate::host_exports::last_refusal() {
+            lines.push(format!("sdl2_detour_refusal: {reason}"));
+        }
     }
     let rebuilt = TABLE_REBUILDS.load(Ordering::Relaxed);
     if rebuilt > 0 {
@@ -356,6 +489,9 @@ pub(crate) fn dispatch(
     if let Some(stats) = STATS.get(index) {
         ExportStats::bump(&stats.calls);
     }
+    // Plant any pending intra-module detours before the module can reach them.
+    // Cheap: the pending set is empty after the first call that installs them.
+    crate::host_exports::install_pending_detours(ctx.engine, ctx.state);
     let lower = name.to_ascii_lowercase();
     let handled = match lower.as_str() {
         "sdl_locksurface" => lock_surface(ctx)?,
@@ -364,6 +500,7 @@ pub(crate) fn dispatch(
         "sdl_fillrects" => fill::handle_fill_rects(ctx)?,
         "sdl_upperblit" | "sdl_blitsurface" => blit::handle_upper_blit(ctx)?,
         "sdl_lowerblit" => blit::handle_lower_blit(ctx)?,
+        "sdl_softstretch" => stretch::handle_soft_stretch(ctx)?,
         _ => return Ok(None),
     };
     Ok(Some(handled))
@@ -440,6 +577,7 @@ mod tests {
                         | "sdl_fillrects"
                         | "sdl_upperblit"
                         | "sdl_lowerblit"
+                        | "sdl_softstretch"
                 ),
                 "{name} has no dispatch arm"
             );

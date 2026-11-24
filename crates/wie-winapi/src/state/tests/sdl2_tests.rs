@@ -1154,7 +1154,7 @@ fn a_stale_palette_with_no_table_stays_with_the_guest() {
         0,
         (1, 1),
     );
-    let guest_body = record_export_site(&mut engine, &mut state);
+    let guest_body = record_export_site(&mut engine, &mut state, "SDL_LowerBlit");
 
     write_guest_rect(&mut engine, RECT, 0, 0, 4, 3);
     let dst_rect = 0x5080_u64;
@@ -1245,7 +1245,7 @@ fn a_stale_destination_palette_stays_with_the_guest() {
     );
     engine.mem_write(SRC_PIXELS, &[0, 1, 2, 3]).expect("src");
     engine.mem_write(DST_PIXELS, &[0xEE_u8; 4]).expect("dst");
-    let guest_body = record_export_site(&mut engine, &mut state);
+    let guest_body = record_export_site(&mut engine, &mut state, "SDL_LowerBlit");
 
     write_guest_rect(&mut engine, RECT, 0, 0, 4, 1);
     let dst_rect = 0x5090_u64;
@@ -1292,7 +1292,7 @@ fn a_format_with_inconsistent_channels_is_never_used() {
     torn[42] = 0;
     torn[43] = 24;
     engine.mem_write(DST_FORMAT, &torn).expect("write format");
-    let guest_body = record_export_site(&mut engine, &mut state);
+    let guest_body = record_export_site(&mut engine, &mut state, "SDL_LowerBlit");
 
     write_guest_rect(&mut engine, RECT, 0, 0, 4, 3);
     let dst_rect = 0x50A0_u64;
@@ -1315,7 +1315,7 @@ fn a_format_with_inconsistent_channels_is_never_used() {
 /// Record an `SDL_LowerBlit` export site so a decline can be observed as the
 /// actual tail jump the emulator performs, rather than inferred from counters
 /// that other tests are incrementing at the same time.
-fn record_export_site(engine: &mut IcedCpu, state: &mut WinApiState) -> u64 {
+fn record_export_site(engine: &mut IcedCpu, state: &mut WinApiState, export: &str) -> u64 {
     let export_va = 0x6000_u64;
     let stub = [0x48_u8, 0xff, 0x25, 0x00, 0x00, 0x00, 0x00];
     engine
@@ -1331,11 +1331,753 @@ fn record_export_site(engine: &mut IcedCpu, state: &mut WinApiState) -> u64 {
         engine,
         state,
         "SDL2.dll",
-        "SDL_LowerBlit",
+        export,
         0x0000_0000_6a00_5678,
         export_va,
         0x0000_0000_1400_0000,
         0x2000,
     );
     guest_body
+}
+
+// ── SDL_SoftStretch (the scaled present) ──────────────────────────────────
+//
+// `SDL_BlitScaled` on same-format surfaces is not a blitter at all: it is
+// `SDL_SoftStretch`'s own nearest scaler, and its per-pixel 16.16 stepping is
+// the largest single consumer in the DOOM Retro profile. The comparison is
+// against a transcription of `scale_mat_nearest_N`, never against ourselves.
+
+/// Formats whose bytes-per-pixel covers SDL's four `scale_mat_nearest_N`
+/// variants, with the matching width in bytes.
+const STRETCH_FORMATS: [(u32, u8, u8); 4] = [
+    (PIXELFORMAT_INDEX8, 8, 1),
+    (PIXELFORMAT_RGB565, 16, 2),
+    (PIXELFORMAT_RGB24, 24, 3),
+    (PIXELFORMAT_ARGB8888, 32, 4),
+];
+
+/// Build a same-format source and destination pair for one stretch.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per stretch dimension; a struct would restate them"
+)]
+fn run_stretch(
+    engine: &mut IcedCpu,
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    bpp: usize,
+    format: u32,
+    bits: u8,
+) {
+    write_format(
+        engine,
+        SRC_FORMAT,
+        format,
+        0,
+        bits,
+        u8::try_from(bpp).unwrap(),
+    );
+    write_format(
+        engine,
+        DST_FORMAT,
+        format,
+        0,
+        bits,
+        u8::try_from(bpp).unwrap(),
+    );
+    let src_pitch = i32::try_from(src_w * bpp).unwrap();
+    let dst_pitch = i32::try_from(dst_w * bpp).unwrap();
+    write_surface(
+        engine,
+        SRC_SURFACE,
+        0,
+        SRC_FORMAT,
+        i32::try_from(src_w).unwrap(),
+        i32::try_from(src_h).unwrap(),
+        src_pitch,
+        SRC_PIXELS,
+        0,
+        (
+            0,
+            0,
+            u16::try_from(src_w).unwrap(),
+            u16::try_from(src_h).unwrap(),
+        ),
+        BLIT_MAP,
+    );
+    write_surface(
+        engine,
+        DST_SURFACE,
+        0,
+        DST_FORMAT,
+        i32::try_from(dst_w).unwrap(),
+        i32::try_from(dst_h).unwrap(),
+        dst_pitch,
+        DST_PIXELS,
+        0,
+        (
+            0,
+            0,
+            u16::try_from(dst_w).unwrap(),
+            u16::try_from(dst_h).unwrap(),
+        ),
+        0,
+    );
+    // A source pattern with no repeating period inside a row, so a one-pixel
+    // stepping error cannot pass by luck.
+    let source: Vec<u8> = (0..src_pitch as usize * src_h)
+        .map(|i| u8::try_from((i * 7 + 13) % 251).unwrap_or(0))
+        .collect();
+    engine.mem_write(SRC_PIXELS, &source).expect("src pixels");
+    let dst_bytes = dst_pitch as usize * dst_h;
+    engine
+        .mem_write(DST_PIXELS, &vec![0xEE_u8; dst_bytes])
+        .expect("dst pixels");
+}
+
+/// The stepper must be SDL's, for every destination width SDL has a scaler for
+/// and for the ratios where a from-zero stepper silently shifts every column.
+#[test]
+fn a_nearest_stretch_reproduces_sdls_stepping() {
+    for (format, bits, bpp) in STRETCH_FORMATS {
+        for (src_w, src_h, dst_w, dst_h) in [
+            (5, 4, 8, 7),
+            (3, 2, 2, 3),
+            (7, 3, 3, 7),
+            (9, 9, 2, 2),
+            (6, 5, 6, 5),
+        ] {
+            let mut engine = test_engine();
+            let mut state = default_winapi_state();
+            run_stretch(
+                &mut engine,
+                src_w,
+                src_h,
+                dst_w,
+                dst_h,
+                usize::from(bpp),
+                format,
+                bits,
+            );
+            let src_rect = 0x5100_u64;
+            let dst_rect = 0x5110_u64;
+            write_guest_rect(
+                &mut engine,
+                src_rect,
+                0,
+                0,
+                u16::try_from(src_w).unwrap(),
+                u16::try_from(src_h).unwrap(),
+            );
+            write_guest_rect(
+                &mut engine,
+                dst_rect,
+                0,
+                0,
+                u16::try_from(dst_w).unwrap(),
+                u16::try_from(dst_h).unwrap(),
+            );
+            write_regs(&mut engine, SRC_SURFACE, src_rect, DST_SURFACE, dst_rect, 0);
+            assert_return_value!(
+                crate::sdl2::stretch::handle_soft_stretch(&mut HandlerContext::new(
+                    &mut engine,
+                    test_environment(),
+                    &mut state
+                )),
+                0
+            );
+
+            let bpp = usize::from(bpp);
+            let source = read_bytes(&mut engine, SRC_PIXELS, src_w * bpp * src_h);
+            let expected = crate::sdl2::stretch::reference::nearest(
+                &source,
+                src_w,
+                src_h,
+                src_w * bpp,
+                dst_w,
+                dst_h,
+                dst_w * bpp,
+                bpp,
+                0xEE,
+            );
+            let got = read_bytes(&mut engine, DST_PIXELS, dst_w * bpp * dst_h);
+            assert_eq!(
+                got, expected,
+                "format {format:#010x} {src_w}x{src_h} -> {dst_w}x{dst_h}: \
+                 the stretch must be SDL's, pixel for pixel"
+            );
+        }
+    }
+}
+
+/// A NULL rect means the whole surface, on both sides — SDL substitutes one and
+/// the scaler then covers `src->w x src->h` into `dst->w x dst->h`.
+#[test]
+fn a_stretch_with_null_rects_covers_both_surfaces() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    run_stretch(&mut engine, 4, 4, 6, 6, 4, PIXELFORMAT_ARGB8888, 32);
+    write_regs(&mut engine, SRC_SURFACE, 0, DST_SURFACE, 0, 0);
+    assert_return_value!(
+        crate::sdl2::stretch::handle_soft_stretch(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        0
+    );
+    let source = read_bytes(&mut engine, SRC_PIXELS, 4 * 4 * 4);
+    let expected = crate::sdl2::stretch::reference::nearest(&source, 4, 4, 16, 6, 6, 24, 4, 0xEE);
+    assert_eq!(read_bytes(&mut engine, DST_PIXELS, 6 * 6 * 4), expected);
+}
+
+/// A destination rect with no area is a documented success that touches
+/// nothing — not an error and not a write.
+#[test]
+fn an_empty_stretch_destination_is_a_no_op_success() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    run_stretch(&mut engine, 4, 4, 6, 6, 4, PIXELFORMAT_ARGB8888, 32);
+    write_guest_rect(&mut engine, 0x5120, 0, 0, 6, 0);
+    write_regs(&mut engine, SRC_SURFACE, 0, DST_SURFACE, 0x5120, 0);
+    assert_return_value!(
+        crate::sdl2::stretch::handle_soft_stretch(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        0
+    );
+    assert_eq!(
+        read_bytes(&mut engine, DST_PIXELS, 6 * 6 * 4),
+        vec![0xEE_u8; 6 * 6 * 4],
+        "an empty stretch must not write a pixel"
+    );
+}
+
+/// `SDL_UpperSoftStretch` refuses two different formats with an error string;
+/// the handler must hand the call back rather than guess at a conversion.
+#[test]
+fn a_stretch_between_different_formats_stays_with_the_guest() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    run_stretch(&mut engine, 4, 4, 6, 6, 4, PIXELFORMAT_ARGB8888, 32);
+    // Same width, different format: the pair SDL errors on.
+    write_format(&mut engine, DST_FORMAT, PIXELFORMAT_RGBA4444, 0, 16, 2);
+    let guest_body = record_export_site(&mut engine, &mut state, "SDL_SoftStretch");
+    write_guest_rect(&mut engine, 0x5130, 0, 0, 4, 4);
+    write_guest_rect(&mut engine, 0x5140, 0, 0, 6, 6);
+    write_regs(&mut engine, SRC_SURFACE, 0x5130, DST_SURFACE, 0x5140, 0);
+    let result = crate::sdl2::stretch::handle_soft_stretch(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("fall-through must succeed");
+    assert_eq!(
+        result.return_address, guest_body,
+        "a mismatched pair is SDL's error to report, not ours to convert"
+    );
+}
+
+/// A rect that leaves its surface is SDL's "Invalid blit rectangle" error; the
+/// handler must not scale a single pixel of it.
+#[test]
+fn a_stretch_rect_outside_its_surface_stays_with_the_guest() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    run_stretch(&mut engine, 4, 4, 6, 6, 4, PIXELFORMAT_ARGB8888, 32);
+    let guest_body = record_export_site(&mut engine, &mut state, "SDL_SoftStretch");
+    // Source rect starts inside and runs two columns past the right edge.
+    write_guest_rect(&mut engine, 0x5150, 2, 0, 4, 4);
+    write_guest_rect(&mut engine, 0x5160, 0, 0, 6, 6);
+    write_regs(&mut engine, SRC_SURFACE, 0x5150, DST_SURFACE, 0x5160, 0);
+    let result = crate::sdl2::stretch::handle_soft_stretch(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("fall-through must succeed");
+    assert_eq!(result.return_address, guest_body);
+    assert_eq!(
+        read_bytes(&mut engine, DST_PIXELS, 6 * 6 * 4),
+        vec![0xEE_u8; 6 * 6 * 4],
+        "a refused stretch must not have written a pixel"
+    );
+}
+
+/// `SDL_SoftStretch` must be wired all the way through the string dispatcher,
+/// not just present in `EXPORTS`: the export census test proves there is an arm,
+/// this proves the arm is the stretch handler (a NULL surface declines through
+/// it, which the "unsupported" path could never do).
+#[test]
+fn the_soft_stretch_export_dispatches_to_the_stretch_handler() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    run_stretch(&mut engine, 4, 4, 6, 6, 4, PIXELFORMAT_ARGB8888, 32);
+    let guest_body = record_export_site(&mut engine, &mut state, "SDL_SoftStretch");
+    // NULL source surface: SDL dereferences it and faults, so the handler must
+    // hand the call back instead of touching memory.
+    write_regs(&mut engine, 0, 0, DST_SURFACE, 0, 0);
+    let outcome = crate::dispatch_winapi(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        "SDL2.dll",
+        "SDL_SoftStretch",
+    )
+    .expect("dispatch must succeed");
+    assert_eq!(
+        outcome.return_address, guest_body,
+        "a NULL surface must fall through to SDL, through this export's own handler"
+    );
+    assert_eq!(
+        read_bytes(&mut engine, DST_PIXELS, 6 * 6 * 4),
+        vec![0xEE_u8; 6 * 6 * 4]
+    );
+}
+
+// ── The intra-module detour (the mechanism, tested as a mechanism) ─────────
+//
+// A guest DLL that calls its own function *by address* (`callq 0x1800d8040`)
+// never touches the dynapi slot, so planting a fake VA in the slot cannot reach
+// it. The fix is an entry patch plus a relocated prologue, and the claim it
+// rests on is general: **any** direct intra-module call to a patched entry is
+// interceptable. These tests are that claim, on a fixture module with no import
+// table involvement at all.
+
+/// A second fake module image, big enough to hold a trampoline tail.
+const INTERNAL_BASE: u64 = 0x8000;
+const INTERNAL_SIZE: usize = 0x2000;
+/// The module's own internal implementation.
+const INTERNAL_BODY: u64 = 0x8200;
+/// A caller inside the same module: `call INTERNAL_BODY`.
+const INTERNAL_CALLER: u64 = 0x8400;
+/// The export trampoline that reaches the same body through a slot.
+const INTERNAL_EXPORT: u64 = 0x8100;
+
+/// The 12-byte prologue of `SDL_SoftStretch`'s real body, read off the guest
+/// binary (`0x1800d8040`): `sub rsp, 0x38` then `mov dword [rsp+0x20], 0`.
+const INTERNAL_PROLOGUE: [u8; 12] = [
+    0x48, 0x83, 0xec, 0x38, // sub rsp, 0x38
+    0xc7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00, // mov dword [rsp+0x20], 0
+];
+
+/// Lay out the fixture module: a body with a real prologue, an export
+/// trampoline over a slot that points at it, and a direct `call` from another
+/// function in the same module.
+fn write_internal_module(engine: &mut IcedCpu, prologue: &[u8; 12]) {
+    engine
+        .mem_write(INTERNAL_BODY, prologue)
+        .expect("write body prologue");
+    // `mov eax, 1; ret` after the prologue, so the body is a real function.
+    engine
+        .mem_write(INTERNAL_BODY + 12, &[0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3])
+        .expect("write body");
+    // `call INTERNAL_BODY; ret` — the direct, intra-module call.
+    let mut caller = vec![0xe8_u8];
+    let displacement = i32::try_from(INTERNAL_BODY).expect("body va")
+        - i32::try_from(INTERNAL_CALLER + 5).expect("caller va");
+    caller.extend_from_slice(&displacement.to_le_bytes());
+    caller.push(0xc3);
+    engine
+        .mem_write(INTERNAL_CALLER, &caller)
+        .expect("write caller");
+    // The export: `jmp qword ptr [rip+disp32]` over a slot holding the body.
+    let slot = INTERNAL_EXPORT + 7 + 0x40;
+    let disp =
+        i32::try_from(slot).expect("slot") - i32::try_from(INTERNAL_EXPORT + 7).expect("stub");
+    let mut stub = vec![0x48_u8, 0xff, 0x25];
+    stub.extend_from_slice(&disp.to_le_bytes());
+    engine
+        .mem_write(INTERNAL_EXPORT, &stub)
+        .expect("write stub");
+    engine
+        .mem_write(slot, &INTERNAL_BODY.to_le_bytes())
+        .expect("write slot");
+}
+
+fn internal_site(engine: &mut IcedCpu, state: &mut WinApiState) -> u64 {
+    let fake_va = crate::fake_va::encode_unresolved(11);
+    crate::host_exports::record_for_test(
+        engine,
+        state,
+        "SDL2.dll",
+        "SDL_SoftStretch",
+        fake_va,
+        INTERNAL_EXPORT,
+        INTERNAL_BASE,
+        INTERNAL_SIZE,
+    );
+    fake_va
+}
+
+/// The whole point: after the detour is planted, the module's *direct* call to
+/// its own body lands on the host handler, and a decline resumes in the
+/// relocated prologue rather than in the patch.
+#[test]
+fn a_direct_intra_module_call_is_intercepted_by_the_detour() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_internal_module(&mut engine, &INTERNAL_PROLOGUE);
+    let fake_va = internal_site(&mut engine, &mut state);
+
+    // The first fall-through is also the install, so this is the call that has
+    // to resume in the trampoline: resuming at the entry would jump straight
+    // back into the patch that re-enters this handler (an infinite loop on the
+    // real guest, and the reason the install runs *before* the return address
+    // is chosen).
+    write_regs(&mut engine, 0, 0, 0, 0, 0);
+    let first = crate::host_exports::fall_through(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        "SDL2.dll",
+        "SDL_SoftStretch",
+    )
+    .expect("fall-through must succeed");
+    let trampoline_va = INTERNAL_BASE + u64::try_from(INTERNAL_SIZE).expect("size") - 32;
+    assert_eq!(
+        first.return_address, trampoline_va,
+        "a decline resumes in the relocated prologue on the very call that plants it"
+    );
+
+    // The body's entry is now `mov rax, fake; jmp rax`.
+    let patched = read_bytes(&mut engine, INTERNAL_BODY, 12);
+    let mut expected = vec![0x48_u8, 0xb8];
+    expected.extend_from_slice(&fake_va.to_le_bytes());
+    expected.extend_from_slice(&[0xff, 0xe0]);
+    assert_eq!(
+        patched, expected,
+        "the direct call must now land on the host handler's fake VA"
+    );
+
+    // The displaced prologue, plus a jump back into the body, lives in the
+    // image tail — the same RWX page class as every other guest code byte.
+    let trampoline = read_bytes(&mut engine, trampoline_va, 24);
+    assert_eq!(
+        &trampoline[..12],
+        &INTERNAL_PROLOGUE,
+        "the relocated prologue must be the bytes we displaced"
+    );
+    let mut jump_back = vec![0x48_u8, 0xb8];
+    jump_back.extend_from_slice(&(INTERNAL_BODY + 12).to_le_bytes());
+    jump_back.extend_from_slice(&[0xff, 0xe0]);
+    assert_eq!(
+        &trampoline[12..24],
+        &jump_back[..],
+        "and then rejoin the body"
+    );
+
+    // A second decline resumes in the trampoline, not in the patch (which would
+    // loop) and not in the body (whose prologue is gone).
+    write_regs(&mut engine, 0, 0, 0, 0, 0);
+    let second = crate::host_exports::fall_through(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        "SDL2.dll",
+        "SDL_SoftStretch",
+    )
+    .expect("fall-through must succeed");
+    assert_eq!(
+        second.return_address, trampoline_va,
+        "a declined detoured call must resume in the relocated prologue"
+    );
+}
+
+/// The shape DOOM Retro actually has: an export the guest never imports and
+/// never looks up, so there is **no dispatch slot at all**, and the module's own
+/// code calls the export's entry by direct address.
+///
+/// This is the case a slot-derived patch rule silently skips: the export is
+/// served from the import-table side, `arm` finds no slot to derive, and the
+/// detour is never planted — leaving the largest block in the render phase on
+/// the emulated path while every counter says the interception is working.
+#[test]
+fn a_slotless_export_is_detoured_at_its_own_entry() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // The export entry *is* the body: no thunk, no writable pointer.
+    write_internal_module(&mut engine, &INTERNAL_PROLOGUE);
+    let fake_va = crate::fake_va::encode_unresolved(12);
+    crate::host_exports::record_for_test(
+        &mut engine,
+        &mut state,
+        "SDL2.dll",
+        "SDL_SoftStretch",
+        fake_va,
+        INTERNAL_BODY,
+        INTERNAL_BASE,
+        INTERNAL_SIZE,
+    );
+    let site = state
+        .module_state
+        .host_exports
+        .values()
+        .next()
+        .copied()
+        .expect("a recorded site");
+    assert_eq!(
+        site.slot_va, 0,
+        "the fixture must model an export with no dispatch slot"
+    );
+
+    write_regs(&mut engine, 0, 0, 0, 0, 0);
+    let result = crate::host_exports::fall_through(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        "SDL2.dll",
+        "SDL_SoftStretch",
+    )
+    .expect("fall-through must succeed");
+
+    let mut expected = vec![0x48_u8, 0xb8];
+    expected.extend_from_slice(&fake_va.to_le_bytes());
+    expected.extend_from_slice(&[0xff, 0xe0]);
+    assert_eq!(
+        read_bytes(&mut engine, INTERNAL_BODY, 12),
+        expected,
+        "the entry must be patched even though no slot points at it"
+    );
+    let trampoline_va = INTERNAL_BASE + u64::try_from(INTERNAL_SIZE).expect("size") - 32;
+    assert_eq!(
+        &read_bytes(&mut engine, trampoline_va, 12),
+        &INTERNAL_PROLOGUE,
+        "the displaced prologue lives in the image tail"
+    );
+    assert_eq!(
+        result.return_address, trampoline_va,
+        "the declined call resumes in the relocated prologue"
+    );
+}
+
+/// The shape DOOM Retro actually has, and the reason the detour never fired:
+/// the export entry is a `jmp qword ptr [rip+disp32]` thunk over a dispatch slot
+/// that lives **outside** the module image (SDL2's dynapi arena), and that slot
+/// still holds zero when the export is recorded at load time.
+///
+/// The body is therefore unknown at record time and becomes known only when the
+/// module initialises the slot, so the patch target has to be re-derived at
+/// *install* time. Remembering the load-time value instead retires the site as
+/// unpatchable — which is what the profile reported as `0 planted, 1 refused`.
+#[test]
+fn a_thunk_export_whose_slot_initialises_late_still_gets_detoured() {
+    const OUTSIDE_SLOT: u64 = INTERNAL_BASE + INTERNAL_SIZE as u64 + 0x100;
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_internal_module(&mut engine, &INTERNAL_PROLOGUE);
+    // Re-point the export thunk at a slot outside the image and leave it zero:
+    // the dynapi table is not initialised yet.
+    let disp = i32::try_from(OUTSIDE_SLOT).expect("slot")
+        - i32::try_from(INTERNAL_EXPORT + 7).expect("stub");
+    let mut stub = vec![0x48_u8, 0xff, 0x25];
+    stub.extend_from_slice(&disp.to_le_bytes());
+    engine
+        .mem_write(INTERNAL_EXPORT, &stub)
+        .expect("rewrite export thunk");
+    engine
+        .mem_write(OUTSIDE_SLOT, &0_u64.to_le_bytes())
+        .expect("zero the dispatch slot");
+
+    let fake_va = crate::fake_va::encode_unresolved(13);
+    crate::host_exports::record_for_test(
+        &mut engine,
+        &mut state,
+        "SDL2.dll",
+        "SDL_SoftStretch",
+        fake_va,
+        INTERNAL_EXPORT,
+        INTERNAL_BASE,
+        INTERNAL_SIZE,
+    );
+    let site = state
+        .module_state
+        .host_exports
+        .values()
+        .next()
+        .copied()
+        .expect("a recorded site");
+    assert_eq!(
+        site.slot_va, 0,
+        "a slot holding zero must not be armed as the live body"
+    );
+
+    // The module's own init fills the slot after the export was recorded.
+    engine
+        .mem_write(OUTSIDE_SLOT, &INTERNAL_BODY.to_le_bytes())
+        .expect("initialise the dispatch slot");
+
+    write_regs(&mut engine, 0, 0, 0, 0, 0);
+    let result = crate::host_exports::fall_through(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        "SDL2.dll",
+        "SDL_SoftStretch",
+    )
+    .expect("fall-through must succeed");
+
+    let mut expected = vec![0x48_u8, 0xb8];
+    expected.extend_from_slice(&fake_va.to_le_bytes());
+    expected.extend_from_slice(&[0xff, 0xe0]);
+    assert_eq!(
+        read_bytes(&mut engine, INTERNAL_BODY, 12),
+        expected,
+        "the body behind a late-initialised slot must still be patched"
+    );
+    let trampoline_va = INTERNAL_BASE + u64::try_from(INTERNAL_SIZE).expect("size") - 32;
+    assert_eq!(
+        result.return_address, trampoline_va,
+        "the declined call resumes in the relocated prologue"
+    );
+}
+
+/// The named-internal-entry path, which is the only one that reaches the block
+/// the attribution doc implicates: the audited body is not what the export
+/// thunk or its dispatch slot points at, so its address is declared and its
+/// first bytes are the guard.
+#[test]
+fn a_named_internal_entry_is_patched_only_when_its_prologue_matches() {
+    // Matching bytes: the declared entry is patched and the call is detoured.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_internal_module(&mut engine, &INTERNAL_PROLOGUE);
+    let fake_va = crate::fake_va::encode_unresolved(14);
+    crate::host_exports::record_for_test(
+        &mut engine,
+        &mut state,
+        "SDL2.dll",
+        "SDL_SoftStretch",
+        fake_va,
+        INTERNAL_EXPORT,
+        INTERNAL_BASE,
+        INTERNAL_SIZE,
+    );
+    crate::host_exports::set_internal_entry(
+        &mut state,
+        "SDL2.dll",
+        "SDL_SoftStretch",
+        INTERNAL_BODY,
+        INTERNAL_PROLOGUE,
+    );
+    write_regs(&mut engine, 0, 0, 0, 0, 0);
+    let result = crate::host_exports::fall_through(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        "SDL2.dll",
+        "SDL_SoftStretch",
+    )
+    .expect("fall-through must succeed");
+    let trampoline_va = INTERNAL_BASE + u64::try_from(INTERNAL_SIZE).expect("size") - 32;
+    assert_eq!(
+        result.return_address, trampoline_va,
+        "a named internal entry must be detoured"
+    );
+
+    // A different build: the bytes at the declared entry are not the audited
+    // function, so nothing may be patched.
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_internal_module(&mut engine, &INTERNAL_PROLOGUE);
+    let before = read_bytes(&mut engine, INTERNAL_BODY, 12);
+    let fake_va = crate::fake_va::encode_unresolved(15);
+    crate::host_exports::record_for_test(
+        &mut engine,
+        &mut state,
+        "SDL2.dll",
+        "SDL_SoftStretch",
+        fake_va,
+        INTERNAL_EXPORT,
+        INTERNAL_BASE,
+        INTERNAL_SIZE,
+    );
+    let mut wrong = INTERNAL_PROLOGUE;
+    wrong[11] = 0xff;
+    crate::host_exports::set_internal_entry(
+        &mut state,
+        "SDL2.dll",
+        "SDL_SoftStretch",
+        INTERNAL_BODY,
+        wrong,
+    );
+    write_regs(&mut engine, 0, 0, 0, 0, 0);
+    let refused = crate::host_exports::fall_through(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        "SDL2.dll",
+        "SDL_SoftStretch",
+    )
+    .expect("fall-through must succeed");
+    assert_eq!(
+        read_bytes(&mut engine, INTERNAL_BODY, 12),
+        before,
+        "a prologue that is not the audited function must be left untouched"
+    );
+    assert!(refused.return_address != trampoline_va);
+}
+
+/// A prologue that cannot be relocated must be left alone. This is the refusal
+/// that matters: copying a RIP-relative instruction to another address silently
+/// corrupts the guest, and an unpatched function still works.
+#[test]
+fn a_prologue_that_cannot_be_relocated_is_refused() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    // `mov rax, [rip+disp32]` — address-dependent, so it must never be copied.
+    let rip_relative: [u8; 12] = [
+        0x48, 0x8b, 0x05, 0x10, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90,
+    ];
+    write_internal_module(&mut engine, &rip_relative);
+    let before = read_bytes(&mut engine, INTERNAL_BODY, 12);
+    let _fake = internal_site(&mut engine, &mut state);
+
+    write_regs(&mut engine, 0, 0, 0, 0, 0);
+    let result = crate::host_exports::fall_through(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        "SDL2.dll",
+        "SDL_SoftStretch",
+    )
+    .expect("fall-through must succeed");
+
+    assert_eq!(
+        result.return_address, INTERNAL_BODY,
+        "a refused detour falls through to the body itself"
+    );
+    assert_eq!(
+        read_bytes(&mut engine, INTERNAL_BODY, 12),
+        before,
+        "a refused detour must leave the guest's code byte-identical"
+    );
+    // And no trampoline was written into the image tail.
+    let tail = INTERNAL_BASE + u64::try_from(INTERNAL_SIZE).expect("size") - 32;
+    assert_eq!(read_bytes(&mut engine, tail, 24), vec![0u8; 24]);
+}
+
+/// The relocator accepts the real `SDL_SoftStretch` prologue and rejects the
+/// two forms that cannot move: a branch and a RIP-relative operand.
+#[test]
+fn the_prologue_relocator_whitelists_only_position_independent_bytes() {
+    use crate::host_exports::relocatable_prologue_for_test as relocatable;
+    assert_eq!(relocatable(&INTERNAL_PROLOGUE), Some(12));
+    // push rbx; sub rsp, 0x28; mov [rsp+0x30], rbx  (a classic MSVC prologue)
+    assert_eq!(
+        relocatable(&[
+            0x53, 0x48, 0x83, 0xec, 0x28, 0x48, 0x89, 0x5c, 0x24, 0x30, 0x90, 0x90
+        ]),
+        Some(12)
+    );
+    // A relative branch inside the patch window: refused.
+    assert_eq!(
+        relocatable(&[
+            0xe8, 0x00, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+        ]),
+        None
+    );
+    // A RIP-relative load: refused.
+    assert_eq!(
+        relocatable(&[
+            0x48, 0x8b, 0x05, 0x00, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90
+        ]),
+        None
+    );
+    // An instruction that straddles the 12-byte boundary: refused, because the
+    // trampoline would replay a truncated instruction.
+    assert_eq!(
+        relocatable(&[
+            0x48, 0x83, 0xec, 0x38, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x00
+        ]),
+        None
+    );
 }

@@ -252,6 +252,25 @@ impl WieApp {
                 if handle.pending_frames() > 0 {
                     rt.window.request_redraw();
                 }
+                // Frame-indexed capture (`--screenshot-on-frame`): this is
+                // the frame the presenter is about to draw, taken from the
+                // same per-window slot the present below consumes — the only
+                // point where "the Nth published frame" is a frame rather than
+                // a wake.
+                if let Some(frame) = frame.as_ref() {
+                    let captured = self.capture.as_mut().is_some_and(|capture| {
+                        capture.observe_frame(
+                            frame.width,
+                            frame.height,
+                            frame.stride,
+                            &frame.pixels,
+                        )
+                    });
+                    if captured {
+                        event_loop.exit();
+                        return;
+                    }
+                }
                 if let Some(frame) = frame {
                     let (dst_w, dst_h) = {
                         let s = rt.window.inner_size();

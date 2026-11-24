@@ -1013,6 +1013,13 @@ pub fn resolve_static_guest_import(
         "loaded static guest DLL"
     );
 
+    // Exports the host serves *and* must patch inside the module itself (see
+    // `host_exports::install_wanted_detours`). An import-table override only
+    // records the names this exe happens to import; an intra-module detour is
+    // needed exactly for the names it does *not* import, so they have to be
+    // recorded from the module's own export table at load time.
+    crate::sdl2::record_module_detours(engine, state, &norm);
+
     // Resolve the loaded DLL's own guest-DLL imports. `load_dll` already
     // applied the DLL's section protects (IAT is READONLY), so relax the
     // nested-slot span, patch, then re-apply the protects. A failed nested

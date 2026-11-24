@@ -599,4 +599,42 @@ mod tests {
             }
         ));
     }
+
+    /// Frame-indexed capture is a `--gui` + `--screenshot` pair; the pairing is
+    /// enforced at run time (like the other mode conflicts above), and the
+    /// frame index is a plain 1-based count.
+    #[test]
+    fn screenshot_on_frame_parses_as_a_run_arg() {
+        assert!(matches!(
+            parse_run(&[
+                "--gui",
+                "--screenshot",
+                "out.bmp",
+                "--screenshot-on-frame",
+                "60"
+            ]),
+            Command::Run {
+                args: RunArgs {
+                    gui: true,
+                    screenshot: Some(_),
+                    screenshot_on_frame: Some(60),
+                    ..
+                },
+                ..
+            }
+        ));
+        // Without --gui it still parses; `run_entry` rejects it with an
+        // explanation rather than the parser failing obscurely.
+        assert!(matches!(
+            parse_run(&["--screenshot-on-frame", "3"]),
+            Command::Run {
+                args: RunArgs {
+                    gui: false,
+                    screenshot_on_frame: Some(3),
+                    ..
+                },
+                ..
+            }
+        ));
+    }
 }

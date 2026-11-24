@@ -36,6 +36,7 @@
 #[cfg(target_os = "macos")]
 pub mod app;
 pub mod arg_preflight;
+pub mod capture;
 pub mod file_dialog;
 pub mod find_dialog;
 pub mod font_dialog;

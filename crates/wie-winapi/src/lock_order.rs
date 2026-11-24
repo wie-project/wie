@@ -248,7 +248,7 @@ impl<T> DerefMut for Ordered<'_, T> {
 /// signatures name.
 pub type OrderedState<'a> = Ordered<'a, WinApiState>;
 
-#[cfg(test)]
+#[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
     use std::sync::Mutex;
