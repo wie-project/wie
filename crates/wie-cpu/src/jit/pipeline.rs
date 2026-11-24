@@ -627,9 +627,30 @@ impl JitCpu {
                         inv_gen,
                     )
                 {
-                    // Enqueue tier-1 bg before installing baseline (otherwise
-                    // enqueue would see Ready and return `Ready`).
-                    drop(self.enqueue_bg(rip, &kind, inv_gen, false));
+                    // Enqueue a background tier-1 job only for a block that can
+                    // actually tier up. `earns_tier` (`jit/tier.rs`) returns
+                    // `Speed` only for `is_self_loop`, and the "baseline" compile
+                    // below — `baseline::try_compile_baseline` — is a full
+                    // `compile_from_kind_shared` at exactly the tier this job
+                    // would decide. For every non-self-loop block the enqueue was
+                    // therefore a **duplicate compile of the RIP we install two
+                    // lines later**: same input, same tier, same output, twice the
+                    // Cranelift work, and while it ran the worker held the engine
+                    // mutex the guest thread needs for its own inline compile.
+                    //
+                    // Measured on the `scripts/real-guest-perf.sh` corpus with
+                    // interleaved pairs (median of per-pair ratios, calm host):
+                    // `7za h` 1.57x (3.28 s -> 2.07 s, 5/5 pairs) and `7za x`
+                    // 1.62x (10.04 s -> 6.19 s, 5/5), with `bg_compiles`
+                    // 2139 -> 336 / 5951 -> 668 and compile CPU roughly halved.
+                    // The guest's instruction count, `iced` residue and `eager`
+                    // promotions are unchanged (9115 vs 9132; 1920 vs 1920),
+                    // which is the proof that nothing but the duplicate compile
+                    // was removed. `long_loop` is flat (median ratio 1.000, 1/5),
+                    // i.e. the self-loop tier-up path is intact.
+                    if is_loop {
+                        drop(self.enqueue_bg(rip, &kind, inv_gen, false));
+                    }
                     let meta = CompiledRunMeta::from(&baseline);
                     self.insert_ready(rip, baseline);
                     self.stats.profile.eager_compiles =

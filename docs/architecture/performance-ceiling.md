@@ -21,7 +21,7 @@ were made free and nothing else changed: `1 / (1 - measured share)`.
 
 | # | Lever | Measured current cost (real guest) | Ceiling | Effort | Risk | Reversible | Kind |
 |---|---|---|---|---|---|---|---|
-| **L1** | Per-dispatch-entry frame marshalling: `JitCtx` is built by value and copied back on every dispatcher entry (4.6 KB of struct copy + ~100 scalar copies) | **32% of the guest thread on `7za a -mx9`** (memmove alone 8.9%); ≈180 ns/entry × 225.9M entries ≈ 40 s of 102.6 s. `x`: 24% | **≤1.45x on mx9/mx1** (1/(1−0.32)) | M (≈400–600 LOC, 2 files) | Medium: ABI + lifetime; must keep chain-entry and dispatcher-entry state identical | Yes (feature flag) | Architecture (`jit/pipeline.rs` + peer-owned `jit/lower/mod.rs`) |
+| ~~**L1**~~ **LANDED** | Per-dispatch-entry frame marshalling: `JitCtx` is built by value and copied back on every dispatcher entry (4.6 KB of struct copy + ~100 scalar copies) | **32% of the guest thread on `7za a -mx9`** (memmove alone 8.9%); ≈180 ns/entry × 225.9M entries ≈ 40 s of 102.6 s. `x`: 24% | **≤1.45x on mx9/mx1** (1/(1−0.32)) | M (≈400–600 LOC, 2 files) | Medium: ABI + lifetime; must keep chain-entry and dispatcher-entry state identical | Yes (feature flag) | Architecture (`jit/pipeline.rs` + peer-owned `jit/lower/mod.rs`) |
 | **L2** | Compile serialisation: one `Mutex<JitEngine>` held across Cranelift's `compile_function` for every block, on every thread | **`x`: 24% of the guest thread blocked at `lock_unpoisoned(&self.engine)` (`shared.rs:1137`) + 25% compiling = 49%**; mx9 startup window: 53% lock-wait; mx9 steady state: 1% | **1.5–1.9x on the extraction class** (1/(1−0.49) = 1.96); ≤1.05x mx9 | L (per-thread `JITModule`s, chain table gains a module dimension) | High: `FuncId` is module-local; cache/chain keys must carry the module | Hard | Architecture |
 | **L3** | Cranelift codegen cost per block (88% of compile time is Cranelift's own regalloc+isel, 4% is our CLIF emission) | compile CPU: 20.3 s (`mx9`), 12.7 s (`mx1`), 6.5 s (`x`), 3.2 s (`h`); guest-visible stall 0.5 / 1.6 / 10.8 / **10.6%** | **≤1.12x on `h`** (1/(1−0.106)); ~1.1x on `x` when loaded; 1.005x on mx9 | XL (second backend: no-regalloc baseline emitter + tiering) | High | Yes (tier choice) | Architecture |
 | **L4** | First-execution compiles: a block executed **once** is compiled anyway | eager compiles: 7592 (`mx9`), 7173 (`mx1`), 5784 (`x`), 1893 (`h`); `h` compiles 2087 blocks to retire 5.5M instructions | bounded by the stall it removes: **1.11x `h`**, ~1.1x `x`, ≈1.005x mx9 | S–M | Low | Yes | Patch-ish (needs a "compile on 2nd execution" decision, not a knob) |
@@ -84,8 +84,18 @@ the stack attribution.
 
 ## 2. The workload matrix
 
-Profiled, `/tmp/bins/h_sym`, corpus `/tmp/corpus`. Each row is one full run; the
-archive was created from scratch in that run.
+> **Round-3 status of this section:** every row below was measured at `2e0a1dd`,
+> **before** the persistent-frame change (`94621e2`, `8b75698`). The `mx9`/`x`/`h` rows
+> are also not reproducible any more, for a reason §1 documents but that this run got
+> wrong: the archives were written to `C:\` (the bottle) and only `rm`'d on the host, so
+> at least one of these runs *updated* a pre-existing archive instead of compressing
+> from scratch. Re-running the same binary on the same corpus today gives 7.64 G insns /
+> 122.6 M entries where the table says 9.37 G / 225.9 M. **Treat this table as a
+> historical record; §11.1 has the post-frame-fix matrix measured with
+> `scripts/real-guest-perf.sh` (which refuses to measure an archive it could not
+> delete).**
+
+Profiled, `/tmp/bins/h_sym`, corpus `/tmp/corpus`. Each row is one full run.
 
 | | `a -mx9` | `a -mx1` | `x` | `h` |
 |---|---|---|---|---|
@@ -578,6 +588,7 @@ lever; access to the module is. Cross-thread scaling measurement is a peer's lan
 | Chain-hop store elimination | Already measured in round 2: removing 27–75% of the hop's GPR stores gave paired medians 0.9955/1.0264 → reverted. The stores are free; the hop is not where the time is. |
 | More compile workers | `WIE_JIT_WORKERS=1` was indistinguishable from the default on `mx1s` (1.146, 0.925 — median 1.03, opposite signs). |
 | Tuning `--max-api` / stop counts | Stops are bounded by handler time (≤1.2%) and `resolve_ms`; mx9 does 20 424 stops in 102.6 s. |
+| `WIE_JIT_HOTNESS_THRESHOLD` as a promotion-threshold knob | **The knob's value is ignored.** `select_hot_threshold` (`jit/pipeline.rs`) takes it as `fixed_hotness` and uses it only as an `== 0` switch for the forced-eager regime; every non-zero value produces the same `work_weighted_threshold(pure_insns, target_work)`. Only `WIE_JIT_TARGET_WORK` moves the threshold (and it measured 0.996 / 0.987 — §4.4). Round 3 found this while looking for a cheap way to express the lazy policy; it is a documentation defect in `docs/RUNBOOK.md`, not a lever. |
 
 ---
 
@@ -610,8 +621,17 @@ mx9s,base, 34450.33   mx9s,s1, 34779.65    ratio 1.0096
 mx9s,base, 38395.70   mx9s,s1, 36431.43    ratio 0.9488
 median 1.0096 (1/3 pairs better); insns 1 921 171 081 in 5 of the 6 runs
 (the sixth differs by 0.00005% — background-compile timing trades a chain edge for a
-dispatcher entry, which is why entries, not wall, is the stable counter across arms)
+dispatcher entry)
 ```
+
+> **Correction (round 3):** this round originally read "which is why entries, not wall,
+> is the stable counter across arms". That is wrong, and the same paragraph's own data
+> refutes it: *instructions* are the stable counter (~5e-7 relative spread), while
+> **entries move ±10% between runs of the identical workload** because how many block
+> edges chain versus return to the dispatcher depends on when the background compiles
+> land. Measured at HEAD on the calibrated corpus, three reps of `7za a -mx9` retired
+> 7 623 206 484 ± 200 instructions but reported 68.7 M, 82.1 M and 79.9 M entries. Any
+> argument that leans on an entry count has to quote the spread with it.
 
 **Reverted.** Median +1.0%, 1/3 pairs — indistinguishable from the host drift, which
 moved the base arm from 32.2 s to 38.4 s across the three pairs. The useful part of the
@@ -1100,3 +1120,378 @@ this one is flagged as such — but the direction is worth a proper A/B on a qui
 because it says the frame change bought its 1.73x single-threaded and paid some of it
 back at N threads. It also means §10.6's ceilings should be re-derived on HEAD before
 anyone acts on them.
+
+### 10.10 Closing round: the lead tested, the regression settled, the kernel time named
+
+The dispatcher-entry fix (`8b75698`, frame marshalling 32% → 5-6%) changed the profile enough
+that §10.4–§10.9's ranking had to be re-derived before acting on any of it. Re-sampled
+first, then tested the lead, then settled the flagged regression. **Two of §10.9's numbers
+were wrong and are corrected here.**
+
+#### The profile after the entry fix (re-ranked, `-mx9 -mmt=2`, two 12 s windows)
+
+| bucket | `-mmt=2` now | was (§10.3, pre-fix) |
+|---|---|---|
+| condvar (parked threads) | 70.5% | 76.5% |
+| emitted code | 10.7% | 6.0% |
+| `_platform_memmove` | **0.33%** | 8.00% |
+| mutex (`__psynch_mutexwait`) | 2.05% | 0.81% |
+| semaphore / other kernel | 0.99% | 0.29% |
+| Cranelift | 0.06% | 0.03% |
+| translation path (`mem.rs`/`tlb.rs` tags) | **~2.6% of the worker's leaves** | (was reported as 14.5%) |
+
+`memmove` collapsing from 8% to 0.3% is the entry fix, visible from the other side: the
+frame copy *was* the memmove. Emitted code is now the largest running bucket, mutex wait is
+the second largest thing that is not the guest's own work, and Cranelift remains
+irrelevant at steady state. Note the parked share (70.5%) is not a defect: it is a thread
+pool with 2-3 working threads on 7 host threads.
+
+**Correction 1.** §10.9's "the worker's memory-helper share is 24.3% vs the pump's 5.5%,
+4.4x" is an artefact of that section's bucket definition, which matched the substring
+`resolve` and therefore swept every dispatcher frame that inlines `resolve_fake_api_at`
+into "memory helper". Re-attributed by `sample`'s `file:line` tags, the worker's
+translation time is **~2.6% of its leaves**, not 24%. The asymmetry between pump and worker
+is real but small, and the "3.9x less efficient" figure built on it does not survive: at
+current HEAD `ps -M` shows the pump at 95.7% of a core and the worker at **28.6%**, so the
+worker contributes ~19 s of CPU to a 65 s run, not 44 s.
+
+#### The lever: seeding a new engine's TLB — implemented, measured, rejected
+
+§10.9's lead was "per-thread translation warmth". The cheap fix is to publish a running
+engine's TLB in `JitShared` and copy it into every engine that starts later. Written and
+built (in a scratch clone, since `pipeline.rs` was being edited by a peer):
+
+* `JitShared::seed_tlb: Mutex<Option<GenTlb<…>>>`, published once by the first engine past
+  2 M retired instructions (`publish_seed_tlb`, first-writer-wins);
+* `PerThreadJitState::new` copies it into `ctx.tlb` when present;
+* ~40 lines, two files (`shared.rs`, `cpu_engine.rs`), no `unsafe`, no new lock.
+
+**Soundness, which is the reason this could be tried at all:** a `TlbValue` carries the
+guest range, the host base, the software permission bits and the `GuestMemory` generation;
+all four are process-wide (one shared `RwLock<GuestMemory>`, one generation counter), and
+`GenTlb::lookup` admits an entry only when its stamp equals the caller's current
+generation. A copy taken before a map/unmap/protect is therefore *refused*, so a stale copy
+is a miss and never a wrong address. No pin needs to transfer, because the generation bump
+that unmaps a region is the same event that invalidates every copy. **It is sound and it
+still does not pay:**
+
+| `-mx9` | base median | warm-start median | paired | `cpu_user` |
+|---|---|---|---|---|
+| `-mmt=2` (n=2 clean) | 51.5 s | 59.3 s | **0.87, 1.67** | 88.7 → 104.1 s |
+| `-mmt=4` (n=2) | 52.9, 53.5 s | 56.0, 54.5 s | **0.95, 0.98** | 90.6 → 96.7 s |
+
+Three of four pairs favour the base and the fourth is the one whose base arm ran at load
+10.5 against the experimental arm's 19.5 — i.e. a starved run, not a win. The change raises
+`cpu_user` in every pair. Plausible mechanism: the snapshot is the *pump's* working set, so
+the worker starts with a table full of pages it does not touch, and those entries are
+evicted by its own misses — the warm start costs conflict misses instead of cold ones.
+**Reverted; nothing shipped.** The lead is dead at this size, and a `-mmt=2` worker at 29%
+of a core has little to recover anyway.
+
+#### The regression: settled, and it was not one
+
+Interleaved adjacent pairs, current HEAD against `94621e2^` (`2e0a1dd`), same corpus,
+repetitions interleaved, load 3.8–5.4 in the clean repetition:
+
+| cell | HEAD | `2e0a1dd` | ratio |
+|---|---|---|---|
+| `-mx1 -mmt=1` | 16.08, 16.66 s | 28.55, 29.61 s | **1.78x** |
+| `-mx1 -mmt=8` | 19.56 s | 34.19 s | **1.75x** |
+| `-mx9 -mmt=1` | 54.58, 68.88 s | 117.88, 132.24 s | **2.16x, 1.92x** |
+| `-mx9 -mmt=8` | 66.26, 57.22 s | 108.45 s | **1.64x** |
+
+**The single-threaded win is intact and larger than claimed** (1.78x at `-mx1`, 2.16x at
+`-mx9`, against the commit message's 1.33x), and **the multithread case did not regress** —
+HEAD is 1.6–1.75x faster at `-mmt=8` too.
+
+**Correction 2.** §10.9's "adding threads now costs 44% of wall clock, where on `2e0a1dd` it
+cost 18%" does not reproduce. Measured in the same window, both commits pay about the same
+relative penalty: HEAD 16.08 → 19.56 s (**+22%**), `2e0a1dd` 28.55 → 34.19 s (**+20%**). The
+44% came from comparing HEAD's post-fix baseline against a pre-fix arm that ran in a
+different load window — exactly the error the flag said it might be. The multithread
+penalty is a property of the emulator's threading, not of the frame change.
+
+#### The `cpu_sys` that "appeared from nowhere": named, and it is not new
+
+It is bimodal, in **both** commits and at both levels — the same config lands either near
+0.2–1.7 s or near 5–10 s: `-mx1 -mmt=8` gave HEAD 6.87 / 5.76 s and `2e0a1dd` 10.65 / 1.48 s;
+`-mx9 -mmt=8` gave HEAD 9.59 / 1.71 s and `2e0a1dd` 1.75 s. So it is a *mode*, not a
+regression, and not a property of the frame change.
+
+Three 4 s samples of a `-mx1 -mmt=8` run (3.77 s `cpu_sys` of 19.6 s wall) name it:
+
+| kernel frame | why it is there |
+|---|---|
+| `__psynch_mutexwait`, `__psynch_mutexdrop` | contended host `pthread_mutex` (the biggest single term) |
+| `__psynch_cvwait`, `__semwait_signal` | condvar waits — parked guest threads, and `sync_obj::park_brief`'s `wait_ms(1)` |
+| `mach_msg2_trap` | the messenger/thread-port traffic that accompanies wakeups |
+| `__open`, `__fcntl`, `__rename`, `closehandle` (14 calls) | the VFS, and **not** the cause: 13 files means ~14 handle operations regardless of thread count |
+
+So the kernel time is **host synchronisation traffic, not emulator syscalls and not file
+I/O**. The suspect that fits both the magnitude and the thread-count dependence is
+`sync_obj::park_brief` (`wie-winapi/src/sync_obj.rs:1103`): a loser on a guest
+`CRITICAL_SECTION` does 14 `sched_yield()` calls and then a **1 ms-granular** timed wait,
+per attempt. 7-Zip's allocator serialises on exactly such a section from every encoder
+thread, so at `-mmt=8` that is a syscall ladder being climbed thousands of times a second
+across 6 threads. That is a hypothesis with a mechanism and a file, not a measurement —
+**it needs the same interleaved A/B any other lever does, and there was no room this
+round**, so nothing was changed.
+
+#### The threading ledger, after all of it
+
+| lever | status | the number that decides it |
+|---|---|---|
+| Partition/shard `WinApiState` | **dead** | 1.4 ms of guest wait per 60 s; mutex waits 2.05% of samples |
+| Per-thread `JITModule` (kill compile serialisation) | **bounded** | Cranelift 0.06% of samples; `bg_stall` 4.9% of wall at `-mx9` |
+| Per-thread heap shards | **dead** | `HeapAlloc`/`Free` 0.004% of wall |
+| Warm-start TLB seeding | **dead (§10.10)** | 0.87 / 0.95 / 0.98 paired, and `cpu_user` up in every pair |
+| Dispatcher-entry frame marshalling | **shipped, 32% → 5-6%** | `memmove` 8.0% → 0.33% of samples |
+| Park/wake ladder (`park_brief`: 14 yields + 1 ms wait) | **open, named** | 5-10 s `cpu_sys` in the multi-thread mode, dominated by `__psynch_mutexwait` + `__semwait_signal` |
+| A genuine 8-thread guest | **still unmeasured** | `-mmt=8` starts 2-3 encoders on a corpus this size (§10.1) |
+
+What is left for threading is therefore not a lock and not the JIT: it is the park/wake
+ladder, worth a measured **5-10 s of `cpu_sys`** on a 20 s run when the mode engages, and
+the honest 8-thread workload that would show whether the `-mmt=8` penumbra is real.
+
+---
+
+## 11. Closing round: the compile class, re-measured after the frame fix
+
+The dispatcher-entry work landed (`94621e2` + `8b75698`: frame marshalling 32% → 5-6%).
+That moved the profile enough that §2–§9's ranking had to be re-derived before anything
+else was attempted, so this round measured first. Everything below is at HEAD
+`8b75698`, measured with `scripts/real-guest-perf.sh` (deterministic corpus, CRC-checked,
+archives on `D:`, per-arm warmup, load-gated) and `/usr/bin/sample` on a
+symbol-bearing release build (`CARGO_PROFILE_RELEASE_STRIP=false … _DEBUG=1`).
+
+### 11.1 The matrix after the frame fix
+
+`./scripts/real-guest-perf.sh --classes x,h,mx9 --arms def --reps 3 --max-load 8`
+(host load 2.6-4.9 at rep start; the harness's own default gate is 2.0 and would have
+skipped every rep, so the limit was raised deliberately and the load is quoted with the
+numbers).
+
+| | `x` | `h` | `a -mx9` |
+|---|---|---|---|
+| wall (median, spread) | **11.767 s** (10.456-13.174) | **3.344 s** (3.301-3.841) | **81.906 s** (76.365-84.275) |
+| guest insns | 120.915 M | 5.7915 M | 7.6232 G |
+| dispatcher entries (3 reps) | 3.94 / 4.53 / 4.24 M | 4 200 / 4 269 / 4 326 | 68.7 / 82.1 / 79.9 M |
+| guest insns / entry | 26.7-30.7 | 1 338-1 379 | 92.9-110.9 |
+| compile CPU (all threads, median) | **11.02 s** | **4.97 s** | **27.07 s** |
+| guest waits for a compile | 30-32 ms (0.3%) | **299-344 ms (9.3%)** | 0.81-0.84 s (1.0%) |
+
+Three things to read off it. **(1)** `x` costs 11 s of wall to retire 121 M guest
+instructions — 11 M insn/s, an eighth of mx9's rate — while burning 8.5-12.3 s of
+compile CPU for it. `h` is worse in proportion: 5.8 M instructions, 4.6-5.8 s of
+compiling, and 9.3% of its wall is the guest thread *waiting* for compiles. **(2)**
+Entry counts are not a stable metric: identical instruction counts ±200, entries ±10%
+(§6's correction). **(3)** mx9 is unchanged in wall by any of this: it compiles 27 s of
+CPU in the background and pays 1% of wall for it.
+
+These six rows are the state **before** §11.4's change; D2 then moves `x` 11.77 → 6.19 s
+and `h` 3.34 → 2.07 s on the same corpus, and leaves mx9 where it is.
+
+### 11.2 Where the guest thread actually is now
+
+Fresh `sample` windows at HEAD, per thread (the guest thread is the one that matters;
+`idle/wait` on the four compile workers is 77-83%):
+
+| class | window | guest-thread split |
+|---|---|---|
+| `a -mx9` | t≈40 s of 82 s | **emitted 86%**, memory helpers 9%, dispatch **4%**, compile ~0% |
+| `x` | t≈3-6 s of 11.8 s | **engine-mutex wait 51.6%**, **inline Cranelift 47%**, dispatch 1%, emitted 0% |
+| `h` | whole 3.3 s run | **compile 45%**, **engine-mutex wait 40%**, dispatch 14%, emitted ~0% |
+
+The dispatcher is confirmed solved (4-5% on the compute class, 1-14% on the I/O
+classes). What replaced it on the I/O classes is not a lock, not dispatch, not the
+guest's own code: it is Cranelift. The raw leaves under the `x` guest thread are
+`__psynch_mutexwait` (51.6%) plus `regalloc::ion` / `compile_block` / `aarch64
+compile_function` internals (47%) — i.e. the guest thread is either compiling or queued
+behind someone else's compile for essentially the whole sampled window.
+
+### 11.3 The "tier-0 baseline" is a full Cranelift compile on the guest thread
+
+The code path is the one at the top of `run_compiled`'s miss arm: during boot mode (the
+first 5 M guest instructions — which is **86% of `h`'s entire run** and 4% of `x`'s
+instructions but most of `x`'s distinct blocks) every first-visited `Pure` block calls
+`baseline::try_compile_baseline`. Its body is:
+
+```rust
+// crates/wie-cpu/src/jit/baseline.rs
+shared.compile_from_kind_shared(fast_api, rip, kind, inv_gen)
+```
+
+with a comment claiming "0.2 ms per block vs ~3 ms for Cranelift". It is not: it *is*
+Cranelift, at the base tier, holding `lock_unpoisoned(&self.engine)` while it runs, and
+the next two lines then enqueue a background tier-1 job for the **same RIP**, which
+`compile_from_kind_shared` compiles a second time at the same tier. Measured cost per
+compile on the calm-host runs: `compile_us / (bg_compiles + eager)` ≈ **0.7 ms on `x`**
+(8.0 s / 11 593) and **1.0 ms on `h`** (4.08 s / 4 079). The 2.4-2.9 ms in an earlier
+draft of this section was read off the load-25-40 window, where contention inflates every
+compile; it is quoted here as the loaded number, not the per-compile cost.
+
+So the I/O classes currently pay **two Cranelift compiles per block**, one of them
+synchronous on the guest thread, and the guest then waits on the engine mutex while the
+workers run the copies. That is the whole of §11.2's 85-99%.
+
+### 11.4 Candidate A — fewer compiles: one refutation and one win
+
+**A1 — delete the inline baseline, let the block run iced once and compile on its 2nd
+visit (`thr = 1` already means "second visit"). Refuted.** `h`, one binary pair:
+
+```
+h base   wall 4.504   compile_us  5 034 026   bg_compiles 2116   deferred    0   cooled_down    4   hot  199
+h a1     wall 4.565   compile_us 18 826 134   bg_compiles 4019   deferred 4837   cooled_down 1377   hot 7792
+```
+
+Removing the inline compile does not remove work, it removes the *Ready* install — so
+every block falls into the `Hot{thr:1}` promotion path, the queue saturates
+(`deferred 4837`), each deferral re-promotes later, and the machine compiles **1.9x as
+many blocks for 3.7x the compile CPU**. Wall does not move. The baseline path is
+load-bearing precisely because it installs the block immediately and never returns to
+the promotion machinery.
+
+**D2 — stop compiling the same block twice. Shipped.** Keep the inline baseline (it
+installs Ready at the tier the job would choose) and enqueue the background tier-1 job
+**only for a block that can actually tier up**. `earns_tier` (`jit/tier.rs:133`) returns
+`Speed` only for a self-loop, so `if is_loop { enqueue }` is exactly "when the job would
+not be a duplicate". Everything else — bytes installed, Ready timing, ledger writes,
+`insert_ready` chain bookkeeping — is unchanged, which the counters confirm:
+
+```
+                     bg_compiles        compile_us        iced        eager
+h   base                    2139       21 680 863        9132         1940
+h   d2                       336        4 633 539        9115         1920
+x   base                    5951       49.2-53.7 s      28 577        5642
+x   d2                       668        6.0-7.4 s       28 454        5582
+```
+
+(`h`/`x` rows are the last pair of each class: `bg_compiles`, `iced` and `eager` are the
+in-process counters from `WIE_RUNTIME_PROFILE`, `compile_us` is the per-run spread over
+all five `x` pairs. `iced` differs by 0.4% and `eager` by 1%, i.e. within run-to-run
+noise; `bg_compiles` and `compile_us` fall by 6-7x, which is the change itself.)
+
+Interleaved pairs, medians of per-pair ratios (arm/base, <1 is better). **Re-measured
+on a calm host (load 2.3-2.8)** after the first window ran under load 25-40 while a peer
+was building — both windows are reported because they say different things: the calm one
+is the number to use, the loaded one shows the win survives contention.
+
+| class | window | per-pair wall ratios | median | compile CPU |
+|---|---|---|---|---|
+| `h` (5 pairs) | load 2.3-2.8 | 0.820, 0.635, 0.631, 0.629, 0.644 | **0.635** (5/5) | 4.08 → 2.09-2.60 s |
+| `x` (5 pairs) | load 2.3-2.8 | 0.602, 0.619, 0.615, 0.618, 0.617 | **0.617** (5/5) | 7.82-8.09 → 3.37-3.63 s |
+| `h` (7 pairs) | load 25-40 | 1.036, 0.752, 0.903, 0.903, 0.646, 0.906, 0.769 | 0.903 (6/7) | 21.7 → 4.6 s |
+| `x` (5 pairs) | load 25-40 | 1.014, 0.943, 0.868, 0.762, 0.519 | 0.868 (4/5) | ~50 → 6.7 s |
+| `mx9s` (3 pairs) | load 13-40 | 1.004, … | 1.00 (flat) | 17.5 → 13.5 s |
+
+**On a calm host this is 1.57x on `h` (3.28 s → 2.07 s) and 1.62x on `x`
+(10.04 s → 6.19 s)**, five pairs each, every pair favouring the change, with guest
+instructions identical to 8e-6. The loaded window shows the same change compressed to
+-10/-13%: under heavy contention the host, not the emulator, sets the wall.
+
+**Mechanism confirmed by re-sampling** (`r3_d2`, same windows as §11.2): the `x` guest
+thread is still 98% compile-path (72% compiling, 26% mutex wait) and `h` is 65% compile +
+14% wait — the *share* is unchanged because the *run* is now about 1.6x shorter. That is
+the expected signature of removing a duplicate compile rather than a lock: the same
+serial work, done half as often.
+
+**Control:** `long_loop` (the compute micro, whose block is a self-loop and therefore
+still takes the tier-up enqueue) measured 0.415/0.427/0.431/0.442/0.433 s base against
+0.433/0.439/0.431/0.407/0.432 s d2 — median ratio **1.000**, 1/5 pairs better, i.e. flat
+inside the documented 0.25-0.50 s host-dependent spread. The tier-up path is intact.
+
+The win is where the compile class is: **1.57x on `h`, 1.62x on `x`** on a calm host
+(and still -10/-13% under load 25-40), and neutral on the compute class, whose guest
+thread is 86% emitted code, so removing background compile work cannot help it. The
+instruction counts are identical between arms
+(5 791 549 vs 5 791 549 on `h`), the iced residue is identical (9 115 vs 9 132), and the
+promotions are identical (1 920 vs 1 940) — the change removes compiles and nothing
+else. That triple is the mechanism check: if the win had come from executing *less*
+guest code or *more* iced, these would have moved.
+
+**A2 (`is_ucrt → (2, false)`, i.e. don't compile a UCRT-ending block on first
+execution) was not run**: A1 shows what deferral does to this promotion machine, and A2
+defers the same 1 920-5 590 blocks through the same queue. Refuted by the same
+mechanism and the same numbers rather than by a fresh experiment.
+
+### 11.5 Candidate B — a real tier-0 emitter: bounded, not built
+
+What it must absorb is now precisely stated: `baseline::try_compile_baseline` must
+become an actual single-pass emitter, because today it is a second Cranelift compile.
+The requirement set that A1 established empirically:
+
+1. **Install Ready immediately** (A1's 4 837 deferrals / 1 377 cooldown timeouts are
+   what happens otherwise).
+2. Emit at the tier the block is tagged with, so the register/frame contract at the
+   boundary is unchanged (the `JitCtx` ABI, `OFF_*` offsets, `gpr_dirty_bits`).
+3. Leave the self-loop tier-up path intact (D2's `is_loop` guard is where that lives).
+
+**Bound (re-derived after D2, §11.4).** D2 removed the duplicate compile, so what
+remains is the *single* inline compile per block, and it is now the guest thread's
+dominant cost: 72% compiling + 26% engine-mutex wait on `x`, 65% + 14% on `h`
+(re-sampled, §11.4). A tier-0 emitter at 0.2-0.3 ms instead of the measured 0.7-1.0 ms would cut that
+work by roughly 10x, and if it emits into its own buffer it also removes most of the
+mutex wait:
+
+* the compile half (72% of `x`'s 6.19 s) → ~7%, the wait half (26%) → ~0,
+* so `x` could go from 6.19 s to ~2.2 s of compile-path time; the remaining wall is the
+  guest's own execution, which is small on this class.
+
+**That makes the ceiling ≥1.4x and plausibly ~2x on `x`/`h`** — but it is an upper
+bound with a modelled cost, not a measurement, and the cost is the emitted code: a
+no-regalloc emitter retires more host instructions per guest instruction, and `x`
+retires 121 M guest instructions, so its runtime penalty is not negligible the way it is
+for a 5.8 M-instruction `h`. The honest statement is "worth a project, with the runtime
+penalty measured on `x` before the emitter is generalised", and it is worth ~0 on `mx9`
+(boot mode = the first 5 M of 7.6 G instructions).
+
+**Cost.** A slot-based no-regalloc emitter (every guest GPR op becomes
+`ldr ctx+off / op / str ctx+off`) plausibly retires 1.5-3x the host instructions of the
+Cranelift block for the same guest instructions. At ~10 ns of extra runtime per execution
+of a 30-instruction block (30 × ~1 extra host insn × 0.33 ns), break-even against the
+measured ~1 ms compile is **≈100 000 executions** — and the measured population is
+nowhere near that: `h` compiles 4 079 blocks for 4 216 dispatcher entries (≈1 entry per
+compile, i.e. **essentially every `h` block is first-execution-only**), while `x`
+compiles 11 593 blocks for 4.7 M entries (≈400 entries per compile, genuinely hot). So
+the emitter wins by a wide margin on `h`-shaped guests and needs the runtime penalty
+measured on `x`-shaped ones before it is worth generalising — which is exactly the
+"large but not yet unambiguous" verdict. The reason this is *not* implemented here is that
+it is an ARM64 emitter plus its own fault/exit paths, not a round-sized change; the
+bound above is what a dispatch decision should be made on.
+
+### 11.6 Reconciliation: 225.9 M entries vs the harness's 81.2 M
+
+A peer flagged that §2/§3 projected ~220 M dispatcher entries per mx9 run while
+`scripts/real-guest-perf.sh` measures 81.2 M for the same 7.62 G instructions. Both
+numbers were real; the doc's row was wrong three times over.
+
+| measurement | insns | entries | insns/entry |
+|---|---|---|---|
+| §2 table, `2e0a1dd`, `/tmp/corpus`, `C:\out.7z` | 9.370 G | 225.86 M | 41.6 |
+| **same binary, same corpus, today, `D:\` archive** | **7.640 G** | **122.62 M** | 62.5 |
+| HEAD `8b75698`, calibrated corpus (`D:\`) | 7.623 G | 68.7-82.1 M | 92.9-110.9 |
+
+1. **Different corpus.** §2 used this document's ad-hoc `/tmp/corpus` (random-word
+   text); the harness uses its calibrated set (patterned text). Insns differ 7.62 vs
+   9.37 G.
+2. **The archive hazard, in the direction §1 did not describe.** The §2 runs wrote to
+   `C:\out.7z` (the bottle) and `rm`'d only the host path, so the run *updated* a
+   pre-existing archive — extra decompress/recompress work. Re-running the identical
+   binary on the identical corpus with a `D:` archive gives 7.640 G / 122.6 M, which
+   the §2 row does not.
+3. **Entry counts are not a stable counter** (§6's correction): ±10% run to run for
+   identical instructions, so 68.7 / 79.9 / 82.1 M are the same workload and 81.2 M is
+   inside that spread. The harness is right; §2's row and §6's "entries, not wall" aside
+   are corrected in place.
+
+### 11.7 The ranking, as it now stands
+
+| # | Lever | Measured cost at HEAD | Ceiling | Effort | Status |
+|---|---|---|---|---|---|
+| 1 | **Duplicate compile removal** (D2) | `h`/`x` compile CPU 4.08→2.09-2.60 s / 7.82→3.37-3.63 s | **landed: 1.57x `h`, 1.62x `x`** (calm host); flat on mx9 | S | **shipped this round** |
+| 2 | **A real tier-0 emitter** (B) | after D2 the remaining inline compile is 72% of `x`'s guest thread (65% of `h`'s) + a further 26%/14% mutex wait; 0.7-1.0 ms per block | **≥1.4x, plausibly ~2x on `x`/`h`**, ~0 on mx9 | XL (ARM64 emitter) | bounded, not built |
+| 3 | **Emitted-code quality** | 86% of mx9's guest thread; `opt_speed` measured 1.19-1.21x *slower* | only better *lowering* helps; the optimiser does not | L | open, per-instruction work |
+| 4 | **Memory helpers** | 9% of mx9's guest thread; 274 M helper calls/run | ≤9% if every helper access became inline; the inline path currently earns 1.4% (`WIE_JIT_MEM=slow`), so the ceiling needs better pin/TLB coverage, not a faster helper | M | open |
+| 5 | Host stops / handlers | ≤1.2% of wall on every class | ≤1.2% | — | dead |
+| 6 | Interpreter residue | 0.02-0.9% of retired instructions | ≤0.8% | — | dead |
+| 7 | Dispatcher entry | 4-5% (mx9), 1-14% (I/O) | ≤5% | — | **landed (32% → 4%)** |
