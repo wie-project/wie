@@ -652,22 +652,21 @@ fn handle_realloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     finish(engine, new_addr)
 }
 /// Read a NUL-terminated string from guest memory into a host buffer.
+///
+/// Page-sliced bulk read: one lock acquisition per 4 KiB page instead of one per
+/// byte. This is the reader behind every printf-family format string, every
+/// `strtol`/`strtod` argument, `strtok`'s delimiter set and `fopen`'s mode, so a
+/// 40-byte format string used to cost 40 `mem_read` calls — each paying a
+/// memory-lock acquire, a generation load and a page-table walk — before a
+/// single `%` was parsed.
+///
+/// Decoding stays lossy UTF-8 (not the cp1252 A-path decode): `strtod` and the
+/// printf walkers were written against this contract.
 fn read_guest_str(engine: &mut dyn wie_cpu::CpuEngine, ptr: u64, max: usize) -> Result<String> {
     if ptr == 0 {
         return Ok(String::new());
     }
-    let mut bytes = Vec::with_capacity(max.min(128));
-    for i in 0..max {
-        let mut b = [0_u8; 1];
-        let off = u64::try_from(i).unwrap_or(0);
-        if engine.mem_read(ptr.wrapping_add(off), &mut b).is_err() {
-            break;
-        }
-        if b[0] == 0 {
-            break;
-        }
-        bytes.push(b[0]);
-    }
+    let bytes = crate::guest_string::read_ansi_bytes_best_effort(engine, ptr, max)?;
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 

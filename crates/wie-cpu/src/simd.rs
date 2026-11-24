@@ -8,6 +8,61 @@
 /// (`0xAARRGGBB` → `0x00RRGGBB`).
 const O_RGB_MASK: u32 = 0x00FF_FFFF;
 
+/// [`mask_bgra_to_0rgb`] for a pixel-word source rather than a byte view.
+///
+/// Same kernel, no cast: callers that already hold `&[u32]` (the GL software
+/// backbuffer) would otherwise have to reach for `bytemuck`, and the two
+/// implementations would drift.
+pub fn mask_words_to_0rgb(dst: &mut [u32], src: &[u32]) {
+    let n = dst.len().min(src.len());
+    if n == 0 {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: `n` bounds every access; `src` holds at least `n` words and
+        // `dst` at least `n`, both properly aligned already (they are `&[u32]`,
+        // so the NEON unaligned-load tolerance is not even needed here).
+        #[expect(unsafe_code)]
+        unsafe {
+            use std::arch::aarch64::{vandq_u32, vdupq_n_u32, vld1q_u32, vst1q_u32};
+
+            let mask = vdupq_n_u32(O_RGB_MASK);
+            let src_p = src.as_ptr();
+            let dst_p = dst.as_mut_ptr();
+            let n16 = n & !15;
+            let mut i = 0;
+            while i < n16 {
+                let v0 = vld1q_u32(src_p.add(i));
+                let v1 = vld1q_u32(src_p.add(i + 4));
+                let v2 = vld1q_u32(src_p.add(i + 8));
+                let v3 = vld1q_u32(src_p.add(i + 12));
+                vst1q_u32(dst_p.add(i), vandq_u32(v0, mask));
+                vst1q_u32(dst_p.add(i + 4), vandq_u32(v1, mask));
+                vst1q_u32(dst_p.add(i + 8), vandq_u32(v2, mask));
+                vst1q_u32(dst_p.add(i + 12), vandq_u32(v3, mask));
+                i += 16;
+            }
+            let n4 = n & !3;
+            while i < n4 {
+                let v = vld1q_u32(src_p.add(i));
+                vst1q_u32(dst_p.add(i), vandq_u32(v, mask));
+                i += 4;
+            }
+            while i < n {
+                dst_p.add(i).write(src_p.add(i).read() & O_RGB_MASK);
+                i += 1;
+            }
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for (d, s) in dst.iter_mut().zip(src.iter()).take(n) {
+            *d = *s & O_RGB_MASK;
+        }
+    }
+}
+
 /// Mask the alpha byte of little-endian BGRA pixels (`0xAARRGGBB`) into
 /// present-format 0RGB (`0x00RRGGBB`).
 ///
@@ -141,6 +196,43 @@ pub fn stretch_nearest_strided(
     dst_w: u32,
     dst_h: u32,
 ) {
+    stretch_impl::<false>(buf, dst_stride, src, src_w, src_h, dst_w, dst_h, O_RGB_MASK);
+}
+
+/// [`stretch_nearest_strided`] with the alpha byte masked away, producing
+/// present-format 0RGB as it scales.
+///
+/// For a caller whose source carries meaning in the alpha byte (the GL software
+/// backbuffer) but whose destination is an 0RGB present surface: the mask is one
+/// `and` per source pixel, folded into the stretch the caller was going to run
+/// anyway. Composing two passes here instead would copy the frame twice.
+///
+/// `MASKED` is a const generic rather than a runtime flag, so the unmasked entry
+/// point above generates no `and` at all — the two loop variants are
+/// monomorphised separately.
+pub fn stretch_nearest_masked_strided(
+    buf: &mut [u32],
+    dst_stride: u32,
+    src: &[u32],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) {
+    stretch_impl::<true>(buf, dst_stride, src, src_w, src_h, dst_w, dst_h, O_RGB_MASK);
+}
+
+#[expect(clippy::too_many_arguments, reason = "a kernel, not an interface")]
+fn stretch_impl<const MASKED: bool>(
+    buf: &mut [u32],
+    dst_stride: u32,
+    src: &[u32],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    mask: u32,
+) {
     let (src_w, src_h, dst_w, dst_h) = (
         usize::try_from(src_w).unwrap_or(0),
         usize::try_from(src_h).unwrap_or(0),
@@ -159,7 +251,7 @@ pub fn stretch_nearest_strided(
         .checked_mul(dst_h)
         .is_some_and(|n| buf.len() >= n);
     if !(src_full && dst_full) {
-        stretch_checked(buf, dst_stride, src, src_w, src_h, dst_w, dst_h);
+        stretch_checked::<MASKED>(buf, dst_stride, src, src_w, src_h, dst_w, dst_h, mask);
         return;
     }
     // Integer upscale: each source pixel is written as a run of `kx`, and each
@@ -178,7 +270,11 @@ pub fn stretch_nearest_strided(
                     let src_row = (dy / ky) * src_w;
                     let dst_row = dy * dst_stride;
                     for sx in 0..src_w {
-                        let px = *src.get_unchecked(src_row + sx);
+                        let px = if MASKED {
+                            *src.get_unchecked(src_row + sx) & mask
+                        } else {
+                            *src.get_unchecked(src_row + sx)
+                        };
                         let base = dst_row + sx * kx;
                         write_run(buf.get_unchecked_mut(base..base + kx), px);
                     }
@@ -201,7 +297,12 @@ pub fn stretch_nearest_strided(
             let mut sx = 0usize;
             let mut col_acc = 0usize;
             for dx in 0..dst_w {
-                *buf.get_unchecked_mut(dst_row + dx) = *src.get_unchecked(src_row + sx);
+                let px = if MASKED {
+                    *src.get_unchecked(src_row + sx) & mask
+                } else {
+                    *src.get_unchecked(src_row + sx)
+                };
+                *buf.get_unchecked_mut(dst_row + dx) = px;
                 col_acc += src_w;
                 while col_acc >= dst_w {
                     col_acc -= dst_w;
@@ -289,7 +390,8 @@ fn write_run(dst: &mut [u32], px: u32) {
 
 /// Fully bounds-checked fallback for [`stretch_nearest_strided`], used when
 /// either buffer does not provably hold its pitched extent. Same mapping.
-fn stretch_checked(
+#[expect(clippy::too_many_arguments, reason = "a kernel, not an interface")]
+fn stretch_checked<const MASKED: bool>(
     buf: &mut [u32],
     dst_stride: usize,
     src: &[u32],
@@ -297,6 +399,7 @@ fn stretch_checked(
     src_h: usize,
     dst_w: usize,
     dst_h: usize,
+    mask: u32,
 ) {
     let mut sy = 0usize;
     let mut row_acc = 0usize;
@@ -318,7 +421,7 @@ fn stretch_checked(
         let mut col_acc = 0usize;
         for dst_px in dst_row_slice.iter_mut() {
             if let Some(&src_px) = src_row_slice.get(sx) {
-                *dst_px = src_px;
+                *dst_px = if MASKED { src_px & mask } else { src_px };
             }
             col_acc += src_w;
             while col_acc >= dst_w {
@@ -513,8 +616,8 @@ pub fn mul_0rgb_4x(dst: &mut [u32; 4], src: &[u32; 4]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        blend_0rgb_4x, fill_0rgb_4x, mask_bgra_to_0rgb, mul_0rgb_4x, stretch_nearest,
-        stretch_nearest_strided,
+        blend_0rgb_4x, fill_0rgb_4x, mask_bgra_to_0rgb, mask_words_to_0rgb, mul_0rgb_4x,
+        stretch_nearest, stretch_nearest_masked_strided, stretch_nearest_strided,
     };
 
     /// Deterministic 32-bit LCG (no external dep in tests).
@@ -624,6 +727,63 @@ mod tests {
         mask_bgra_to_0rgb(&mut dst, &src);
         assert_eq!(dst[0], 0x0033_2211);
         assert_eq!(dst[1], 0x00CC_BBAA);
+    }
+
+    #[test]
+    fn mask_words_matches_the_byte_kernel() {
+        // The word-slice entry point exists so the GL backbuffer (already
+        // `&[u32]`) does not need a cast; it must be byte-identical to the
+        // byte-view kernel the software present path uses. Sizes straddle the
+        // 16-pixel NEON main loop, the 4-pixel step and the scalar tail.
+        let mut state = 0x1234_5678_u32;
+        for n in [0_usize, 1, 2, 3, 4, 5, 15, 16, 17, 31, 32, 33, 100] {
+            let words: Vec<u32> = (0..n).map(|_| lcg(&mut state)).collect();
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let mut from_words = vec![0xDEAD_BEEFu32; n];
+            let mut from_bytes = vec![0xDEAD_BEEFu32; n];
+            mask_words_to_0rgb(&mut from_words, &words);
+            mask_bgra_to_0rgb(&mut from_bytes, &bytes);
+            assert_eq!(from_words, from_bytes, "n = {n}");
+            for (dst, src) in from_words.iter().zip(words.iter()) {
+                assert_eq!(*dst, *src & 0x00FF_FFFF, "n = {n}");
+            }
+        }
+    }
+
+    #[test]
+    fn mask_words_leaves_the_destination_tail_untouched() {
+        let src = [0x1122_3344_u32, 0x5566_7788];
+        let mut dst = [0xAAAA_AAAA_u32; 3];
+        mask_words_to_0rgb(&mut dst, &src);
+        assert_eq!(dst[0], 0x0022_3344);
+        assert_eq!(dst[1], 0x0066_7788);
+        assert_eq!(dst[2], 0xAAAA_AAAA);
+    }
+
+    #[test]
+    fn masked_stretch_equals_unmasked_then_mask() {
+        // The masked entry point is a const-generic instantiation of the same
+        // kernel: it must produce exactly the unmasked result with the alpha
+        // byte cleared, on every branch (integer upscale, general ratio,
+        // checked fallback), or the two variants have drifted.
+        let mut state = 0x9E37_79B9_u32;
+        let cases = [
+            (8_u32, 6_u32, 16_u32, 12_u32), // integer 2x
+            (8, 6, 24, 18),                 // integer 3x
+            (8, 6, 12, 9),                  // non-integer
+            (8, 6, 4, 3),                   // down
+            (8, 6, 8, 6),                   // 1:1
+        ];
+        for (sw, sh, dw, dh) in cases {
+            let src: Vec<u32> = (0..sw * sh).map(|_| lcg(&mut state)).collect();
+            let mut plain = vec![0u32; (dw * dh) as usize];
+            let mut masked = vec![0u32; (dw * dh) as usize];
+            stretch_nearest_strided(&mut plain, dw, &src, sw, sh, dw, dh);
+            stretch_nearest_masked_strided(&mut masked, dw, &src, sw, sh, dw, dh);
+            for (i, (p, m)) in plain.iter().zip(masked.iter()).enumerate() {
+                assert_eq!(*m, *p & 0x00FF_FFFF, "case {sw}x{sh}->{dw}x{dh} idx {i}");
+            }
+        }
     }
 
     #[test]

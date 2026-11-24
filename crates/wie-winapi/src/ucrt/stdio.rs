@@ -28,6 +28,22 @@ pub(crate) fn handle_acrt_iob_func(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 /// Cap output at 64 KiB per call (matches JIT fast path guard).
 const MAX_FWRITE_OUTPUT: usize = 64 * 1024;
 
+/// Cap on a single `fputs`/`puts` line. Long enough for any real console line,
+/// short enough that a stray pointer into a huge zero-free region cannot make
+/// the emulator read megabytes on the guest's behalf.
+const MAX_CONSOLE_STRING: usize = 1_000_000;
+
+/// Read a NUL-terminated guest string headed for the console.
+///
+/// One lock acquisition per 4 KiB page. The previous shape in `fputs` and `puts`
+/// called `mem_read` once per byte — a lock acquire, a generation load and a
+/// page-table walk per character, so a 200-character line cost 200 of them.
+/// Best-effort: a line whose tail page is unmapped prints short rather than
+/// failing the call.
+fn read_console_string(engine: &mut dyn wie_cpu::CpuEngine, address: u64) -> Result<Vec<u8>> {
+    crate::guest_string::read_ansi_bytes_best_effort(engine, address, MAX_CONSOLE_STRING)
+}
+
 pub(crate) fn handle_fwrite(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let buf = engine.read_rcx()?;
@@ -677,20 +693,7 @@ pub(crate) fn handle_fputs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     if s == 0 {
         return finish(&mut *ctx.engine, u64::from(u32::MAX)); // EOF
     }
-    let mut bytes = Vec::new();
-    let mut off = 0_u64;
-    loop {
-        let mut b = [0_u8; 1];
-        ctx.engine.mem_read(s.wrapping_add(off), &mut b)?;
-        if b[0] == 0 {
-            break;
-        }
-        bytes.push(b[0]);
-        off = off.saturating_add(1);
-        if off > 1_000_000 {
-            break;
-        }
-    }
+    let bytes = read_console_string(&mut *ctx.engine, s)?;
     if stream == FILE_STDERR {
         write_host_console(FILE_STDERR, &bytes);
     } else {
@@ -705,20 +708,7 @@ pub(crate) fn handle_puts(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     if s == 0 {
         return finish(&mut *ctx.engine, u64::from(u32::MAX)); // EOF
     }
-    let mut bytes = Vec::new();
-    let mut off = 0_u64;
-    loop {
-        let mut b = [0_u8; 1];
-        ctx.engine.mem_read(s.wrapping_add(off), &mut b)?;
-        if b[0] == 0 {
-            break;
-        }
-        bytes.push(b[0]);
-        off = off.saturating_add(1);
-        if off > 1_000_000 {
-            break;
-        }
-    }
+    let mut bytes = read_console_string(&mut *ctx.engine, s)?;
     bytes.push(b'\n');
     crate::console::api::emit_text_from_bytes(&mut *ctx.state, &bytes);
     let engine = &mut *ctx.engine;

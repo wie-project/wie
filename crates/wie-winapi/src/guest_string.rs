@@ -79,38 +79,76 @@ pub(crate) fn read_ansi_lossy(
 
 /// Read raw ANSI bytes (NUL-terminated), excluding the terminator.
 ///
-/// Reads guest memory in 4 KiB slices (one lock acquisition per page) and scans
-/// for NUL on the host side — orders of magnitude cheaper than the previous
-/// byte-per-lock loop on long paths.
+/// Reads guest memory in 4 KiB slices (one lock acquisition per page) straight
+/// into the destination buffer, then scans for NUL on the host side — orders of
+/// magnitude cheaper than a byte-per-lock loop, which is what every caller of
+/// this used to hand-roll.
 pub(crate) fn read_ansi_bytes(
     engine: &mut dyn wie_cpu::CpuEngine,
     address: u64,
     max_bytes: usize,
+) -> Result<Vec<u8>> {
+    read_ansi_bytes_inner(engine, address, max_bytes, true)
+}
+
+/// [`read_ansi_bytes`], but an unreadable guest page ends the string instead of
+/// failing the call: whatever prefix was read stays readable.
+///
+/// For console output sinks only. A truncated line is a better outcome than a
+/// handler error, and a line that ends at an unmapped page still has its NUL in
+/// the last mapped page, so the truncation does not bite in practice.
+pub(crate) fn read_ansi_bytes_best_effort(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    address: u64,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    read_ansi_bytes_inner(engine, address, max_bytes, false)
+}
+
+/// `fault_is_error == false` stops on a fault instead of propagating it.
+fn read_ansi_bytes_inner(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    address: u64,
+    max_bytes: usize,
+    fault_is_error: bool,
 ) -> Result<Vec<u8>> {
     if address == 0 || max_bytes == 0 {
         return Ok(Vec::new());
     }
 
     // Preallocate the common short-string size; long paths grow geometrically.
-    let mut bytes: Vec<u8> = Vec::with_capacity(128);
-    let mut scratch = [0_u8; 4096];
+    // Bytes are read straight into the tail of this buffer — a staging array
+    // would add a second copy of every string for no benefit (the page-slice
+    // rule only needs the *read* to stop at a page boundary, which it does).
+    let mut bytes: Vec<u8> = Vec::with_capacity(max_bytes.min(128));
     let mut remaining = max_bytes;
     let mut cursor = address;
 
     while remaining > 0 {
-        let want = remaining.min(scratch.len());
-        let slice = scratch.get_mut(..want).context("ANSI slice bounds")?;
-        let got = read_page_slice(engine, cursor, slice)?;
+        let start = bytes.len();
+        let want = remaining.min(PAGE_SIZE as usize);
+        // Zero-fill is overwritten by the guest read below; it exists so the
+        // buffer's length, not its contents, tracks progress.
+        bytes.resize(start + want, 0);
+        let tail = bytes.get_mut(start..).context("ANSI tail bounds")?;
+        let got = match read_page_slice(engine, cursor, tail) {
+            Ok(got) => got,
+            Err(_unreadable) if !fault_is_error => {
+                bytes.truncate(start);
+                break;
+            }
+            Err(error) => return Err(error),
+        };
         if got == 0 {
+            bytes.truncate(start);
             break;
         }
-        let got_slice = slice.get(..got).context("ANSI got_slice bounds")?;
-        if let Some(nul) = got_slice.iter().position(|&b| b == 0) {
-            let head = got_slice.get(..nul).context("ANSI head bounds")?;
-            bytes.extend_from_slice(head);
+        let chunk = bytes.get(start..start + got).context("ANSI chunk bounds")?;
+        if let Some(nul) = chunk.iter().position(|&byte| byte == 0) {
+            bytes.truncate(start + nul);
             return Ok(bytes);
         }
-        bytes.extend_from_slice(got_slice);
+        bytes.truncate(start + got);
         cursor = cursor.wrapping_add(u64::try_from(got).unwrap_or(0));
         remaining = remaining.saturating_sub(got);
     }
@@ -668,6 +706,69 @@ mod tests {
             .expect("write guest literal");
         let text = read_ansi_lossy(&mut engine, BUF, 64).expect("read ANSI");
         assert_eq!(text, "café");
+    }
+
+    /// The page-sliced reader must return the same bytes the old byte-at-a-time
+    /// loop did, including across a page boundary (where the page-slice rule
+    /// splits the read) and when the NUL lands exactly on a page's last byte.
+    #[test]
+    fn read_ansi_bytes_spans_pages_and_stops_at_nul() {
+        let mut engine = test_engine();
+        // 0x3F00 is 0x100 bytes before the page boundary at 0x4000.
+        let start = 0x3F00_u64;
+        let mut payload = vec![b'a'; 0x180]; // 0x100 to the boundary, then 0x80 more
+        payload.push(0);
+        engine.mem_write(start, &payload).expect("write payload");
+        let bytes = read_ansi_bytes(&mut engine, start, 4096).expect("read across pages");
+        assert_eq!(bytes.len(), 0x180);
+        assert!(bytes.iter().all(|&b| b == b'a'));
+
+        // NUL as the very last byte of a page: the read must not touch the next.
+        let last = 0x4FFF_u64;
+        engine.mem_write(last, &[b'z', 0]).expect("write tail");
+        let bytes = read_ansi_bytes(&mut engine, last, 4096).expect("read page tail");
+        assert_eq!(bytes, b"z");
+    }
+
+    /// `max_bytes` caps an unterminated string without reading past it.
+    #[test]
+    fn read_ansi_bytes_respects_the_cap() {
+        let mut engine = test_engine();
+        engine.mem_write(BUF, &[b'q'; 64]).expect("write run");
+        let bytes = read_ansi_bytes(&mut engine, BUF, 10).expect("read capped");
+        assert_eq!(bytes.len(), 10);
+
+        // Zero cap and null pointer both yield nothing, without a lock.
+        assert!(
+            read_ansi_bytes(&mut engine, BUF, 0)
+                .expect("zero cap")
+                .is_empty()
+        );
+        assert!(
+            read_ansi_bytes(&mut engine, 0, 64)
+                .expect("null ptr")
+                .is_empty()
+        );
+    }
+
+    /// A string that runs into unmapped memory: the strict reader reports the
+    /// fault, the best-effort one returns what it read. Console output uses the
+    /// best-effort shape so a truncated line still prints.
+    #[test]
+    fn best_effort_stops_at_an_unreadable_page() {
+        let mut engine = test_engine();
+        // Mapped range is 0x1000..0x101000; put 8 bytes ending exactly at the end.
+        let start = 0x100FF8_u64;
+        engine
+            .mem_write(start, &[b'r'; 8])
+            .expect("write at mapping end");
+        let lenient = read_ansi_bytes_best_effort(&mut engine, start, 4096)
+            .expect("best effort must not fail");
+        assert_eq!(lenient, b"rrrrrrrr");
+        assert!(
+            read_ansi_bytes(&mut engine, start, 4096).is_err(),
+            "the strict reader still reports the unmapped page"
+        );
     }
 
     #[test]

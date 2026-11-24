@@ -1554,42 +1554,37 @@ pub(crate) fn gl_frame_into(
         return false;
     }
     if fw == logical_w && fh == height {
-        // Direct row-major copy with padded stride, no alloc.
-        let src_stride = fw as usize;
-        let dst_stride = padded_w as usize;
-        for y in 0..height as usize {
-            let src_start = y * src_stride;
-            let dst_start = y * dst_stride;
-            if src_start + logical_w as usize <= ctx.backbuffer.len()
-                && dst_start + logical_w as usize <= dst.len()
-            {
-                for x in 0..logical_w as usize {
-                    dst[dst_start + x] = ctx.backbuffer[src_start + x] & 0x00FF_FFFF;
-                }
-            }
+        // 1:1 — one NEON mask pass per row, straight into the padded stride.
+        // This is the same conversion `mask_bgra_to_0rgb` does for the software
+        // present path; the hand-rolled per-pixel scalar loop it replaces was
+        // ~2 M bounds-checked iterations at 1080p.
+        let src_stride = usize::try_from(fw).unwrap_or(0);
+        let dst_stride = usize::try_from(padded_w).unwrap_or(0);
+        let width = usize::try_from(logical_w).unwrap_or(0);
+        for y in 0..usize::try_from(height).unwrap_or(0) {
+            let (Some(src_row), Some(dst_row)) = (
+                ctx.backbuffer
+                    .get(y * src_stride..(y * src_stride).saturating_add(width)),
+                dst.get_mut(y * dst_stride..(y * dst_stride).saturating_add(width)),
+            ) else {
+                continue;
+            };
+            wie_cpu::mask_words_to_0rgb(dst_row, src_row);
         }
     } else {
-        // Nearest-neighbour stretch directly into pooled slice (no temp Vec).
-        let logical_w_us = logical_w as usize;
-        let padded_w_us = padded_w as usize;
-        let h_us = height as usize;
-        let fw_us = fw as usize;
-        let fh_us = fh as usize;
-        if logical_w_us > 0 && h_us > 0 && fw_us > 0 && fh_us > 0 {
-            for y in 0..h_us {
-                let src_y = (y * fh_us) / h_us;
-                let dst_row = y * padded_w_us;
-                let src_row = src_y * fw_us;
-                for x in 0..logical_w_us {
-                    let src_x = (x * fw_us) / logical_w_us;
-                    let src_idx = src_row + src_x;
-                    let dst_idx = dst_row + x;
-                    if src_idx < ctx.backbuffer.len() && dst_idx < dst.len() {
-                        dst[dst_idx] = ctx.backbuffer[src_idx] & 0x00FF_FFFF;
-                    }
-                }
-            }
-        }
+        // Nearest-neighbour stretch directly into the pooled slice, no temp.
+        // The shared kernel replaces two integer divisions per pixel, and the
+        // masked entry point folds the 0RGB alpha clear into the same pass (the
+        // old loop ANDed per pixel inside a doubly-nested scalar loop).
+        wie_cpu::stretch_nearest_masked_strided(
+            dst,
+            padded_w,
+            &ctx.backbuffer,
+            fw,
+            fh,
+            logical_w,
+            height,
+        );
     }
     true
 }

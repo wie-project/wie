@@ -893,3 +893,54 @@ fn resize_keeps_quad_center_readback_red() {
     let px = gl_read_pixels(&ctx, 400, 300, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE);
     assert_eq!(&px[..3], &[255, 0, 0], "center red after resize to 800x600");
 }
+
+/// The present conversion must be exactly `& 0x00FF_FFFF` on every logical
+/// pixel, with the 64-px padding tail left alone. This path now runs the shared
+/// NEON kernel (`mask_words_to_0rgb`) instead of a per-pixel scalar loop, so the
+/// test pins the mapping rather than the implementation.
+#[test]
+fn gl_frame_into_masks_every_pixel_and_respects_pitch() {
+    let mut ctx = GlCtx::new();
+    gl_ensure_framebuffer(&mut ctx, 4, 3);
+    for (i, slot) in ctx.backbuffer.iter_mut().enumerate() {
+        // High alpha byte so a missing mask is visible.
+        *slot = 0xFF00_0000 | (u32::try_from(i).unwrap_or(0) * 0x0001_0101);
+    }
+    let (padded_w, h) = (8_u32, 3_u32);
+    let mut dst = vec![0xDEAD_BEEFu32; 8 * 3];
+    assert!(gl_frame_into(&mut ctx, &mut dst, 4, h, padded_w, 4, 3));
+    for y in 0..h as usize {
+        for x in 0..4 {
+            let want = ctx.backbuffer[y * 4 + x] & 0x00FF_FFFF;
+            assert_eq!(dst[y * 8 + x], want, "pixel ({x},{y})");
+        }
+        // Padding carries no content and must not be written.
+        for x in 4..8 {
+            assert_eq!(dst[y * 8 + x], 0xDEAD_BEEF, "padding ({x},{y})");
+        }
+    }
+}
+
+/// A framebuffer larger than the surface goes through the shared stretch
+/// kernel: nearest-neighbour `sx = x * src_w / dst_w`, masked, no temp `Vec`.
+#[test]
+fn gl_frame_into_stretches_down_by_nearest_neighbour() {
+    let mut ctx = GlCtx::new();
+    gl_ensure_framebuffer(&mut ctx, 8, 6);
+    for (i, slot) in ctx.backbuffer.iter_mut().enumerate() {
+        *slot = 0xFF00_0000 | u32::try_from(i + 1).unwrap_or(0);
+    }
+    // The surface (8x6) is larger than the client area (4x3) — the shape a
+    // window gets when the backbuffer has not followed a shrink yet.
+    let (dst_w, dst_h) = (4_u32, 3_u32);
+    let mut dst = vec![0u32; 4 * 3];
+    assert!(gl_frame_into(&mut ctx, &mut dst, dst_w, dst_h, dst_w, 8, 6));
+    for y in 0..dst_h as usize {
+        for x in 0..dst_w as usize {
+            let src_x = x * 8 / 4;
+            let src_y = y * 6 / 3;
+            let want = ctx.backbuffer[src_y * 8 + src_x] & 0x00FF_FFFF;
+            assert_eq!(dst[y * 4 + x], want, "({x},{y})");
+        }
+    }
+}

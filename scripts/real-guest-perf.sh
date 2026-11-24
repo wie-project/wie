@@ -64,6 +64,8 @@
 #   workers0   WIE_JIT_BG=0          no background compile worker
 #   workers1   WIE_JIT_WORKERS=1     one compile worker
 #   mem_slow   WIE_JIT_MEM=slow      helper-only memory (oracle, ~28x)
+#   mem_pin    WIE_JIT_MEM=pin       top-2 data-pin IR added to the sticky TLB
+#   mem_sticky WIE_JIT_MEM=sticky    sticky TLB only, no data-pin stage
 #   simd0      WIE_JIT_SIMD=0        scalar XMM lowering
 #
 # Exit status: 0 measured, 1 a run failed, 2 usage/binary/corpus problem,
@@ -267,6 +269,8 @@ arm_env() {
     workers0)  echo "WIE_JIT_BG=0" ;;
     workers1)  echo "WIE_JIT_WORKERS=1" ;;
     mem_slow)  echo "WIE_JIT_MEM=slow" ;;
+    mem_pin)   echo "WIE_JIT_MEM=pin" ;;
+    mem_sticky) echo "WIE_JIT_MEM=sticky" ;;
     simd0)     echo "WIE_JIT_SIMD=0" ;;
     *) echo "unknown arm: $1" >&2; return 2 ;;
   esac
