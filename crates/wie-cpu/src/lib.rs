@@ -25,7 +25,19 @@ mod teb;
 /// Backed by `papaya` (hazard-pointer epoch reclamation); readers and writers
 /// proceed without a global lock, which is what the shared block cache and
 /// chain-id table need under the multithreaded runtime.
-pub type ConcurrentHashMap<K, V> = papaya::HashMap<K, V>;
+pub type ConcurrentHashMap<K, V> = papaya::HashMap<K, V, ahash::RandomState>;
+
+/// Build a [`ConcurrentHashMap`].
+///
+/// The hasher is `ahash`, not `papaya`'s default SipHash: the block cache is
+/// keyed by guest VA and is queried once per dispatch entry (~1.3 M/s on a
+/// real guest), where `core::hash::sip` measured 3 % of the guest thread on its
+/// own. `ahash` is randomly seeded per map, so the collision resistance that
+/// matters for an untrusted key stream still holds.
+#[must_use]
+pub fn new_concurrent_map<K, V>() -> ConcurrentHashMap<K, V> {
+    papaya::HashMap::with_hasher(ahash::RandomState::new())
+}
 
 /// Dump residual iced-interpreter mnemonic histogram (`WIE_EXEC_TRACE=1`).
 pub use exec::degraded_insn_count;

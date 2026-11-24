@@ -33,7 +33,7 @@ use super::lower::{self, CHAIN_SLOTS, CompiledBlock, JitCtx, compile_block};
 use super::pipeline::resolve_thunk_va;
 use super::profile::BgCompileProfile;
 use super::trampolines::match_micro_stub;
-use crate::ConcurrentHashMap;
+use crate::{ConcurrentHashMap, new_concurrent_map};
 use crate::exec::HookWindow;
 use crate::lock::{lock_unpoisoned, read_unpoisoned};
 use crate::mem::GuestMemory;
@@ -420,8 +420,8 @@ impl JitShared {
         Self {
             engine: Mutex::new(has_engine),
             mem: RwLock::new(GuestMemory::new()),
-            cache: ConcurrentHashMap::new(),
-            chain_ids: ConcurrentHashMap::new(),
+            cache: new_concurrent_map(),
+            chain_ids: new_concurrent_map(),
             code_pages: Mutex::new(HashMap::new()),
             recent_installs: Mutex::new(Vec::new()),
             pending_code_writes: Mutex::new(Vec::new()),
