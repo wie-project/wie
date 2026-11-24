@@ -6,14 +6,13 @@
 // ---------------------------------------------------------------------------
 // Win32 message constants
 //
-// Single source of truth: the values live in `wie-winapi::user32::wm`; these
-// `pub(crate) const` aliases keep the host-side type `u32` (the
-// `post_message` boundary) while referencing the same constants the emulator
-// core dispatches on.
+// Single source of truth: the values live in `wie_runtime::host::WinMsg`
+// (re-exported from `wie-winapi`'s `user32::wm`); these `pub(crate) const`
+// aliases keep the host-side type `u32` (the `post_message` boundary) while
+// referencing the same constants the emulator core dispatches on.
 // ---------------------------------------------------------------------------
 
-use wie_winapi::user32::Dimension;
-use wie_winapi::user32::wm::WinMsg;
+use wie_runtime::host::{Dimension, WinMsg};
 
 pub(crate) const WM_KEYDOWN: u32 = WinMsg::WM_KEYDOWN.as_u32();
 pub(crate) const WM_KEYUP: u32 = WinMsg::WM_KEYUP.as_u32();

@@ -17,8 +17,9 @@
 //! The cost of two modules is that a `cranelift_module::FuncId` is only
 //! meaningful **inside its declaring module** (`Module::declare_func_in_func`
 //! indexes that module's own `compiled_functions`). That invariant is enforced
-//! by tier-tagging `JitShared::chain_ids` and by compiling against a
-//! same-tier-only snapshot — see [`super::shared::JitShared::chain_map_for`].
+//! by tier-tagging `JitShared::chain_ids` and by resolving every direct-chain
+//! edge through a same-tier-only lookup — see
+//! [`super::shared::JitShared::chain_func_for`].
 //!
 //! Fields are `pub(super)` because `lower.rs` mutates [`IsaEngine`] fields
 //! directly during block compilation (visible across `crate::jit`).

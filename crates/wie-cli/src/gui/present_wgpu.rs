@@ -17,8 +17,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use wie_winapi::gdi32::IRect;
-use wie_winapi::present::SurfaceFrame;
+use wie_runtime::host::{IRect, SurfaceFrame};
 use winit::window::Window;
 
 /// Fullscreen-triangle blit: sample the staging texture and write opaque RGB.
@@ -744,7 +743,7 @@ fn color_channel(background_color: u32, shift: u32) -> f64 {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use wie_winapi::gdi32::IRect;
+    use wie_runtime::host::IRect;
 
     /// A `w × h` frame filled with one color.
     fn frame(w: u32, h: u32, fill: u32) -> Vec<u32> {

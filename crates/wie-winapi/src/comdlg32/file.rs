@@ -205,28 +205,24 @@ fn handle_get_file_name(
     unicode: bool,
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let ofn_va = read_arg(engine, ArgReg::Rcx, api_name)?;
+    let ofn_va = read_arg(&mut *ctx.engine, ArgReg::Rcx, api_name)?;
 
     if ofn_va == 0 {
-        state.set_comm_dlg_extended_error(CDERR_NONE);
+        ctx.dialogs().set_comm_dlg_extended_error(CDERR_NONE);
         return ctx.finish(0);
     }
 
     // One typed read for the whole OPENFILENAME (the four buffer fields the
     // policy and interactive flows write through); the layout + offsets live
     // in `crate::guest_layout::OpenFileName`.
-    let ofn = with_typed_read::<OpenFileName, _, _>(engine, ofn_va, |ofn| Ok(*ofn))
+    let ofn = with_typed_read::<OpenFileName, _, _>(&mut *ctx.engine, ofn_va, |ofn| Ok(*ofn))
         .with_context(|| format!("failed to read OPENFILENAME for {api_name}"))?;
     let file_buffer_va = ofn.lpstr_file;
     let max_file = ofn.n_max_file;
     let file_title_va = ofn.lpstr_file_title;
     let max_file_title = ofn.n_max_file_title;
 
-    // Clone the policy to avoid borrowing state.window_state() across
-    // mutable accesses inside the match arms.
-    let policy = state.file_dialog_policy().clone();
+    let policy = ctx.dialogs().file_dialog_policy();
     let buffer = OfnBuffer {
         ofn_ptr: ofn_va,
         file_buffer_ptr: file_buffer_va,
@@ -236,14 +232,14 @@ fn handle_get_file_name(
     };
     let return_value = match policy {
         FileDialogPolicy::Cancel => {
-            state.set_comm_dlg_extended_error(CDERR_NONE);
+            ctx.dialogs().set_comm_dlg_extended_error(CDERR_NONE);
             tracing::debug!(api = api_name, "file dialog cancelled by policy");
             0
         }
 
         FileDialogPolicy::Accept { path } => {
             if buffer.file_buffer_ptr == 0 || buffer.max_file == 0 {
-                state.set_comm_dlg_extended_error(CDERR_NONE);
+                ctx.dialogs().set_comm_dlg_extended_error(CDERR_NONE);
                 tracing::warn!(
                     api = api_name,
                     "file dialog accept policy but lpstrFile/nMaxFile invalid"
@@ -251,7 +247,7 @@ fn handle_get_file_name(
                 0
             } else {
                 write_selected_path(
-                    engine,
+                    &mut *ctx.engine,
                     &SelectedPathWrite {
                         ofn_ptr: buffer.ofn_ptr,
                         file_buffer_ptr: buffer.file_buffer_ptr,
@@ -264,8 +260,8 @@ fn handle_get_file_name(
                 )
                 .with_context(|| format!("failed to write selected path for {api_name}"))?;
 
-                state.set_comm_dlg_extended_error(CDERR_NONE);
-                state.set_last_file_dialog_path(Some(path.clone()));
+                ctx.dialogs().set_comm_dlg_extended_error(CDERR_NONE);
+                ctx.dialogs().set_last_file_dialog_path(Some(path.clone()));
 
                 tracing::info!(api = api_name, %path, unicode, "file dialog accepted");
                 1
@@ -279,10 +275,7 @@ fn handle_get_file_name(
         // (headless/trace sessions), build the in-app "FileDialog" window and
         // run its modal message loop in-guest (the DialogBoxParam pattern).
         FileDialogPolicy::Interactive => {
-            let bridge_registered = state
-                .try_window_state()
-                .is_some_and(|window_state| window_state.file_dialog_bridge.is_some());
-            if bridge_registered {
+            if ctx.dialogs().has_native_file_dialog_bridge() {
                 return open_host_file_dialog_via_bridge(ctx, api_name, unicode, &buffer);
             }
             return open_host_file_dialog(ctx, api_name, unicode, &buffer);

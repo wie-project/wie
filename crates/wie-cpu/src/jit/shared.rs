@@ -266,7 +266,7 @@ pub struct JitShared {
     /// Ready-block FuncIds for chaining, **tagged with the module (tier) that
     /// declared them** — a `FuncId` is only valid inside its own
     /// `JITModule`, so the tag is what keeps direct chaining same-tier-only.
-    /// See [`Self::chain_map_for`].
+    /// See [`Self::chain_func_for`].
     #[doc(hidden)]
     pub chain_ids: ConcurrentHashMap<u64, ChainTarget>,
     /// Guest page keys covered by Ready blocks (SMC tracking).
@@ -1136,13 +1136,21 @@ impl JitShared {
                 let mut tier = self.decide_tier(rip, block::term_is_self_loop(term.as_ref(), rip));
                 let mut eng_guard = lock_unpoisoned(&self.engine);
                 loop {
-                    // Chain-id snapshot for THIS module only (pin guard must not
-                    // outlive the snapshot — the engine lock and `compile_block`
-                    // run after it drops).
-                    let chain_map: HashMap<u64, cranelift_module::FuncId> = if chain_on {
-                        self.chain_map_for(tier)
-                    } else {
-                        HashMap::new()
+                    // Chain targets are resolved one VA at a time, from inside
+                    // the lowering, against the live `chain_ids` table filtered
+                    // to THIS module's tier. This used to build a whole-table
+                    // snapshot here — a walk of every chain entry plus one
+                    // `HashMap` allocation, per compiled block, while holding
+                    // `engine`, the one mutex every compiling thread serialises
+                    // on (measured on 7-Zip `a -mx1`: ~8k chain entries, ~11k
+                    // foreground compiles). `tier` is captured by value so the
+                    // downgrade retry below can still change it.
+                    let chain = |va: u64| {
+                        if chain_on {
+                            self.chain_func_for(tier, va)
+                        } else {
+                            None
+                        }
                     };
                     let outcome =
                         eng_guard
@@ -1150,7 +1158,7 @@ impl JitShared {
                             .and_then(|eng| eng.module_for(tier))
                             .map(|module| {
                                 compile_block(
-                                    module, rip, &insns, end_rip, term, call_fast, &chain_map,
+                                    module, rip, &insns, end_rip, term, call_fast, &chain,
                                     bytes_len, inv_gen, tier,
                                 )
                             });
@@ -1266,22 +1274,18 @@ impl JitShared {
     /// edge falls back to the late-bound chain-table hop or the dispatcher,
     /// both of which were already the supported fallback paths and are covered
     /// by the chaining / edge-IC / dispatcher tests.
-    pub(super) fn chain_map_for(&self, tier: OptTier) -> HashMap<u64, cranelift_module::FuncId> {
-        let guard = self.chain_ids.pin();
-        guard
-            .iter()
-            .filter(|(_, t)| t.tier == tier)
-            .map(|(&va, t)| (va, t.func_id))
-            .collect()
-    }
-
     /// Live direct-chain target for `va` in `tier`'s module.
     ///
-    /// The single-VA form of [`Self::chain_map_for`] — same table, same
-    /// same-tier filter, no snapshot allocated — used to turn a persisted chain
-    /// edge's recorded guest VA back into a `FuncId` of *this* run. `None` means
-    /// this run has no chainable block there (never compiled it, or invalidated
-    /// it since), which refuses the blob rather than chaining into a dead target.
+    /// One point lookup against the tier-tagged table: the only shape the two
+    /// consumers need. Lowering asks it for at most four VAs per block (a
+    /// [headless note](`super::lower::ChainLookup`)), and code-cache restore
+    /// asks it for each persisted chain edge. It deliberately does **not**
+    /// materialise a snapshot: a `HashMap` of the whole table costs O(chain
+    /// entries) plus one allocation per compiled block, and the compile path
+    /// runs it while holding the `engine` mutex — the single lock every
+    /// compiling thread serialises on. `None` means this run has no chainable
+    /// block there (never compiled it, or invalidated it since), which refuses
+    /// the blob rather than chaining into a dead target.
     ///
     /// The ids it returns are the load-bearing precondition of
     /// [`crate::jit::engine::IsaEngine::define_persisted`]: `chain_ids` is only

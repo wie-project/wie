@@ -1,7 +1,58 @@
 # ADR 0006 — A `port` module as `wie-winapi`'s published surface
 
 Status: **Accepted** · 2026-11-23 — decisions 1 and 2 implemented (`a4ba020`);
-decision 3 **not implemented**. Proposed 2026-10-01 · maintainability plan T3.5
+decision 3 implemented after `30f68bc` (see its note). Proposed 2026-10-01 ·
+maintainability plan T3.5
+
+## Implementation note — decision 3 (2026-11-23, after `30f68bc`)
+
+`wie-cli` no longer depends on `wie-winapi`. The edge is gone from
+`crates/wie-cli/Cargo.toml`, from `Cargo.lock`, and from `EXPECTED_EDGES` in
+`check_deps()` — where its absence is now *load-bearing*: re-adding the
+dependency fails the step as an UNEXPECTED edge (verified by re-adding the line,
+watching the step exit 1 and name `wie-cli -> wie-winapi`, then removing it).
+`grep -rn wie_winapi crates/wie-cli/src` reads **0** at this commit (57 before).
+
+What replaced it is `crates/wie-runtime/src/host.rs`, the session's host-facing
+surface, in the three classes decision 3 asked for:
+
+1. **Types the host names** — `Dimension`, `Hwnd`, `SurfaceFrame`,
+   `DisplayMetrics`, `VolumeConfig`, the dialog policies and their
+   request/pick payloads: re-exported from `wie_winapi::port` where `port`
+   publishes them, and from the crate root where it does not (those payloads
+   are host callback data with no guest-visible layout, so `port` was never
+   their right home).
+2. **Host services** — `host_path_to_guest`, `global_bottle_root`,
+   `drive_letter`, `profile_sigint_armed`, `set_raw_mode`, … re-exported. Pure
+   functions over host paths / the host tty: no guest state, no big lock.
+   `bottle::guest_path_to_host` is aliased `bottle_guest_path_to_host` because
+   `wie-winapi` exports a *different* `guest_path_to_host` (the `VolumeConfig`
+   one) under the same name.
+3. **Work that belongs to the session** — the synthesized raw-input lane. The
+   CLI used to call `user32::raw_input::{post_raw_keyboard_event,
+   post_raw_mouse_event, is_legacy_*_excluded}` and post the `WM_INPUT`s itself;
+   those are now `GuestHandle::{post_raw_keyboard, post_raw_mouse_move,
+   post_raw_mouse_button, post_raw_mouse_wheel, legacy_keyboard_input_excluded,
+   legacy_mouse_input_excluded}`, which encode the record, apply the
+   registration filter, and deliver through `post_message` (queue mutex only,
+   never the big one). The `RAWINPUT` vocabulary — `RawInputPost`,
+   `RawMouseReport`, `RawMouseButton` — no longer crosses a crate boundary.
+
+**Where the premise still does not hold:** `port` publishes neither `WinMsg`
+(the `WM_*` vocabulary the host derives its message-id constants from) nor
+`IRect` (the type of `SurfaceFrame::region`), so `host.rs` names those two
+through the gated module paths. That is one file and it is recorded as a single
+scoped entry in `check_winapi_port`'s allow-list, with the follow-up named
+there: publish both in `port` §6, then delete the entry. So the win here is the
+*dependency edge*, machine-enforced; the port surface itself still needs those
+two names to be complete for host consumers.
+
+`wie-cli`'s own test count did not move (115 unit/integration tests, all in-crate
+unit tests plus `tests/run_entry.rs`; the crate has no end-to-end guest runs of
+its own — those live in `wie-runtime`'s `micro_gui_window`). `wie-runtime` is
+189/189. Behaviour is unchanged by construction: every call site keeps its
+arguments, its ordering, and its `WM_INPUT` debug log (same `wiegui` target,
+same fields — it moved one frame down the stack, into the session).
 
 ## Implementation note (2026-11-23)
 
@@ -45,13 +96,8 @@ which runs only the `file-sizes` and `dep-direction` policy steps.
 2. **The reference count is not 405.** At `a4ba020^`, `grep -rn wie_winapi
    crates/wie-runtime/src | wc -l` = 400; including `tests/` it is 503. The 405
    in Context reproduces under neither reading.
-3. **Decision 3 did not land.** `wie-cli` still declares
-   `wie-winapi = { path = "../wie-winapi" }` (`crates/wie-cli/Cargo.toml:35`) and
-   still reaches `wie_winapi::user32::`, `::gdi32::`, `::present::` directly from
-   `gui/`. `scripts/check.sh` lists that edge in `EXPECTED_EDGES` as a known
-   deviation, so the gate does not cover the CLI. Re-exporting
-   `console::profile_sigint_armed` / `ensure_hooks_installed` from `wie-runtime`
-   and dropping the dependency is still open work.
+3. **Decision 3 did not land at `a4ba020`** — recorded here as history. It
+   landed after `30f68bc`; see the decision-3 note above.
 4. **One item of Context is now stale in the other direction:** the ADR records
    `user32::handle_get_dc` as a direct handler call at `session/mod.rs:930`. It
    is gone — the gate forbids that shape, and the runtime reaches the same

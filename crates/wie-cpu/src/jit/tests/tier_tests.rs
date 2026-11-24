@@ -8,7 +8,7 @@
 //! declared it, and `Module::declare_func_in_func` indexes *this* module's
 //! table. So handing a `FuncId` from the other tier's module to a compile
 //! either panics or silently names a different function and emits a call to
-//! the wrong address. The invariant is that `JitShared::chain_map_for` offers
+//! the wrong address. The invariant is that `JitShared::chain_func_for` offers
 //! each module only its own ids; a cross-tier edge then falls back to the
 //! late-bound chain hop / dispatcher, both already supported and tested
 //! elsewhere.
@@ -171,16 +171,18 @@ fn cross_tier_successor_edge_falls_back_and_still_executes() {
     );
 }
 
-/// The filter that makes the invariant hold, asserted directly: each module's
-/// map holds its own ids and nothing else, so no cross-module `FuncId` can
-/// reach `declare_func_in_func`.
+/// The filter that makes the invariant hold, asserted directly: the lookup a
+/// compile resolves its chain edges with answers with its own module's ids and
+/// nothing else, so no cross-module `FuncId` can reach `declare_func_in_func`.
+///
+/// This goes through `chain_func_for` — the lookup the compile path and the
+/// code-cache restore path both call — rather than a whole-table snapshot, so
+/// the assertion covers the code that actually feeds `declare_func_in_func`.
 #[test]
 fn chain_map_is_partitioned_by_tier() {
     let mut cpu = tier_cpu();
     run_tier_program(&mut cpu);
 
-    let base_ids = cpu.shared.chain_map_for(OptTier::Base);
-    let speed_ids = cpu.shared.chain_map_for(OptTier::Speed);
     let loop_va = SIMD_BASE + LOOP_OFF;
     let exit_va = SIMD_BASE + EXIT_OFF;
 
@@ -199,15 +201,28 @@ fn chain_map_is_partitioned_by_tier() {
         .expect("exit chain id")
         .func_id;
 
-    assert_eq!(speed_ids.get(&loop_va).copied(), Some(loop_id));
-    assert_eq!(base_ids.get(&exit_va).copied(), Some(exit_id));
-    assert!(
-        !speed_ids.contains_key(&exit_va),
-        "a base-module FuncId leaked into the tier module's direct-chain map"
+    assert_eq!(
+        cpu.shared.chain_func_for(OptTier::Speed, loop_va),
+        Some(loop_id)
     );
-    assert!(
-        !base_ids.contains_key(&loop_va),
-        "a tier-module FuncId leaked into the base module's direct-chain map"
+    assert_eq!(
+        cpu.shared.chain_func_for(OptTier::Base, exit_va),
+        Some(exit_id)
+    );
+    assert_eq!(
+        cpu.shared.chain_func_for(OptTier::Speed, exit_va),
+        None,
+        "a base-module FuncId leaked into the tier module's direct-chain lookup"
+    );
+    assert_eq!(
+        cpu.shared.chain_func_for(OptTier::Base, loop_va),
+        None,
+        "a tier-module FuncId leaked into the base module's direct-chain lookup"
+    );
+    assert_eq!(
+        cpu.shared.chain_func_for(OptTier::Base, 0xdead_0000),
+        None,
+        "an uncompiled VA must not resolve to any FuncId"
     );
     // Two distinct modules, so the partition is not vacuous: each tier's code
     // resolves inside the module that declared it.

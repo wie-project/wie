@@ -1,7 +1,7 @@
 //! Interactive print-dialog integration (host side).
 //!
 //! `PrintDlgW` (comdlg32) is implemented in `wie-winapi`: under
-//! [`wie_winapi::PrintDialogPolicy::Interactive`] the handler runs the native
+//! [`wie_runtime::host::PrintDialogPolicy::Interactive`] the handler runs the native
 //! macOS print panel (NSPrintPanel — the OS-equivalent of Windows' PrintDlg
 //! dialog) through the bridge registered here, then writes the pick back into
 //! the guest `PRINTDLG` (`hDC` / `nCopies` / `hDevMode` / `hDevNames`). The
@@ -9,7 +9,7 @@
 //! emulated print output matches what the user chose.
 //!
 //! `PageSetupDlgW` (comdlg32) gets the same treatment: under
-//! [`wie_winapi::PageSetupDialogPolicy::Interactive`] the handler runs the
+//! [`wie_runtime::host::PageSetupDialogPolicy::Interactive`] the handler runs the
 //! native macOS page-layout panel (NSPageLayout — the OS-equivalent of
 //! Windows' Page Setup dialog) through a second bridge registered here, then
 //! writes the pick's paper/orientation back into the guest `PAGESETUPDLG`
@@ -22,16 +22,20 @@
 //! macOS-only winit entry) shows the panels exactly when a real window is on
 //! screen, and — on macOS — registers the native bridges. Headless runs and
 //! `trace` keep the default
-//! [`wie_winapi::PrintDialogPolicy::Cancel`] / [`wie_winapi::PageSetupDialogPolicy::Cancel`]
+//! [`wie_runtime::host::PrintDialogPolicy::Cancel`] / [`wie_runtime::host::PageSetupDialogPolicy::Cancel`]
 //! policies and never open a panel.
 //!
 //! The bridge also maintains the session-scoped NSPrintInfo id-table: the
-//! handler assigns each `PrintDlgW` call an id ([`wie_winapi::PrintDialogRequest::print_info_id`]),
+//! handler assigns each `PrintDlgW` call an id ([`wie_runtime::host::PrintDialogRequest::print_info_id`]),
 //! and the bridge registers the user's resulting `NSPrintInfo` under that key.
 //! The EndDoc handoff ([`run_native_print_job`]) consumes the entry to drive a
 //! real NSPrintOperation — the guest's pages, the user's destination.
 
 use wie_runtime::RuntimeSession;
+use wie_runtime::host::{
+    PageSetupDialogPick, PageSetupDialogPolicy, PageSetupDialogRequest, PrintDialogPick,
+    PrintDialogPolicy, PrintDialogRequest, PrintJobRequest,
+};
 
 // Names the `declare_class!` print-view definition needs at MODULE scope (the
 // macro expands where it is invoked, not inside the bridge function): the
@@ -55,7 +59,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 /// `run_windowed`.
 #[cfg(target_os = "macos")]
 pub fn enable_interactive_print_dialogs(session: &mut RuntimeSession) {
-    session.set_print_dialog_policy(wie_winapi::PrintDialogPolicy::Interactive);
+    session.set_print_dialog_policy(PrintDialogPolicy::Interactive);
 }
 
 /// Non-macOS builds have no native print panel: keep the default Cancel
@@ -100,7 +104,7 @@ unsafe impl Send for PrintInfoEntry {}
 
 /// Host-side NSPrintInfo id-table: print-dialog id → the user's `NSPrintInfo`.
 ///
-/// The handler assigns the id ([`wie_winapi::PrintDialogRequest::print_info_id`]);
+/// The handler assigns the id ([`wie_runtime::host::PrintDialogRequest::print_info_id`]);
 /// the bridge registers the retained `NSPrintInfo` here on accept. P3's EndDoc
 /// handoff looks the entry up (and consumes it) to drive a real
 /// NSPrintOperation; a leak-per-print is acceptable.
@@ -111,7 +115,7 @@ pub type PrintInfoTable =
 /// Register the native macOS print-panel bridge on a GUI session.
 ///
 /// With a bridge registered, `PrintDlgW` under
-/// [`wie_winapi::PrintDialogPolicy::Interactive`] shows a real NSPrintPanel:
+/// [`wie_runtime::host::PrintDialogPolicy::Interactive`] shows a real NSPrintPanel:
 /// the guest thread blocks inside the bridge until the user dismisses it
 /// (dialog semantics, the same seam as the file-dialog bridge), then the
 /// handler writes the pick back into the `PRINTDLG`. Sessions that never
@@ -148,9 +152,9 @@ const DMORIENT_LANDSCAPE: u16 = 2;
 #[cfg(target_os = "macos")]
 #[expect(unsafe_code)]
 fn show_native_print_dialog(
-    request: &wie_winapi::PrintDialogRequest,
+    request: &PrintDialogRequest,
     table: &PrintInfoTable,
-) -> Option<wie_winapi::PrintDialogPick> {
+) -> Option<PrintDialogPick> {
     use objc2::ClassType;
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
@@ -237,7 +241,7 @@ fn show_native_print_dialog(
             (width_mm, height_mm)
         };
 
-        let pick = wie_winapi::PrintDialogPick {
+        let pick = PrintDialogPick {
             paper_size_mm,
             orientation: if orientation == NSPaperOrientation::Landscape {
                 DMORIENT_LANDSCAPE
@@ -265,7 +269,7 @@ fn show_native_print_dialog(
 /// `run_windowed`.
 #[cfg(target_os = "macos")]
 pub fn enable_interactive_page_setup_dialogs(session: &mut RuntimeSession) {
-    session.set_page_setup_dialog_policy(wie_winapi::PageSetupDialogPolicy::Interactive);
+    session.set_page_setup_dialog_policy(PageSetupDialogPolicy::Interactive);
 }
 
 /// Non-macOS builds have no native page-layout panel: keep the default Cancel
@@ -276,7 +280,7 @@ pub fn enable_interactive_page_setup_dialogs(_session: &mut RuntimeSession) {}
 /// Register the native macOS page-setup bridge on a GUI session.
 ///
 /// With a bridge registered, `PageSetupDlgW` under
-/// [`wie_winapi::PageSetupDialogPolicy::Interactive`] shows a real
+/// [`wie_runtime::host::PageSetupDialogPolicy::Interactive`] shows a real
 /// NSPageLayout panel: the guest thread blocks inside the bridge until the
 /// user dismisses it (dialog semantics, the same seam as the print-panel
 /// bridge), then the handler writes the pick back into the `PAGESETUPDLG`.
@@ -299,9 +303,7 @@ pub fn register_native_page_setup_dialog_bridge(handle: &wie_runtime::GuestHandl
 /// returned plain-data pick is written back into the guest `PAGESETUPDLG`.
 #[cfg(target_os = "macos")]
 #[expect(unsafe_code)]
-fn show_native_page_setup_dialog(
-    request: &wie_winapi::PageSetupDialogRequest,
-) -> Option<wie_winapi::PageSetupDialogPick> {
+fn show_native_page_setup_dialog(request: &PageSetupDialogRequest) -> Option<PageSetupDialogPick> {
     use objc2::ClassType;
     use objc2_app_kit::{NSPageLayout, NSPageLayoutResult, NSPaperOrientation, NSPrintInfo};
     use objc2_foundation::{NSSize, run_on_main};
@@ -355,7 +357,7 @@ fn show_native_page_setup_dialog(
             (width_mm, height_mm)
         };
 
-        Some(wie_winapi::PageSetupDialogPick {
+        Some(PageSetupDialogPick {
             paper_size_mm,
             orientation: if orientation == NSPaperOrientation::Landscape {
                 DMORIENT_LANDSCAPE
@@ -396,7 +398,7 @@ pub fn register_native_print_job_bridge(handle: &wie_runtime::GuestHandle, table
 /// here (a leak-per-print would otherwise keep the settings forever).
 #[cfg(target_os = "macos")]
 #[expect(unsafe_code)]
-fn run_native_print_job(request: wie_winapi::PrintJobRequest, table: &PrintInfoTable) -> bool {
+fn run_native_print_job(request: PrintJobRequest, table: &PrintInfoTable) -> bool {
     use objc2::ClassType;
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;

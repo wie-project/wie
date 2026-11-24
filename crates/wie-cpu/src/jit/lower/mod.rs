@@ -681,15 +681,40 @@ fn empty_chain_refs() -> &'static HashMap<u64, FuncRef> {
     EMPTY.get_or_init(HashMap::new)
 }
 
+/// A chain lookup used by [`compile_block`]: guest VA → the `FuncId` this
+/// run compiled it to, in the module being lowered into.
+///
+/// This is a **point lookup, not a snapshot**. Lowering asks for at most four
+/// specific VAs (the terminator's chain targets, a `call`'s return address and
+/// the fallthrough address), so a whole-table map is the wrong shape: it costs
+/// O(chain-table) to build and allocates a `HashMap` per block — inside the
+/// engine lock, i.e. inside the one region every compiling thread serialises
+/// on. The compile path therefore passes a closure over
+/// [`JitShared::chain_func_for`](super::shared::JitShared::chain_func_for),
+/// and the tier-partition test pins that same lookup, so the invariant is
+/// asserted on the path production uses.
+pub(super) trait ChainLookup {
+    /// The `FuncId` for `va`, or `None` when this run has no chainable block
+    /// there (never compiled, invalidated since, or a different tier's).
+    fn chain_func(&self, va: u64) -> Option<FuncId>;
+}
+
+impl<F: Fn(u64) -> Option<FuncId>> ChainLookup for F {
+    fn chain_func(&self, va: u64) -> Option<FuncId> {
+        self(va)
+    }
+}
+
 /// Lower one block into `eng`'s module and finalize it.
 ///
-/// `chain` MUST contain only `FuncId`s declared by the SAME module `eng`
-/// belongs to (see [`IsaEngine`]): every id in it is handed to
+/// `chain` MUST return only `FuncId`s declared by the SAME module `eng`
+/// belongs to (see [`IsaEngine`]): every id it returns is handed to
 /// `Module::declare_func_in_func`, which indexes this module's own function
-/// table. The caller enforces that by building the map from a tier-filtered
-/// snapshot of `JitShared::chain_ids`
-/// ([`JitShared::chain_map_for`](super::shared::JitShared::chain_map_for));
-/// a cross-tier successor is instead left to the late-bound chain hop or the
+/// table. The caller enforces that with a tier-filtered view of
+/// `JitShared::chain_ids` — [`ChainLookup`] over
+/// [`JitShared::chain_func_for`](super::shared::JitShared::chain_func_for),
+/// which is what both the compile path and the code-cache restore path use; a
+/// cross-tier successor is instead left to the late-bound chain hop or the
 /// dispatcher, which is the supported fallback.
 ///
 /// `tier` is the opt level `eng` was built for; it is recorded in the returned
@@ -705,7 +730,7 @@ pub(super) fn compile_block(
     end_rip: u64,
     term: Option<BlockTerm>,
     call_fast: Option<FastApiKind>,
-    chain: &HashMap<u64, FuncId>,
+    chain: &dyn ChainLookup,
     bytes_len: u32,
     inv_gen_baked: u64,
     tier: OptTier,
@@ -925,7 +950,7 @@ pub(super) fn compile_block(
                 if va == start_rip {
                     continue; // self-loop uses IR jump
                 }
-                if let Some(&fid) = chain.get(&va) {
+                if let Some(fid) = chain.chain_func(va) {
                     chain_refs
                         .get_or_insert_with(HashMap::new)
                         .insert(va, eng.module.declare_func_in_func(fid, bcx.func));
@@ -934,7 +959,7 @@ pub(super) fn compile_block(
             // Also pre-declare return_ip for Call (common after callee returns).
             if let BlockTerm::Call { return_ip, .. } = t
                 && return_ip != start_rip
-                && let Some(&fid) = chain.get(&return_ip)
+                && let Some(fid) = chain.chain_func(return_ip)
             {
                 chain_refs
                     .get_or_insert_with(HashMap::new)
@@ -943,7 +968,7 @@ pub(super) fn compile_block(
         }
         // Fallthrough chain.
         if term.is_none()
-            && let Some(&fid) = chain.get(&end_rip)
+            && let Some(fid) = chain.chain_func(end_rip)
         {
             chain_refs
                 .get_or_insert_with(HashMap::new)

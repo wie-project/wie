@@ -19,6 +19,10 @@ mod session;
 mod trace;
 
 pub use gui_loop::{GuiControl, GuiOutcome, run_windowed};
+// The host-facing surface (ADR-0006 decision 3): every `wie-winapi` name the
+// CLI is allowed to say, plus the `GuestHandle` entry points for host work
+// that used to call the emulator directly.
+pub mod host;
 pub use hooks::RuntimeFakeApiEntry;
 pub use memory::{
     DEFAULT_LAYOUT, FAKE_API_BASE, FAKE_API_SIZE, PROCESS_HEAP_BASE, PROCESS_HEAP_HANDLE,

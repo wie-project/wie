@@ -31,6 +31,7 @@ use std::net::TcpStream;
 use ahash::HashMapExt;
 use anyhow::{Context, Result, anyhow};
 
+use crate::capability::LastErrorAccess;
 use crate::guest_memory::write_u32;
 use crate::kernel32::{
     low_u32, read_ansi_string_from_cpu, read_stack_u64, read_wide_string_from_cpu,
@@ -177,10 +178,10 @@ fn finish(engine: &mut dyn wie_cpu::CpuEngine, value: u64) -> Result<WinApiHandl
 /// Finish with the process last-error recorded and `FALSE` returned.
 fn finish_false(
     engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    state: &mut dyn LastErrorAccess,
     code: u32,
 ) -> Result<WinApiHandlerResult> {
-    state.process.last_error = code;
+    state.set_process_last_error(code);
     finish(engine, 0)
 }
 
@@ -968,16 +969,14 @@ fn is_ignored_option(option: u32) -> bool {
 /// `ERROR_INVALID_PARAMETER` instead of faking success. The option values are
 /// encoding-independent, so the ANSI variant delegates here.
 fn handle_internet_set_option_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _h = engine.read_rcx()?;
-    let option = low_u32(engine.read_rdx()?, "InternetSetOptionW option")?;
-    let _buffer_va = engine.read_r8()?;
-    let _buffer_len = engine.read_r9()?;
+    let _h = ctx.engine.read_rcx()?;
+    let option = low_u32(ctx.engine.read_rdx()?, "InternetSetOptionW option")?;
+    let _buffer_va = ctx.engine.read_r8()?;
+    let _buffer_len = ctx.engine.read_r9()?;
     if is_ignored_option(option) {
-        finish(engine, 1)
+        finish(&mut *ctx.engine, 1)
     } else {
-        finish_false(engine, state, ERROR_INVALID_PARAMETER)
+        finish_false(&mut *ctx.engine, &mut *ctx.state, ERROR_INVALID_PARAMETER)
     }
 }
 
@@ -1006,13 +1005,11 @@ fn handle_internet_get_connected_state(
 ///
 /// Always fails with `ERROR_INVALID_PARAMETER` — no option data is faked.
 fn handle_internet_query_option_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _h = engine.read_rcx()?;
-    let _option = engine.read_rdx()?;
-    let _buffer_va = engine.read_r8()?;
-    let _buffer_len_va = engine.read_r9()?;
-    finish_false(engine, state, ERROR_INVALID_PARAMETER)
+    let _h = ctx.engine.read_rcx()?;
+    let _option = ctx.engine.read_rdx()?;
+    let _buffer_va = ctx.engine.read_r8()?;
+    let _buffer_len_va = ctx.engine.read_r9()?;
+    finish_false(&mut *ctx.engine, &mut *ctx.state, ERROR_INVALID_PARAMETER)
 }
 
 /// `BOOL InternetQueryOptionA(...)` — ANSI variant.

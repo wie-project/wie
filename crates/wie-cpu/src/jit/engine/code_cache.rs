@@ -48,9 +48,8 @@
 //! transfers to** (the block's `exit_rip`) and nothing else, and restore turns
 //! that VA back into a live `FuncId` through
 //! [`JitShared::chain_func_for`](crate::jit::shared::JitShared::chain_func_for)
-//! — the single-VA form of the same tier-tagged snapshot
-//! [`JitShared::chain_map_for`](crate::jit::shared::JitShared::chain_map_for)
-//! offers a fresh compile. Why that cannot honour a stale target:
+//! — the same tier-tagged lookup a fresh compile resolves its own chain edges
+//! with. Why that cannot honour a stale target:
 //!
 //! 1. **The VA is invariant.** The probe has already proven the blob's bytes are
 //!    byte-identical to live guest memory at `[va, guest_end)` (FNV-1a below),

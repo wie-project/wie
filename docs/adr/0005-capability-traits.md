@@ -1,14 +1,18 @@
 # ADR 0005 — Capability traits on the Win32 dispatch port
 
-Status: **Accepted** · 2026-11-23 — implemented (`a4ba020`). Proposed 2026-10-01 ·
-maintainability plan T3.4
+Status: **Accepted** · 2026-11-23 — implemented (`a4ba020`); stage 2 the same day
+(whole-state bindings 476 → 470, ratcheted); stage 3 added `LastErrorAccess`
+(470 → 439, ratcheted). Proposed 2026-10-01 · maintainability plan T3.4
 
 ## Implementation note (2026-11-23)
 
 The three traits exist in a private `capability` module (the same
 `#[expect(unreachable_pub)]` shape as `state`, because `port` is the published
 surface): `ConsoleAccess` 7 verbs, `WindowDialogAccess` 22 verbs, `PresentAccess`
-18 verbs. How a handler obtains one:
+18 verbs (stage 2 grew `ConsoleAccess` to 8 own + 2 inherited = 10 and
+`WindowDialogAccess` to 23, leaving `PresentAccess` alone; stage 3 added
+`LastErrorAccess` with 2 verbs — see the later notes). How a handler obtains
+one:
 
 | Capability | Route from `HandlerContext` |
 | --- | --- |
@@ -54,7 +58,10 @@ were re-taken during implementation and three of them do not survive:
    the wide handle is still everywhere the handler body starts. That is a fair
    description of stage 1: the two dominant clusters have named, checkable seams;
    the crate does not have a capability-only dispatch path, and `PresentAccess` in
-   particular cannot fail a reach.
+   particular cannot fail a reach. (Stage 2 measured those 476 against what each
+   body actually touches: six were inside the three traits' reach, they are
+   narrowed, and the remaining 470 are now a machine-checked budget. See the next
+   section.)
 
 The lock-order hazard this ADR's Context records as "prose in ~10 doc comments
 across 4 files" was one statement of the order, in a "Lock ordering:" paragraph on
@@ -67,6 +74,205 @@ rather than the rule specified. It is now a type —
 `WindowState`'s 31 fields are still `pub`, which is the deferral this ADR states
 explicitly ("Explicitly not decided here"); nothing about that clause has
 changed.
+
+## Implementation note — stage 2 (2026-11-23)
+
+Stage 1 left **476** whole-state bindings
+(`grep -rn 'let state = &mut \*ctx.state' crates/wie-winapi/src | wc -l`). Stage 2
+asked each of them the only question that decides whether it may narrow at all:
+*what does this body actually touch?*
+
+**Method (so the number is checkable, not asserted).** For each binding, the
+enclosing function's *reach* is every `state.<member>` and `state.<member>()` path
+in its body, plus the same for every callee it passes `state` to, transitively.
+Each path is then **covered** (a `PresentAccess` verb, a `ConsoleAccess` verb, a
+`WindowDialogAccess` verb, or a `window_state().<dialog field>` the trait exposes
+as a verb) or **outside** (everything else — `process`, `kernel`, `heap_state`,
+`file_io`, `module_state`, a `DllId` slot, `window_state().windows`, …). A binding
+is narrowable only when its reach is empty or entirely covered.
+
+**Result: 476 → 470.** Six bindings were inside the three traits' reach. All six
+are gone; no handler was rewritten to spell `ctx.state` inline instead of binding
+it — that would lower the count without narrowing anything, and the count is only
+worth having as a proxy for reach.
+
+| Handler | Capability | Route it now takes |
+| --- | --- | --- |
+| `comdlg32/color.rs::handle_choose_color_a` | dialog | `ctx.dialogs().set_comm_dlg_extended_error` |
+| `comdlg32/font.rs::handle_choose_font_w` | dialog | `ctx.dialogs().font_dialog_policy()` + `state_comm_dlg_none(ctx.dialogs())` |
+| `comdlg32/file.rs::handle_get_file_name` | dialog | `ctx.dialogs()` for policy/error/path + the new `has_native_file_dialog_bridge` predicate |
+| `user32/window/geom_ops.rs::handle_set_window_pos` | present | new `apply_z_order(&mut dyn PresentAccess, …)` helper |
+| `ucrt/stdio.rs::handle_getchar` | console | `ctx.console()` → `ConsoleCall` (`stdin_read_char`) |
+| `ucrt/stdio.rs::handle_fgets` | console | `ctx.console()` → `ConsoleCall` (`stdin_available`/`stdin_refill`/`stdin_is_live_host`/`stdin_take`) |
+
+**Four trait edits, all verbs or parameters — no struct handed back.**
+
+- `ConsoleAccess::stdin_read_char()` — `getchar`'s line-at-a-time rule (consume
+  the byte, discard the rest up to `\n`) moved out of the `ucrt` handler into
+  `console/stdin.rs`, where the buffer lives.
+- `ConsoleAccess::stdin_is_live_host()` — `fgets` asks one yes/no question before
+  deciding to block on the host; a predicate, not `file_io.stdin_mode`.
+- `ConsoleAccess::stdin_refill(max_line)` — **parameterised, not widened.** The
+  two callers have two buffering policies (`ReadConsole`/`ReadFile` 64 KiB,
+  `ucrt`'s line reader the CRT's 4 KiB); folding one into the verb would have
+  changed the other caller's behaviour, so the cap is spelled at each call site.
+- `WindowDialogAccess::has_native_file_dialog_bridge()` — `GetOpenFileName` asks
+  whether the host panel exists and must not reach the closure behind it.
+  `print_dialog_bridge` is still unreachable: `PrintDlgW` is a wide handler.
+
+**Why the other 470 do not narrow.** Every remaining binding reaches a member
+that *no* capability exposes, which is this ADR's own decision ("no capability
+exposes `process`, `kernel`, `heap_state`, `module_state`, or `dll_states`") and,
+for `window_state`, its documented exclusion list. Counted per cluster:
+
+| Cluster | Bindings | The reach that keeps it wide | Verdict |
+| --- | --- | --- | --- |
+| `kernel32` | 131 | `process.last_error` (most), `heap_state.heap`, `kernel.sync`, `kernel.threads`, `file_io.{open_files,volumes,virtual_files}`, `module_state` | outside every named capability |
+| `user32` | 106 | `window_state().windows` / geometry / focus / capture / menus / `touch_window_mirror`; `post_message`; `message_queue` | `WindowDialogAccess` excludes window machinery by decision |
+| `d3d9` | 74 | its own `DllId::D3d9` slot (plus present verbs, already narrowed) | a per-DLL slot has no capability |
+| crate root | 74 | `ws2_32` 21, `wininet` 9, `comctl32` 9, `winmm` 7, `version` 7, `oleaut32` 6, and ten 1–2s — each its own slot or a host-side map (`wininet`, `winmm`, `ole32`) | same |
+| `gdi32` | 43 | `gdi_state().{find_dc,alloc_dc,find_print_job_mut}`, `with_font_engine`, `window_state().{window_width,window_height}` | gdi state has no capability; the present half is already narrowed |
+| `advapi32` | 13 | `process.registry_keys`, `registry.persist` | no registry capability |
+| `ucrt` | 13 | `heap_state.heap`, `file_io.ucrt_files`, and `handle_stdio_common_vfscanf`'s cursor rewind | heap + the CRT's own file map |
+| `comdlg32` | 8 | the interactive panel builders: `create_window_record`, modal frames, `heap_state.heap` for the DEVMODE/DEVNAMES blocks | genuinely multi-capability (dialog **and** windows **and** heap) |
+| `dinput` | 7 | its own slot | same |
+| `pthread` | 1 | `kernel.threads` | no kernel capability |
+
+Two consequences of that table are worth stating plainly:
+
+1. **The single largest blocker is the last-error alias.** 138 of the 476 bindings
+   write `state.process.last_error`, and for 33 of them that write is the
+   *entire* reach — they bind an eight-sub-state object to touch one `u32`. A
+   last-error capability would be the highest-value next trait by an order of
+   magnitude; it is deliberately *not* added here, because this ADR decides not
+   to expose `process` and a trait invented to make a count look better is the
+   failure mode this whole decision exists to avoid. (`ConsoleAccess` carries
+   `set_process_last_error` because a console handler's failure paths are console
+   work; the same argument does not stretch over `PresentAccess`.)
+2. **A handler needing two capabilities keeps the wide borrow** — two mutable
+   borrows of one state are impossible — so `comdlg32`'s panel builders stay wide
+   even though both of their capabilities now have names. That is the rule, not a
+   gap.
+
+**The ratchet.** `scripts/check.sh --only state-bindings` (a policy step of the gate, right after
+the port boundary, and its own named CI step) counts the same grep against
+`MAX_WHOLE_STATE_BINDINGS = 470` and fails above it, printing the per-file census
+of whatever is there so the next reader sees *where* the draft went. It is a
+ceiling with a documented one-line raise for a genuinely multi-capability handler,
+and it ramps down: when the count is under the budget it prints the number to pin,
+so a narrowing cannot silently regress. Falsified before committing — adding one
+binding made it exit 1 at 471, removing it returned 0 at 470.
+
+**What moved in the stage-1 table.** `ConsoleAccess` now reaches 56
+`ctx.console()` call sites (54 before) and `ConsoleCall` is the parameter type at
+77 sites; `WindowDialogAccess` is reached by `ctx.dialogs()` at 13 sites (1
+before) and is the parameter type of 1 helper; `PresentAccess` is the parameter
+type of 1 helper and still has no context accessor, which is why present
+narrowing happens at helper signatures. `comdlg32` still reaches `window_state()`
+171 times (non-comment, measured on this branch; the 146/154 above were
+`a4ba020`-era) — the dialog *plumbing* is now capability-typed, the panel
+*building* is not, and that split is the honest one.
+
+## Implementation note — stage 3 (2026-11-23): the last-error capability
+
+Stage 2 ended with a measured floor of 470 and one finding it could name
+precisely: **the largest single blocker was the last-error alias.** 138 of the
+476 bindings wrote `state.process.last_error`, and for 33 of them that write was
+their *entire* reach — an eight-sub-state borrow to store one `u32`. That is a
+capability worth adding, and it does not require exposing `process`.
+
+**The verb list came from the sites, not from the field.** Reading all 138, a
+handler does exactly two things: read the alias (`GetLastError`,
+`WSAGetLastError`) and write it (everything else). Nothing in the crate reads or
+writes the active thread's slot from a handler — `grep -rn 'threads.active'`
+outside `state/` finds only `tls_values`, a different field — because the
+thread-slot verbs and the publish step belong to the *dispatch boundary*:
+`absorb_guest_last_error` before a dispatch and `publish_last_error_to_guest`
+after it, in `wie-runtime`. So the trait is two verbs:
+
+| Verb | Reaches | Sites |
+| --- | --- | --- |
+| `last_error()` | `process.last_error` (read) | 2 |
+| `set_process_last_error(u32)` | `process.last_error` (write) | 136 |
+
+**The fold-at-boundary rule is load-bearing, and it is why two verbs suffice.**
+A handler writes the *alias* and returns; after the handler returns,
+`publish_last_error_to_guest` copies `process.last_error` into the active
+thread's slot and then into the engine's GS-relative TEB word, so the guest sees
+the value without the handler ever touching the slot. A trait that also exposed
+the slot would invite handlers to write the same value twice and would blur the
+one case where the alias is deliberately stale — thread activation, where
+`set_active_last_error` writes the slot *alone* because the alias still holds
+the previous thread's value. That seam is `wie-runtime`'s and holds
+`&mut WinApiState`; it needs no verb here and gets none.
+
+**Reconciliation: the console verb was this verb.** `ConsoleAccess` declared its
+own `set_process_last_error` with the fold-at-boundary reasoning written out on
+it. Same receiver, same effect, same justification — so `ConsoleAccess` is now a
+**subtrait** of `LastErrorAccess` and the duplicate declaration is gone. Console
+handlers (`cx.state.set_process_last_error(e)`, ~30 sites) compile unchanged
+through supertrait method resolution; there is one spelling, one doc, one
+implementation.
+
+**Route.** `ctx.last_error()` → `&mut dyn LastErrorAccess`, the shape
+`dialogs()` has and *not* the shape `console()` has: the capability has no
+struct to hand back, so there is nothing for the CPU port to sit beside. A
+handler that needs the engine and the capability in the *same call* passes two
+disjoint field reborrows (`&mut *ctx.engine`, `&mut *ctx.state`) — legal where
+`ctx.last_error()` is not, because that borrows the whole context. Four call
+sites do this; the constraint still lives in the callee's narrowed parameter.
+
+**Result: 470 → 439.** 31 bindings narrowed; the 33 candidates minus two that
+only *looked* last-error-only:
+
+| Narrowed (31) | Where |
+| --- | --- |
+| `advapi32` (1) | `handle_open_process_token` |
+| `kernel32/memory.rs` (5) | `VirtualAlloc`/`VirtualFree`/`VirtualProtect`/`VirtualQuery`/`OpenFileMapping` |
+| `kernel32/file_io/vol.rs` (6) | `CreateHardLinkW`, `FindFirst/NextStreamW`, `DeviceIoControl`, `GetTempPathW/A` |
+| `kernel32/file_io/time.rs` (2) | `FileTimeToLocalFileTime`, `FileTimeToSystemTime` |
+| `kernel32/file_io/path.rs` (1) | the `Get*PathName` mock, plus `write_mock_string_{a,w}` narrowed to the capability |
+| `kernel32/misc` (4) | `GetLastError`, `SetLastError`, `GetComputerNameExW`, `GetTimeZoneInformation`, `GetTimeFormatW`/`GetDateFormatW` |
+| `kernel32/sync.rs` (3) | `InterlockedFlushSList`, `OpenEventW`, `FlushInstructionCache` |
+| `kernel32/module.rs` (2) | `GetModuleFileNameA/W` |
+| `kernel32` others (2) | `AssignProcessToJobObject`, `MultiByteToWideChar` |
+| `wininet` (2) | `InternetSetOptionW`, `InternetQueryOptionW` (via `finish_false`, narrowed) |
+| `ws2_32` (2) | `WSAGetLastError`, `WSASetLastError` |
+
+| Left wide, and why (2) | |
+| --- | --- |
+| `get_module_handle` | also reads module state: `resolve_loaded_module_handle(…, state: &WinApiState)` |
+| `load_library` | also *mutates* it: `resolve_or_load_dll(…, state: &mut WinApiState)` |
+
+Both were flagged by the stage-2 script as last-error-only and are not: the
+callee takes `state` in a position the script's call pattern misses. Reading the
+body is what settled it, which is the rule for this whole exercise.
+
+**What is left, and why it is a *decision* rather than a backlog.** 439 bindings
+remain, each reaching a member no capability exposes:
+
+| Blocker | Bindings it appears in | Why it is still there |
+| --- | --- | --- |
+| `window_state().windows` + focus/capture/menus/geometry/`touch_window_mirror` | 68 + 36 + 26 + 25 + … | `WindowDialogAccess` excludes the window machinery *by decision*; a capability for it is `user32`'s own seam, sized far larger than a scalar |
+| `heap_state.heap` | 59 | every allocating handler needs it; a heap capability is a different design (the heap is `Arc<Mutex<_>>`, not a field) |
+| `kernel.sync` / `kernel.threads` | 39 + 33 | no capability; the scheduler handle exists for the port, not for handlers |
+| `file_io.{volumes,open_files,virtual_files}` / `process.{main_module_*,registry_keys}` | 32 + 22 + 21 / 26 | no capability; each is a struct, not a scalar or a verb list |
+| each `DllId` slot (`d3d9` 24, `ws2`, `wininet`, `winmm`, `ole32`, …) | 24 + … | a handler that *owns* a DLL slot has no capability to take |
+| `process.last_error` **plus** one of the above (~100) | 100 | the capability exists now, but the handler needs a second reach too, and two mutable borrows of one state are impossible |
+
+### What this ADR now measures twice
+
+The crate-wide narrowing this ADR implied is **one capability per state
+cluster** — last-error, the window machinery, the heap, each `DllId` slot — not
+three traits plus migration. Stage 2 measured that, and stage 3 confirmed it
+from the other direction: adding the single highest-value capability moved 476
+to 439 (-7.8%), not to zero, and the next cluster on the list (window machinery,
+68+) is not a scalar but a small object graph. Three more capabilities would
+cover the scalars; the rest is a different design question with its own cost,
+which is why it is *not* decided here.
+
+The Consequences section below is phrased to describe the seam these traits
+actually are.
 
 ## Context
 
@@ -133,7 +339,10 @@ Two further hazards this decision does not resolve but must not make worse:
 Extract **named capability traits** off `WinApiState` — `ConsoleAccess`,
 `WindowDialogAccess`, `PresentAccess` — returned by `HandlerContext` methods, so
 the cross-module reads become compiler-checked through a named seam rather than
-a bare `&mut`.
+a bare `&mut`. Stage 3 (below) added a fourth on the same terms,
+`LastErrorAccess`; the mechanism, the rule ("verbs, never the struct") and the
+reversibility are unchanged, which is what makes a per-cluster capability an
+incremental decision rather than a redesign.
 
 Additionally, move console handlers into `src/console/` so that `DllId::Console`'s
 owner and its callers finally agree.
@@ -178,14 +387,44 @@ owner and its callers finally agree.
 - This is a prerequisite for keeping `wie-winapi` internals movable — see
   ADR-0006, which records why the crate's current public surface makes every
   such refactor cross-crate.
+- **These traits are seams for state clusters, not a crate-wide narrowing — and
+  that is now measured twice.** The narrowing this ADR implied is *one
+  capability per state cluster*: last-error, the window machinery, the heap,
+  `kernel.sync`/`threads`, `file_io`, and each `DllId` slot. Four of them landed
+  (`ConsoleAccess`, `WindowDialogAccess`, `PresentAccess`, `LastErrorAccess`) and
+  together they take the crate from 476 whole-state bindings to 439. The
+  remaining 439 are not migration debt: each reaches a member no capability
+  exposes, so covering them is three more scalar-ish capabilities (window
+  machinery 68+, heap 59, kernel 72) plus a per-DLL-slot decision — a separate
+  design question, with its own cost, deliberately not decided by this ADR. The
+  capability mechanism, not its result, is what this ADR settles.
+- **The remaining reach cannot regrow silently.** `./scripts/check.sh --only
+  state-bindings` fails when the binding count rises above a committed budget, so
+  a new wide handler is a policy failure rather than a review miss — the same
+  shape as the crate-layering and port-boundary checks.
+- **The cost of a wide handler is now legible.** Because the budget prints the
+  per-file census on failure, "how much unconstrained reach does this module
+  carry?" is a number anyone can ask for; after stage 3 `d3d9` (74), `user32`
+  (106) and `kernel32` (95) are the three answers worth watching, and
+  `kernel32`'s fall from 131 is the last-error capability's visible effect.
+- **The fold-at-boundary rule survives as documentation, not as convention.**
+  `LastErrorAccess` states, in the trait's own doc, why a handler may write the
+  process alias and never the active thread's slot — so the next handler author
+  who wonders "should I also set the thread's value?" reads the answer where the
+  verb is defined instead of inferring it from the runtime's dispatch code.
+- **A cross-cutting scalar can be a capability without becoming a hole.** The
+  last-error trait hands out two verbs over one `u32` and no `&mut ProcessState`,
+  which is the test for the next one: a capability is a verb list or a scalar,
+  never a struct with the old name.
 
 ## Validation
 
 - The change is type-level, so `cargo check -p wie-winapi -p wie-runtime
   --all-targets` is the primary evidence: the compiler names every site that
   reaches past its capability.
-- `cargo nextest run -p wie-winapi` — 1,261 tests, none of which should need
-  editing, since they reach state the same way the handlers do.
+- `cargo nextest run -p wie-winapi` — 1,320 tests (2,018 workspace-wide), none of
+  which needed editing at either stage, since they reach state the same way the
+  handlers do.
 - `./scripts/check.sh --only file-sizes` and `./scripts/run-micro-suite.sh` unchanged
   baseline, since this touches no behaviour.
 

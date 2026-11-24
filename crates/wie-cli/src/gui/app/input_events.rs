@@ -9,21 +9,26 @@
 //!
 //! # Raw input (`WM_INPUT`)
 //!
-//! Each keyboard/mouse arm additionally feeds the RawInput lane
-//! ([`raw_input`]) and posts the `WM_INPUT` records come back as. The
-//! registration/exclusion filtering and the `RAWINPUT` encoding live in
-//! wie-winapi, which owns the state; this module only names the target windows
-//! and forwards the posts. **The records are SYNTHESIZED from the keyboard and
-//! mouse state WIE already tracks** — macOS exposes no raw HID stream and winit
-//! has no portable raw-input event, so WIE never sees a hardware report (see
-//! the `crate::user32::raw_input` module docs for the full list of deviations).
+//! Each keyboard/mouse arm additionally feeds the RawInput lane through
+//! [`wie_runtime::GuestHandle::post_raw_keyboard`] /
+//! [`wie_runtime::GuestHandle::post_raw_mouse_move`] /
+//! [`wie_runtime::GuestHandle::post_raw_mouse_button`] /
+//! [`wie_runtime::GuestHandle::post_raw_mouse_wheel`]. Those methods own the
+//! whole lane: the `RAWINPUT` encoding, the registration/exclusion filtering,
+//! and the `WM_INPUT` posts. This module only names the target windows, because
+//! that is the one part the host knows. **The records are SYNTHESIZED from the
+//! keyboard and mouse state WIE already tracks** — macOS exposes no raw HID
+//! stream and winit has no portable raw-input event, so WIE never sees a
+//! hardware report (the deviation list lives in `user32::raw_input`'s module
+//! docs).
 //!
-//! Like every other message here, a `WM_INPUT` goes out through
-//! `GuestHandle::post_message`, which routes it to the queue of the thread that
-//! owns the window. Nothing on this path takes the big `WinApiState` lock: the
-//! window reads go through the presenter mirror ([`WieApp::mouse_target`] and
-//! friends) and the RawInput state has its own module-local mutex, because a
-//! guest thread holds the big lock for the whole of an API call.
+//! Like every other message here, the `WM_INPUT`s go out through
+//! [`wie_runtime::GuestHandle::post_message`], which routes them to the queue of
+//! the thread that owns the window. Nothing on this path takes the big
+//! `WinApiState` lock: the window reads go through the presenter mirror
+//! ([`WieApp::mouse_target`] and friends) and the RawInput state has its own
+//! module-local mutex, because a guest thread holds the big lock for the whole
+//! of an API call.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,9 +37,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::WindowId;
 
-use wie_runtime::GuestHandle;
-use wie_winapi::user32::WinMsg;
-use wie_winapi::user32::raw_input::{self, RawInputPost, RawMouseButton, RawMouseReport};
+use wie_runtime::host::{ClientPoint, HostMouseButton};
 
 use super::{RESIZE_SETTLE_MS, WHEEL_DELTA, WieApp, wheel_notches};
 use crate::gui::input;
@@ -43,27 +46,6 @@ use crate::gui::input;
 // the frame as presented ONLY when it reached the screen (a skipped present
 // must stay retryable).
 use crate::gui::present_wgpu::PresentOutcome;
-
-/// `WM_INPUT` (winuser.h:1173) — the raw-input delivery message.
-const WM_INPUT: u32 = WinMsg::WM_INPUT.as_u32();
-
-/// The `WM_INPUT` posts the RawInput lane produced, sent to their windows.
-///
-/// The posts are already resolved: `wParam` carries `GET_RAWINPUT_CODE_WPARAM`
-/// and `lParam` the fake `HRAWINPUT` the guest hands to `GetRawInputData`.
-/// Empty whenever no window registered the class, which is the common case, so
-/// this is a no-op for a guest that never calls `RegisterRawInputDevices`.
-fn post_raw_input(handle: &GuestHandle, posts: Vec<RawInputPost>) {
-    for post in posts {
-        tracing::debug!(
-            target: "wiegui",
-            hwnd = post.hwnd,
-            wparam = post.wparam,
-            "WM_INPUT"
-        );
-        handle.post_message(post.hwnd, WM_INPUT, post.wparam, post.lparam);
-    }
-}
 
 /// The message for a left-button press: WM_LBUTTONDBLCLK when it lands on the
 /// SAME target window within the double-click time window AND the double-click
@@ -163,16 +145,8 @@ impl WieApp {
                 // from them go with them — so a registered-and-excluding guest
                 // sees WM_INPUT only. The lane does the registration filtering,
                 // so this is a no-op for a guest that never registered.
-                let posts = raw_input::post_raw_keyboard_event(
-                    hwnd,
-                    Some(event_hwnd),
-                    handle.focus_window(),
-                    vk,
-                    pressed,
-                    key_message,
-                );
-                post_raw_input(handle, posts);
-                if raw_input::is_legacy_keyboard_input_excluded(hwnd) {
+                handle.post_raw_keyboard(hwnd, Some(event_hwnd), vk, pressed, key_message);
+                if handle.legacy_keyboard_input_excluded(hwnd) {
                     return;
                 }
                 if pressed {
@@ -406,19 +380,12 @@ impl WieApp {
                     None => (0, 0),
                 };
                 self.last_raw_cursor = Some((i32::from(rx), i32::from(ry)));
-                let posts = raw_input::post_raw_mouse_event(
-                    target,
-                    event_hwnd,
-                    handle.focus_window(),
-                    RawMouseReport::Movement { dx, dy },
-                    u32::from(mk),
-                );
-                post_raw_input(handle, posts);
+                handle.post_raw_mouse_move(target, event_hwnd, dx, dy, u32::from(mk));
                 // `RIDEV_EXCLUDE` for the mouse class replaces WM_MOUSEMOVE
                 // with the WM_INPUT above. Only that message is suppressed —
                 // the GetCursorPos mirror below is a host read, not a guest
                 // message, and must keep running.
-                if !raw_input::is_legacy_mouse_input_excluded(target) {
+                if !handle.legacy_mouse_input_excluded(target) {
                     // MSG.pt must share lParam's CHILD-relative space: a guest
                     // reading MSG.pt (e.g. the wndproc's own hit-testing) would
                     // otherwise mix child-relative lParam with top-level-relative
@@ -456,11 +423,11 @@ impl WieApp {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = matches!(state, winit::event::ElementState::Pressed);
                 // Track pressed buttons for MK_* flags in subsequent messages.
-                let (bit, raw_button) = match button {
-                    winit::event::MouseButton::Left => (input::MK_LBUTTON, RawMouseButton::Left),
-                    winit::event::MouseButton::Right => (input::MK_RBUTTON, RawMouseButton::Right),
+                let (bit, host_button) = match button {
+                    winit::event::MouseButton::Left => (input::MK_LBUTTON, HostMouseButton::Left),
+                    winit::event::MouseButton::Right => (input::MK_RBUTTON, HostMouseButton::Right),
                     winit::event::MouseButton::Middle => {
-                        (input::MK_MBUTTON, RawMouseButton::Middle)
+                        (input::MK_MBUTTON, HostMouseButton::Middle)
                     }
                     _ => return,
                 };
@@ -517,20 +484,15 @@ impl WieApp {
                 let mk = self.mk_flags();
                 // Synthesized RAWMOUSE for the same press/release, at the
                 // client-relative position the legacy lParam carries.
-                let posts = raw_input::post_raw_mouse_event(
+                handle.post_raw_mouse_button(
                     target,
                     event_hwnd,
-                    handle.focus_window(),
-                    RawMouseReport::Button {
-                        button: raw_button,
-                        down: pressed,
-                        x: i32::from(rx),
-                        y: i32::from(ry),
-                    },
+                    host_button,
+                    pressed,
+                    ClientPoint::new(i32::from(rx), i32::from(ry)),
                     u32::from(mk),
                 );
-                post_raw_input(handle, posts);
-                if raw_input::is_legacy_mouse_input_excluded(target) {
+                if handle.legacy_mouse_input_excluded(target) {
                     return;
                 }
                 let lparam = input::make_lparam(rx, ry);
@@ -588,24 +550,19 @@ impl WieApp {
                 // Synthesized RAWMOUSE per non-zero notch. `RIDEV_EXCLUDE` for
                 // the mouse class replaces the legacy WM_MOUSEWHEEL messages
                 // with these, so the two are gated by the same flag.
-                let excluded = raw_input::is_legacy_mouse_input_excluded(target);
+                let excluded = handle.legacy_mouse_input_excluded(target);
                 for (horizontal, notches) in [(false, notch_y), (true, notch_x)] {
                     if notches == 0 {
                         continue;
                     }
-                    let posts = raw_input::post_raw_mouse_event(
+                    handle.post_raw_mouse_wheel(
                         target,
                         event_hwnd,
-                        handle.focus_window(),
-                        RawMouseReport::Wheel {
-                            horizontal,
-                            notches,
-                            x: i32::from(rx),
-                            y: i32::from(ry),
-                        },
+                        horizontal,
+                        notches,
+                        ClientPoint::new(i32::from(rx), i32::from(ry)),
                         u32::from(mk),
                     );
-                    post_raw_input(handle, posts);
                     if excluded {
                         continue;
                     }

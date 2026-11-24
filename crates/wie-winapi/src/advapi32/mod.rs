@@ -286,16 +286,15 @@ const FAKE_PROCESS_TOKEN: u64 = 0x0000_0000_7000_0001;
 
 /// `BOOL OpenProcessToken(HANDLE ProcessHandle, DWORD DesiredAccess, PHANDLE TokenHandle)`.
 fn handle_open_process_token(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _process = engine.read_rcx().context("OpenProcessToken RCX")?;
-    let _access = engine.read_rdx().context("OpenProcessToken RDX")?;
-    let token_out = engine.read_r8().context("OpenProcessToken R8")?;
+    let _process = ctx.engine.read_rcx().context("OpenProcessToken RCX")?;
+    let _access = ctx.engine.read_rdx().context("OpenProcessToken RDX")?;
+    let token_out = ctx.engine.read_r8().context("OpenProcessToken R8")?;
     if token_out != 0 {
-        write_guest_u64(engine, token_out, FAKE_PROCESS_TOKEN)?;
+        write_guest_u64(&mut *ctx.engine, token_out, FAKE_PROCESS_TOKEN)?;
     }
-    state.process.last_error = 0;
-    return_bool(engine, true)
+    // The only state this handler touches: one alias write (ADR-0005 stage 3).
+    ctx.last_error().set_process_last_error(0);
+    return_bool(&mut *ctx.engine, true)
 }
 
 /// `BOOL AdjustTokenPrivileges(...)` — succeed without changing privileges.

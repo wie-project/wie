@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Pre-PR checklist and the single source of truth for what the gate runs:
-# the three policy checks (file sizes, crate layering, the wie-winapi port
-# boundary), fmt, clippy, the tests and the end-to-end micro-suite. Exits
-# non-zero on first failure.
+# the four policy checks (file sizes, crate layering, the wie-winapi port
+# boundary, the whole-state binding budget), fmt, clippy, the tests and the
+# end-to-end micro-suite. Exits non-zero on first failure.
 #
 # Callers:
 #   README.md / CONTRIBUTING.md      ./scripts/check.sh
@@ -28,7 +28,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # The canonical order. A space-separated string, not an array: bash 3.2 (the
 # macOS system bash) errors on expanding an empty array under `set -u`, and the
 # other two scripts this one absorbed had that hazard documented.
-ALL_STEPS="file-sizes dep-direction winapi-port fmt clippy micro-exes nextest micro-suite perf"
+ALL_STEPS="file-sizes dep-direction winapi-port state-bindings fmt clippy micro-exes nextest micro-suite perf"
 
 usage() {
   cat <<EOF
@@ -131,10 +131,15 @@ check_deps() {
   # EXPECTED INTERNAL EDGE SET — the single source of truth.
   # One line here = one deliberate architecture change.
   # -------------------------------------------------------------------------
+  # `wie-cli -> wie-winapi` was here until ADR-0006 decision 3 landed. It is
+  # now a *forbidden* edge, not a missing one: the CLI is host code and reaches
+  # WinAPI only through `wie_runtime::host` (the session's published surface),
+  # so it cannot bypass `RuntimeSession`'s lock and in-guest-callback
+  # invariants. Adding the dependency back shows up below as an UNEXPECTED
+  # edge; that is the failure this line's absence buys.
   local EXPECTED_EDGES=(
     "wie-cli -> wie-pe"
     "wie-cli -> wie-runtime"
-    "wie-cli -> wie-winapi"
     "wie-runtime -> wie-cpu"
     "wie-runtime -> wie-pe"
     "wie-runtime -> wie-winapi"
@@ -256,11 +261,9 @@ print("\n".join(sorted(rows)))
 # ALLOWED_DEEP ever approaches the size of the reference count (~400), the gate
 # is not constraining anything and the port surface needs widening instead.
 #
-# KNOWN WIDE SURFACE, not yet gated: `state.kernel.sync` (~45 sites — the
-# scheduler drives SyncState's fields directly) and the `WinApiState` struct
-# literal in `crates/wie-runtime/src/memory.rs`. Both need one opaque handle
-# apiece, which is a change of its own. Listing them here rather than silently
-# omitting them is the point: they are visible debt, not an oversight.
+# There is no known wide surface left: the scheduler handle closed
+# `state.kernel.sync` and `port::WinApiStateSeed` closed the struct literal, and
+# R2/R3 gate both. `ALLOWED_DEEP` is empty and should stay that way.
 #
 # Costs ~10ms (grep, no build), so it runs next to dep-direction, before
 # anything expensive.
@@ -422,6 +425,79 @@ check_winapi_port() {
 }
 
 # ---------------------------------------------------------------------------
+# Step 2c — whole-state binding budget (ADR-0005)
+#
+#   A handler that starts with `let state = &mut *ctx.state;` can reach all
+#   eight sub-states and every DLL slot, which is exactly what ADR-0005's three
+#   capability traits exist to stop — but a trait only constrains a handler that
+#   takes one. Stage 2 narrowed every site the three traits can reach (ADR-0005's
+#   implementation note has the per-cluster table); this budget is what keeps the
+#   remaining inventory a *documented ceiling* rather than a number that grows.
+#
+#   It is a ceiling, not a target, and it is allowed to fall: a genuinely
+#   multi-capability handler keeps the wide borrow (two mutable borrows of one
+#   state are impossible), so raising it is a legitimate ONE-LINE edit of
+#   MAX_WHOLE_STATE_BINDINGS. Lowering it is the point of every narrowing.
+#
+#   No test can assert this — the pattern is a source shape, not a runtime
+#   property — so it is checked the same way check_winapi_port() checks its own.
+# ---------------------------------------------------------------------------
+check_state_bindings() {
+  # 476 when ADR-0005's implementation note was written; 470 after stage 2
+  # narrowed the six sites inside the three traits' reach; 439 after stage 3
+  # added `LastErrorAccess` and narrowed the 31 handlers whose whole reach was
+  # the last-error alias.
+  #
+  # What the remaining 439 still need, in descending order of how many bindings
+  # each one blocks (ADR-0005 stage-3 note has the per-cluster table):
+  #   - `window_state().windows` + the rest of the window machinery (focus,
+  #     capture, menus, geometry, `touch_window_mirror`): excluded from
+  #     `WindowDialogAccess` on purpose — that is `user32`'s, not a dialog's.
+  #   - `heap_state.heap`: no capability; every allocating handler needs it.
+  #   - `kernel.sync` / `kernel.threads`: no capability.
+  #   - `file_io.{volumes,open_files,virtual_files,host_file_mounts}` and
+  #     `process.{main_module_*,registry_keys}`: no capability.
+  #   - each `DllId` slot (`d3d9`, `ws2`, `wininet`, `winmm`, `ole32`, …): a
+  #     handler that owns a DLL slot has no capability to take.
+  #   - `process.last_error` alongside one of the above (~100 sites): the
+  #     capability now exists, but the handler needs a second reach too, and two
+  #     mutable borrows of one state are impossible.
+  local MAX_WHOLE_STATE_BINDINGS=439
+  local hits count
+
+  hits=$(grep -rn 'let state = &mut \*ctx\.state' "$ROOT/crates/wie-winapi/src" || true)
+  count=0
+  if [[ -n "$hits" ]]; then
+    count=$(printf '%s\n' "$hits" | wc -l | tr -d ' ')
+  fi
+
+  if (( count > MAX_WHOLE_STATE_BINDINGS )); then
+    echo "whole-state bindings: $count > budget $MAX_WHOLE_STATE_BINDINGS (ADR-0005)"
+    printf '%s\n' "$hits" \
+      | sed "s#^$ROOT/##" \
+      | cut -d: -f1 \
+      | sort | uniq -c | sort -rn \
+      | sed 's/^/  /'
+    echo "  a handler holding one of these reaches every sub-state and DLL slot,"
+    echo "  so no capability trait constrains it. Narrow it instead:"
+    echo "    - console-only      → cx = ctx.console() (ConsoleCall)"
+    echo "    - dialog-only       → ctx.dialogs() / state_comm_dlg_none(ctx.dialogs())"
+    echo "    - present-only      → a helper taking &mut dyn PresentAccess"
+    echo "    - last-error only   → ctx.last_error() (LastErrorAccess)"
+    echo "  If it genuinely needs two capabilities, raise the budget:"
+    echo "    MAX_WHOLE_STATE_BINDINGS in check_state_bindings()."
+    exit 1
+  fi
+
+  if (( count < MAX_WHOLE_STATE_BINDINGS )); then
+    echo "whole-state bindings ok ($count < budget $MAX_WHOLE_STATE_BINDINGS, ADR-0005)"
+    echo "  ramps down: set MAX_WHOLE_STATE_BINDINGS=$count so the gain cannot regress"
+  else
+    echo "whole-state bindings ok ($count = budget $MAX_WHOLE_STATE_BINDINGS, ADR-0005)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Step 8 — `perf` budget: long_loop wall-clock.
 #
 # CONTRIBUTING rule 2 makes the long_loop pin a pass/fail condition, so it needs
@@ -567,6 +643,7 @@ step_header() {
     file-sizes)    echo "=== file sizes ===" ;;
     dep-direction) echo "=== crate dependency direction ===" ;;
     winapi-port)   echo "=== wie-winapi port boundary (ADR-0006) ===" ;;
+    state-bindings) echo "=== whole-state binding budget (ADR-0005) ===" ;;
     fmt)           echo "=== cargo fmt ===" ;;
     clippy)        echo "=== cargo clippy (advisory; no -D warnings — clippy lints are not denied) ===" ;;
     micro-exes)    echo "=== micro-exes (fixtures for the integration tests) ===" ;;
@@ -581,6 +658,7 @@ run_step() {
     file-sizes)    check_file_sizes ;;
     dep-direction) check_deps ;;
     winapi-port)   check_winapi_port ;;
+    state-bindings) check_state_bindings ;;
     fmt)           cargo fmt --all --check --manifest-path "$ROOT/Cargo.toml" ;;
     clippy)        cargo clippy --workspace --all-targets --manifest-path "$ROOT/Cargo.toml" ;;
     micro-exes)    make -C "$ROOT/micro-exes" ;;

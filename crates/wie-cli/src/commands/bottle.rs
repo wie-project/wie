@@ -10,10 +10,14 @@ use crate::commands::util::write_line;
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
+use wie_runtime::host::{
+    VolumeConfig, bottle_guest_path_to_host, drive_letter, global_bottle_root, host_path_to_guest,
+    seed_default_skeleton,
+};
 
 /// The directory holding all named bottles: `~/Library/Application Support/WIE/bottles`.
 fn bottles_dir() -> PathBuf {
-    wie_winapi::global_bottle_root()
+    global_bottle_root()
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("bottles")
@@ -76,7 +80,7 @@ fn create(bottles_dir: &Path, name: &str) -> Result<()> {
     // (GetWindowsDirectory, GetSystemDirectory, GetTempPath, SHGetFolderPath)
     // point at directories that exist. Idempotent: create_dir_all no-ops on
     // re-runs, matching the session-start seeding policy.
-    wie_winapi::seed_default_skeleton(&root)
+    seed_default_skeleton(&root)
         .with_context(|| format!("failed to seed bottle '{name}' at {}", root.display()))?;
     Ok(())
 }
@@ -176,7 +180,7 @@ fn copy_into(src: &Path, dst: &Path) -> Result<()> {
 /// Resolve a guest path (e.g. `C:\Apps\Foo`) to its host path inside the
 /// bottle's `drive_c`. Rejects paths that do not stay under `C:\`.
 fn resolve_guest_path(bottle_root: &Path, guest_path: &str) -> Result<PathBuf> {
-    wie_winapi::bottle::guest_path_to_host(bottle_root, guest_path)
+    bottle_guest_path_to_host(bottle_root, guest_path)
         .filter(|host| host.starts_with(drive_c_dir(bottle_root)))
         .with_context(|| format!("guest path '{guest_path}' must live under C:\\"))
 }
@@ -269,7 +273,7 @@ pub fn resolve_bottle_exe(bottle_root: &Path, arg: &Path) -> Result<PathBuf> {
 /// through the bottle mapping, never through a drive_c search.
 fn is_explicit_guest_path(arg: &str) -> bool {
     let trimmed = arg.trim().trim_matches('"');
-    wie_winapi::vfs::path::drive_letter(trimmed).is_some() || trimmed.starts_with(r"\\")
+    drive_letter(trimmed).is_some() || trimmed.starts_with(r"\\")
 }
 
 /// Split a search argument into a normalized drive_c-relative target.
@@ -334,11 +338,11 @@ fn collect_drive_c_matches(
 /// does not map (should not happen for search results, which come from the
 /// bottle's own `drive_c`).
 fn guest_label(bottle_root: &Path, host: &Path) -> String {
-    let volumes = wie_winapi::VolumeConfig {
+    let volumes = VolumeConfig {
         bottle_root: Some(bottle_root.to_path_buf()),
         drive_d_root: None,
     };
-    wie_winapi::host_path_to_guest(&volumes, host).unwrap_or_else(|| host.display().to_string())
+    host_path_to_guest(&volumes, host).unwrap_or_else(|| host.display().to_string())
 }
 
 /// The bottle's name (its directory basename) for error messages.

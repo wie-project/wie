@@ -11,9 +11,8 @@ use anyhow::{Context, Result};
 use wie_runtime::GuestHandle;
 use wie_runtime::MenuNode;
 use wie_runtime::RuntimeSession;
+use wie_runtime::host::{Dimension, DisplayMetrics, Hwnd, MessageQueueIdlePolicy};
 use wie_runtime::{GuiControl, GuiOutcome, run_windowed};
-use wie_winapi::handles::Hwnd;
-use wie_winapi::user32::Dimension;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -839,7 +838,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
 /// live NSApplication on the main thread — winit's EventLoop build
 /// initializes AppKit on macOS, and this runs right after it.
 #[cfg(target_os = "macos")]
-fn primary_display_metrics() -> Option<wie_winapi::DisplayMetrics> {
+fn primary_display_metrics() -> Option<DisplayMetrics> {
     let marker = objc2_foundation::MainThreadMarker::new()?;
     let screen = objc2_app_kit::NSScreen::mainScreen(marker)?;
     let size = screen.frame().size;
@@ -850,14 +849,14 @@ fn primary_display_metrics() -> Option<wie_winapi::DisplayMetrics> {
         return None;
     }
     // Clamp before converting so the f64→i32 step cannot saturate.
-    Some(wie_winapi::DisplayMetrics::new(
+    Some(DisplayMetrics::new(
         width.min(f64::from(i32::MAX)) as i32,
         height.min(f64::from(i32::MAX)) as i32,
     ))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn primary_display_metrics() -> Option<wie_winapi::DisplayMetrics> {
+fn primary_display_metrics() -> Option<DisplayMetrics> {
     None
 }
 
@@ -942,7 +941,7 @@ pub fn run_gui_windowed(
             .spawn(move || {
                 match RuntimeSession::new_with_options(
                     &staged.run_path,
-                    wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
+                    MessageQueueIdlePolicy::YieldOnIdle,
                     wie_runtime::DEFAULT_LAYOUT.with_env_overrides(),
                     session_options,
                 ) {
@@ -1366,7 +1365,7 @@ mod tests {
     #[test]
     fn settle_posts_logical_size() {
         use crate::gui::input::physical_size_to_dimension;
-        use wie_winapi::user32::Dimension;
+        use wie_runtime::host::Dimension;
         // Retina 2×: a 1280×960 physical window is a 640×480 logical window.
         assert_eq!(
             physical_size_to_dimension(1280, 960, 2.0),

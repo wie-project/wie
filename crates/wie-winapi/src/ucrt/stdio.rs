@@ -652,82 +652,23 @@ pub(crate) fn handle_putchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     finish(engine, u64::from(ch))
 }
 /// `getchar()` — read one character from stdin, return it or EOF.
+///
+/// Narrows onto [`ConsoleCall`] (ADR-0005 stage 2): the handler reads no
+/// argument (so it never touches the engine) and the line-at-a-time buffer rule
+/// is the console's, behind
+/// [`ConsoleAccess::stdin_read_char`](crate::capability::ConsoleAccess::stdin_read_char).
+/// Before the narrowing this body carried the raw `file_io.stdin_bytes` /
+/// `stdin_cursor` / `stdin_mode` pokes plus the TTY poll; all of it now sits in
+/// `console::stdin`, where the buffer lives.
 pub(crate) fn handle_getchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    ctx.state.flush_console();
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    if state.file_io.stdin_cursor < state.file_io.stdin_bytes.len() {
-        // Data already in the guest-side buffer.
-        let idx = state.file_io.stdin_cursor;
-        let ch = state.file_io.stdin_bytes[idx];
-        if ch == b'\n' {
-            state.file_io.stdin_cursor = idx.wrapping_add(1);
-            return finish(engine, u64::from(b'\n'));
-        }
-        // Not '\n' — skip ahead if there's a newline later in the buffer.
-        if let Some(nl_pos) = state.file_io.stdin_bytes[idx..]
-            .iter()
-            .position(|&b| b == b'\n')
-        {
-            state.file_io.stdin_cursor = idx.wrapping_add(nl_pos).wrapping_add(1);
-            return finish(engine, u64::from(b'\n'));
-        }
-        state.file_io.stdin_cursor = idx.wrapping_add(1);
-        return finish(engine, u64::from(ch));
-    }
-    if state.file_io.stdin_mode != GuestStdinMode::LiveHost {
-        return finish(engine, u64::from(u32::MAX)); // EOF (InjectOnly)
-    }
-    // LiveHost mode with a TTY: read raw bytes from stdin.
-    // We buffer up to 64 bytes so arrow-key escape sequences
-    // (3 bytes each) don't need three separate poll/read rounds.
-    if crate::console::host_term::is_tty() {
-        use crate::console::host_term;
-        const BUF_CAP: usize = 64;
-        let mut buf = [0_u8; BUF_CAP];
-        // Only poll when the buffer is empty (subsequent getchar
-        // calls after an arrow key will find buffered bytes).
-        if state.file_io.stdin_cursor >= state.file_io.stdin_bytes.len() {
-            state.file_io.stdin_bytes.clear();
-            if host_term::poll_stdin_ready(-1) {
-                let n = host_term::read_stdin(&mut buf);
-                if n > 0 {
-                    state.file_io.stdin_bytes = buf[..n].to_vec();
-                    state.file_io.stdin_cursor = 0;
-                }
-            }
-        }
-        let idx = state.file_io.stdin_cursor;
-        if idx < state.file_io.stdin_bytes.len() {
-            let ch = state.file_io.stdin_bytes[idx];
-            state.file_io.stdin_cursor = idx.wrapping_add(1);
-            return finish(engine, u64::from(ch));
-        }
-    } else {
-        // Piped input: read a line (like fgets) so shared state works.
-        use std::io::Read;
-        let mut line = Vec::new();
-        let mut byte = [0_u8; 1];
-        let mut host_stdin = std::io::stdin().lock();
-        loop {
-            if line.len() >= MAX_STDIN_LINE || host_stdin.read(&mut byte).unwrap_or(0) == 0 {
-                break;
-            }
-            line.push(byte[0]);
-            if byte[0] == b'\n' {
-                break;
-            }
-        }
-        if !line.is_empty() {
-            state.file_io.stdin_bytes = line;
-            state.file_io.stdin_cursor = 0;
-            let idx = 0_usize;
-            let ch = state.file_io.stdin_bytes[idx];
-            state.file_io.stdin_cursor = idx.wrapping_add(1);
-            return finish(engine, u64::from(ch));
-        }
-    }
-    finish(engine, u64::from(u32::MAX)) // EOF
+    let cx = ctx.console();
+    cx.state.flush_console();
+    // `None` is EOF, which the CRT reports as `u32::MAX` (not `-1` as i32).
+    let value = match cx.state.stdin_read_char() {
+        Some(ch) => u64::from(ch),
+        None => u64::from(u32::MAX),
+    };
+    finish(cx.engine, value)
 }
 /// `fputs(s, stream)`.
 pub(crate) fn handle_fputs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -835,10 +776,18 @@ pub(crate) fn handle_fclose(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     finish(engine, u64::from(u32::MAX)) // EOF = not implemented
 }
 /// `fgets(buf, max, stream)` — read one line from stdin.
+///
+/// Narrows onto [`ConsoleCall`] (ADR-0005 stage 2): the line-refill policy and
+/// the buffer are the console's, reached through
+/// [`ConsoleAccess::stdin_refill`](crate::capability::ConsoleAccess::stdin_refill)
+/// / [`stdin_is_live_host`](crate::capability::ConsoleAccess::stdin_is_live_host)
+/// / [`stdin_take`](crate::capability::ConsoleAccess::stdin_take). The copy loop
+/// still consumes the buffer ONE byte at a time so the cursor advance stays
+/// interleaved with the guest store, exactly as before the narrowing.
 pub(crate) fn handle_fgets(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    ctx.state.flush_console();
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
+    let cx = ctx.console();
+    cx.state.flush_console();
+    let engine = cx.engine;
     let buf = engine.read_rcx()?;
     let max = engine.read_rdx()?;
     let _stream = engine.read_r8()?;
@@ -846,37 +795,21 @@ pub(crate) fn handle_fgets(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         return finish(engine, 0); // NULL
     }
     let cap = usize::try_from(max).unwrap_or(0);
-    // Refill from host stdin if buffer is empty and LiveHost mode.
-    if state.file_io.stdin_cursor >= state.file_io.stdin_bytes.len()
-        && state.file_io.stdin_mode == GuestStdinMode::LiveHost
-    {
-        use std::io::Read;
-        let mut line = Vec::new();
-        let mut byte = [0_u8; 1];
-        let mut stdin = std::io::stdin().lock();
-        loop {
-            if line.len() >= MAX_STDIN_LINE || stdin.read(&mut byte).unwrap_or(0) == 0 {
-                break;
-            }
-            line.push(byte[0]);
-            if byte[0] == b'\n' {
-                break;
-            }
-        }
-        if !line.is_empty() {
-            state.file_io.stdin_bytes = line;
-            state.file_io.stdin_cursor = 0;
-        }
+    // Refill from host stdin if buffer is empty and LiveHost mode. The 4 KiB
+    // cap is the CRT's own (`MAX_STDIN_LINE`), not the console's line cap.
+    // A host read error leaves the buffer unrefilled (the console's refill
+    // contract: `Err` stores nothing), where the pre-narrowing inline loop kept
+    // the partial line — the one difference, on an unreachable-in-practice path
+    // (`stdin` read failure after a partial line).
+    if cx.state.stdin_available() == 0 && cx.state.stdin_is_live_host() {
+        let _ = cx.state.stdin_refill(MAX_STDIN_LINE);
     }
     // Copy from stdin buffer to guest buffer.
     let mut written = 0_usize;
     while written < cap.saturating_sub(1) {
-        let idx = state.file_io.stdin_cursor;
-        if idx >= state.file_io.stdin_bytes.len() {
+        let Some(&c) = cx.state.stdin_take(1).first() else {
             break;
-        }
-        let c = state.file_io.stdin_bytes[idx];
-        state.file_io.stdin_cursor = idx.wrapping_add(1);
+        };
         let byte = [c];
         engine.mem_write(buf.wrapping_add(u64::try_from(written).unwrap_or(0)), &byte)?;
         written = written.wrapping_add(1);

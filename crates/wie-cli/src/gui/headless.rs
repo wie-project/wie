@@ -48,7 +48,7 @@ pub fn run_screenshot(
     // screenshot, plus the staged folder's guest current directory.
     let mut session = RuntimeSession::new_with_options(
         &prepared.staged.run_path,
-        wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
+        wie_runtime::host::MessageQueueIdlePolicy::YieldOnIdle,
         wie_runtime::DEFAULT_LAYOUT.with_env_overrides(),
         prepared.session_options,
     )?;

@@ -109,37 +109,39 @@ pub fn handle_move_file_with_progress_w(
     handle_move_file_w(ctx)
 }
 pub fn handle_create_hard_link_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
-    state.process.last_error = ERROR_INVALID_FUNCTION;
-    ret_u64(engine, 0, "CreateHardLinkW")
+    let _ = (
+        ctx.engine.read_rcx()?,
+        ctx.engine.read_rdx()?,
+        ctx.engine.read_r8()?,
+    );
+    ctx.last_error()
+        .set_process_last_error(ERROR_INVALID_FUNCTION);
+    ret_u64(&mut *ctx.engine, 0, "CreateHardLinkW")
 }
 pub fn handle_find_first_stream_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
-    state.process.last_error = ERROR_HANDLE_EOF;
-    ret_u64(engine, INVALID_HANDLE_VALUE, "FindFirstStreamW")
+    let _ = (
+        ctx.engine.read_rcx()?,
+        ctx.engine.read_rdx()?,
+        ctx.engine.read_r8()?,
+    );
+    ctx.last_error().set_process_last_error(ERROR_HANDLE_EOF);
+    ret_u64(&mut *ctx.engine, INVALID_HANDLE_VALUE, "FindFirstStreamW")
 }
 pub fn handle_find_next_stream_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _ = (engine.read_rcx()?, engine.read_rdx()?);
-    state.process.last_error = ERROR_HANDLE_EOF;
-    ret_u64(engine, 0, "FindNextStreamW")
+    let _ = (ctx.engine.read_rcx()?, ctx.engine.read_rdx()?);
+    ctx.last_error().set_process_last_error(ERROR_HANDLE_EOF);
+    ret_u64(&mut *ctx.engine, 0, "FindNextStreamW")
 }
 pub fn handle_device_io_control(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let _ = (
-        engine.read_rcx()?,
-        engine.read_rdx()?,
-        engine.read_r8()?,
-        engine.read_r9()?,
+        ctx.engine.read_rcx()?,
+        ctx.engine.read_rdx()?,
+        ctx.engine.read_r8()?,
+        ctx.engine.read_r9()?,
     );
-    state.process.last_error = ERROR_INVALID_FUNCTION;
-    ret_u64(engine, 0, "DeviceIoControl")
+    ctx.last_error()
+        .set_process_last_error(ERROR_INVALID_FUNCTION);
+    ret_u64(&mut *ctx.engine, 0, "DeviceIoControl")
 }
 /// Cap for the `GetTempFileName` prefix buffer (`lpszPrefixString`, 3 chars
 /// used of a small TCHAR buffer).
@@ -388,10 +390,8 @@ pub fn handle_get_file_attributes_ex_a(
     ctx.finish(1)
 }
 pub fn handle_get_temp_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let buffer_len = engine.read_rcx()?;
-    let buffer_va = engine.read_rdx()?;
+    let buffer_len = ctx.engine.read_rcx()?;
+    let buffer_va = ctx.engine.read_rdx()?;
     // Trailing backslash per Microsoft Learn.
     let temp = format!("{}\\", crate::vfs::GUEST_TEMP_PATH.trim_end_matches('\\'));
     let units: Vec<u16> = temp.encode_utf16().collect();
@@ -401,18 +401,16 @@ pub fn handle_get_temp_path_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     } else {
         let mut terminated = units;
         terminated.push(0);
-        write_guest_utf16_units(engine, buffer_va, &terminated)?;
+        write_guest_utf16_units(&mut *ctx.engine, buffer_va, &terminated)?;
         u64::try_from(terminated.len().saturating_sub(1)).unwrap_or(0)
     };
-    state.process.last_error = 0;
+    ctx.last_error().set_process_last_error(0);
     ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!GetTempPathA`.
 pub fn handle_get_temp_path_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let buffer_len = engine.read_rcx()?;
-    let buffer_va = engine.read_rdx()?;
+    let buffer_len = ctx.engine.read_rcx()?;
+    let buffer_va = ctx.engine.read_rdx()?;
     let temp = format!("{}\\", crate::vfs::GUEST_TEMP_PATH.trim_end_matches('\\'));
     let bytes = crate::vfs::encode_acp(&temp);
     let required = u64::try_from(bytes.len().saturating_add(1)).unwrap_or(0);
@@ -421,10 +419,10 @@ pub fn handle_get_temp_path_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     } else {
         let mut out = bytes;
         out.push(0);
-        engine.mem_write(buffer_va, &out)?;
+        ctx.engine.mem_write(buffer_va, &out)?;
         u64::try_from(out.len().saturating_sub(1)).unwrap_or(0)
     };
-    state.process.last_error = 0;
+    ctx.last_error().set_process_last_error(0);
     ctx.finish(return_value)
 }
 /// Shared body of `GetTempFileNameA/W` (unique name under path; creates a

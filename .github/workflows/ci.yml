@@ -99,6 +99,15 @@ jobs:
       - name: wie-winapi port boundary
         run: ./scripts/check.sh --only winapi-port
 
+      # ADR-0005's ratchet: a handler that binds `let state = &mut *ctx.state`
+      # can reach all eight sub-states and every DLL slot, so none of the three
+      # capability traits constrains it. Stage 2 narrowed every site the traits
+      # reach and this budget stops the remaining inventory from regrowing; a
+      # genuinely multi-capability handler raises the number by one line in
+      # check_state_bindings(). ~1s (grep, no compile).
+      - name: Whole-state binding budget
+        run: ./scripts/check.sh --only state-bindings
+
       # No -D warnings: scripts/check.sh (the authoritative local gate) runs
       # clippy advisory, and the workspace lint table denies no clippy lints
       # (Cargo.toml [workspace.lints]). Keep the two invocations identical.

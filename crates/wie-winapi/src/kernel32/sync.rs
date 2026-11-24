@@ -382,21 +382,21 @@ pub fn handle_initialize_slist_head(ctx: &mut HandlerContext<'_>) -> Result<WinA
 /// Returns the first element pointer (low 16-bit tag bits masked off) and
 /// resets the 16-byte `SLIST_HEADER` to empty.
 pub fn handle_interlocked_flush_slist(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let head_va = engine
+    let head_va = ctx
+        .engine
         .read_rcx()
         .context("failed to read RCX for InterlockedFlushSList")?;
     let mut header = [0_u8; 16];
-    if head_va == 0 || engine.mem_read(head_va, &mut header).is_err() {
-        state.process.last_error = ERROR_INVALID_PARAMETER;
+    if head_va == 0 || ctx.engine.mem_read(head_va, &mut header).is_err() {
+        ctx.last_error()
+            .set_process_last_error(ERROR_INVALID_PARAMETER);
         return ctx.finish(0);
     }
     let first = u64::from_le_bytes(header[..8].try_into().unwrap_or([0; 8])) & !0xf;
-    engine
+    ctx.engine
         .mem_write(head_va, &[0_u8; 16])
         .context("failed to clear SLIST_HEADER")?;
-    state.process.last_error = 0;
+    ctx.last_error().set_process_last_error(0);
     ctx.finish(first)
 }
 /// Handles `KERNEL32.dll!WaitForSingleObjectEx` — same semantics as
@@ -435,14 +435,13 @@ pub fn handle_release_semaphore(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     }
 }
 pub fn handle_open_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _access = engine.read_rcx()?;
-    let _inherit = engine.read_rdx()?;
-    let _name = engine.read_r9().or_else(|_| engine.read_r8())?;
+    let _access = ctx.engine.read_rcx()?;
+    let _inherit = ctx.engine.read_rdx()?;
+    let _name = ctx.engine.read_r9().or_else(|_| ctx.engine.read_r8())?;
     // Named events not supported yet.
-    state.process.last_error = ERROR_FILE_NOT_FOUND;
-    ret_u64(engine, 0, "OpenEventW")
+    ctx.last_error()
+        .set_process_last_error(ERROR_FILE_NOT_FOUND);
+    ret_u64(&mut *ctx.engine, 0, "OpenEventW")
 }
 pub fn handle_wait_for_multiple_objects(
     ctx: &mut HandlerContext<'_>,
@@ -979,30 +978,33 @@ pub(crate) fn handle_reset_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub(crate) fn handle_flush_instruction_cache(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _process = engine
+    let _process = ctx
+        .engine
         .read_rcx()
         .context("failed to read RCX for FlushInstructionCache")?;
-    let base = engine
+    let base = ctx
+        .engine
         .read_rdx()
         .context("failed to read RDX for FlushInstructionCache")?;
-    let size = engine
+    let size = ctx
+        .engine
         .read_r8()
         .context("failed to read R8 for FlushInstructionCache")?;
     let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
     if size_usize == usize::MAX && size != 0 {
-        state.process.last_error = ERROR_INVALID_PARAMETER;
+        ctx.last_error()
+            .set_process_last_error(ERROR_INVALID_PARAMETER);
         return ctx.finish(0);
     }
-    match engine.flush_instruction_cache(base, size_usize) {
+    let flushed = ctx.engine.flush_instruction_cache(base, size_usize);
+    match flushed {
         Ok(()) => {
-            state.process.last_error = 0;
+            ctx.last_error().set_process_last_error(0);
             ctx.finish(1)
         }
         Err(e) => {
-            state.process.last_error =
-                wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            let last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            ctx.last_error().set_process_last_error(last_error);
             ctx.finish(0)
         }
     }

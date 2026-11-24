@@ -12,7 +12,6 @@ pub fn handle_file_time_to_local_file_time(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let input_file_time_va = engine
         .read_rcx()
         .context("failed to read RCX for FileTimeToLocalFileTime")?;
@@ -34,9 +33,10 @@ pub fn handle_file_time_to_local_file_time(
             .mem_write(output_file_time_va, &bytes)
             .context("failed to write output FILETIME")?;
 
-        state.process.last_error = 0;
+        ctx.last_error().set_process_last_error(0);
     } else {
-        state.process.last_error = ERROR_INVALID_PARAMETER;
+        ctx.last_error()
+            .set_process_last_error(ERROR_INVALID_PARAMETER);
     }
 
     let return_value = u64::from(success);
@@ -48,7 +48,6 @@ pub fn handle_file_time_to_system_time(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let input_file_time_va = engine
         .read_rcx()
         .context("failed to read RCX for FileTimeToSystemTime")?;
@@ -76,9 +75,10 @@ pub fn handle_file_time_to_system_time(
         })
         .context("failed to write SYSTEMTIME")?;
 
-        state.process.last_error = 0;
+        ctx.last_error().set_process_last_error(0);
     } else {
-        state.process.last_error = ERROR_INVALID_PARAMETER;
+        ctx.last_error()
+            .set_process_last_error(ERROR_INVALID_PARAMETER);
     }
 
     let return_value = u64::from(success);

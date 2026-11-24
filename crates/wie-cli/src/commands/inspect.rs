@@ -129,7 +129,7 @@ pub fn winapi_map(path: &Path, out: Option<&Path>) -> Result<()> {
             import.name.clone()
         };
 
-        let implemented = wie_winapi::is_winapi_implemented(&import.library, &name);
+        let implemented = wie_runtime::host::is_winapi_implemented(&import.library, &name);
 
         if implemented {
             implemented_count = implemented_count

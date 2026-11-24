@@ -99,9 +99,12 @@ pub fn handle_move_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 /// handled by `SetWindowPlacement` / `MoveWindow`, so they are ignored —
 /// matching the pre-lane stub, which accepted the placement without
 /// maintaining a full window manager.
+///
+/// The whole handler is [`PresentAccess`] work — read four arguments and a flag
+/// word, then reorder the presenter's top-level list — so the z-order mapping
+/// lives in [`apply_z_order`], which can reach nothing else (ADR-0005 stage 2).
 pub fn handle_set_window_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let window_handle = read_arg(engine, ArgReg::Rcx, "SetWindowPos")?;
     let insert_after = read_arg(engine, ArgReg::Rdx, "SetWindowPos")?;
     let _x = read_arg(engine, ArgReg::R8, "SetWindowPos")?;
@@ -118,23 +121,32 @@ pub fn handle_set_window_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
 
     // SWP_NOZORDER (0x0004): the caller explicitly leaves the z-order alone.
     if flags & SWP_NOZORDER == 0 {
-        let hwnd = crate::handles::Hwnd::from(window_handle);
-        // hWndInsertAfter read as its SIGNED sentinel values: HWND_TOP = 0,
-        // HWND_BOTTOM = 1, HWND_TOPMOST = -1, HWND_NOTOPMOST = -2. Any other
-        // value is a window handle (place the window below that window) —
-        // not tracked here, keeping the minimal z-order model.
-        match insert_after {
-            0 | HWND_TOPMOST => {
-                state.z_order_to_top(hwnd);
-            }
-            1 | HWND_NOTOPMOST => {
-                state.z_order_to_bottom(hwnd);
-            }
-            _ => {}
-        }
+        apply_z_order(&mut *ctx.state, window_handle, insert_after);
     }
 
     ctx.finish(1)
+}
+
+/// Map `hWndInsertAfter` onto a presenter z-order move.
+///
+/// Takes the presenter capability rather than the state: reordering the
+/// top-level list is the only effect this handler has on the emulator, and the
+/// signature is what holds it to that.
+fn apply_z_order(state: &mut dyn PresentAccess, window_handle: u64, insert_after: u64) {
+    let hwnd = crate::handles::Hwnd::from(window_handle);
+    // hWndInsertAfter read as its SIGNED sentinel values: HWND_TOP = 0,
+    // HWND_BOTTOM = 1, HWND_TOPMOST = -1, HWND_NOTOPMOST = -2. Any other
+    // value is a window handle (place the window below that window) —
+    // not tracked here, keeping the minimal z-order model.
+    match insert_after {
+        0 | HWND_TOPMOST => {
+            state.z_order_to_top(hwnd);
+        }
+        1 | HWND_NOTOPMOST => {
+            state.z_order_to_bottom(hwnd);
+        }
+        _ => {}
+    }
 }
 
 /// `SetWindowPos` flag bit that leaves the z-order untouched.

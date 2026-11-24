@@ -5,6 +5,7 @@ use super::{
     get_user_profile_dir_impl, read_ansi_string_from_cpu, read_guest_utf16_lossy, read_u16,
     read_wide_string_from_cpu, write_guest_u64, write_guest_utf16_units,
 };
+use crate::capability::LastErrorAccess;
 
 /// Handles `KERNEL32.dll!GetCurrentDirectoryW`.
 ///
@@ -35,7 +36,7 @@ pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
 
     // Need nBufferLength > character_count so there is room for the NUL.
     let return_value = if buffer_va == 0 || buffer_length <= character_count {
-        state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
+        state.set_process_last_error(ERROR_INSUFFICIENT_BUFFER);
         required_with_nul
     } else {
         let mut encoded = directory;
@@ -56,7 +57,7 @@ pub fn handle_get_current_directory_w(ctx: &mut HandlerContext<'_>) -> Result<Wi
             .mem_write(buffer_va, &bytes)
             .context("failed to write GetCurrentDirectoryW buffer")?;
 
-        state.process.last_error = 0;
+        state.set_process_last_error(0);
         character_count
     };
 
@@ -114,7 +115,6 @@ fn handle_mock_long_short_path_impl(
     wide: bool,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let src = engine.read_rcx()?;
     let dst = engine.read_rdx()?;
     let dst_len = engine.read_r8()?;
@@ -123,10 +123,13 @@ fn handle_mock_long_short_path_impl(
     } else {
         read_ansi_string_from_cpu(engine, src, 1024)?
     };
+
+    // Engine and capability in one call: two disjoint reborrows of `ctx`'s
+    // fields, which is what `write_mock_string_*`'s narrowed parameter asks for.
     let written = if wide {
-        write_mock_string_w(engine, state, &path, dst, dst_len)?
+        write_mock_string_w(&mut *ctx.engine, &mut *ctx.state, &path, dst, dst_len)?
     } else {
-        write_mock_string_a(engine, state, &path, dst, dst_len)?
+        write_mock_string_a(&mut *ctx.engine, &mut *ctx.state, &path, dst, dst_len)?
     };
     ctx.finish(written)
 }
@@ -224,7 +227,7 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
                     .remove(&crate::KernelHandle::from(source_handle));
             }
             engine.mem_write(target_handle_va, &new_handle_u64.to_le_bytes())?;
-            state.process.last_error = 0;
+            state.set_process_last_error(0);
             return ctx.finish(1);
         }
         state.process.last_error = ERROR_INVALID_HANDLE;
@@ -265,7 +268,7 @@ pub(crate) fn handle_duplicate_handle(ctx: &mut HandlerContext<'_>) -> Result<Wi
     }
 
     engine.mem_write(target_handle_va, &new_handle_u64.to_le_bytes())?;
-    state.process.last_error = 0;
+    state.set_process_last_error(0);
     ctx.finish(1) // TRUE
 }
 /// Handles `KERNEL32.dll!GetFullPathNameW`.
@@ -319,7 +322,7 @@ pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
                     write_guest_u64(engine, file_part_out_va, 0)?;
                 }
 
-                state.process.last_error = 0;
+                state.set_process_last_error(0);
 
                 u64::try_from(required_with_null)
                     .context("GetFullPathNameW required length does not fit u64")?
@@ -354,7 +357,7 @@ pub fn handle_get_full_path_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
                     write_guest_u64(engine, file_part_out_va, file_part_va)?;
                 }
 
-                state.process.last_error = 0;
+                state.set_process_last_error(0);
 
                 u64::try_from(path_length)
                     .context("GetFullPathNameW result length does not fit u64")?
@@ -392,7 +395,7 @@ pub fn handle_get_full_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinAp
                 if file_part_out_va != 0 {
                     write_guest_u64(engine, file_part_out_va, 0)?;
                 }
-                state.process.last_error = 0;
+                state.set_process_last_error(0);
                 u64::try_from(required_with_null).unwrap_or(0)
             } else {
                 let mut out = path_bytes;
@@ -404,7 +407,7 @@ pub fn handle_get_full_path_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinAp
                         output_buffer_va.saturating_add(u64::try_from(file_off).unwrap_or(0));
                     write_guest_u64(engine, file_part_out_va, file_part_va)?;
                 }
-                state.process.last_error = 0;
+                state.set_process_last_error(0);
                 u64::try_from(path_length).unwrap_or(0)
             }
         }
@@ -429,13 +432,13 @@ pub fn handle_get_current_directory_a(ctx: &mut HandlerContext<'_>) -> Result<Wi
         .checked_add(1)
         .context("GetCurrentDirectoryA required size overflow")?;
     let return_value = if buffer_va == 0 || buffer_length <= character_count {
-        state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
+        state.set_process_last_error(ERROR_INSUFFICIENT_BUFFER);
         required_with_nul
     } else {
         let mut out = bytes;
         out.push(0);
         engine.mem_write(buffer_va, &out)?;
-        state.process.last_error = 0;
+        state.set_process_last_error(0);
         character_count
     };
     ctx.finish(return_value)
@@ -483,7 +486,7 @@ fn set_current_directory_impl(state: &mut WinApiState, directory: &str) -> bool 
         .is_some_and(|map| map.host.is_dir());
     if exists {
         state.file_io.current_directory_wide = confined.encode_utf16().collect();
-        state.process.last_error = 0;
+        state.set_process_last_error(0);
         true
     } else {
         state.process.last_error = ERROR_PATH_NOT_FOUND;
@@ -619,26 +622,26 @@ pub(crate) fn copy_path_w_to_guest_buffer(
 /// (excluding NUL), or 0 with `ERROR_INSUFFICIENT_BUFFER` on truncation.
 pub(crate) fn write_mock_string_a(
     engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    state: &mut dyn LastErrorAccess,
     s: &str,
     out_va: u64,
     out_cap: u64,
 ) -> Result<u64> {
     if out_va == 0 || out_cap == 0 {
-        state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
+        state.set_process_last_error(ERROR_INSUFFICIENT_BUFFER);
         return Ok(0);
     }
     let encoded = crate::vfs::encode_acp(s);
     let needed = encoded.len(); // bytes (excluding NUL)
     let cap = usize::try_from(out_cap).unwrap_or(0);
     if cap < needed.saturating_add(1) {
-        state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
+        state.set_process_last_error(ERROR_INSUFFICIENT_BUFFER);
         return Ok(0);
     }
     let mut payload = encoded;
     payload.push(0);
     engine.mem_write(out_va, &payload)?;
-    state.process.last_error = 0;
+    state.set_process_last_error(0);
     Ok(u64::try_from(needed).unwrap_or(0))
 }
 
@@ -647,26 +650,26 @@ pub(crate) fn write_mock_string_a(
 /// (excluding NUL), or 0 with `ERROR_INSUFFICIENT_BUFFER` on truncation.
 pub(crate) fn write_mock_string_w(
     engine: &mut dyn wie_cpu::CpuEngine,
-    state: &mut WinApiState,
+    state: &mut dyn LastErrorAccess,
     s: &str,
     out_va: u64,
     out_cap: u64,
 ) -> Result<u64> {
     if out_va == 0 || out_cap == 0 {
-        state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
+        state.set_process_last_error(ERROR_INSUFFICIENT_BUFFER);
         return Ok(0);
     }
     let units: Vec<u16> = s.encode_utf16().collect();
     let needed = units.len();
     let cap = usize::try_from(out_cap).unwrap_or(0);
     if cap < needed.saturating_add(1) {
-        state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
+        state.set_process_last_error(ERROR_INSUFFICIENT_BUFFER);
         return Ok(0);
     }
     let mut bytes = crate::guest_string::utf16_units_to_le(&units);
     bytes.extend_from_slice(&0_u16.to_le_bytes());
     engine.mem_write(out_va, &bytes)?;
-    state.process.last_error = 0;
+    state.set_process_last_error(0);
     Ok(u64::try_from(needed).unwrap_or(0))
 }
 

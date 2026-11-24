@@ -276,11 +276,9 @@ pub fn handle_create_job_object_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 pub fn handle_assign_process_to_job_object(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _job = engine.read_rcx()?;
-    let _proc = engine.read_rdx()?;
-    state.process.last_error = 0;
+    let _job = ctx.engine.read_rcx()?;
+    let _proc = ctx.engine.read_rdx()?;
+    ctx.last_error().set_process_last_error(0);
     ctx.finish(1)
 }
 /// Handles `KERNEL32.dll!TerminateProcess` — signal process exit.

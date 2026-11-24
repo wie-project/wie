@@ -19,7 +19,7 @@
 //! open a dialog.
 
 use wie_runtime::RuntimeSession;
-use wie_winapi::FontDialogPolicy;
+use wie_runtime::host::FontDialogPolicy;
 
 /// Enable interactive font dialogs on a GUI session.
 ///

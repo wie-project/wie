@@ -414,19 +414,18 @@ fn handle_wsacleanup(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult
 /// `int WSAGetLastError(void)` — routes through the process last-error slot,
 /// mirroring how the `KERNEL32` `GetLastError` handler works.
 fn handle_wsagetlasterror(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let state = &mut *ctx.state;
-    let value = u64::from(state.process.last_error);
+    let value = u64::from(ctx.last_error().last_error());
     finish(ctx.engine, value)
 }
 
 /// `int WSASetLastError(int iError)`
 fn handle_wsasetlasterror(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let error_raw = engine.read_rcx()?;
+    let error_raw = ctx.engine.read_rcx()?;
     let error = u32::try_from(error_raw & 0xffff_ffff).context("WSASetLastError value")?;
-    state.process.last_error = error;
-    finish(engine, 0)
+    // The alias, exactly like `SetLastError`: the dispatch boundary publishes
+    // it to the guest's TEB (ADR-0005 stage 3).
+    ctx.last_error().set_process_last_error(error);
+    finish(&mut *ctx.engine, 0)
 }
 
 /// `SOCKET socket(int af, int type, int protocol)`

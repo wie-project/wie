@@ -205,7 +205,6 @@ pub(crate) fn resolve_windows_dll_path(
 pub fn handle_get_module_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let module_file_name_a_va = ctx.environment.module_file_name_a_ptr;
     let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let _module_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleFileNameA")?;
@@ -221,11 +220,11 @@ pub fn handle_get_module_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<Win
     let (return_value, truncated) =
         copy_path_a_to_guest_buffer(engine, module_file_name_a_va, buffer_va, buffer_len)?;
 
-    state.process.last_error = if truncated {
+    ctx.last_error().set_process_last_error(if truncated {
         ERROR_INSUFFICIENT_BUFFER
     } else {
         0
-    };
+    });
 
     ctx.finish(return_value)
 }
@@ -233,7 +232,6 @@ pub fn handle_get_module_file_name_a(ctx: &mut HandlerContext<'_>) -> Result<Win
 pub fn handle_get_module_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let module_file_name_w_va = ctx.environment.module_file_name_w_ptr;
     let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let _module_handle = engine
         .read_rcx()
         .context("failed to read RCX for GetModuleFileNameW")?;
@@ -249,11 +247,11 @@ pub fn handle_get_module_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<Win
     let (return_value, truncated) =
         copy_path_w_to_guest_buffer(engine, module_file_name_w_va, buffer_va, buffer_len)?;
 
-    state.process.last_error = if truncated {
+    ctx.last_error().set_process_last_error(if truncated {
         ERROR_INSUFFICIENT_BUFFER
     } else {
         0
-    };
+    });
 
     ctx.finish(return_value)
 }

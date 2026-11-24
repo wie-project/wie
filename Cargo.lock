@@ -3073,7 +3073,6 @@ dependencies = [
  "wgpu",
  "wie-pe",
  "wie-runtime",
- "wie-winapi",
  "winit",
 ]
 

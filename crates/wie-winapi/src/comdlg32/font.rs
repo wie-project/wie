@@ -72,21 +72,25 @@ const FONT_DLG_CY: i32 = 260;
 /// FALSE like a user canceling. Under [`FontDialogPolicy::Interactive`] builds
 /// the host font dialog and runs its in-guest modal loop (see
 /// [`open_host_font_dialog`]).
+///
+/// The policy read and the `CDERR_NONE` writes go through
+/// [`WindowDialogAccess`](crate::capability::WindowDialogAccess) — a
+/// `ctx.dialogs()` call each, never a whole-state binding (ADR-0005 stage 2).
+/// The interactive arm hands the whole context to [`open_host_font_dialog`],
+/// which builds guest windows and stays wide; that is why this handler narrows
+/// per call rather than substituting the context's state.
 pub fn handle_choose_font_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let cf_va = read_arg(engine, ArgReg::Rcx, "ChooseFontW")?;
+    let cf_va = read_arg(&mut *ctx.engine, ArgReg::Rcx, "ChooseFontW")?;
 
     if cf_va == 0 {
-        state_comm_dlg_none(state);
+        state_comm_dlg_none(ctx.dialogs());
         return ctx.finish(0);
     }
 
-    // Clone the policy to avoid borrowing window_state() across the match.
-    let policy = state.font_dialog_policy().clone();
+    let policy = ctx.dialogs().font_dialog_policy();
     match policy {
         FontDialogPolicy::Cancel => {
-            state_comm_dlg_none(state);
+            state_comm_dlg_none(ctx.dialogs());
             tracing::debug!("ChooseFontW cancelled by policy");
             ctx.finish(0)
         }

@@ -188,17 +188,16 @@ pub fn handle_get_computer_name_a(ctx: &mut HandlerContext<'_>) -> Result<WinApi
 }
 /// Handles `KERNEL32.dll!GetComputerNameExW` — returns appropriate name type.
 pub fn handle_get_computer_name_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let name_type = engine.read_rcx()?;
-    let name_va = engine.read_rdx()?;
-    let size_va = engine.read_r8()?;
+    let name_type = ctx.engine.read_rcx()?;
+    let name_va = ctx.engine.read_rdx()?;
+    let size_va = ctx.engine.read_r8()?;
     match name_type {
         0 | 5 => get_canonical_computer_name(ctx, name_va, size_va),
         1 | 3 => get_dns_hostname(ctx, name_va, size_va),
         _ => {
             // Unsupported type → ERROR_INVALID_PARAMETER
-            state.process.last_error = ERROR_INVALID_PARAMETER;
+            ctx.last_error()
+                .set_process_last_error(ERROR_INVALID_PARAMETER);
             ctx.finish(0)
         }
     }

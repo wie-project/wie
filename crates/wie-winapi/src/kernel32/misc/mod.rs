@@ -227,23 +227,23 @@ pub fn handle_free_environment_strings_w(
 }
 /// Handles `KERNEL32.dll!GetLastError`.
 pub fn handle_get_last_error(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let state = &mut *ctx.state;
-    let return_value = u64::from(state.process.last_error);
+    let return_value = u64::from(ctx.last_error().last_error());
 
     ctx.finish(return_value)
 }
 /// Handles `KERNEL32.dll!SetLastError`.
 pub fn handle_set_last_error(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let error_raw = engine
+    let error_raw = ctx
+        .engine
         .read_rcx()
         .context("failed to read RCX for SetLastError")?;
 
     let error =
         u32::try_from(error_raw & 0xffff_ffff).context("SetLastError value does not fit u32")?;
 
-    state.process.last_error = error;
+    // `SetLastError` sets the alias; the dispatch boundary publishes it to the
+    // guest's TEB (ADR-0005 stage 3, `LastErrorAccess`).
+    ctx.last_error().set_process_last_error(error);
 
     ctx.finish(0)
 }

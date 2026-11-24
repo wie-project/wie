@@ -130,7 +130,6 @@ pub fn handle_get_time_zone_information(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let time_zone_info_va = engine
         .read_rcx()
         .context("failed to read RCX for GetTimeZoneInformation")?;
@@ -176,9 +175,10 @@ pub fn handle_get_time_zone_information(
             .context("failed to write TIME_ZONE_INFORMATION DaylightDate")?;
         write_guest_u32(engine, daylight_bias_address, 0)?;
 
-        state.process.last_error = 0;
+        ctx.last_error().set_process_last_error(0);
     } else {
-        state.process.last_error = ERROR_INVALID_PARAMETER;
+        ctx.last_error()
+            .set_process_last_error(ERROR_INVALID_PARAMETER);
     }
 
     let return_value = if success {
@@ -288,7 +288,6 @@ fn handle_get_time_date_format(
     api_name: &str,
 ) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let locale_raw = engine
         .read_rcx()
         .with_context(|| format!("failed to read RCX for {api_name}"))?;
@@ -343,11 +342,12 @@ fn handle_get_time_date_format(
         }
     };
 
-    state.process.last_error = if return_value == 0 {
-        ERROR_INVALID_PARAMETER
-    } else {
-        0
-    };
+    ctx.last_error()
+        .set_process_last_error(if return_value == 0 {
+            ERROR_INVALID_PARAMETER
+        } else {
+            0
+        });
 
     ctx.finish(return_value)
 }

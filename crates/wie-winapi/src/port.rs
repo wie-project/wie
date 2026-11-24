@@ -170,10 +170,21 @@ pub use crate::idle::{IdleContext, IdlePolicy};
 // The window pump crosses here. `Dimension` is the geometry type winit hands
 // the runtime; the `MessageQueue` / `PresentChannel` pair is the lock-free
 // host↔guest seam; `MirrorWindow` / `SurfaceFrame` are what the presenter
-// reads back. These were reached as `wie_winapi::present::`/`::user32::` before
-// ADR-0006; they are re-exported here so the module path is no longer public
-// API.
+// reads back, and `IRect` is the type of `SurfaceFrame::region`, so a presenter
+// that reads a frame's dirty rect must name it. `WinMsg` is the WM_*
+// vocabulary: `user32::wm` is the single source of truth for the message
+// values, and both the host (which derives its `u32` ids from it) and the
+// guest dispatch read it, so a host post and a guest handler cannot drift.
+// The raw-input lane is here because synthesizing one is host work whose
+// vocabulary stays inside the emulator: the host says "left button at (x, y)"
+// and `RawMouseButton` / `RawMouseReport` / `RawInputPost` carry it through the
+// encoding to the `WM_INPUT` posts.
+//
+// All of these were reached as `wie_winapi::present::` / `::user32::` /
+// `::gdi32::` before ADR-0006; they are re-exported here so the module path is
+// no longer public API.
 pub use crate::comdlg32::{FONT_DLG_STRIKEOUT_ID, FONT_DLG_UNDERLINE_ID};
+pub use crate::gdi32::IRect;
 pub use crate::handles::{Hmenu, Hwnd};
 pub use crate::present::{
     CaptureStreamerHandle, MessageBoxBridge, MessageQueue, MessageSignal, MirrorWindow,
@@ -186,6 +197,11 @@ pub use crate::state::{
     PrintJobBridge, QueuedWindowMessage, WindowFlags, WindowRecord,
 };
 pub use crate::user32::dragdrop::FAKE_HDROP;
+pub use crate::user32::raw_input::{
+    RawInputPost, RawMouseButton, RawMouseReport, is_legacy_keyboard_input_excluded,
+    is_legacy_mouse_input_excluded, post_raw_keyboard_event, post_raw_mouse_event,
+};
+pub use crate::user32::wm::WinMsg;
 pub use crate::user32::{Dimension, MenuEntry, MenuRecord};
 
 // ── §7 Platform services the runtime drives ────────────────────────────────

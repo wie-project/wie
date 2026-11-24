@@ -4,7 +4,10 @@ use super::util::write_entry_trace_summary;
 use anyhow::{Context, Result, bail};
 use std::io;
 use std::path::{Path, PathBuf};
-use wie_winapi::VolumeConfig;
+use wie_runtime::host::{
+    MessageQueueIdlePolicy, VolumeConfig, bottle_root_from_env, drive_d_from_env,
+    global_bottle_root, host_path_to_guest,
+};
 
 /// Whether a stdin path represents an interactive terminal rather than a file.
 /// When true, the emulator reads line-by-line from the host TTY instead of
@@ -189,7 +192,7 @@ pub fn stage_run_source(
     let run_path = dest_dir.join(&rel_run_path);
     // The staged dir's guest label is the process current directory (the
     // exe's own guest path stays `C:\Program Files\{name}\{name}.exe`).
-    let guest_current_directory = wie_winapi::host_path_to_guest(volumes, &dest_dir);
+    let guest_current_directory = host_path_to_guest(volumes, &dest_dir);
     Ok(StagedRunSource {
         run_path,
         guest_current_directory,
@@ -207,10 +210,10 @@ pub fn resolve_volume_config(
     VolumeConfig::from_parts(
         bottle_root
             .map(std::path::Path::to_path_buf)
-            .or_else(wie_winapi::bottle_root_from_env),
+            .or_else(bottle_root_from_env),
         drive_d_root
             .map(std::path::Path::to_path_buf)
-            .or_else(wie_winapi::drive_d_from_env),
+            .or_else(drive_d_from_env),
     )
 }
 
@@ -404,7 +407,7 @@ pub fn run_micro(path: &Path, options: MicroRunOptions<'_>) -> Result<()> {
         Some(r) => tracing::debug!("bottle_root: {} (override)", r.display()),
         None => tracing::debug!(
             "bottle_root: {} (global default)",
-            wie_winapi::global_bottle_root().display()
+            global_bottle_root().display()
         ),
     }
     if let Some(ref d) = volumes.drive_d_root {
@@ -579,14 +582,14 @@ pub fn run_until_yield(path: &Path, max_api: usize, bottle_root: Option<&Path>) 
 /// Owns raw-mode entry so the terminal is restored on *every* exit path —
 /// normal return, `?` error propagation, and panics.
 ///
-/// The guard always restores on drop: [`wie_winapi::console::restore_terminal`]
+/// The guard always restores on drop: [`wie_runtime::host::restore_terminal`]
 /// is idempotent, so it also covers raw mode the guest entered itself through
 /// `ReadConsoleInput` / `_getch` (`pump::ensure_input_ready`).
 struct TerminalRawGuard;
 
 impl TerminalRawGuard {
     fn enter() -> Self {
-        if !wie_winapi::console::set_raw_mode(true) {
+        if !wie_runtime::host::set_raw_mode(true) {
             tracing::warn!(
                 "warning: --console needs a terminal (stdin is not a tty); keys will require Enter"
             );
@@ -597,7 +600,7 @@ impl TerminalRawGuard {
 
 impl Drop for TerminalRawGuard {
     fn drop(&mut self) {
-        wie_winapi::console::restore_terminal();
+        wie_runtime::host::restore_terminal();
     }
 }
 
@@ -646,7 +649,7 @@ pub fn run_console_interactive(
 
     let mut session = wie_runtime::RuntimeSession::new_with_options(
         &prepared.staged.run_path,
-        wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
+        MessageQueueIdlePolicy::YieldOnIdle,
         wie_runtime::DEFAULT_LAYOUT.with_env_overrides(),
         // Defaults: no guest argv and empty stdin bytes → LiveHost mode, so
         // ReadFile(STD_INPUT_HANDLE) and ReadConsoleInputW read from the host
@@ -789,7 +792,7 @@ mod tests {
         // mirrors (see session/init.rs identity derivation).
         let volumes = c_volumes(bottle.path());
         assert_eq!(
-            wie_winapi::host_path_to_guest(&volumes, &staged.run_path).as_deref(),
+            host_path_to_guest(&volumes, &staged.run_path).as_deref(),
             Some(r"C:\Program Files\app\app.exe"),
             "the in-bottle copy resolves to its Program Files guest path"
         );
@@ -1175,7 +1178,7 @@ mod tests {
         assert_eq!(identity.module_file_name, "crt_hello.exe");
         let volumes = c_volumes(bottle.path());
         assert_eq!(
-            wie_winapi::host_path_to_guest(&volumes, &copy).as_deref(),
+            host_path_to_guest(&volumes, &copy).as_deref(),
             Some(r"C:\Program Files\crt_hello\crt_hello.exe"),
             "the copy's guest module path is its Program Files location"
         );

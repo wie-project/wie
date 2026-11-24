@@ -447,7 +447,6 @@ pub fn handle_get_string_type_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 /// Handles `KERNEL32.dll!MultiByteToWideChar`.
 pub fn handle_multi_byte_to_wide_char(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
     let code_page = engine.read_rcx()?;
     let _flags = engine.read_rdx()?;
     let input_va = engine.read_r8()?;
@@ -478,7 +477,8 @@ pub fn handle_multi_byte_to_wide_char(ctx: &mut HandlerContext<'_>) -> Result<Wi
         if output_len_usize < units.len() {
             // Too small a buffer: Windows fails with ERROR_INSUFFICIENT_BUFFER
             // (the pump publishes it to the TEB so a guest GetLastError sees it).
-            state.process.last_error = ERROR_INSUFFICIENT_BUFFER;
+            ctx.last_error()
+                .set_process_last_error(ERROR_INSUFFICIENT_BUFFER);
             0
         } else {
             let output_bytes = crate::guest_string::utf16_units_to_le(&units);

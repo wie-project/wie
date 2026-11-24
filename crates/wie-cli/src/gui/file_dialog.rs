@@ -18,7 +18,7 @@
 //! a dialog.
 
 use wie_runtime::RuntimeSession;
-use wie_winapi::FileDialogPolicy;
+use wie_runtime::host::{FileDialogPick, FileDialogPolicy, FileDialogRequest};
 
 /// Enable interactive file dialogs on a GUI session.
 ///
@@ -68,10 +68,10 @@ pub fn register_native_file_dialog_bridge(
 /// bridge uses), so the guest parks with correct dialog semantics.
 #[cfg(target_os = "macos")]
 fn show_native_file_dialog(
-    request: &wie_winapi::FileDialogRequest,
+    request: &FileDialogRequest,
     handle: &wie_runtime::GuestHandle,
     window_slots: &WindowSlot,
-) -> Option<wie_winapi::FileDialogPick> {
+) -> Option<FileDialogPick> {
     let mut dialog = rfd::FileDialog::new();
     if let Some(parent) = super::app::resolve_dialog_parent(handle, window_slots) {
         dialog = dialog.set_parent(parent.as_ref());
@@ -101,5 +101,5 @@ fn show_native_file_dialog(
     } else {
         dialog.pick_file()
     };
-    picked.map(|host_path| wie_winapi::FileDialogPick { host_path })
+    picked.map(|host_path| FileDialogPick { host_path })
 }

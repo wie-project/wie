@@ -50,7 +50,10 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
             .len()
             .saturating_sub(state.file_io.stdin_cursor);
         if available == 0 && state.file_io.stdin_mode == crate::GuestStdinMode::LiveHost {
-            match refill_stdin_from_host(&mut state.file_io) {
+            match refill_stdin_from_host(
+                &mut state.file_io,
+                crate::console::stdin::MAX_HOST_STDIN_LINE,
+            ) {
                 Ok(true) => {
                     available = state
                         .file_io

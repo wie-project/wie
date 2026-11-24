@@ -17,7 +17,7 @@
 
 use anyhow::Result;
 use wie_runtime::SessionOptions;
-use wie_winapi::vfs::{VolumeConfig, guest_path_to_host, normalize_windows_path_separators};
+use wie_runtime::host::{VolumeConfig, guest_path_to_host, normalize_windows_path_separators};
 
 /// Verify explicit guest argv file dependencies and build the session
 /// bootstrap options for a GUI run.

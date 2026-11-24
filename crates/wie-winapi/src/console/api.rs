@@ -564,7 +564,13 @@ fn read_console(cx: &mut ConsoleCall<'_>, wide: bool) -> Result<WinApiHandlerRes
 
     // Reuse the existing stdin buffer so ReadConsole and ReadFile on the same
     // handle stay in step — a program may mix them across its lifetime.
-    if cx.state.stdin_available() == 0 && cx.state.stdin_refill().is_err() {
+    // `ReadConsole` buffers a whole host line: the console's own 64 KiB cap.
+    if cx.state.stdin_available() == 0
+        && cx
+            .state
+            .stdin_refill(crate::console::stdin::MAX_HOST_STDIN_LINE)
+            .is_err()
+    {
         cx.state
             .set_process_last_error(crate::kernel32::ERROR_READ_FAULT);
         return ret_u64(cx.engine, 0, api);

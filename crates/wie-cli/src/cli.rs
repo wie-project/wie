@@ -311,8 +311,8 @@ pub fn run_entry(
     // do — the default SIGINT disposition would kill the process there with
     // no chance to dump the profile report. Gate-off cost: one cached-bool
     // load; behavior is untouched when profiling is off.
-    if wie_winapi::console::profile_sigint_armed() {
-        wie_winapi::console::ensure_hooks_installed();
+    if wie_runtime::host::profile_sigint_armed() {
+        wie_runtime::host::ensure_hooks_installed();
     }
 
     // GUI/screenshot mode takes precedence over persistent/micro.

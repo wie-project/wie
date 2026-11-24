@@ -1429,6 +1429,25 @@ impl<'a> HandlerContext<'a> {
         self.state
     }
 
+    /// The last-error capability: read and write the process last-error alias,
+    /// and nothing else (ADR-0005 stage 3).
+    ///
+    /// A plain `&mut dyn` like [`Self::dialogs`], not a context struct like
+    /// [`Self::console`]: the capability has no struct to hand back — two verbs
+    /// over one `u32` — so there is nothing for the CPU port to sit beside. A
+    /// handler that reads its arguments *and* reports an error therefore takes
+    /// the capability per call (`ctx.last_error()`) instead of holding it across
+    /// the register reads, which is also what keeps `&mut *ctx.engine` reborrows
+    /// legal between the two.
+    ///
+    /// The alias-only shape is the point: `publish_last_error_to_guest` folds it
+    /// into the active thread's slot and the guest TEB page at the dispatch
+    /// boundary, so a handler never needs the thread slot. See
+    /// [`LastErrorAccess`](crate::capability::LastErrorAccess).
+    pub fn last_error(&mut self) -> &mut dyn crate::capability::LastErrorAccess {
+        self.state
+    }
+
     /// Canonical handler tail: pop the guest return address, write `value`
     /// into RAX, and package the result.
     ///

@@ -31,8 +31,13 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 wie-pe = { path = "../wie-pe" }
+# ADR-0006 decision 3: no `wie-winapi` edge. The CLI is host code; it names
+# WinAPI types and calls host services through `wie_runtime::host` (the
+# session's published surface), never through the emulator's crate. Re-adding
+# the line is caught by `./scripts/check.sh --only dep-direction` (the compiler
+# is not the only gate here: a `use wie_winapi::…` would fail to resolve, but
+# the edge itself is a policy decision recorded in `EXPECTED_EDGES`).
 wie-runtime = { path = "../wie-runtime" }
-wie-winapi = { path = "../wie-winapi" }
 
 # macOS application menu bar (guest window menu -> top bar). muda is a safe
 # wrapper over AppKit — no hand-written objc2 lives in this crate anymore.

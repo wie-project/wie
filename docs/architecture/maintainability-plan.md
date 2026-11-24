@@ -41,12 +41,12 @@ Item-by-item, with the check that shows it:
 | T1.1 | **DONE** | `[lints] workspace = true` in all five crates (`grep -c '\[lints\]' crates/*/Cargo.toml`) |
 | T1.2 | **DECIDED — option A** | no `[workspace.lints.clippy]` anywhere; clippy runs without `-D warnings` in both `check.sh:554` and `ci.yml:97`. The workspace is nevertheless 0-warning, so option B is now a *scope* decision, not a cleanup |
 | T1.3 | **DONE** | `crates/wie-runtime/tests/runbook_knobs.rs` asserts bidirectional equality (`live ⊆ documented`, `documented ⊆ live ∪ {RUST_LOG}`) |
-| T1.4 | **DONE** | `check_deps()` in `scripts/check.sh` compares `cargo metadata`'s internal edges against `EXPECTED_EDGES` (8 normal, 0 dev) |
+| T1.4 | **DONE** | `check_deps()` in `scripts/check.sh` compares `cargo metadata`'s internal edges against `EXPECTED_EDGES` (7 normal, 0 dev — 8 until ADR-0006 decision 3 removed `wie-cli -> wie-winapi`) |
 | T2.1–T2.8, T2.10 | **DONE** | see each item |
 | T2.9 | **OPEN** | `winapi_state_default()` still defined 4× (`state/tests/mod.rs:109`, `version.rs:994`, `kernel32/file_io/path.rs:782`, `ole_clipboard.rs:409`) |
 | T3.1, T3.2, T3.4, T3.6 | **DONE** | ADRs 0007, 0004, 0005, 0009 — accepted 2026-11-23 |
 | T3.3 | **OPEN** | ADR-0008 (`Control` trait) is still `Proposed`; no `trait` exists under `user32/controls/` |
-| T3.5 | **PARTIAL** | `port` + the `winapi-port` gate landed; ADR-0006 decision 3 (`wie-cli` off its direct `wie-winapi` dependency) did not |
+| T3.5 | **DONE** | `port` + the `winapi-port` gate landed at `a4ba020`; decision 3 (`wie-cli` off its direct `wie-winapi` dependency) landed after `30f68bc` — the CLI now reaches WinAPI only through `wie_runtime::host`, and `EXPECTED_EDGES` no longer contains the edge, so re-adding it fails `check_deps()` |
 | T4.1, T4.2, T4.3, T4.4, T4.6, T4.7 | **DONE** | see each item |
 | T4.5 | **PARTIAL** | CI gained the non-macOS compile job; `winapi-port` is still not a CI step |
 
@@ -80,7 +80,6 @@ found **eleven more**; they are listed under [Figures corrected on
 | --- | --- |
 | T3.3 — `Control` trait (ADR-[0008](../adr/0008-control-trait.md)) | recorded, not applied |
 | T2.9 — `winapi_state_default()` dedup | 4 copies remain |
-| T3.5 decision 3 — drop `wie-cli`'s direct `wie-winapi` dependency | `gui/` still reaches `wie_winapi::user32::`/`::gdi32::`/`::present::` |
 | T4.5 — `winapi-port` as a CI step | runs locally via `check.sh`; `ci.yml` runs only `file-sizes` and `dep-direction` of the policy steps |
 | `lock`-shift/rotate test rows | 8 unencodable rows dropped; SDM, `mingw-as` and iced all agree they do not exist (`objdump` disagrees) |
 | `exec_shift` locked branch | unreachable by the same argument; kept as a documented guard on the interpreter's fallback path |
@@ -348,9 +347,12 @@ Add a test that parses the RUNBOOK table's knob column and asserts equality with
 
 **Status: DONE.** `check_deps()` in `scripts/check.sh` (step 2 of 9) compares
 `cargo metadata`'s internal edges against `EXPECTED_EDGES` and prints
-`crate dependency direction ok (8 internal normal edges, 8 expected, 0 internal
+`crate dependency direction ok (7 internal normal edges, 7 expected, 0 internal
 dev edges)`. It is a gate step, not a `cargo test`. The `wie-cli → wie-winapi`
-deviation recorded below is still in `EXPECTED_EDGES` as a known edge — see T3.5.
+deviation recorded below was removed from `EXPECTED_EDGES` when ADR-0006
+decision 3 landed (T3.5), which turns it from a known edge into a *failing* one:
+re-adding the dependency exits 1 with `UNEXPECTED internal dependency edge(s)
+[normal] wie-cli -> wie-winapi`.
 
 **Zero architecture-boundary tests exist.** 1,884 tests, of which 104 (5.5%) live in `tests/`. `wie-cli` has **0** integration tests. (Pre-change figures; `wie-cli` now has `tests/run_entry.rs` — 7 tests — because T2.2 landed, and the workspace total is 2,018.) Nothing asserts the crate flow, so the one invariant CLAUDE.md calls load-bearing is unverified by construction.
 
@@ -361,10 +363,17 @@ wie-pe     → (none internal)
 wie-cpu    → (none internal)          [dev: criterion]
 wie-winapi → wie-cpu, wie-pe
 wie-runtime→ wie-pe, wie-cpu, wie-winapi
-wie-cli    → wie-pe, wie-runtime, wie-winapi   [+ winit, wgpu, muda, rfd, objc2*]
+wie-cli    → wie-pe, wie-runtime             [+ winit, wgpu, muda, rfd, objc2*]
 ```
 
-No cycles, no internal dev-deps, no feature-gated internal deps. One deviation: **`wie-cli` reaches around `wie-runtime` into `wie-winapi`** (`main.rs` calls `console::profile_sigint_armed()` / `ensure_hooks_installed()`), so the CLI can call any WinAPI handler directly, bypassing `RuntimeSession`'s lock and in-guest-callback invariants — the documented deadlock class.
+No cycles, no internal dev-deps, no feature-gated internal deps, and — since
+ADR-0006 decision 3 — no `wie-cli → wie-winapi` edge either. That edge was the
+one structural anomaly: it let the CLI reach around `wie-runtime` and call
+WinAPI directly, bypassing `RuntimeSession`'s lock and in-guest-callback
+invariants (the documented deadlock class). It is now unreachable by
+construction: `wie-cli` names `wie_runtime::host::…` instead, and a transitive
+dependency is not nameable, so a `use wie_winapi::…` in the CLI does not
+compile.
 
 **Change.** ~50 lines: run `cargo metadata`, assert the internal edge set equals a hardcoded list. No new deps. Optionally extend to forbid `wie_winapi::{user32,gdi32,present,...}::` in `wie-runtime/src` outside an allow-list (T3.5 makes that list short).
 

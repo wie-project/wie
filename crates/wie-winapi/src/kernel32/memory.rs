@@ -148,40 +148,47 @@ pub fn handle_unmap_view_of_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
     ret_bool_true(engine, "UnmapViewOfFile")
 }
 pub fn handle_open_file_mapping(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let _ = (engine.read_rcx()?, engine.read_rdx()?, engine.read_r8()?);
-    state.process.last_error = ERROR_FILE_NOT_FOUND;
-    ret_u64(engine, 0, "OpenFileMapping")
+    let _ = (
+        ctx.engine.read_rcx()?,
+        ctx.engine.read_rdx()?,
+        ctx.engine.read_r8()?,
+    );
+    ctx.last_error()
+        .set_process_last_error(ERROR_FILE_NOT_FOUND);
+    ret_u64(&mut *ctx.engine, 0, "OpenFileMapping")
 }
 pub(crate) fn handle_virtual_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let addr = engine.read_rcx()?;
-    let size = engine.read_rdx()?;
-    let alloc_type = u32::try_from(engine.read_r8()? & 0xffff_ffff).unwrap_or(0);
-    let protect = u32::try_from(engine.read_r9()? & 0xffff_ffff).unwrap_or(0);
+    let addr = ctx.engine.read_rcx()?;
+    let size = ctx.engine.read_rdx()?;
+    let alloc_type = u32::try_from(ctx.engine.read_r8()? & 0xffff_ffff).unwrap_or(0);
+    let protect = u32::try_from(ctx.engine.read_r9()? & 0xffff_ffff).unwrap_or(0);
     let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
     if size_usize == usize::MAX {
-        state.process.last_error = ERROR_INVALID_PARAMETER;
+        ctx.last_error()
+            .set_process_last_error(ERROR_INVALID_PARAMETER);
         return ctx.finish(0);
     }
-    match engine.virtual_alloc(addr, size_usize, alloc_type, protect) {
+    // The allocation result is bound before the match so the engine reborrow
+    // ends before the arms take the last-error capability.
+    let allocation = ctx
+        .engine
+        .virtual_alloc(addr, size_usize, alloc_type, protect);
+    match allocation {
         Ok(base) => {
-            state.process.last_error = 0;
+            ctx.last_error().set_process_last_error(0);
             tracing::debug!(addr, size, alloc_type, protect, base, "VirtualAlloc ok");
             ctx.finish(base)
         }
         Err(e) => {
-            state.process.last_error =
-                wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            let last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            ctx.last_error().set_process_last_error(last_error);
             tracing::debug!(
                 addr,
                 size,
                 alloc_type,
                 protect,
                 error = %e,
-                last_error = state.process.last_error,
+                last_error,
                 "VirtualAlloc failed"
             );
             ctx.finish(0)
@@ -189,73 +196,73 @@ pub(crate) fn handle_virtual_alloc(ctx: &mut HandlerContext<'_>) -> Result<WinAp
     }
 }
 pub(crate) fn handle_virtual_free(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let addr = engine.read_rcx()?;
-    let size = engine.read_rdx()?;
-    let free_type = u32::try_from(engine.read_r8()? & 0xffff_ffff).unwrap_or(0);
+    let addr = ctx.engine.read_rcx()?;
+    let size = ctx.engine.read_rdx()?;
+    let free_type = u32::try_from(ctx.engine.read_r8()? & 0xffff_ffff).unwrap_or(0);
     let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
     if size_usize == usize::MAX {
-        state.process.last_error = ERROR_INVALID_PARAMETER;
+        ctx.last_error()
+            .set_process_last_error(ERROR_INVALID_PARAMETER);
         return ctx.finish(0);
     }
-    match engine.virtual_free(addr, size_usize, free_type) {
+    let freed = ctx.engine.virtual_free(addr, size_usize, free_type);
+    match freed {
         Ok(()) => {
-            state.process.last_error = 0;
+            ctx.last_error().set_process_last_error(0);
             ctx.finish(1)
         }
         Err(e) => {
-            state.process.last_error =
-                wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            let last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            ctx.last_error().set_process_last_error(last_error);
             ctx.finish(0)
         }
     }
 }
 pub(crate) fn handle_virtual_protect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let addr = engine.read_rcx()?;
-    let size = engine.read_rdx()?;
-    let new_protect = u32::try_from(engine.read_r8()? & 0xffff_ffff).unwrap_or(0);
-    let old_prot = engine.read_r9()?;
+    let addr = ctx.engine.read_rcx()?;
+    let size = ctx.engine.read_rdx()?;
+    let new_protect = u32::try_from(ctx.engine.read_r8()? & 0xffff_ffff).unwrap_or(0);
+    let old_prot = ctx.engine.read_r9()?;
     // Microsoft Learn: if lpflOldProtect is NULL or invalid, the function fails.
     if old_prot == 0 {
-        state.process.last_error = ERROR_INVALID_PARAMETER;
+        ctx.last_error()
+            .set_process_last_error(ERROR_INVALID_PARAMETER);
         return ctx.finish(0);
     }
     let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
     if size_usize == 0 || size_usize == usize::MAX {
-        state.process.last_error = ERROR_INVALID_PARAMETER;
+        ctx.last_error()
+            .set_process_last_error(ERROR_INVALID_PARAMETER);
         return ctx.finish(0);
     }
-    match engine.virtual_protect(addr, size_usize, new_protect) {
+    let protection = ctx.engine.virtual_protect(addr, size_usize, new_protect);
+    match protection {
         Ok(old) => {
-            write_guest_u32(engine, old_prot, old)?;
-            state.process.last_error = 0;
+            write_guest_u32(&mut *ctx.engine, old_prot, old)?;
+            ctx.last_error().set_process_last_error(0);
             ctx.finish(1)
         }
         Err(e) => {
-            state.process.last_error =
-                wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            let last_error = wie_cpu::win32_from_cpu_error(&e).unwrap_or(ERROR_INVALID_PARAMETER);
+            ctx.last_error().set_process_last_error(last_error);
             ctx.finish(0)
         }
     }
 }
 pub(crate) fn handle_virtual_query(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    let address = engine.read_rcx()?;
-    let buffer = engine.read_rdx()?;
-    let length = engine.read_r8()?;
+    let address = ctx.engine.read_rcx()?;
+    let buffer = ctx.engine.read_rdx()?;
+    let length = ctx.engine.read_r8()?;
 
     if buffer == 0 || length < MEMORY_BASIC_INFORMATION_SIZE {
-        state.process.last_error = ERROR_INVALID_PARAMETER;
+        ctx.last_error()
+            .set_process_last_error(ERROR_INVALID_PARAMETER);
         return ctx.finish(0);
     }
 
-    let mbi = engine.virtual_query(address);
+    let mbi = ctx.engine.virtual_query(address);
     let bytes = mbi.to_bytes();
-    engine.mem_write(buffer, &bytes)?;
-    state.process.last_error = 0;
+    ctx.engine.mem_write(buffer, &bytes)?;
+    ctx.last_error().set_process_last_error(0);
     ctx.finish(MEMORY_BASIC_INFORMATION_SIZE)
 }
