@@ -309,6 +309,14 @@ impl JitCpu {
     }
 
     pub(super) fn drain_pending_code_writes(&mut self) {
+        // Fast path: nothing has been queued since this engine's last drain, so
+        // there is neither a page to invalidate nor an overflow to honour. One
+        // relaxed load replaces a mutex acquisition on every dispatch entry.
+        let pending_gen = self.shared.pending_code_gen.load(Ordering::Relaxed);
+        if pending_gen == self.thread.drained_pending_gen {
+            return;
+        }
+        self.thread.drained_pending_gen = pending_gen;
         let overflow = self
             .shared
             .pending_code_overflow
@@ -333,6 +341,10 @@ impl JitCpu {
         if len == 0 || self.shared.pending_code_overflow.load(Ordering::Relaxed) {
             return;
         }
+        // Published before the set is touched: a drainer that observes this
+        // generation must also observe the push that follows it, and one that
+        // observes the push always observes a generation it has not drained.
+        self.shared.pending_code_gen.fetch_add(1, Ordering::Relaxed);
         let len_u = u64::try_from(len).unwrap_or(u64::MAX);
         let end = address.saturating_add(len_u);
         if end <= address && len > 0 {

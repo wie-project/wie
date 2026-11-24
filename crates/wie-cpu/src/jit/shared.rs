@@ -33,11 +33,11 @@ use super::lower::{self, CHAIN_SLOTS, CompiledBlock, JitCtx, compile_block};
 use super::pipeline::resolve_thunk_va;
 use super::profile::BgCompileProfile;
 use super::trampolines::match_micro_stub;
-use crate::{ConcurrentHashMap, new_concurrent_map};
 use crate::exec::HookWindow;
 use crate::lock::{lock_unpoisoned, read_unpoisoned};
 use crate::mem::GuestMemory;
 use crate::regs::RegFile;
+use crate::{ConcurrentHashMap, new_concurrent_map};
 use ahash::HashMap;
 use ahash::HashMapExt;
 use std::collections::VecDeque;
@@ -280,6 +280,15 @@ pub struct JitShared {
     pub pending_code_writes: Mutex<Vec<u64>>,
     /// Set when too many distinct pages were written; drain does a full code flush.
     pub pending_code_overflow: AtomicBool,
+    /// Bumped on every mutation of `pending_code_writes`.
+    ///
+    /// `drain_pending_code_writes` runs once per dispatch entry (~1.5 M/s on a
+    /// real guest) and only cares when the set is non-empty or the overflow flag
+    /// moved — both of which are rare. Without this counter the common case had
+    /// to take the set's mutex to find out it was empty; with it the entry path
+    /// is one relaxed load, and the lock is taken only by a thread that has
+    /// actually seen a new generation.
+    pub pending_code_gen: AtomicU64,
     /// Cached GuestMemory generation, updated on map/protect/free (avoids mem lock).
     pub mem_gen: AtomicU64,
     /// Whether the Cranelift engine was successfully initialized.
@@ -426,6 +435,7 @@ impl JitShared {
             recent_installs: Mutex::new(Vec::new()),
             pending_code_writes: Mutex::new(Vec::new()),
             pending_code_overflow: AtomicBool::new(false),
+            pending_code_gen: AtomicU64::new(0),
             mem_gen: AtomicU64::new(0),
             engine_ready: AtomicBool::new(engine_ready),
             bg_pool: Mutex::new(None),
@@ -1545,6 +1555,11 @@ pub struct PerThreadJitState {
     pub ctx: JitCtx,
     /// Generation at which the frame's pins were last rebuilt.
     pub pins_gen: u64,
+    /// `JitShared::pending_code_gen` as of this engine's last drain.
+    ///
+    /// When it still matches, nothing has been queued since the last drain and
+    /// the (mutex-guarded) set does not have to be visited at all.
+    pub drained_pending_gen: u64,
     /// The session's one [`GuestMemory`], captured **once** at engine
     /// construction and stamped into [`JitCtx::mem`] on every entry.
     ///
@@ -1635,6 +1650,7 @@ impl PerThreadJitState {
             iced_steps: 0,
             ctx,
             pins_gen: u64::MAX,
+            drained_pending_gen: 0,
             guest_mem,
             chain_slots: Box::new([lower::ChainSlot::empty(); CHAIN_SLOTS]),
             opcode_sample_i: 0,
