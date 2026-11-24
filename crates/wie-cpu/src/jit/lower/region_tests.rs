@@ -20,7 +20,9 @@
 //!   (`eb 01` + one byte).
 
 use super::super::block::BlockTerm;
-use super::region::{LoopRegion, RegionLimits, RegionRefusal, form_loop_region};
+use super::region::{
+    LoopRegion, RegionLimits, RegionRefusal, form_loop_region, form_self_loop_region,
+};
 use crate::RwxPerms;
 use crate::mem::GuestMemory;
 use iced_x86::{Mnemonic, Register};
@@ -65,6 +67,26 @@ fn form_with(
 /// is asserted through this rather than through `assert_eq!` on the `Result`.
 fn refusal(mem: &GuestMemory, start: u64) -> RegionRefusal {
     match form(mem, start) {
+        Ok(region) => panic!("expected a refusal at {start:#x}, got {region:?}"),
+        Err(why) => why,
+    }
+}
+
+fn form_self(mem: &GuestMemory, start: u64) -> Result<LoopRegion, RegionRefusal> {
+    form_self_loop_region(mem, None, start, &RegionLimits::default())
+}
+
+fn form_self_with(
+    mem: &GuestMemory,
+    start: u64,
+    limits: RegionLimits,
+) -> Result<LoopRegion, RegionRefusal> {
+    form_self_loop_region(mem, None, start, &limits)
+}
+
+/// The refusal [`form_self`] produces, panicking with the region if it produced one.
+fn self_refusal(mem: &GuestMemory, start: u64) -> RegionRefusal {
+    match form_self(mem, start) {
         Ok(region) => panic!("expected a refusal at {start:#x}, got {region:?}"),
         Err(why) => why,
     }
@@ -571,6 +593,480 @@ fn every_region_edge_stays_inside_or_is_an_exit() {
     }
 }
 
+// ── self-loop formation (`form_self_loop_region`) ───────────────────────
+//
+// A **self-loop** is a block whose own terminator comes back to its entry. The
+// SCC fold in `form_loop_region` cannot always express one: when the block sits
+// inside a larger loop, its strongly connected component contains a cycle that
+// does not pass through the entry, which is `Irreducible`. The two hottest blocks
+// in the corpus are that shape, so the one-block form is not a convenience — it
+// is the only thing that reaches them.
+
+/// A self-loop nested inside a larger loop: the exact shape the SCC fold refuses.
+///
+/// ```text
+/// A +0x00: inc   r11d             ; 41 FF C3
+///   +0x03: cmp   r11d, 0x100     ; 41 81 FB 00 01 00 00
+///   +0x0a: je    A               ; 74 F4   back edge to its own entry
+///   +0x0c: jmp   B               ; EB 06   not-taken falls out of the self-loop
+///   +0x0e: nop ×6                ; unreachable padding
+/// B +0x14: cmp   ecx, ebx        ; 3B CB
+///   +0x16: je    Y               ; 74 08   taken -> the inner cycle
+/// D +0x18: jmp   A               ; EB E6   one way back to the loop
+///   +0x1a: nop ×6
+/// Y +0x20: jmp   B               ; EB F2   the inner cycle B <-> Y
+///   +0x22: ud2
+/// ```
+///
+/// The component of `A` is `{A, B, D, Y}` and contains the cycle `B -> Y -> B`,
+/// which never passes through `A`. That is `Irreducible` for the SCC fold and a
+/// perfectly ordinary one-block loop for the self-loop form.
+const NESTED_SELF_LOOP: [u8; 0x24] = [
+    0x41, 0xFF, 0xC3, // inc r11d
+    0x41, 0x81, 0xFB, 0x00, 0x01, 0x00, 0x00, // cmp r11d, 0x100
+    0x74, 0xF4, // je A
+    0xEB, 0x06, // jmp B (+0x14)
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding
+    0x3B, 0xCB, // B: cmp ecx, ebx
+    0x74, 0x08, // je Y (+0x20)
+    0xEB, 0xE6, // D: jmp A
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding
+    0xEB, 0xF2, // Y: jmp B (+0x14)
+    0x0F, 0x0B, // ud2
+];
+
+/// The two forms disagree on this shape, and the disagreement is the *point*: the
+/// SCC fold refuses it as irreducible, and the one-block form takes it.
+#[test]
+fn a_nested_self_loop_is_irreducible_for_the_scc_fold_and_a_region_for_the_self_loop_form() {
+    let mem = guest();
+    place(&mem, BASE, &NESTED_SELF_LOOP);
+
+    assert_eq!(
+        refusal(&mem, BASE),
+        RegionRefusal::Irreducible { at: BASE + 0x14 },
+        "the SCC fold must keep refusing this: its component has a cycle that \
+         does not pass through the entry"
+    );
+
+    let region = form_self(&mem, BASE).expect("the block is a self-loop");
+    assert_eq!(region.entry(), BASE);
+    assert_eq!(starts(&region), vec![BASE], "one block, no exploration");
+    assert_eq!(region.blocks()[0].insn_count(), 3, "inc; cmp; je");
+    assert_eq!(
+        region.back_edges(),
+        &[(0, 0)],
+        "the back edge is the block's own branch, from itself to itself"
+    );
+    assert_eq!(
+        region.exit_targets(),
+        vec![BASE + 0x0C],
+        "the not-taken side is the only way out"
+    );
+    assert!(
+        !region.exits()[0].is_taken(),
+        "the exit is the `je`'s fallthrough, so it is not the taken slot"
+    );
+    assert_eq!(gprs(&region), vec![Register::R11], "only the counter");
+}
+
+/// A block that does not branch to itself is not a defect — it is the
+/// precondition, and it is the one answer that lets `form_region` fall through to
+/// the SCC fold without the refusal being lost.
+#[test]
+fn a_block_that_does_not_branch_to_itself_is_no_back_edge() {
+    let mem = guest();
+    place(&mem, BASE, &NESTED_SELF_LOOP);
+    // `B` (`cmp ecx, ebx; je Y`) has no successor equal to itself.
+    assert_eq!(
+        self_refusal(&mem, BASE + 0x14),
+        RegionRefusal::NoBackEdge,
+        "B's successors are Y and its own fallthrough, neither of which is B"
+    );
+}
+
+/// `jmp $`: a block whose only successor is itself. The region has **no exits at
+/// all**, so the emitted function's only departure is the invalidation guard on
+/// the back edge — the same escape the block path's in-frame self-loop has.
+#[test]
+fn a_no_exit_self_loop_forms_a_region_with_no_exits() {
+    let mem = guest();
+    place(&mem, BASE, &[0xEB, 0xFE]); // jmp $
+    let region = form_self(&mem, BASE).expect("jmp $ is a self-loop");
+    assert_eq!(starts(&region), vec![BASE]);
+    assert_eq!(region.back_edges(), &[(0, 0)]);
+    assert!(
+        region.exits().is_empty(),
+        "no successor other than itself: nothing for an exit block to write back"
+    );
+    assert!(region.exit_targets().is_empty());
+}
+
+/// `jne $` — a self-loop with **both** a taken side and a fallthrough out, both of
+/// them different addresses. Two exits, both from block 0, one of them taken.
+#[test]
+fn a_two_exit_self_loop_records_both_slots() {
+    let mem = guest();
+    place(&mem, BASE, &[0x75, 0xFE, 0x0F, 0x0B]); // jne $ ; ud2
+    let region = form_self(&mem, BASE).expect("jne $ is a self-loop");
+    assert_eq!(region.blocks()[0].successors().1, 2);
+    assert_eq!(
+        region.exit_targets(),
+        vec![BASE + 2],
+        "taken is the block itself, so only the fallthrough is an exit"
+    );
+    assert!(!region.exits()[0].is_taken());
+}
+
+/// The shapes a *call* or a *string op* would make unsafe cannot be a one-block
+/// self-loop at all — and that is a structural fact, not a lucky one.
+///
+/// A `call` terminates the block, and its only static successor is its **return
+/// site**, which is strictly past the block's own entry: so `call $`'s successor is
+/// not `$`. A string op also ends the block (`decode_pure_gpr_block` breaks after
+/// one, because `REP` needs a dynamic exit RIP), so the block has no terminator and
+/// its successor is `end_rip`. Neither can report its own entry as a successor, so
+/// both answer [`RegionRefusal::NoBackEdge`] here — the precondition, and the answer
+/// that makes `form_region` hand them to the SCC fold, which refuses them for the
+/// reasons that already exist (`Call`, `StringOp`).
+///
+/// What *is* reachable from the one-block form is
+/// [`RegionRefusal::UnguardableAddress`]: an ordinary instruction whose address the
+/// refill probe cannot vouch for, in a block that does branch to itself.
+#[test]
+fn a_call_a_ret_or_a_string_op_can_never_be_a_one_block_self_loop() {
+    // `call $` — recursively calls its own entry; the block's successor is the
+    // return site (BASE+5), not BASE.
+    let mem = guest();
+    place(&mem, BASE, &[0xE8, 0xFB, 0xFF, 0xFF, 0xFF]); // call BASE
+    assert_eq!(
+        self_refusal(&mem, BASE),
+        RegionRefusal::NoBackEdge,
+        "a call's successor is its return site, never its own entry"
+    );
+
+    // `ret` — no static successor at all.
+    let mem = guest();
+    place(&mem, BASE, &[0xC3, 0xEB, 0xFE]); // ret; jmp $
+    assert_eq!(self_refusal(&mem, BASE), RegionRefusal::NoBackEdge);
+
+    // `rep stosb; jmp $` — the string op ends the block, so the `jmp` is a
+    // *different* block and the first one's successor is its `end_rip`.
+    let mem = guest();
+    place(&mem, BASE, &[0xF3, 0xAA, 0xEB, 0xFC]);
+    assert_eq!(self_refusal(&mem, BASE), RegionRefusal::NoBackEdge);
+
+    // The one thing `check_block` *can* catch for a self-loop: an address the
+    // refill probe cannot be trusted with, beside a branch back to the entry.
+    // `mov eax, [ebx]` with an address-size override, so the probe would be handed
+    // an address the guest never computed.
+    let mem = guest();
+    place(
+        &mem,
+        BASE,
+        &[
+            0x67, 0x8B, 0x03, // mov eax, dword ptr [ebx]  (addr32)
+            0xEB, 0xFB, // jmp BASE
+        ],
+    );
+    assert_eq!(
+        self_refusal(&mem, BASE),
+        RegionRefusal::UnguardableAddress {
+            at: BASE,
+            why: "addr32"
+        },
+        "an unguardable address next to a back edge must not fold"
+    );
+}
+
+/// …and the fallback still refuses them for the reasons that already exist, so a
+/// call loop never becomes a region by way of the self-loop rescue.
+#[test]
+fn a_call_loop_is_refused_by_the_scc_fold_after_the_self_loop_form_declines() {
+    let mem = guest();
+    // call BASE+0x100, then a branch back to BASE: a two-block cycle through a call.
+    place(&mem, BASE, &[0xE8, 0xFB, 0x00, 0x00, 0x00, 0xEB, 0xF9]);
+    assert_eq!(self_refusal(&mem, BASE), RegionRefusal::NoBackEdge);
+    assert!(
+        matches!(refusal(&mem, BASE), RegionRefusal::Call { .. }),
+        "the SCC fold must still name the call, got {:?}",
+        refusal(&mem, BASE)
+    );
+    assert!(
+        matches!(
+            super::region_emit::form_region(&mem, None, BASE, true),
+            Err(RegionRefusal::Call { .. })
+        ),
+        "the pipeline's entry point must report the call, not `NoBackEdge`"
+    );
+}
+
+/// A `ud2` at the entry is not a lowerable block, so there is nothing to fold.
+#[test]
+fn a_non_lowerable_self_loop_entry_is_refused() {
+    let mem = guest();
+    place(&mem, BASE, &STOP);
+    assert_eq!(self_refusal(&mem, BASE), RegionRefusal::EntryNotLowerable);
+}
+
+/// The bounds are the SCC fold's fields, read for a one-block region.
+#[test]
+fn the_self_loop_bounds_are_enforced() {
+    let mem = guest();
+    place(&mem, BASE, &NESTED_SELF_LOOP);
+    assert_eq!(
+        match form_self_with(
+            &mem,
+            BASE,
+            RegionLimits {
+                max_insns: 2,
+                ..RegionLimits::default()
+            }
+        ) {
+            Ok(region) => panic!("expected TooManyInsns, got {region:?}"),
+            Err(why) => why,
+        },
+        RegionRefusal::TooManyInsns { insns: 3, limit: 2 },
+        "three instructions in the block, against a limit of two"
+    );
+
+    // `max_exit_targets` is unreachable for real code in a one-block region (a
+    // terminator has at most two slots), so pin the wiring with a limit of zero.
+    let mem = guest();
+    place(&mem, BASE, &NESTED_SELF_LOOP);
+    assert_eq!(
+        match form_self_with(
+            &mem,
+            BASE,
+            RegionLimits {
+                max_exit_targets: 0,
+                ..RegionLimits::default()
+            }
+        ) {
+            Ok(region) => panic!("expected TooManyExitTargets, got {region:?}"),
+            Err(why) => why,
+        },
+        RegionRefusal::TooManyExitTargets {
+            targets: 1,
+            limit: 0
+        }
+    );
+}
+
+/// The ordering `form_region` uses: the SCC fold gets first refusal.
+///
+/// The shape below is the one that makes the ordering matter — a block with a
+/// **taken slot back to itself** *and* a fallthrough into a path that returns to
+/// it, so both formations are possible and the bigger fold must win:
+///
+/// ```text
+/// B +0x00: cmp ecx, 0      ; 83 F9 00
+///   +0x03: je  B           ; 74 FB    slot 0 = B itself, slot 1 = +0x05
+///   +0x05: jmp C           ; EB 02    (padding at +0x07)
+/// C +0x09: jmp B           ; EB F5
+///   +0x0b: ud2
+/// ```
+///
+/// The SCC fold sees `{B, +0x05, C}` with two back edges that both target the
+/// entry, so it accepts. The self-loop form would take `{B}` alone and leave
+/// `+0x05`/`C` on the block path — a region that shrinks, which formation does not
+/// do. This pins that `form_region` returns the three-block fold.
+#[test]
+fn form_region_prefers_the_scc_fold_when_the_component_is_foldable() {
+    let mem = guest();
+    place(
+        &mem,
+        BASE,
+        &[
+            0x83, 0xF9, 0x00, // cmp ecx, 0
+            0x74, 0xFB, // je B
+            0xEB, 0x02, // jmp C
+            0x90, 0x90, // padding
+            0xEB, 0xF5, // C: jmp B
+            0x0F, 0x0B, // ud2
+        ],
+    );
+    let scc = form(&mem, BASE).expect("three blocks through B");
+    assert_eq!(
+        starts(&scc),
+        vec![BASE, BASE + 0x05, BASE + 0x09],
+        "the SCC fold takes the whole cycle"
+    );
+
+    // The one-block form is available here too, and takes strictly less.
+    let one = form_self(&mem, BASE).expect("B branches to itself");
+    assert_eq!(starts(&one), vec![BASE]);
+
+    let chosen = super::region_emit::form_region(&mem, None, BASE, true)
+        .unwrap_or_else(|why| panic!("form_region refused: {why:?}"));
+    assert_eq!(
+        starts(&chosen),
+        vec![BASE, BASE + 0x05, BASE + 0x09],
+        "the emitter's entry point must return the wider fold, not the one-block \
+         region that would shrink it"
+    );
+}
+
+/// **The gate itself**, and it is keyed on the *shape*, not on the formation.
+///
+/// `allow_self_loop = false` (the default, `WIE_JIT_REGION_SELF_LOOP` off) refuses
+/// a one-block region whichever formation found it:
+///
+/// * a **nested** self-loop, which only `form_self_loop_region` can form (the SCC
+///   fold calls it `Irreducible`) — DOOM's blit shape;
+/// * a **pure** self-loop, which the SCC fold *already* accepts
+///   (`block_count == 1 && succ[0].contains(0)`), so gating only the new formation
+///   would leave the trap half-open. Measured on a bounded DOOM run with the gate
+///   keyed on the formation: 116 of 200 regions were still one-block.
+///
+/// And a multi-block loop is unaffected in either direction — the measured
+/// regression is specific to the one-block shape, so the gate must not touch the
+/// latch fold that carries the 4x compile-time win.
+#[test]
+fn the_self_loop_gate_is_the_only_thing_between_a_self_loop_and_a_region() {
+    // Nested self-loop: the SCC fold cannot form it at all.
+    let mem = guest();
+    place(&mem, BASE, &NESTED_SELF_LOOP);
+    assert_eq!(
+        refusal(&mem, BASE),
+        RegionRefusal::Irreducible { at: BASE + 0x14 },
+        "precondition: the SCC fold refuses this shape"
+    );
+    assert_eq!(
+        super::region_emit::form_region(&mem, None, BASE, false).unwrap_err(),
+        RegionRefusal::SelfLoopGatedOff { at: BASE },
+        "gate closed: the shape is refused by name, not silently mis-formed"
+    );
+    let armed = super::region_emit::form_region(&mem, None, BASE, true)
+        .unwrap_or_else(|why| panic!("form_region refused with the gate open: {why:?}"));
+    assert_eq!(
+        starts(&armed),
+        vec![BASE],
+        "gate open: one block, own header"
+    );
+    assert_eq!(armed.back_edges(), &[(0, 0)]);
+
+    // Pure self-loop: the SCC fold *would* form it, and the gate must still
+    // refuse the shape while it is off.
+    let mem = guest();
+    place(&mem, BASE, &[0xEB, 0xFE]); // jmp $
+    assert!(
+        form(&mem, BASE).is_ok(),
+        "precondition: the SCC fold accepts a pure self-loop"
+    );
+    assert_eq!(
+        super::region_emit::form_region(&mem, None, BASE, false).unwrap_err(),
+        RegionRefusal::SelfLoopGatedOff { at: BASE },
+        "the gate is on the shape, so the SCC form's one-block answer is gated too"
+    );
+    assert_eq!(
+        starts(
+            &super::region_emit::form_region(&mem, None, BASE, true)
+                .expect("gate open: the pure self-loop forms")
+        ),
+        vec![BASE]
+    );
+
+    // A two-block loop: identical either way.
+    let mem = guest();
+    place(&mem, BASE, &DOOM_SHAPE);
+    stop(&mem, BASE + 0x20);
+    for allow in [false, true] {
+        let region = super::region_emit::form_region(&mem, None, BASE, allow)
+            .unwrap_or_else(|why| panic!("two-block loop refused (allow={allow}): {why:?}"));
+        assert_eq!(
+            starts(&region),
+            vec![BASE, BASE + 0x0F],
+            "a two-block loop folds through the SCC form whatever the \
+             self-loop gate says (allow_self_loop={allow})"
+        );
+    }
+}
+
+/// The self-loop that matters: DOOM Retro's SDL2 scaled blit, `0x1800d8fb0`./// The self-loop that matters: DOOM Retro's SDL2 scaled blit, `0x1800d8fb0`.
+///
+/// This is the block that is 54.1 % of guest time, and it is the reason
+/// [`form_self_loop_region`] exists: it is a self-loop *nested inside a larger
+/// loop*, so the SCC fold cannot express it (its component holds a cycle that never
+/// returns to the entry), and before this formation it stayed on the block path
+/// forever — with no entry hoist and no native back edge.
+///
+/// The test is a skip-when-absent, like [`doomretro_hot_loop_is_discovered`], and
+/// asserts the *disagreement* between the two forms as well as the region itself:
+/// that disagreement is the whole justification for the second formation function.
+#[test]
+fn doomretro_blit_self_loop_folds_at_its_own_header() {
+    const BLIT: u64 = 0x1_800d_8fb0;
+    let Some(image) = PeImage::named("SDL2.dll") else {
+        eprintln!("skip: real_exes/doomretro/SDL2.dll not present");
+        return;
+    };
+    let mem = image.guest_window(0x1_800d_8000, 0x8000);
+
+    // The counterfactual: what the SCC fold said before this slice.
+    let scc = match form_loop_region(&mem, None, BLIT, &RegionLimits::default()) {
+        Ok(region) => {
+            eprintln!(
+                "blit: SCC fold ACCEPTED, blocks={:#x?} — the self-loop form is then \
+                 not needed for this shape (re-check the refusals)",
+                starts(&region)
+            );
+            None
+        }
+        Err(why) => {
+            eprintln!("blit: SCC fold refused {why:?}");
+            Some(why)
+        }
+    };
+
+    let region = form_self_loop_region(&mem, None, BLIT, &RegionLimits::default())
+        .expect("DOOM's blit block is a self-loop and must fold");
+    eprintln!(
+        "blit region: entry={:#x} blocks={:#x?} insns={} live_in={:?} exits={:#x?} back={:?}",
+        region.entry(),
+        starts(&region),
+        region.insn_count(),
+        gprs(&region),
+        region.exit_targets(),
+        region.back_edges()
+    );
+
+    assert_eq!(region.entry(), BLIT);
+    assert_eq!(starts(&region), vec![BLIT], "one block, no exploration");
+    assert_eq!(region.insn_count(), 8, "mov/add/shr/mov/mov/add/sub/jne");
+    assert_eq!(
+        region.back_edges(),
+        &[(0, 0)],
+        "the block branches to its own entry"
+    );
+    assert_eq!(
+        region.exit_targets(),
+        vec![BLIT + 0x1A],
+        "the `jne`'s not-taken side, the loop's only way out"
+    );
+    assert!(
+        !region.exits()[0].is_taken(),
+        "an exit from a `jne` is its fallthrough, not its taken side"
+    );
+    assert_eq!(
+        gprs(&region),
+        vec![
+            Register::RAX,
+            Register::RDX,
+            Register::R8,
+            Register::R9,
+            Register::R10
+        ],
+        "5 live-in GPRs, zero XMM, no RFLAGS: the `mov`/`add` chain carries its own          state, which is what makes a one-block region cheap to enter"
+    );
+    assert_eq!(region.live_in().reg_count(), 5);
+    assert_eq!(
+        scc,
+        Some(RegionRefusal::Irreducible { at: BLIT + 0x1A }),
+        "the counterfactual: the SCC fold refuses the blit because the cycle it          cannot see through is at the `jne`'s fallthrough"
+    );
+}
+
 /// The fixture that matters: DOOM Retro's actual hot loop.
 ///
 /// `real_exes/doomretro/doomretro.exe` is not in every checkout, so the test skips
@@ -726,9 +1222,18 @@ struct PeImage {
 }
 
 impl PeImage {
+    /// DOOM Retro's own image.
     fn open() -> Option<Self> {
+        Self::named("doomretro.exe")
+    }
+
+    /// Any of the shipped PE modules, by file name — SDL2's scaled blit lives in
+    /// `SDL2.dll`, which is mapped at `0x1800_0000` rather than the exe's
+    /// `0x1400_0000`, and its bytes are not in `doomretro.exe`.
+    fn named(name: &str) -> Option<Self> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../real_exes/doomretro/doomretro.exe");
+            .join("../../real_exes/doomretro")
+            .join(name);
         let file = std::fs::read(&path).ok()?;
         let lfanew = u32::from_le_bytes(file.get(0x3C..0x40)?.try_into().ok()?) as usize;
         let coff = lfanew.checked_add(4)?;

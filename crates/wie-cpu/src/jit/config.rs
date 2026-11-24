@@ -130,6 +130,59 @@ pub(super) struct JitConfig {
     /// (`jit/lower/region.rs`, `jit/lower/region_emit.rs`). Off by default; see
     /// [`Self::region_enabled`] for why.
     region_enabled: bool,
+    /// `WIE_JIT_REGION_SELF_LOOP=1` — let region formation fold a **one-block
+    /// self-loop**: the block whose own terminator comes back to its entry
+    /// ([`form_self_loop_region`](crate::jit::lower::region)).
+    ///
+    /// Off by default. The reason is **not** a missing measurement, and it is
+    /// **not** a ratio either: it is that the one shape with a measured
+    /// per-instruction loss is the hot one. DOOM Retro's scaled blit
+    /// `0x1800d8fb0` is a self-loop, is 54.1 % of guest time, and emits **171 host
+    /// instructions per iteration as a region against 156 as a block**
+    /// (`docs/architecture/region-regalloc.md`). The entry hoist a region buys is
+    /// one the block prologue already does, so what is left is the region's
+    /// per-iteration flag round trip with a one-block body to amortise it over.
+    /// A knob whose only measured case is neutral-to-negative on the block that
+    /// matters is off for a stated reason.
+    ///
+    /// **What the timing actually says.** On a quiet host, `cargo build
+    /// --release` of this tree, four interleaved reps of
+    /// `micro-exes/out/long_loop.exe` (`0x140001040`, 100 M iterations), this is
+    /// **neutral within noise**: `emu_ms` 341.42 / 318.52 / 313.81 / 360.06
+    /// (median ~330) for the block path against 372.34 / 350.20 / 297.24 / 296.93
+    /// (median ~323) with `WIE_JIT_REGION=1 WIE_JIT_REGION_SELF_LOOP=1`, and every
+    /// arm shows `hops=0 block_entries=1 cache_hits=1` — nothing is exiting or
+    /// dispatching per iteration. Two earlier ratios are **superseded, not
+    /// deleted**, because each was true of the build that produced it and each is
+    /// paired with the commit that changed it: **6.3x** (`emu_ms` 205/210/214 vs
+    /// 1318/1319/1320 at `8febf9b`) before `4991913` hoisted the memory-probe span,
+    /// which made both arms cheaper and left **4.5x** (`emu_ms` 936.6 / 941.5 /
+    /// 952.8 / 944.6 with the knob on against 161.8 / 208.9 / 206.8 / 130.5 with
+    /// regions off, on the tree at `4991913`), before `c0e6934` stopped the entry
+    /// decoding a RFLAGS word that no hot instruction reads. `0x140001040` has
+    /// `live_in=[RSP]` and reads no flag, so that commit removes exactly the
+    /// per-entry `decompose_packed`/`flush_pending` pair the 4.5x was attributed
+    /// to — consistent with the ratio closing, not proof that it was the only term.
+    ///
+    /// The ratio is **load-sensitive**, and that matters more than either number:
+    /// the same three arms re-run on a host at load average 11-12 with a game
+    /// holding 131 % of a core give ~5.7x, and `WIE_JIT_SSA_FLAGS=0` removes only
+    /// ~15 % of the armed arm there (2155/2468 -> 1822/2278 ms) rather than the
+    /// 32 % it removed on the pre-hoist build. Under contention the excess is
+    /// therefore dominated by memory traffic — most consistent with spill traffic
+    /// for the 17-wide parameter file the region carries across the back edge
+    /// (hypothesis, not measured) — rather than by flag ALU. Measure this on an
+    /// idle host or not at all.
+    ///
+    /// Multi-block regions are *not* affected and are not gated: `chain_hops` goes
+    /// 56.8 ms -> 39.1 ms and 65307 dispatcher entries -> 1, `cpp_dtor` and
+    /// `crypt_hash` are parity.
+    ///
+    /// Turn it on to re-measure, not to ship: the two remaining wins are to thread
+    /// the flag state (the six i1s) as block parameters instead of the packed word,
+    /// and to narrow `STATE_PARAMS` to `live_in() union written` so the entry stops
+    /// loading slots the region never reads.
+    region_self_loop_enabled: bool,
     /// `WIE_JIT_MAP=<path>` — append `host_addr guest_start insns` for every
     /// compiled block, so an OS-level sample of this process can be attributed
     /// to guest code. Off by default.
@@ -365,6 +418,18 @@ impl JitConfig {
                         || v.eq_ignore_ascii_case("on")
                         || v.eq_ignore_ascii_case("yes")
             ),
+            // Self-loop regions (`WIE_JIT_REGION_SELF_LOOP=1`). Same plain
+            // opt-in parse, and the same reason it is not forced off under
+            // `cfg(test)`: the emitter's self-loop tests flip the per-engine
+            // latch instead (`JitShared::region_self_loop_force`).
+            region_self_loop_enabled: matches!(
+                std::env::var("WIE_JIT_REGION_SELF_LOOP"),
+                Ok(v)
+                    if v == "1"
+                        || v.eq_ignore_ascii_case("true")
+                        || v.eq_ignore_ascii_case("on")
+                        || v.eq_ignore_ascii_case("yes")
+            ),
             ir_dump_path: std::env::var_os("WIE_JIT_DUMP_IR")
                 .filter(|p| !p.is_empty())
                 .map(std::path::PathBuf::from),
@@ -411,6 +476,15 @@ impl JitConfig {
     #[must_use]
     pub(super) fn region_enabled(&self) -> bool {
         self.region_enabled
+    }
+
+    /// Whether a **one-block self-loop** may be folded into a region
+    /// (`WIE_JIT_REGION_SELF_LOOP`, default off — see the field's docs for what
+    /// that default encodes: neutral within noise on `long_loop`, and the hot
+    /// blit loses 171 vs 156 host instructions per iteration).
+    #[must_use]
+    pub(super) fn region_self_loop_enabled(&self) -> bool {
+        self.region_self_loop_enabled
     }
 
     /// Fingerprint of everything that changes the *emitted code* for the same
@@ -485,6 +559,12 @@ impl JitConfig {
         // same treatment `chain_enabled` gets — makes the two modes separate
         // files instead of one file with two meanings per key.
         h = mix(h, u64::from(self.region_enabled));
+        // Shape-affecting, not just perf-affecting: with self-loops on, the same
+        // RIP compiles to a region covering the block's own bytes with a native
+        // back edge; with them off, to a plain block. A persisted blob must not
+        // cross that line, or a `.code` file written by one setting replays the
+        // other setting's shape.
+        h = mix(h, u64::from(self.region_self_loop_enabled));
         // Build + host shape. `cfg!` keeps this a compile-time constant, so a
         // debug-built test process can never accept a release blob.
         h = mix(h, u64::from(cfg!(debug_assertions)));

@@ -397,6 +397,14 @@ pub struct JitShared {
     /// engine the test opened.
     #[cfg(test)]
     pub(super) region_force: AtomicBool,
+    /// Test-only latch for **one-block self-loop** regions, separate from
+    /// [`Self::region_force`] because the two are separately gated in shipping
+    /// builds: `WIE_JIT_REGION` and `WIE_JIT_REGION_SELF_LOOP`. A test that wants
+    /// the self-loop emitter must ask for it by name, which is also what makes
+    /// the gate itself testable (turn it off with `region_force` on and the same
+    /// RIP must come out a block).
+    #[cfg(test)]
+    pub(super) region_self_loop_force: AtomicBool,
 }
 
 impl JitShared {
@@ -471,6 +479,8 @@ impl JitShared {
             bg_force: AtomicBool::new(false),
             #[cfg(test)]
             region_force: AtomicBool::new(false),
+            #[cfg(test)]
+            region_self_loop_force: AtomicBool::new(false),
         }
     }
 
@@ -864,6 +874,31 @@ impl JitShared {
 
     #[cfg(not(test))]
     fn region_force_test(&self) -> bool {
+        let _ = self;
+        false
+    }
+
+    /// Whether a **one-block self-loop** may be folded into a region, for this
+    /// instance: the env opt-in (`WIE_JIT_REGION_SELF_LOOP=1`, off) or the test
+    /// latch.
+    ///
+    /// Independent of [`Self::region_enabled_here`] in both directions, on
+    /// purpose: the measured loss is specific to the one-block shape (DOOM's blit
+    /// at 171 host instructions per iteration against the block path's 156;
+    /// `long_loop` neutral within noise; `chain_hops` 1.45x *faster*), so "regions
+    /// are on" must not imply "self-loops are on" — that is the trap this split
+    /// removes.
+    pub(super) fn region_self_loop_here(&self) -> bool {
+        JitConfig::get().region_self_loop_enabled() || self.region_self_loop_force_test()
+    }
+
+    #[cfg(test)]
+    fn region_self_loop_force_test(&self) -> bool {
+        self.region_self_loop_force.load(Ordering::Relaxed)
+    }
+
+    #[cfg(not(test))]
+    fn region_self_loop_force_test(&self) -> bool {
         let _ = self;
         false
     }

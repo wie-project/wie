@@ -114,6 +114,16 @@ fn jit_with(base: u64, bytes: &[u8], region: bool) -> Box<JitCpu> {
     cpu.shared_jit()
         .region_force
         .store(region, std::sync::atomic::Ordering::Relaxed);
+    // Self-loops are gated separately in shipping builds
+    // (`WIE_JIT_REGION_SELF_LOOP`, default off — the shape loses on DOOM's blit,
+    // 171 host instructions per iteration against the block path's 156; neutral
+    // within noise on `long_loop`). These tests exist to keep the one-block
+    // *emitter* correct, so they ask for it explicitly;
+    // `a_self_loop_region_needs_its_own_knob` is the test that pins the gate
+    // itself.
+    cpu.shared_jit()
+        .region_self_loop_force
+        .store(region, std::sync::atomic::Ordering::Relaxed);
     // Register pressure is what makes a block path visible in `chain.hops`; keep
     // the chain machinery at its default so the hop counter is meaningful.
     cpu
@@ -922,13 +932,13 @@ fn a_fold_from_an_outside_latch_keeps_the_headers_earned_tier() {
 fn self_loop_shapes_fold_or_refuse_without_panicking() {
     // `jmp $` — an unconditional one-instruction infinite loop: a one-block region
     // with **no exit at all**, so the emitted function's only exits are its
-    // invalidation guard. Compile-only (running it is an infinite loop by design).
+    // invalidation guard.
     let jmp_self = [0xEB_u8, 0xFE];
     // `jne $` — conditional, both a taken side and a fallthrough out.
     let jne_self = [0x75_u8, 0xFE, 0x0F, 0x0B];
-    for (base, bytes) in [
-        (SELF_LOOP_ENTRY + 0x2000, &jmp_self[..]),
-        (SELF_LOOP_ENTRY + 0x3000, &jne_self[..]),
+    for (name, base, bytes) in [
+        ("jmp $", SELF_LOOP_ENTRY + 0x2000, &jmp_self[..]),
+        ("jne $", SELF_LOOP_ENTRY + 0x3000, &jne_self[..]),
     ] {
         let mut cpu = jit_with(base, bytes, true);
         // `try_compile` is the promotion entry point: whatever it decides, it must
@@ -936,9 +946,155 @@ fn self_loop_shapes_fold_or_refuse_without_panicking() {
         let compiled = cpu.try_compile(base).expect("a lowerable block");
         assert!(
             compiled.insn_count >= 1,
-            "shape at {base:#x} compiled to nothing"
+            "{name} at {base:#x} compiled to nothing"
+        );
+        assert_eq!(
+            (compiled.guest_start, compiled.guest_end),
+            (base, base + 2),
+            "{name}: keyed at its own header, owning its own two bytes"
         );
     }
+}
+
+/// **The gate's wiring.** A one-block self-loop region lives behind its own knob
+/// — `WIE_JIT_REGION_SELF_LOOP`, default off — and `WIE_JIT_REGION` alone must
+/// not arm it. The reason it is off is the *hot* block: DOOM's scaled blit
+/// `0x1800d8fb0` emits 171 host instructions per iteration as a region against
+/// 156 as a block. Timed cleanly, `long_loop` is neutral within noise (median
+/// ~323 ms armed vs ~330 gated, quiet host, `hops=0`, `block_entries=1`,
+/// `cache_hits=1` in every arm — the back edge is native and the loop never
+/// leaves the frame); the 4.5x at `4991913` and 6.3x before that commit's
+/// memory-probe hoist are superseded builds.
+/// `WIE_JIT_REGION_SELF_LOOP`, default off — and `WIE_JIT_REGION` alone must not
+/// arm it.
+///
+/// This pins the latch wiring; the *decision* it feeds is pinned one layer down,
+/// in `region_tests::the_self_loop_gate_is_the_only_thing_between_a_self_loop_and_a_region`,
+/// where `form_region(.., false)` can be shown to return the SCC answer. Both
+/// halves are needed: this one catches "the flag is read but not passed", that
+/// one catches "the flag is passed but ignored".
+#[test]
+fn a_self_loop_region_needs_its_own_knob() {
+    let base = SELF_LOOP_ENTRY + 0x6000;
+    let bytes = [0x48u8, 0xFF, 0xC9, 0x75, 0xFC]; // sub rcx,1 ; jne $-2
+
+    // `WIE_JIT_REGION` alone: regions on, self-loops off.
+    let mut gated = jit_with(base, &bytes, true);
+    gated
+        .shared_jit()
+        .region_self_loop_force
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        gated.shared_jit().region_enabled_here(),
+        "precondition: the region knob is on"
+    );
+    assert!(
+        !gated.shared_jit().region_self_loop_here(),
+        "the self-loop gate must stay closed with only WIE_JIT_REGION armed"
+    );
+    let block = gated.try_compile(base).expect("the block still compiles");
+    assert!(block.insn_count >= 1, "and it is still a lowerable block");
+
+    // Both latches: the one-block region, which the emitter must keep correct
+    // even while the policy keeps it off by default.
+    let mut armed = jit_with(base, &bytes, true);
+    assert!(
+        armed.shared_jit().region_self_loop_here(),
+        "the latch is what the pipeline reads, so it must be observable here"
+    );
+    let region = armed.try_compile(base).expect("the block still compiles");
+    assert_eq!(
+        region.insn_count, block.insn_count,
+        "the same guest instructions either way — a shape decision, not a \
+         coverage one"
+    );
+    assert!(region.func_id.is_some(), "still a real Cranelift function");
+}
+
+/// **What this pair of shapes cannot tell you**, and why that is the interesting
+/// part.
+///
+/// A one-block region and the block path's own self-loop block are the *same*
+/// emitted shape: one Cranelift function, one internal native back edge, a trip
+/// charge and an invalidation guard on it (`emit::lower_self_loop_term` emits the
+/// same three things the region's back edge does). So `CompiledBlock` metadata is
+/// byte-for-byte identical across the knob for `jmp $`, and an assertion that
+/// claimed otherwise would be a fake one.
+///
+/// What a one-block region adds is therefore *not* a removed hop — it is the two
+/// things the region entry buys: the pin/refill descriptors hoisted **once per
+/// entry** instead of probed per memory access (39.8 % of the SDL2 blit's inner
+/// instructions are memory-probe guard chains), and the guest register file carried
+/// as SSA block parameters instead of `JitCtx` slots. That is why the knob's frame
+/// numbers were inconclusive while its compile-time numbers were not: it pays for
+/// *entry* work, and a self-loop is entered once per call, not once per iteration.
+#[test]
+fn a_one_block_region_is_the_same_shape_as_a_self_loop_block() {
+    let base = SELF_LOOP_ENTRY + 0x5000;
+    let bytes = [0xEB_u8, 0xFE]; // jmp $
+    let mut shapes = Vec::new();
+    for region in [true, false] {
+        let mut cpu = jit_with(base, &bytes, region);
+        let compiled = cpu.try_compile(base).expect("a lowerable block");
+        shapes.push((
+            compiled.insn_count,
+            compiled.guest_start,
+            compiled.guest_end,
+            compiled.tier,
+        ));
+    }
+    assert_eq!(
+        shapes[0], shapes[1],
+        "a one-block region and a self-loop block are indistinguishable here — by          design, not by accident (see this test's doc): the block path already          emits an in-frame native back edge for a self-loop"
+    );
+}
+
+/// The **no-exit** case: `jmp $`. A region whose only successor is itself can only
+/// be left by the invalidation guard on its back edge, and that is exactly the
+/// escape the block path's in-frame self-loop has — so a stale generation must get
+/// a guest out of both arms, from the same RIP, in the same number of retired
+/// instructions.
+///
+/// Making the guard stale *before* the run is what keeps this a finite test: the
+/// compiled frame has `invalidate_gen` baked at compile time, so one dispatch runs
+/// the loop's one iteration, sees the mismatch on the back edge, writes the file
+/// back, points the dispatcher at the header and returns. Without that bump a
+/// `jmp $` region (and a `jmp $` block) simply never returns — which is the honest
+/// behaviour of an infinite guest loop and not something to assert on with a
+/// timeout.
+#[test]
+fn a_no_exit_self_loop_is_stopped_by_the_invalidation_guard_in_both_arms() {
+    let base = SELF_LOOP_ENTRY + 0x4000;
+    let mut retired = Vec::new();
+    let mut rips = Vec::new();
+    for region in [true, false] {
+        let mut cpu = jit_with(base, &[0xEB, 0xFE], region); // jmp $
+        compile_and_install(cpu.as_mut(), base);
+        // Stale generation: the guard this frame baked is no longer current.
+        cpu.shared
+            .invalidate_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        let before = cpu.stats().exec.jit_insns;
+        // One dispatch, so an escape that did not happen cannot spin the suite.
+        cpu.run_until_stop(base, 0, 0, 1, 0, 0)
+            .expect("one dispatch");
+        rips.push(cpu.snapshot_thread_context().rip);
+        retired.push(cpu.stats().exec.jit_insns - before);
+    }
+    assert_eq!(
+        rips,
+        vec![base, base],
+        "both arms must leave the infinite loop pointed at its own header, which \
+         is where the dispatcher re-enters — the trip is charged and the guest \
+         makes progress rather than being silently dropped"
+    );
+    assert_eq!(
+        retired,
+        vec![2, 2],
+        "and both must charge exactly the same work: the trip counter is seeded \
+         with the block's static length (1 `jmp`) and bumped once by the back \
+         edge, so 2 — identical in both arms, which is the parity claim"
+    );
 }
 
 /// A self-loop whose body **faults** must leave the region with the guest's own

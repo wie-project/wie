@@ -11,9 +11,22 @@
 //!
 //! This module is the layer underneath region compilation: it answers *which
 //! blocks form one loop, what does that region read and write, and where does it
-//! leave to*. It emits no IR, forms no Cranelift function, allocates no code and
-//! is not wired into the dispatcher. It is a scaffold: nothing here changes what
-//! the emulator executes, so it has no measured effect.
+//! leave to*. It emits no IR: [`super::region_emit`] consumes the [`LoopRegion`]
+//! it describes and emits one Cranelift function from it, behind
+//! `WIE_JIT_REGION` (default off).
+//!
+//! # Two formations, one shape
+//!
+//! [`form_loop_region`] folds the **strongly connected component** of the start —
+//! the general answer, and the one to reach for first, because it takes the whole
+//! loop. [`form_self_loop_region`] folds the **single block** whose own terminator
+//! comes back to its entry, and exists for exactly the shapes the SCC fold cannot
+//! express: a self-loop nested inside a larger loop has a cycle in its component
+//! that does not pass through the entry, so an SCC fold refuses it `Irreducible`.
+//! Both are refused-safe by construction — neither can return a partial region —
+//! and `region_emit::form_region` tries them in that order (see its docs for why
+//! the SCC fold must get first refusal: a block that branches to itself can also
+//! sit on a bigger foldable cycle, and a region must not shrink).
 //!
 //! # What a region is
 //!
@@ -84,8 +97,10 @@
 //!    means the region is either an irreducible control-flow graph (several
 //!    headers, no dominant header — the classic `A→{B,C}`, `{B,C}→D`, `D→{B,C}`
 //!    shape) or a nested loop whose header is not our entry. Both are refused
-//!    here; folding them is a later round with its own argument. Pinned by
-//!    `an_irreducible_cfg_is_refused`.
+//!    *by this formation*; the second is what [`form_self_loop_region`] exists for
+//!    when the entry is itself the nested loop's header. Pinned by
+//!    `an_irreducible_cfg_is_refused` and
+//!    `a_nested_self_loop_is_irreducible_for_the_scc_fold_and_a_region_for_the_self_loop_form`.
 //!
 //!    The closely related rule from the brief — *no edge from outside the region
 //!    into a non-entry block* — is **provable rather than checkable** here, and
@@ -176,16 +191,14 @@
 //!
 //! # Status
 //!
-//! Scaffold. [`form_loop_region`] is called by tests only; `lower/mod.rs` carries a
-//! single `// REGION-COMPILE: hook here` marker where the emitter will attach. No
-//! measurement, no speedup, no change in behaviour.
-
-// The whole surface is consumed by the region emitter, which does not exist yet,
-// so in a non-test build every item here is unreachable. Same precedent as
-// `wie-winapi`'s `console::pump`: state the exception once, at the module level,
-// and delete it when the emitter lands and these items are used for real. (It is
-// an `expect`, so wiring the emitter in and leaving this here turns into an
-// `unfulfilled_lint_expectation` failure — which is the reminder we want.)
+//! Live but off by default (`WIE_JIT_REGION`): [`form_loop_region`] and
+//! [`form_self_loop_region`] are called from the pipeline at three seams (a hot
+//! `try_compile`, a latch's `backward_targets`, and the boot/baseline promotion of
+//! a loop header), and [`super::region_emit`] compiles what they return. With the
+//! knob off no formation is attempted and the per-block path is untouched. The
+//! default is off because the frame measurement is still inconclusive on this
+//! host — the compile-time effect (4x fewer host compiles per DOOM run) is
+//! measured, the frame effect is not.
 
 use super::super::block::{BlockKind, BlockTerm, DecodedInsn, decode_pure_gpr_block};
 use super::opclass;
@@ -577,6 +590,22 @@ pub(super) enum RegionRefusal {
     /// cycle's target): an irreducible loop, or a nested loop whose header is not
     /// this region's entry. Either way there is no single header to fold.
     Irreducible { at: u64 },
+    /// The region formed, but it is a **one-block self-loop** and that shape is
+    /// gated off (`WIE_JIT_REGION_SELF_LOOP`, default off).
+    ///
+    /// A policy refusal, not a soundness one: the emitted region is correct, and
+    /// where it has been timed cleanly it is **neutral within noise** —
+    /// `long_loop`, 100 M iterations, `emu_ms` median ~323 armed against ~330
+    /// gated, quiet host. What keeps the gate closed is the shape that matters:
+    /// DOOM's scaled blit `0x1800d8fb0` emits 171 host instructions per iteration
+    /// as a region against 156 as a block and is 54.1 % of guest time
+    /// (`docs/architecture/region-regalloc.md`), because a one-block body has
+    /// nothing to amortise the per-block flag round trip and the 17-wide
+    /// `STATE_PARAMS` traffic over. Two superseded ratios describe older builds,
+    /// not this one: 4.5x on the tree at `4991913` and 6.3x before that commit's
+    /// memory-probe hoist, both closed by that hoist and by `c0e6934`. `at` is the
+    /// header.
+    SelfLoopGatedOff { at: u64 },
 }
 
 /// One instruction's effect on guest state, as bitmasks.
@@ -997,6 +1026,134 @@ pub(super) fn form_loop_region(
             .into_iter()
             .map(|(from, to)| (local_of[from], local_of[to]))
             .collect(),
+    };
+    region.live_in = analyze_live_ins(&region);
+    Ok(region)
+}
+
+/// Form the **one-block** region at `start`, when `start`'s own terminator
+/// branches back to `start`'s entry.
+///
+/// This is [`form_loop_region`]'s sibling, not a loosening of it. The SCC form
+/// folds "the strongly connected component containing the start", and refuses
+/// ([`RegionRefusal::Irreducible`]) as soon as that component holds a cycle which
+/// does not pass through the entry — which is exactly what a **self-loop inside
+/// any larger loop** looks like, because the block's fallthrough leads into the
+/// rest of the loop and the rest of the loop comes back. Two of the hottest
+/// blocks in the corpus are that shape and are therefore refused by an SCC fold
+/// that is otherwise perfectly correct:
+///
+/// * DOOM Retro's scaled-blit block `0x1800d8fb0` (54.1 % of guest time) — refused
+///   as `Irreducible { at: 0x1800d8fca }`;
+/// * `micro-exes/long_loop`'s inner loop `0x140001040` — refused as
+///   `Irreducible { at: 0x140001075 }`.
+///
+/// Their **component** is not a foldable loop. The **block** is: its terminator
+/// marches straight back to its own entry, so the native back edge is that block's
+/// own branch, and every other successor slot is an exit. Nothing else is needed —
+/// no exploration, no SCC, no reverse postorder, and therefore no way to be
+/// irreducible.
+///
+/// # What it does *not* relax
+///
+/// Every per-block soundness rule still applies, through the same
+/// [`check_block`] the SCC form uses: a string op, an address the refill probe
+/// cannot be trusted with, a `call` terminator, a `ret`. The bounds are the same
+/// [`RegionLimits`] fields, read for a one-block region (`max_insns`, and
+/// `max_exit_targets` against the at most two slots a terminator has).
+///
+/// # No exit at all
+///
+/// `jmp $` — a block whose only successor is itself — forms a region with an
+/// **empty** exit set. That is not a special case in the emitter: the frame's only
+/// return is the back edge's invalidation guard, which is the same escape the block
+/// path's in-frame self-loop has (`emit::lower_self_loop_term` charges the trip and
+/// checks the generation, then jumps). What that means for a guest is that such a
+/// loop can only be stopped by invalidation or by the host, in either path — and
+/// that is what `a_no_exit_self_loop_region_is_stopped_by_invalidation` pins.
+pub(super) fn form_self_loop_region(
+    mem: &GuestMemory,
+    hooks: Option<&HookWindow>,
+    start: u64,
+    limits: &RegionLimits,
+) -> Result<LoopRegion, RegionRefusal> {
+    let BlockKind::Pure {
+        insns,
+        end_rip,
+        bytes_len: _,
+        term,
+    } = decode_pure_gpr_block(mem, hooks, start)
+    else {
+        // Not a lowerable block, or an address the guest asked to stop at: the
+        // same answer the SCC form gives, for the same reason.
+        return Err(RegionRefusal::EntryNotLowerable);
+    };
+
+    // The whole question: does this block's own terminator come back to it?
+    // `block_successors` is the same slot order every other consumer uses, so
+    // "slot 0 is the branch target, slot 1 a fallthrough" holds here too.
+    let (slots, len) = block_successors(term, end_rip);
+    if !slots[..len].contains(&start) {
+        // Not a self-loop: the precondition, not a defect. `form_region` falls
+        // through to the SCC form on exactly this answer.
+        return Err(RegionRefusal::NoBackEdge);
+    }
+
+    if insns.len() > limits.max_insns {
+        return Err(RegionRefusal::TooManyInsns {
+            insns: insns.len(),
+            limit: limits.max_insns,
+        });
+    }
+    // Soundness rules 1–3 for the one block, through the SCC form's own check.
+    check_block(&insns, term)?;
+
+    let mut exits: Vec<RegionExit> = Vec::new();
+    for (slot, &va) in slots[..len].iter().enumerate() {
+        if va == start {
+            continue;
+        }
+        exits.push(RegionExit {
+            target: va,
+            from: 0,
+            taken: slot == 0 && term.is_some(),
+        });
+    }
+    let mut targets: Vec<u64> = Vec::new();
+    for exit in &exits {
+        if !targets.contains(&exit.target) {
+            targets.push(exit.target);
+        }
+    }
+    if targets.len() > limits.max_exit_targets {
+        return Err(RegionRefusal::TooManyExitTargets {
+            targets: targets.len(),
+            limit: limits.max_exit_targets,
+        });
+    }
+
+    let mut region = LoopRegion {
+        entry: start,
+        blocks: vec![RegionBlock {
+            start,
+            first_insn: 0,
+            insn_count: insns.len(),
+            term,
+            end_rip,
+        }],
+        insns: insns
+            .into_iter()
+            .map(|decoded| GuestInsn {
+                rip: decoded.instr.ip(),
+                insn: decoded.instr,
+            })
+            .collect(),
+        live_in: LiveIns::default(),
+        exits,
+        // The cycle this region is: the block's own back edge, which is the edge
+        // the emitter turns into a native `jump` instead of a dispatcher round
+        // trip. Formation guarantees it exists (the check above).
+        back_edges: vec![(0, 0)],
     };
     region.live_in = analyze_live_ins(&region);
     Ok(region)

@@ -1318,6 +1318,7 @@ impl JitCpu {
                         &chain,
                         inv_gen,
                         tier,
+                        self.shared.region_self_loop_here(),
                     )
                 })
         };

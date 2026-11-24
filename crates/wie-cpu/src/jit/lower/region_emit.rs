@@ -149,7 +149,9 @@ use super::err::{LowerError, noted};
 use super::flags::{FlagState, decompose_packed, iconst_u64};
 use super::insn::{PendingFlags, flush_pending, lower_insn};
 use super::mem::{hoist_pin_slot, hoist_refill};
-use super::region::{GuestInsn, LoopRegion, RegionLimits, RegionRefusal, form_loop_region};
+use super::region::{
+    GuestInsn, LoopRegion, RegionLimits, RegionRefusal, form_loop_region, form_self_loop_region,
+};
 use super::{
     ChainLookup, CompiledBlock, GUEST_DATA_REGION_USER_ID, JitCtx, OFF_INV_GEN_BAKED,
     OFF_INV_GEN_PTR, OFF_RFLAGS, OFF_RIP, dump_ir_if_requested, dump_map_if_requested, flag_cond,
@@ -186,12 +188,83 @@ const ALL_GPRS: [bool; 16] = [true; 16];
 /// The one thing `pipeline.rs` needs before it decides whether to compile a
 /// region: `Err` means "compile a single block as usual", and the payload names
 /// the rule that refused, so a refusal can be reported rather than guessed at.
+///
+/// Two formations, in this order:
+///
+/// 1. [`form_loop_region`] — the SCC fold, which is the *general* answer and must
+///    get first refusal. A block whose terminator comes back to itself can still
+///    sit on a bigger foldable cycle (`B: jne C; C: jmp B` folds as the two-block
+///    region `{B, C}`), and formation's rule that a region must not shrink makes
+///    the bigger fold the right one whenever it exists. Trying the one-block form
+///    first would silently take `{B}` and leave `C` on the block path.
+/// 2. [`form_self_loop_region`] — the rescue, for exactly the shapes the SCC fold
+///    *cannot* express. A self-loop nested inside a larger loop has, by
+///    construction, a cycle in its component that does not pass through the entry,
+///    so the SCC fold refuses `Irreducible`. That is the shape of the two hottest
+///    blocks in the corpus: DOOM's scaled blit `0x1800d8fb0` (54.1 % of guest
+///    time, refused `Irreducible { at: 0x1800d8fca }`) and `long_loop`'s inner
+///    loop `0x140001040` (refused `Irreducible { at: 0x140001075 }`).
+///
+/// `allow_self_loop` gates a one-block region (`WIE_JIT_REGION_SELF_LOOP`,
+/// default **off**) — the *shape*, whichever formation produced it. A one-block
+/// self-loop carries a per-iteration tax the shape cannot amortise and **loses on
+/// the hot block**: DOOM's blit `0x1800d8fb0` is 171 host instructions per
+/// iteration as a region against 156 as a block, at 54.1 % of guest time. It is
+/// neutral within noise on `long_loop` (median ~323 armed vs ~330 gated, quiet
+/// host); the 4.5x at `4991913` and 6.3x before its probe hoist are superseded
+/// builds, not this one. So it is opt-in while multi-block regions — which are
+/// neutral to 1.45x *faster* — are not. With the gate closed this function is
+/// what it was before the one-block form existed.
+///
+/// Which refusal gets reported when both fail: the self-loop form's, unless it
+/// answered [`RegionRefusal::NoBackEdge`] — "this block does not branch to
+/// itself" is a precondition failure and says nothing about the loop, so the SCC
+/// fold's answer is what the caller wants. Every other self-loop refusal comes
+/// from the *same* checks the SCC form runs ([`check_block`], the same bounds) and
+/// names the actual defect: a self-loop with a call inside reports
+/// [`RegionRefusal::Call`], where the SCC fold would only get as far as
+/// `Irreducible` about the enclosing loop.
 pub(super) fn form_region(
     mem: &GuestMemory,
     hooks: Option<&HookWindow>,
     rip: u64,
+    allow_self_loop: bool,
 ) -> Result<LoopRegion, RegionRefusal> {
-    form_loop_region(mem, hooks, rip, &RegionLimits::default())
+    let limits = RegionLimits::default();
+    let region = match form_loop_region(mem, hooks, rip, &limits) {
+        Ok(region) => region,
+        Err(scc) => match form_self_loop_region(mem, hooks, rip, &limits) {
+            Ok(region) => region,
+            // Not a self-loop: the precondition, not a defect, and the SCC fold's
+            // answer is the diagnosis of the loop as a whole.
+            Err(RegionRefusal::NoBackEdge) => return Err(scc),
+            // A self-loop refused for a real reason. It reached checks the SCC
+            // fold never got to, so its refusal is the specific one.
+            Err(reason) => return Err(reason),
+        },
+    };
+    // The one-block shape is gated on the **shape**, not on which formation
+    // produced it — `WIE_JIT_REGION_SELF_LOOP` off (the default) refuses it
+    // whichever way it was found.
+    //
+    // That distinction is not pedantic: the SCC fold already accepts a *pure*
+    // self-loop (`block_count == 1 && succ[0].contains(0)`), so gating only the
+    // new formation would leave the trap half-open. Measured on a bounded DOOM
+    // run with the gate closed but keyed on the formation: 116 of 200 regions
+    // were still one-block. A one-block region carries a per-iteration flag
+    // round trip (~32 CLIF ops: `decompose_packed` at every block entry,
+    // `flush_pending` at every block exit) and the register allocator's spill
+    // traffic for the 17-wide `STATE_PARAMS`; a loop whose body *is* one block
+    // has nothing to amortise that over, and on the block that matters it loses:
+    // DOOM's blit `0x1800d8fb0` is 171 host instructions per iteration as a
+    // region against 156 as a block. (`long_loop` is neutral within noise —
+    // median ~323 ms armed vs ~330 gated on a quiet host; the 4.5x at `4991913`
+    // and 6.3x before that commit's probe hoist are superseded builds.)
+    // Multi-block regions are untouched — `chain_hops` is 1.45x *faster*.
+    if !allow_self_loop && region.blocks().len() == 1 {
+        return Err(RegionRefusal::SelfLoopGatedOff { at: region.entry() });
+    }
+    Ok(region)
 }
 
 /// Where a region block's edge goes.
@@ -639,6 +712,12 @@ fn emit_term(
 /// satisfy the borrow checker, not an ordering rule. So a thread blocked on the
 /// engine mutex holds nothing, and a writer blocked on `mem` holds nothing:
 /// neither can close a cycle.
+// One argument per thing the caller already holds: the engine, the guest memory
+// guard, the hook window, the RIP, the chain lookup, the generation bake, the
+// tier and the self-loop gate. Bundling them would be a struct built at the one
+// call site, and every one of them is already borrowed there — same shape and the
+// same allowance as `emit_term` / `lower_term`.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::jit) fn try_compile_region(
     eng: &mut IsaEngine,
     mem: &GuestMemory,
@@ -647,8 +726,9 @@ pub(in crate::jit) fn try_compile_region(
     chain: &dyn ChainLookup,
     inv_gen_baked: u64,
     tier: OptTier,
+    allow_self_loop: bool,
 ) -> Option<CompiledBlock> {
-    let region = match form_region(mem, hooks, rip) {
+    let region = match form_region(mem, hooks, rip, allow_self_loop) {
         Ok(region) => region,
         Err(why) => {
             note_region_event("not a region", rip, &format_args!("{why:?}"));
@@ -1184,7 +1264,7 @@ mod tests {
             eprintln!("skip: real_exes/doomretro/doomretro.exe not present");
             return;
         };
-        let region = form_region(&mem, None, ENTRY).expect("DOOM's hot loop forms a region");
+        let region = form_region(&mem, None, ENTRY, true).expect("DOOM's hot loop forms a region");
 
         // The description this emitter is handed (also pinned by `region_tests`).
         assert_eq!(region.entry(), ENTRY);
