@@ -10,9 +10,40 @@ use crate::helpers::{
 // ---------------------------------------------------------------------------
 // File-menu action repros (real_exes/notepad.exe): the interactive host
 // delivery is proven (MenuEvent → WM_COMMAND works, Exit reacts); these pin
-// whether the guest ACTIONS complete. CMD ids verified against the RT_MENU
-// 0x201 template: New=256, New Window=257, Open=258, Save=259, Save As=260.
+// whether the guest ACTIONS complete. CMD ids come from the guest's own
+// header, real_exes/.rnotepad-src/notepad_res.h.
 // ---------------------------------------------------------------------------
+
+/// RNotepad's menu command ids (real_exes/.rnotepad-src/notepad_res.h).
+const CMD_OPEN: u32 = 0x102;
+const CMD_FONT: u32 = 0x140;
+const CMD_EXIT: u32 = 0x108;
+
+/// The guest's own menu command with this id, read out of the mirrored tree.
+///
+/// Menu titles are localized to the HOST UI language (`lang.rs` mirrors
+/// `AppleLanguages[0]` into RT_MENU selection), so a German macOS gets
+/// "Öffnen..." / "Beenden". Tests must therefore locate a command by its
+/// locale-independent id, not by its English spelling. Panics with the tree
+/// when the id is absent, so a regression names the failure.
+fn menu_command_id(handle: &wie_runtime::GuestHandle, want: u32) -> u32 {
+    let tree = handle.window_menu_items();
+    let found = tree
+        .iter()
+        .flat_map(|top| top.children.iter())
+        .find(|child| child.id == want);
+    match found {
+        Some(child) => {
+            assert!(
+                !child.title.trim().is_empty(),
+                "menu command {want:#x} came back with an empty title (the macOS \
+                 bar renders it)"
+            );
+            child.id
+        }
+        None => panic!("the menu tree must contain command {want:#x}; tree is {tree:?}"),
+    }
+}
 
 /// WM_COMMAND(CMD_OPEN) with the interactive file dialog enabled must make
 /// the guest call GetOpenFileNameW and BUILD the host dialog (a
@@ -25,7 +56,7 @@ fn notepad_file_open_builds_interactive_dialog() {
     use wie_runtime::EntryTraceTermination;
 
     const WM_COMMAND: u32 = 0x0111;
-    const CMD_OPEN: u32 = 258;
+    const CMD_OPEN: u32 = 0x102;
 
     let mut session =
         wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
@@ -134,17 +165,9 @@ fn notepad_font_dialog_survives_control_click() {
     pump_until_windows_ready(&mut session);
 
     let main = session.first_guest_window_handle().unwrap_or(0);
-    // The Format > Font command id (the guest's own menu tree, like the bar).
-    let font_id = handle
-        .window_menu_items()
-        .iter()
-        .find_map(|top| {
-            top.children
-                .iter()
-                .find(|child| child.title.to_lowercase().contains("font"))
-                .map(|child| child.id)
-        })
-        .unwrap_or(0);
+    // The Format > Font command (the guest's own menu tree, like the bar) —
+    // located by id, since the title is localized to the host UI language.
+    let font_id = menu_command_id(&handle, CMD_FONT);
     assert_ne!(font_id, 0, "the Format menu must contain a Font command");
 
     // The font dialog is centered in the owner; its face sample is 5 px in
@@ -407,7 +430,7 @@ fn notepad_file_dialog_paints_into_the_owner_surface() {
     let _suite = gui_suite_serialize();
 
     const WM_COMMAND: u32 = 0x0111;
-    const CMD_OPEN: u32 = 258;
+    const CMD_OPEN: u32 = 0x102;
     // The file dialog is 360×200 (comdlg32 FILE_DLG_CX/CY), centered in the
     // owner's client. The sample is dialog-local (3,33) — the BTNFACE face
     // margin clear of the 1 px border, the EDIT (8,8,344,22) and the LISTBOX
@@ -556,20 +579,10 @@ fn notepad_file_dialog_close_then_first_exit_click_exits() {
     pump_until_windows_ready(&mut session);
 
     let main = session.first_guest_window_handle().unwrap_or(0);
-    let tree = handle.window_menu_items();
-    // The File menu's Open and Exit ids (like the menu-bar decode does).
-    let open_id = tree
-        .iter()
-        .flat_map(|top| top.children.iter())
-        .find(|child| child.title.to_lowercase().contains("pen"))
-        .map(|child| child.id)
-        .unwrap_or(0);
-    let exit_id = tree
-        .iter()
-        .flat_map(|top| top.children.iter())
-        .find(|child| child.title.to_lowercase().contains("xit"))
-        .map(|child| child.id)
-        .unwrap_or(0);
+    // The File menu's Open and Exit ids (like the menu-bar decode does),
+    // located by id — the German titles are "Öffnen" / "Beenden".
+    let open_id = menu_command_id(&handle, CMD_OPEN);
+    let exit_id = menu_command_id(&handle, CMD_EXIT);
     assert_ne!(open_id, 0, "the File menu must contain an Open command");
     assert_ne!(exit_id, 0, "the File menu must contain an Exit command");
 
@@ -681,19 +694,10 @@ fn notepad_modal_dialog_exit_survives_run_windowed_pump() {
     pump_until_windows_ready(&mut session);
 
     let main = session.first_guest_window_handle().unwrap_or(0);
-    let tree = handle.window_menu_items();
-    let open_id = tree
-        .iter()
-        .flat_map(|top| top.children.iter())
-        .find(|child| child.title.to_lowercase().contains("pen"))
-        .map(|child| child.id)
-        .unwrap_or(0);
-    let exit_id = tree
-        .iter()
-        .flat_map(|top| top.children.iter())
-        .find(|child| child.title.to_lowercase().contains("xit"))
-        .map(|child| child.id)
-        .unwrap_or(0);
+    // Open and Exit located by id — the titles are localized to the host UI
+    // language (German: "Öffnen" / "Beenden").
+    let open_id = menu_command_id(&handle, CMD_OPEN);
+    let exit_id = menu_command_id(&handle, CMD_EXIT);
     assert_ne!(open_id, 0, "the File menu must contain an Open command");
     assert_ne!(exit_id, 0, "the File menu must contain an Exit command");
 
@@ -779,7 +783,7 @@ fn notepad_font_dialog_ok_click_then_first_exit_exits() {
     const WM_LBUTTONDOWN: u32 = 0x0201;
     const WM_LBUTTONUP: u32 = 0x0202;
     const MK_LBUTTON: u64 = 0x0001;
-    const CMD_FONT: u32 = 320; // Format→Font...
+    // CMD_FONT is the module-level Format→Font id.
 
     let mut session =
         wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
@@ -791,13 +795,7 @@ fn notepad_font_dialog_ok_click_then_first_exit_exits() {
     pump_until_windows_ready(&mut session);
 
     let main = session.first_guest_window_handle().unwrap_or(0);
-    let tree = handle.window_menu_items();
-    let exit_id = tree
-        .iter()
-        .flat_map(|top| top.children.iter())
-        .find(|child| child.title.to_lowercase().contains("xit"))
-        .map(|child| child.id)
-        .unwrap_or(0);
+    let exit_id = menu_command_id(&handle, CMD_EXIT);
     assert_ne!(exit_id, 0, "the File menu must contain an Exit command");
 
     // Stage 1: Format→Font builds the font dialog and parks the modal loop.
@@ -1037,7 +1035,7 @@ fn notepad_file_open_native_bridge_accept_reads_picked_file() {
     use wie_runtime::EntryTraceTermination;
 
     const WM_COMMAND: u32 = 0x0111;
-    const CMD_OPEN: u32 = 258;
+    const CMD_OPEN: u32 = 0x102;
 
     let bottle =
         std::env::temp_dir().join(format!("wie-ofn-bridge-open-bottle-{}", std::process::id()));
@@ -1165,7 +1163,7 @@ fn notepad_file_open_large_picked_file_loads_in_full() {
     use wie_runtime::EntryTraceTermination;
 
     const WM_COMMAND: u32 = 0x0111;
-    const CMD_OPEN: u32 = 258;
+    const CMD_OPEN: u32 = 0x102;
 
     let bottle =
         std::env::temp_dir().join(format!("wie-ofn-large-open-bottle-{}", std::process::id()));
@@ -1287,7 +1285,7 @@ fn notepad_file_save_then_open_roundtrips_content() {
     const WM_COMMAND: u32 = 0x0111;
     const WM_CHAR: u32 = 0x0102;
     const CMD_SAVE: u32 = 259;
-    const CMD_OPEN: u32 = 258;
+    const CMD_OPEN: u32 = 0x102;
 
     let bottle =
         std::env::temp_dir().join(format!("wie-ofn-roundtrip-bottle-{}", std::process::id()));

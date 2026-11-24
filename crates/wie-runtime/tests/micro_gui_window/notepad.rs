@@ -5,6 +5,36 @@
 
 use crate::helpers::{gui_suite_serialize, pump_until_windows_ready, real_exe};
 
+/// RNotepad's menu command ids (real_exes/.rnotepad-src/notepad_res.h).
+const CMD_EXIT: u32 = 0x108;
+const CMD_STATUSBAR: u32 = 0x150;
+
+/// The guest's own menu command with this id, read out of the mirrored tree.
+///
+/// Menu titles are localized to the HOST UI language (`lang.rs` mirrors
+/// `AppleLanguages[0]` into RT_MENU selection), so a German macOS gets
+/// "Beenden" / "Statusleiste". Tests must therefore locate a command by its
+/// locale-independent id, not by its English spelling. Panics with the tree
+/// when the id is absent, so a regression names the failure.
+fn menu_command_id(handle: &wie_runtime::GuestHandle, want: u32) -> u32 {
+    let tree = handle.window_menu_items();
+    let found = tree
+        .iter()
+        .flat_map(|top| top.children.iter())
+        .find(|child| child.id == want);
+    match found {
+        Some(child) => {
+            assert!(
+                !child.title.trim().is_empty(),
+                "menu command {want:#x} came back with an empty title (the macOS \
+                 bar renders it)"
+            );
+            child.id
+        }
+        None => panic!("the menu tree must contain command {want:#x}; tree is {tree:?}"),
+    }
+}
+
 /// In-process repro for the interactive notepad menubar regression: every
 /// File-menu action (New/Open/Save/Save As/Exit) does nothing in the real
 /// app. The host bar delivers the click by posting `WM_COMMAND(id, 0)` to the
@@ -58,17 +88,9 @@ fn notepad_menu_command_reaches_the_guest_wndproc() {
     );
 
     // The File menu's Exit command — the ids the macOS bar stamps into the
-    // native items and decodes back on click.
-    let tree = handle.window_menu_items();
-    let exit_id = tree
-        .iter()
-        .find_map(|top| {
-            top.children
-                .iter()
-                .find(|child| child.title.to_lowercase().contains("xit"))
-                .map(|child| child.id)
-        })
-        .unwrap_or(0);
+    // native items and decodes back on click. Located by id: the title is
+    // localized to the host UI language (German: "Beenden").
+    let exit_id = menu_command_id(&handle, CMD_EXIT);
     assert_ne!(exit_id, 0, "the File menu must contain an Exit command");
 
     // Post the exact WM_COMMAND the MenuEvent handler posts.
@@ -434,14 +456,9 @@ fn status_bar_toggle_off_removes_the_strip_with_no_further_input() {
 
     // The View menu's Status Bar command — the id the macOS bar stamps into
     // the native item and decodes back on click (mirrors the goto.rs
-    // convention of reading the guest's own menu tree).
-    let tree = handle.window_menu_items();
-    let status_bar_id = tree
-        .iter()
-        .flat_map(|top| top.children.iter())
-        .find(|child| child.title.to_lowercase().contains("status bar"))
-        .map(|child| child.id)
-        .unwrap_or(0);
+    // convention of reading the guest's own menu tree). Located by id, since
+    // the title is localized to the host UI language (German: "Statusleiste").
+    let status_bar_id = menu_command_id(&handle, CMD_STATUSBAR);
     assert_ne!(
         status_bar_id, 0,
         "the View menu must contain a Status Bar command"
@@ -613,11 +630,17 @@ fn time_date_replace_all_clears_rows_below_the_date() {
 }
 
 /// LIVE-symptom regression: New resets the caret to the document start, so
-/// the status-bar Ln/Col indicator must read "Line 1, column 1" on the New
-/// command's OWN pump cycles (the "Col N doesn't return to 1 instantly"
-/// report). The guest refreshes the bar via `DIALOG_StatusBarUpdateAll` after
-/// `SetWindowText(hEdit, NULL)`; if the host fails to reset the edit caret,
-/// the refresh reads the stale position and the bar keeps the old column.
+/// the status-bar Ln/Col indicator must return to the document-start value
+/// on the New command's OWN pump cycles (the "Col N doesn't return to 1
+/// instantly" report). The guest refreshes the bar via
+/// `DIALOG_StatusBarUpdateAll` after `SetWindowText(hEdit, NULL)`; if the host
+/// fails to reset the edit caret, the refresh reads the stale position and
+/// the bar keeps the old column.
+///
+/// The expected text is the guest's OWN startup rendering, captured before
+/// typing: it comes from RT_STRING STRING_LINE_COLUMN (0x188) and is
+/// therefore localized to the host UI language. Asserting the English literal
+/// "Line 1, column 1" made this test pass only on an en-US host.
 #[test]
 fn new_resets_status_bar_line_col_to_one() {
     let path = real_exe("notepad.exe");
@@ -658,8 +681,33 @@ fn new_resets_status_bar_line_col_to_one() {
     assert_ne!(edit, 0, "notepad main EDIT exists");
     assert_ne!(status_bar, 0, "notepad status bar exists");
 
+    // The document-start indicator the guest itself renders, captured BEFORE
+    // any typing. The guest formats this from its RT_STRING STRING_LINE_COLUMN
+    // (0x188), so the text is localized to the host UI language — English
+    // "Line 1, column 1", German "Zeile 1, Spalte 1". Asserting against the
+    // guest's own rendering keeps the intent ("New puts the caret back at the
+    // document start") without pinning a language the test never chose.
+    let mut start_text = handle.status_bar_part_text(status_bar, SBPART_CURPOS);
+    for _ in 0..20 {
+        if start_text.is_some() {
+            break;
+        }
+        let summary = session
+            .run_until_stop(1_000_000)
+            .expect("run for the startup indicator");
+        start_text = handle.status_bar_part_text(status_bar, SBPART_CURPOS);
+        if let EntryTraceTermination::WaitingForMessage = summary.termination {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let start_text = start_text.expect("the status bar must render the startup Ln/Col part");
+    assert!(
+        !start_text.trim().is_empty(),
+        "the startup Ln/Col indicator must not be blank"
+    );
+
     // Type a multi-line document and leave the caret somewhere with a column
-    // > 1, so the pre-New status-bar part reads e.g. "Line 2, column 4".
+    // > 1, so the pre-New status-bar part differs from {start_text}.
     for n in 0..3 {
         for ch in format!("line {n}\r").chars() {
             handle.post_message(edit, WM_CHAR, u64::from(ch as u32), 0);
@@ -672,6 +720,12 @@ fn new_resets_status_bar_line_col_to_one() {
         }
     }
     let before_text = handle.status_bar_part_text(status_bar, SBPART_CURPOS);
+    assert_ne!(
+        before_text.as_deref(),
+        Some(start_text.as_str()),
+        "the typed document must move the indicator away from the document start, \
+         or the New reset this test pins has nothing to prove"
+    );
 
     // ONE New command; the guest clears the edit and refreshes the bar. The
     // save prompt bridge answers IDNO, so no further input is needed.
@@ -681,10 +735,7 @@ fn new_resets_status_bar_line_col_to_one() {
     for _ in 0..80 {
         let summary = session.run_until_stop(1_000_000).expect("run after New");
         after_text = handle.status_bar_part_text(status_bar, SBPART_CURPOS);
-        if after_text
-            .as_deref()
-            .is_some_and(|t| t == "Line 1, column 1")
-        {
+        if after_text.as_deref() == Some(start_text.as_str()) {
             break;
         }
         if let EntryTraceTermination::WaitingForMessage = summary.termination {
@@ -697,7 +748,7 @@ fn new_resets_status_bar_line_col_to_one() {
     );
     assert_eq!(
         after_text.as_deref(),
-        Some("Line 1, column 1"),
+        Some(start_text.as_str()),
         "New must reset the status-bar Ln/Col indicator to the document start \
          on its own pump cycles (the guest refreshes the bar after \
          SetWindowText(NULL); a stale edit caret makes it read the old \
@@ -731,13 +782,8 @@ fn status_bar_toggle_wakes_with_its_publish() {
 
     let main = session.first_guest_window_handle().unwrap_or(0);
     assert_ne!(main, 0, "notepad main window exists");
-    let tree = handle.window_menu_items();
-    let status_bar_id = tree
-        .iter()
-        .flat_map(|top| top.children.iter())
-        .find(|child| child.title.to_lowercase().contains("status bar"))
-        .map(|child| child.id)
-        .unwrap_or(0);
+    // Located by id — the View menu's title is localized (German: "Statusleiste").
+    let status_bar_id = menu_command_id(&handle, CMD_STATUSBAR);
     assert_ne!(
         status_bar_id, 0,
         "the View menu must contain a Status Bar command"
