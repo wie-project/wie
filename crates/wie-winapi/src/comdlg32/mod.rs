@@ -20,6 +20,7 @@ mod file_tests;
 pub(crate) mod test_support;
 
 use crate::WinApiState;
+use crate::capability::WindowDialogAccess;
 use crate::user32::is_known_window;
 
 /// No extended common-dialog error.
@@ -30,8 +31,12 @@ pub(crate) const WS_BORDER: u32 = 0x0080_0000;
 pub(crate) const ES_AUTOHSCROLL: u32 = 0x0080;
 
 /// Clear the common-dialog extended error (a canceled dialog is not an error).
-pub(crate) fn state_comm_dlg_none(state: &mut WinApiState) {
-    state.window_state().comm_dlg_extended_error = CDERR_NONE;
+///
+/// Takes the dialog capability, not a whole state: clearing the error is the
+/// only thing this helper does, so it must not be able to do anything else
+/// (ADR-0005).
+pub(crate) fn state_comm_dlg_none(state: &mut dyn WindowDialogAccess) {
+    state.set_comm_dlg_extended_error(CDERR_NONE);
 }
 
 /// Resolve a dialog's owner: `hwndOwner` when it names a known window, else

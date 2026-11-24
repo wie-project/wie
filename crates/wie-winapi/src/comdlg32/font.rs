@@ -1,6 +1,7 @@
 //! `ChooseFontW` interactive font dialog.
 
 use super::{resolve_dialog_owner, state_comm_dlg_none};
+use crate::capability::WindowDialogAccess;
 use crate::comdlg32::find::create_find_control;
 use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::{ChooseFontW, LogFontW};
@@ -82,7 +83,7 @@ pub fn handle_choose_font_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     }
 
     // Clone the policy to avoid borrowing window_state() across the match.
-    let policy = state.window_state().font_dialog_policy.clone();
+    let policy = state.font_dialog_policy().clone();
     match policy {
         FontDialogPolicy::Cancel => {
             state_comm_dlg_none(state);
@@ -199,13 +200,9 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_va: u64) -> Result<Win
 
     // Without the planted loop/proc bodies (headless/trace sessions) or with a
     // font dialog already open, fall back to Cancel: a guest must never hang.
-    let loop_va = state.window_state().file_dialog_loop_va;
-    let proc_va = state.window_state().file_dialog_proc_va;
-    if log_font_va == 0
-        || loop_va == 0
-        || proc_va == 0
-        || state.window_state().font_dialog.is_some()
-    {
+    let loop_va = state.file_dialog_loop_va();
+    let proc_va = state.file_dialog_proc_va();
+    if log_font_va == 0 || loop_va == 0 || proc_va == 0 || state.font_dialog().is_some() {
         state_comm_dlg_none(state);
         tracing::warn!("ChooseFontW interactive dialog unavailable; cancelling");
         return ctx.finish(0);
@@ -464,7 +461,7 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_va: u64) -> Result<Win
     let _scrolled_size =
         crate::user32::controls::listbox_scroll_selection_into_view(state, size_list_hwnd);
 
-    state.window_state().font_dialog = Some(FontDialogSession {
+    state.set_font_dialog(Some(FontDialogSession {
         dialog_hwnd,
         cf_ptr: cf_va,
         log_font_ptr: log_font_va,
@@ -478,7 +475,7 @@ fn open_host_font_dialog(ctx: &mut HandlerContext<'_>, cf_va: u64) -> Result<Win
         underline_checked,
         selected_family: seed_family,
         selected_point_size: seed_point_size,
-    });
+    }));
 
     // The dialog is modal: an empty GetMessage must yield, and the dialog
     // takes activation. The family LISTBOX gets the initial keyboard focus
@@ -550,7 +547,7 @@ pub(crate) fn complete_font_dialog(
     dialog_hwnd: u64,
     result: u64,
 ) -> Result<Option<u64>> {
-    let Some(session) = state.window_state().font_dialog.clone() else {
+    let Some(session) = state.font_dialog().cloned() else {
         return Ok(Some(result));
     };
     if session.dialog_hwnd != dialog_hwnd {
@@ -561,9 +558,7 @@ pub(crate) fn complete_font_dialog(
     if result == FONT_DLG_STRIKEOUT_ID || result == FONT_DLG_UNDERLINE_ID {
         let (checked, checkbox_hwnd, label) = {
             let font_dialog = state
-                .window_state()
-                .font_dialog
-                .as_mut()
+                .font_dialog_mut()
                 .context("font-dialog session vanished")?;
             if result == FONT_DLG_STRIKEOUT_ID {
                 font_dialog.strikeout_checked = !session.strikeout_checked;
@@ -621,18 +616,14 @@ pub(crate) fn complete_font_dialog(
         (family, point.saturating_mul(10).max(1))
     };
     let strikeout_checked = state
-        .window_state()
-        .font_dialog
-        .as_ref()
+        .font_dialog()
         .map_or(session.strikeout_checked, |s| s.strikeout_checked);
     let underline_checked = state
-        .window_state()
-        .font_dialog
-        .as_ref()
+        .font_dialog()
         .map_or(session.underline_checked, |s| s.underline_checked);
 
     if result == 0 {
-        state.window_state().font_dialog = None;
+        state.set_font_dialog(None);
         return Ok(Some(0));
     }
 
@@ -691,7 +682,7 @@ pub(crate) fn complete_font_dialog(
     })
     .context("failed to write CHOOSEFONTW on font-dialog accept")?;
 
-    state.window_state().font_dialog = None;
+    state.set_font_dialog(None);
     tracing::info!(
         target: "wiegui",
         %family,
@@ -702,7 +693,6 @@ pub(crate) fn complete_font_dialog(
     );
     Ok(Some(1))
 }
-
 #[cfg(test)]
 mod tests {
     use super::{dialog_family_names, handle_choose_font_w};

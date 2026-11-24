@@ -179,7 +179,7 @@ fn notepad_font_dialog_survives_control_click() {
             .unwrap_or((0, String::new(), 0, 0));
     let dx = owner_w.saturating_sub(FONT_DLG_CX).saturating_div(2);
     let dy = owner_h.saturating_sub(FONT_DLG_CY).saturating_div(2);
-    let face_px_at = |frame: &wie_winapi::present::SurfaceFrame| {
+    let face_px_at = |frame: &wie_winapi::port::SurfaceFrame| {
         let x = usize::try_from(dx + 5).unwrap_or(0);
         let y = usize::try_from(dy + 5).unwrap_or(0);
         frame.pixels.get(y * frame.stride as usize + x).copied()

@@ -172,6 +172,38 @@ pub fn handle_reg_open_key_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     reg_open_key(ctx, true, PhkSource::Register, "RegOpenKeyW")
 }
 
+/// The `advapi32.dll` soft export census — the single list behind
+/// [`crate::is_winapi_implemented`] and `names::SOFT_EXPORT_CENSUS`.
+///
+/// Declared beside the arms it describes, so a name is added in one file.
+/// `dispatch_table::census_tests` proves every row here has a dispatch arm.
+///
+/// Not table-driven: `dispatch_advapi32_extra` also accepts `istextunicode`, which is not
+/// censused.
+pub(crate) const EXPORTS: &[&str] = &[
+    "adjusttokenprivileges",
+    "getfilesecuritya",
+    "getfilesecurityw",
+    "lookupprivilegevaluea",
+    "lookupprivilegevaluew",
+    "openprocesstoken",
+    "regcreatekeyexw",
+    "regdeletekeya",
+    "regdeletekeyw",
+    "regdeletevaluew",
+    "regenumkeyexa",
+    "regenumkeyexw",
+    "regenumvaluea",
+    "regenumvaluew",
+    "regflushkey",
+    "regopenkeyexw",
+    "regsavekeya",
+    "regsavekeyw",
+    "setfilesecuritya",
+    "setfilesecurityw",
+    "systemfunction036",
+];
+
 /// Soft-dispatch path for ADVAPI32 exports not yet in the dense `WinApiId` table.
 pub fn dispatch_advapi32_extra(
     ctx: &mut HandlerContext<'_>,

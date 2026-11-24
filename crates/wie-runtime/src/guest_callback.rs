@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use wie_cpu::CpuEngine;
-use wie_winapi::{GuestCallbackRequest, OuterReturn};
+use wie_winapi::port::{GuestCallbackRequest, OuterReturn};
 
 /// Set up Win64 frame + args and transfer control to a guest WndProc.
 ///

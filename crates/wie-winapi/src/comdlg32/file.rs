@@ -2,6 +2,7 @@
 //! `GetFileTitle`.
 
 use super::{CDERR_NONE, ES_AUTOHSCROLL, WS_BORDER, resolve_dialog_owner};
+use crate::capability::WindowDialogAccess;
 use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::OpenFileName;
 use crate::guest_memory::{with_typed_read, with_typed_write};
@@ -68,8 +69,9 @@ pub fn handle_get_save_file_name_w(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 
 /// Handles `comdlg32.dll!CommDlgExtendedError`.
 pub fn handle_comm_dlg_extended_error(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let state = &mut *ctx.state;
-    let return_value = u64::from(state.window_state().comm_dlg_extended_error);
+    // The dialog capability, not the whole state: this handler reads exactly
+    // one value off the common-dialog plumbing (ADR-0005).
+    let return_value = u64::from(ctx.dialogs().comm_dlg_extended_error());
 
     ctx.finish(return_value)
 }
@@ -208,7 +210,7 @@ fn handle_get_file_name(
     let ofn_va = read_arg(engine, ArgReg::Rcx, api_name)?;
 
     if ofn_va == 0 {
-        state.window_state().comm_dlg_extended_error = CDERR_NONE;
+        state.set_comm_dlg_extended_error(CDERR_NONE);
         return ctx.finish(0);
     }
 
@@ -224,7 +226,7 @@ fn handle_get_file_name(
 
     // Clone the policy to avoid borrowing state.window_state() across
     // mutable accesses inside the match arms.
-    let policy = state.window_state().file_dialog_policy.clone();
+    let policy = state.file_dialog_policy().clone();
     let buffer = OfnBuffer {
         ofn_ptr: ofn_va,
         file_buffer_ptr: file_buffer_va,
@@ -234,14 +236,14 @@ fn handle_get_file_name(
     };
     let return_value = match policy {
         FileDialogPolicy::Cancel => {
-            state.window_state().comm_dlg_extended_error = CDERR_NONE;
+            state.set_comm_dlg_extended_error(CDERR_NONE);
             tracing::debug!(api = api_name, "file dialog cancelled by policy");
             0
         }
 
         FileDialogPolicy::Accept { path } => {
             if buffer.file_buffer_ptr == 0 || buffer.max_file == 0 {
-                state.window_state().comm_dlg_extended_error = CDERR_NONE;
+                state.set_comm_dlg_extended_error(CDERR_NONE);
                 tracing::warn!(
                     api = api_name,
                     "file dialog accept policy but lpstrFile/nMaxFile invalid"
@@ -262,8 +264,8 @@ fn handle_get_file_name(
                 )
                 .with_context(|| format!("failed to write selected path for {api_name}"))?;
 
-                state.window_state().comm_dlg_extended_error = CDERR_NONE;
-                state.window_state().last_file_dialog_path = Some(path.clone());
+                state.set_comm_dlg_extended_error(CDERR_NONE);
+                state.set_last_file_dialog_path(Some(path.clone()));
 
                 tracing::info!(api = api_name, %path, unicode, "file dialog accepted");
                 1
@@ -464,7 +466,7 @@ pub(crate) fn complete_file_dialog(
     dialog_hwnd: u64,
     result: u64,
 ) -> Result<u64> {
-    let Some(session) = state.window_state().file_dialog.clone() else {
+    let Some(session) = state.file_dialog().cloned() else {
         return Ok(result);
     };
     if session.dialog_hwnd != dialog_hwnd {
@@ -509,13 +511,13 @@ pub(crate) fn complete_file_dialog(
                     },
                 )
                 .context("failed to write selected file-dialog path")?;
-                state.window_state().last_file_dialog_path = Some(path.clone());
+                state.set_last_file_dialog_path(Some(path.clone()));
                 tracing::info!(%path, unicode = session.unicode, "file dialog accepted");
                 1
             }
         }
     };
-    state.window_state().file_dialog = None;
+    state.set_file_dialog(None);
     Ok(effective)
 }
 
@@ -547,10 +549,10 @@ fn open_host_file_dialog(
 
     // Without the planted loop/proc bodies (headless/trace sessions) or with a
     // file dialog already open, fall back to Cancel: a guest must never hang.
-    let loop_va = state.window_state().file_dialog_loop_va;
-    let proc_va = state.window_state().file_dialog_proc_va;
-    if loop_va == 0 || proc_va == 0 || state.window_state().file_dialog.is_some() {
-        state.window_state().comm_dlg_extended_error = CDERR_NONE;
+    let loop_va = state.file_dialog_loop_va();
+    let proc_va = state.file_dialog_proc_va();
+    if loop_va == 0 || proc_va == 0 || state.file_dialog().is_some() {
+        state.set_comm_dlg_extended_error(CDERR_NONE);
         tracing::warn!(
             api = api_name,
             "interactive file dialog unavailable; cancelling"
@@ -621,7 +623,7 @@ fn open_host_file_dialog(
         unicode,
     )?;
     if dialog_hwnd == 0 {
-        state.window_state().comm_dlg_extended_error = CDERR_NONE;
+        state.set_comm_dlg_extended_error(CDERR_NONE);
         return ctx.finish(0);
     }
     if let Some(window) = find_window_mut(state, dialog_hwnd) {
@@ -734,7 +736,7 @@ fn open_host_file_dialog(
     }
 
     // Record the session for the EndDialog write-back.
-    state.window_state().file_dialog = Some(FileDialogSession {
+    state.set_file_dialog(Some(FileDialogSession {
         dialog_hwnd,
         edit_hwnd,
         ofn_ptr: ofn_va,
@@ -745,7 +747,7 @@ fn open_host_file_dialog(
         unicode,
         initial_dir,
         default_extension,
-    });
+    }));
 
     // The dialog is modal: an empty GetMessage must yield, not synthesize the
     // regression-mode WM_QUIT, and the dialog takes activation. The path EDIT
@@ -824,7 +826,7 @@ fn open_host_file_dialog_via_bridge(
     let state = &mut *ctx.state;
 
     // Re-entry: the runtime recorded the bridge's pick; write it back.
-    if let Some(pending) = state.window_state().pending_native_file_dialog.take() {
+    if let Some(pending) = state.take_pending_native_file_dialog() {
         return finish_native_file_dialog(engine, state, api_name, pending);
     }
 
@@ -890,7 +892,7 @@ fn open_host_file_dialog_via_bridge(
         let mut native = NativePanelCtx::new(state, engine, NativePanelKind::File);
         native.open()?
     };
-    state.window_state().pending_native_file_dialog = Some(PendingNativeFileDialog {
+    state.set_pending_native_file_dialog(Some(PendingNativeFileDialog {
         ofn_ptr: buffer.ofn_ptr,
         file_buffer_ptr: buffer.file_buffer_ptr,
         max_file: buffer.max_file,
@@ -899,7 +901,7 @@ fn open_host_file_dialog_via_bridge(
         unicode,
         pick: None,
         frame: Some(frame),
-    });
+    }));
 
     Err(WinApiControlSignal::FileDialogBridgeRequested { request }.into())
 }
@@ -923,7 +925,7 @@ fn finish_native_file_dialog(
 ) -> Result<WinApiHandlerResult> {
     let frame = pending.frame;
     let Some(pick) = pending.pick else {
-        state.window_state().comm_dlg_extended_error = CDERR_NONE;
+        state.set_comm_dlg_extended_error(CDERR_NONE);
         tracing::info!(api = api_name, "native file dialog cancelled");
         return finish_file_bridge(engine, state, api_name, frame, 0);
     };
@@ -950,7 +952,7 @@ fn finish_native_file_dialog(
         // as FNERR_INVALIDFILENAME (via CommDlgExtendedError) so a program
         // that depends on the pick (notepad's Save/Open) reports a real
         // failure instead of silently acting as if the user pressed Cancel.
-        state.window_state().comm_dlg_extended_error = FNERR_INVALIDFILENAME;
+        state.set_comm_dlg_extended_error(FNERR_INVALIDFILENAME);
         tracing::warn!(
             api = api_name,
             host = %pick.host_path.display(),
@@ -963,7 +965,7 @@ fn finish_native_file_dialog(
     };
 
     if pending.file_buffer_ptr == 0 || pending.max_file == 0 {
-        state.window_state().comm_dlg_extended_error = CDERR_NONE;
+        state.set_comm_dlg_extended_error(CDERR_NONE);
         tracing::warn!(
             api = api_name,
             "file dialog bridge accepted but lpstrFile/nMaxFile invalid"
@@ -988,8 +990,8 @@ fn finish_native_file_dialog(
     )
     .with_context(|| format!("failed to write selected path for {api_name}"))?;
 
-    state.window_state().comm_dlg_extended_error = CDERR_NONE;
-    state.window_state().last_file_dialog_path = Some(guest_path.clone());
+    state.set_comm_dlg_extended_error(CDERR_NONE);
+    state.set_last_file_dialog_path(Some(guest_path.clone()));
     // The post-accept chain's hand-off: the guest path is written back to
     // lpstrFile and this handler returns TRUE — a repro's log ends HERE if the
     // guest never issues the follow-up CreateFileW on the returned path.

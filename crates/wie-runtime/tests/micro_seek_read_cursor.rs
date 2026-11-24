@@ -15,12 +15,12 @@
 
 use ahash::{HashMap, HashMapExt};
 use wie_cpu::{CpuEngine, IcedCpu, RwxPerms};
-use wie_winapi::{
+use wie_winapi::port::{
     DEFAULT_ENVIRONMENT, DllStateMap, FileHandle, FileIoState, FindFileHandle, GuestHeap,
-    GuestIoRuntimeConfig, GuestStdinMode, HandlerContext, HeapState, HostFileMount, KernelState,
-    ModuleHandle, ModuleState, ProcessState, RegistryKeyHandle, ResourceHandle, SyncState,
-    ThreadState, VolumeConfig, WinApiEnvironment, WinApiHandlerResult, WinApiState, dll_loader,
-    present,
+    GuestIoRuntimeConfig, GuestStdinMode, HandlerContext, HeapState, KernelState, MessageQueue,
+    ModuleHandle, ModuleState, ProcessState, REAL_MODULE_HANDLE_BASE, RegistryKeyHandle,
+    ResourceHandle, SyncState, ThreadState, VolumeConfig, WinApiEnvironment, WinApiHandlerResult,
+    WinApiId, WinApiState, dispatch_winapi_id, mount_host_file,
 };
 
 const STACK_VA: u64 = 0x100_0000;
@@ -73,7 +73,7 @@ fn default_winapi_state() -> WinApiState {
         .unwrap_or_else(|e| e.into_inner())
         .attach_guest_control(0x2000);
     WinApiState {
-        display: wie_winapi::DisplayMetrics::default(),
+        display: wie_winapi::port::DisplayMetrics::default(),
         heap_state: HeapState {
             heap,
             next_fls_index: 0,
@@ -128,12 +128,12 @@ fn default_winapi_state() -> WinApiState {
             seh_pending: HashMap::new(),
         },
         dll_states: DllStateMap::new(),
-        message_queue: std::sync::Arc::new(std::sync::Mutex::new(present::MessageQueue::default())),
+        message_queue: std::sync::Arc::new(std::sync::Mutex::new(MessageQueue::default())),
         module_state: ModuleState {
             loaded_modules: HashMap::new(),
             import_resolver: None,
             get_proc_address_cache: HashMap::new(),
-            next_module_handle: ModuleHandle::from(dll_loader::REAL_MODULE_HANDLE_BASE),
+            next_module_handle: ModuleHandle::from(REAL_MODULE_HANDLE_BASE),
         },
     }
 }
@@ -254,16 +254,17 @@ fn seek_read_cursor_tracking_regression() -> anyhow::Result<()> {
     engine.mem_write(TABLE_BASE, &vec![0_u8; TABLE_SIZE])?;
 
     let mut state = default_winapi_state();
-    state.file_io.guest_io = Some(GuestIoRuntimeConfig {
-        table_va: TABLE_BASE,
-        file_data_base: ARENA_BASE,
-        file_data_size: ARENA_SIZE,
-    });
-    state.file_io.guest_file_data_next = ARENA_BASE;
-    state.file_io.host_file_mounts.push(HostFileMount {
-        guest_path: r"C:\probe.bin".to_owned(),
-        host_path: tmp.clone(),
-    });
+    state.attach_guest_io(
+        GuestIoRuntimeConfig {
+            table_va: TABLE_BASE,
+            file_data_base: ARENA_BASE,
+            file_data_size: ARENA_SIZE,
+        },
+        ARENA_BASE,
+    );
+    // The same entry point production uses (`WIE_HOST_FILE_MOUNT`), so the
+    // mount is validated and deduplicated here rather than pushed raw.
+    mount_host_file(&mut state, r"C:\probe.bin", &tmp)?;
 
     // CreateFileW(C:\probe.bin, GENERIC_READ, ..., OPEN_EXISTING) — the small
     // host-backed file stays buffered and is mirrored into the guest I/O table.
@@ -275,7 +276,7 @@ fn seek_read_cursor_tracking_regression() -> anyhow::Result<()> {
     engine.write_rsp(STACK_TOP)?;
     engine.mem_write(STACK_TOP.saturating_add(0x28), &OPEN_EXISTING.to_le_bytes())?;
     let handle = run(&mut engine, &mut state, |ctx| {
-        wie_winapi::kernel32::handle_create_file_w(ctx)
+        dispatch_winapi_id(ctx, WinApiId::Kernel32Createfilew)
     })?;
     assert_ne!(
         handle, INVALID_HANDLE_VALUE,
@@ -283,9 +284,7 @@ fn seek_read_cursor_tracking_regression() -> anyhow::Result<()> {
     );
 
     let open_file = state
-        .file_io
-        .open_files
-        .get(&handle)
+        .open_guest_file(handle)
         .ok_or_else(|| anyhow::anyhow!("CreateFileW did not open a file"))?;
     assert!(
         !open_file.streaming,
@@ -298,7 +297,7 @@ fn seek_read_cursor_tracking_regression() -> anyhow::Result<()> {
     // Sequential read seeds both the host cursor and the guest table cursor at 8.
     set_regs_read(&mut engine, handle, BUF_VA, 8, N_VA)?;
     let ret = run(&mut engine, &mut state, |ctx| {
-        wie_winapi::kernel32::handle_read_file(ctx)
+        dispatch_winapi_id(ctx, WinApiId::Kernel32Readfile)
     })?;
     assert_eq!(ret, 1, "first ReadFile TRUE");
     assert_buf_is_content(&mut engine, BUF_VA, &content, 0, 8, "initial read")?;
@@ -307,7 +306,7 @@ fn seek_read_cursor_tracking_regression() -> anyhow::Result<()> {
     // FILE_CURRENT query reflects the sequential position.
     set_regs_seek(&mut engine, handle, 0, POS_VA, FILE_CURRENT)?;
     let ret = run(&mut engine, &mut state, |ctx| {
-        wie_winapi::kernel32::handle_set_file_pointer_ex(ctx)
+        dispatch_winapi_id(ctx, WinApiId::Kernel32Setfilepointerex)
     })?;
     assert_eq!(ret, 1, "FILE_CURRENT query TRUE");
     assert_eq!(
@@ -321,13 +320,13 @@ fn seek_read_cursor_tracking_regression() -> anyhow::Result<()> {
     // stale pre-seek value (8) and reads at the wrong offset.
     set_regs_seek(&mut engine, handle, 128, 0, FILE_BEGIN)?;
     let ret = run(&mut engine, &mut state, |ctx| {
-        wie_winapi::kernel32::handle_set_file_pointer_ex(ctx)
+        dispatch_winapi_id(ctx, WinApiId::Kernel32Setfilepointerex)
     })?;
     assert_eq!(ret, 1, "seek to 128 TRUE");
 
     set_regs_seek(&mut engine, handle, 0, POS_VA, FILE_CURRENT)?;
     let ret = run(&mut engine, &mut state, |ctx| {
-        wie_winapi::kernel32::handle_set_file_pointer_ex(ctx)
+        dispatch_winapi_id(ctx, WinApiId::Kernel32Setfilepointerex)
     })?;
     assert_eq!(ret, 1, "query after seek TRUE");
     assert_eq!(
@@ -340,7 +339,7 @@ fn seek_read_cursor_tracking_regression() -> anyhow::Result<()> {
     // stale pre-seek position 8.
     set_regs_read(&mut engine, handle, BUF_VA, 8, N_VA)?;
     let ret = run(&mut engine, &mut state, |ctx| {
-        wie_winapi::kernel32::handle_read_file(ctx)
+        dispatch_winapi_id(ctx, WinApiId::Kernel32Readfile)
     })?;
     assert_eq!(ret, 1, "read after seek TRUE");
     assert_buf_is_content(&mut engine, BUF_VA, &content, 128, 8, "read after seek")?;
@@ -357,17 +356,17 @@ fn seek_read_cursor_tracking_regression() -> anyhow::Result<()> {
     for offset in [256_u64, 16, 32] {
         set_regs_seek(&mut engine, handle, offset, 0, FILE_BEGIN)?;
         run(&mut engine, &mut state, |ctx| {
-            wie_winapi::kernel32::handle_set_file_pointer_ex(ctx)
+            dispatch_winapi_id(ctx, WinApiId::Kernel32Setfilepointerex)
         })?;
         set_regs_seek(&mut engine, handle, 0, POS_VA, FILE_CURRENT)?;
         run(&mut engine, &mut state, |ctx| {
-            wie_winapi::kernel32::handle_set_file_pointer_ex(ctx)
+            dispatch_winapi_id(ctx, WinApiId::Kernel32Setfilepointerex)
         })?;
         let pos = guest_read_u64(&mut engine, POS_VA)?;
         assert_eq!(pos, offset, "query matches the seek target");
         set_regs_read(&mut engine, handle, BUF_VA, 8, N_VA)?;
         run(&mut engine, &mut state, |ctx| {
-            wie_winapi::kernel32::handle_read_file(ctx)
+            dispatch_winapi_id(ctx, WinApiId::Kernel32Readfile)
         })?;
         assert_buf_is_content(
             &mut engine,
@@ -383,17 +382,17 @@ fn seek_read_cursor_tracking_regression() -> anyhow::Result<()> {
     let forward = u64::from_le_bytes(8_i64.to_le_bytes());
     set_regs_seek(&mut engine, handle, forward, 0, FILE_CURRENT)?;
     run(&mut engine, &mut state, |ctx| {
-        wie_winapi::kernel32::handle_set_file_pointer_ex(ctx)
+        dispatch_winapi_id(ctx, WinApiId::Kernel32Setfilepointerex)
     })?;
     set_regs_seek(&mut engine, handle, 0, POS_VA, FILE_CURRENT)?;
     run(&mut engine, &mut state, |ctx| {
-        wie_winapi::kernel32::handle_set_file_pointer_ex(ctx)
+        dispatch_winapi_id(ctx, WinApiId::Kernel32Setfilepointerex)
     })?;
     let pos = guest_read_u64(&mut engine, POS_VA)?;
     assert_eq!(pos, 48, "relative FILE_CURRENT seek lands at 48");
     set_regs_read(&mut engine, handle, BUF_VA, 8, N_VA)?;
     run(&mut engine, &mut state, |ctx| {
-        wie_winapi::kernel32::handle_read_file(ctx)
+        dispatch_winapi_id(ctx, WinApiId::Kernel32Readfile)
     })?;
     assert_buf_is_content(
         &mut engine,
@@ -408,17 +407,17 @@ fn seek_read_cursor_tracking_regression() -> anyhow::Result<()> {
     let back = u64::from_le_bytes((-8_i64).to_le_bytes());
     set_regs_seek(&mut engine, handle, back, 0, FILE_END)?;
     run(&mut engine, &mut state, |ctx| {
-        wie_winapi::kernel32::handle_set_file_pointer_ex(ctx)
+        dispatch_winapi_id(ctx, WinApiId::Kernel32Setfilepointerex)
     })?;
     set_regs_seek(&mut engine, handle, 0, POS_VA, FILE_CURRENT)?;
     run(&mut engine, &mut state, |ctx| {
-        wie_winapi::kernel32::handle_set_file_pointer_ex(ctx)
+        dispatch_winapi_id(ctx, WinApiId::Kernel32Setfilepointerex)
     })?;
     let pos = guest_read_u64(&mut engine, POS_VA)?;
     assert_eq!(pos, 1016, "FILE_END relative seek lands at size - 8");
     set_regs_read(&mut engine, handle, BUF_VA, 8, N_VA)?;
     run(&mut engine, &mut state, |ctx| {
-        wie_winapi::kernel32::handle_read_file(ctx)
+        dispatch_winapi_id(ctx, WinApiId::Kernel32Readfile)
     })?;
     assert_buf_is_content(
         &mut engine,

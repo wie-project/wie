@@ -9,6 +9,7 @@
 //! the ancestor surface is published so the control is visible immediately —
 //! the ancestor's own `WM_PAINT` BitBlt may never run again (modal dialogs).
 
+use crate::capability::PresentAccess;
 use anyhow::Result;
 
 use super::{
@@ -793,7 +794,7 @@ impl ControlClassKind {
                     // repaint cycle (parent BitBlt + each child paint) emits
                     // one frame with the union region.
                     if let Some(ancestor) = resolve_window_ancestor(state, hwnd) {
-                        state.present().publish_deferred(ancestor.hwnd);
+                        state.publish_deferred(ancestor.hwnd);
                     }
                 }
                 Ok(Some(0))

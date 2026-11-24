@@ -38,7 +38,7 @@ impl GuestHandle {
             // primary. `push_host` stamps the message and broadcasts the
             // `MessagePosted` wake token, like `queue.push_to`.
             queue.push_host(
-                wie_winapi::handles::Hwnd::from(hwnd),
+                wie_winapi::port::Hwnd::from(hwnd),
                 msg,
                 wparam,
                 lparam,
@@ -64,7 +64,7 @@ impl GuestHandle {
     /// mouse, close, WM_SIZE) wake the guest immediately instead of on a
     /// fixed poll interval.
     #[must_use]
-    pub fn message_signal(&self) -> Option<std::sync::Arc<wie_winapi::present::MessageSignal>> {
+    pub fn message_signal(&self) -> Option<std::sync::Arc<wie_winapi::port::MessageSignal>> {
         self.queue.lock().ok().map(|q| q.signal.clone())
     }
 }

@@ -3,6 +3,7 @@
 //! cheap; no-op success where the operation has no host counterpart.
 
 use super::{Context, HandlerContext, Result, WinApiHandlerResult, low_i32};
+use crate::capability::PresentAccess;
 use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_memory::write_u32;
 use zerocopy::IntoBytes;
@@ -29,9 +30,7 @@ pub fn handle_bring_window_to_top(ctx: &mut HandlerContext<'_>) -> Result<WinApi
     let state = &mut *ctx.state;
     let hwnd = read_arg(engine, ArgReg::Rcx, "BringWindowToTop")?;
     if crate::user32::window::find_window(state, hwnd).is_some() {
-        state
-            .present()
-            .z_order_to_top(crate::handles::Hwnd::from(hwnd));
+        state.z_order_to_top(crate::handles::Hwnd::from(hwnd));
         return ctx.finish(1);
     }
     ctx.finish(0)

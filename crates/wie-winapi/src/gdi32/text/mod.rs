@@ -6,6 +6,7 @@
 //! window DCs (the guest's WM_PAINT BitBlt publishes the frame). Screen DCs
 //! have no backing store and are skipped.
 
+use crate::capability::PresentAccess;
 use anyhow::{Context, Result};
 
 use crate::color::unpack_rgb;
@@ -327,8 +328,8 @@ fn resolve_text_target(state: &mut WinApiState, dc_handle: u64) -> Option<Resolv
         DcKind::Window(hwnd) => {
             let (w, h) = window_client_size(state, hwnd.as_u64());
             let (w, h) = (u32::try_from(w.max(1)).ok()?, u32::try_from(h.max(1)).ok()?);
-            state.present().ensure_surface(hwnd, w, h);
-            let surface = state.present().surfaces.get_mut(&hwnd)?;
+            state.ensure_surface(hwnd, w, h);
+            let surface = state.surface_mut(hwnd)?;
             Some(ResolvedTextTarget {
                 target: TextTarget::Surface {
                     pixels: &mut surface.pixels[..],
@@ -375,7 +376,7 @@ fn mark_surface_dirty(
         && rect.right > rect.left
         && rect.bottom > rect.top
     {
-        state.present().mark_dirty(hwnd, rect);
+        state.mark_dirty(hwnd, rect);
     }
 }
 
@@ -844,7 +845,6 @@ pub(crate) fn render_text_into_surface(
     )
     .map(|_| ())
 }
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {

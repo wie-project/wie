@@ -5,7 +5,7 @@
 //! pump manipulates. The frame installation itself is in `crate::guest_callback`.
 
 use std::sync::Arc;
-use wie_winapi::OuterReturn;
+use wie_winapi::port::OuterReturn;
 
 /// Saved frame for one in-flight guest window-procedure call.
 #[derive(Debug, Clone)]
@@ -13,7 +13,7 @@ pub(super) struct PendingGuestCallback {
     /// `RSP` at the outer host API entry (return address of the caller).
     pub(super) dispatch_rsp: u64,
     /// Original callback request metadata.
-    pub(super) request: wie_winapi::GuestCallbackRequest,
+    pub(super) request: wie_winapi::port::GuestCallbackRequest,
     /// Outer host API that requested the callback (`DispatchMessageA`, `SendMessageA`, …).
     pub(super) outer_library: Arc<str>,
     /// Outer host API export name.

@@ -686,6 +686,24 @@ pub fn handle_create_toolbar_ex(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     ctx.finish(toolbar_handle)
 }
 
+/// The `comctl32.dll` soft export census — the single list behind
+/// [`crate::is_winapi_implemented`] and `names::SOFT_EXPORT_CENSUS`.
+///
+/// Declared beside the arms it describes, so a name is added in one file.
+/// `dispatch_table::census_tests` proves every row here has a dispatch arm.
+///
+/// Not table-driven: `dispatch_comctl32_extra` also accepts `createtoolbarexa` and
+/// `createtoolbarexw`, which are not censused.
+pub(crate) const EXPORTS: &[&str] = &[
+    "createtoolbarex",
+    "imagelist_add",
+    "imagelist_draw",
+    "imagelist_geticonsize",
+    "imagelist_getimagecount",
+    "imagelist_getimageinfo",
+    "imagelist_seticonsize",
+];
+
 /// Soft dispatch for COMCTL32 exports beyond the dense table (toolbar,
 /// remaining ImageList APIs, progress bar). String path only.
 pub fn dispatch_comctl32_extra(

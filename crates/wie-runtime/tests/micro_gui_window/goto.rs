@@ -738,7 +738,7 @@ fn run_goto_flow(
     main: u64,
     goto_id: u32,
     line: &str,
-) -> wie_winapi::present::SurfaceFrame {
+) -> wie_winapi::port::SurfaceFrame {
     use wie_runtime::EntryTraceTermination;
     const WM_COMMAND: u32 = 0x0111;
     const WM_CHAR: u32 = 0x0102;
@@ -890,7 +890,7 @@ fn goto_line_deep_keeps_rows_below_visible() {
 
     // Ink per 19 px text-row band across the whole client — non-white pixels
     // (the text glyphs; the edit background is COLOR_WINDOW-white).
-    let ink_rows = |frame: &wie_winapi::present::SurfaceFrame| -> Vec<u32> {
+    let ink_rows = |frame: &wie_winapi::port::SurfaceFrame| -> Vec<u32> {
         let mut rows = Vec::new();
         for y in (0..frame.height).step_by(19) {
             let mut ink = 0_u32;

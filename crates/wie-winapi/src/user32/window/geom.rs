@@ -2,6 +2,7 @@
 //! (split from the former `window.rs`).
 
 use super::class::{find_window, find_window_mut};
+use crate::capability::PresentAccess;
 use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::{WinPoint, WinRect};
 use crate::state::WindowFlags;
@@ -639,9 +640,7 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
             // can route the move to the matching winit window (multi-window
             // presentation).
             ws.host_geometry_hwnd = Some(window_handle);
-            if let Some(wake) = state.present().wake.as_ref() {
-                wake();
-            }
+            state.wake_presenter();
         }
     }
 
@@ -649,7 +648,6 @@ pub fn handle_set_window_placement(ctx: &mut HandlerContext<'_>) -> Result<WinAp
 
     ctx.finish(return_value)
 }
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {

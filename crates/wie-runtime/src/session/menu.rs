@@ -1,8 +1,8 @@
 //! Menu-tree building for the macOS bar (`MenuNode` + build/cache logic).
 
 use std::sync::{Arc, RwLock};
-use wie_winapi::handles::Hmenu;
-use wie_winapi::user32::menu::{MenuEntry, MenuRecord};
+use wie_winapi::port::Hmenu;
+use wie_winapi::port::{MenuEntry, MenuRecord};
 
 /// One node of the guest window's menu tree, as mirrored into the macOS bar.
 ///
@@ -63,7 +63,7 @@ pub(super) type MenuTreeCache = Arc<RwLock<Option<(Hmenu, Arc<Vec<MenuNode>>)>>>
 /// `Popup` entries recurse into their submenu, `Separator` entries become
 /// separator nodes the host bar renders as real separator lines.
 pub(super) fn build_menu_tree(menus: &[MenuRecord], menu_handle: u64) -> Vec<MenuNode> {
-    let menu_handle = wie_winapi::handles::Hmenu::from(menu_handle);
+    let menu_handle = wie_winapi::port::Hmenu::from(menu_handle);
     let Some(record) = menus.iter().find(|m| m.handle == menu_handle) else {
         return Vec::new();
     };
@@ -122,8 +122,8 @@ pub(super) fn build_menu_tree(menus: &[MenuRecord], menu_handle: u64) -> Vec<Men
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{build_menu_tree, split_accelerator};
-    use wie_winapi::handles::Hmenu;
-    use wie_winapi::user32::menu::{MenuEntry, MenuRecord};
+    use wie_winapi::port::Hmenu;
+    use wie_winapi::port::{MenuEntry, MenuRecord};
 
     fn record(handle: u64, items: Vec<MenuEntry>) -> MenuRecord {
         MenuRecord {

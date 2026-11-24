@@ -669,7 +669,7 @@ impl super::RuntimeSession {
     pub fn enable_frame_timing(&mut self) {
         self.profile_enabled = true;
         self.process.lock_wait_stats.set_enabled(true);
-        wie_winapi::present::set_frame_timing_enabled(true);
+        wie_winapi::port::set_frame_timing_enabled(true);
     }
 
     /// Publish duration of the most recent frame (ns; 0 when timing disabled).

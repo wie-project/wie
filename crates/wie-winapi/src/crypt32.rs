@@ -91,23 +91,23 @@ impl Crypt32State {
     }
 }
 
+crate::soft_dispatch::soft_exports! {
+    ("cryptacquirecontexta", handle_crypt_acquire_context),
+    ("cryptacquirecontextw", handle_crypt_acquire_context),
+    ("cryptcreatehash", handle_crypt_create_hash),
+    ("cryptdestroyhash", handle_crypt_destroy_hash),
+    ("cryptgenrandom", handle_crypt_gen_random),
+    ("cryptgethashparam", handle_crypt_get_hash_param),
+    ("crypthashdata", handle_crypt_hash_data),
+    ("cryptreleasecontext", handle_crypt_release_context),
+}
+
 /// Dispatch a `CRYPT32.dll` export by name (case-insensitive).
 pub fn dispatch_crypt32(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let n = name.to_ascii_lowercase();
-    match n.as_str() {
-        "cryptacquirecontexta" => Ok(Some(handle_crypt_acquire_context(ctx)?)),
-        "cryptacquirecontextw" => Ok(Some(handle_crypt_acquire_context(ctx)?)),
-        "cryptreleasecontext" => Ok(Some(handle_crypt_release_context(ctx)?)),
-        "cryptgenrandom" => Ok(Some(handle_crypt_gen_random(ctx)?)),
-        "cryptcreatehash" => Ok(Some(handle_crypt_create_hash(ctx)?)),
-        "cryptdestroyhash" => Ok(Some(handle_crypt_destroy_hash(ctx)?)),
-        "crypthashdata" => Ok(Some(handle_crypt_hash_data(ctx)?)),
-        "cryptgethashparam" => Ok(Some(handle_crypt_get_hash_param(ctx)?)),
-        _ => Ok(None),
-    }
+    crate::soft_dispatch::dispatch_soft_table(ctx, DISPATCH, name)
 }
 
 /// `BOOL CryptAcquireContextA/W(HCRYPTPROV *phProv, LPCSTR/LPCWSTR szContainer,

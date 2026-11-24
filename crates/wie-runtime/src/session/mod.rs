@@ -53,7 +53,7 @@ pub struct SessionOptions {
     /// `None` (headless / persistent runs) keeps
     /// [`wie_winapi::DisplayMetrics::DEFAULT`] so micro-suite runs stay
     /// deterministic.
-    pub display_metrics: Option<wie_winapi::DisplayMetrics>,
+    pub display_metrics: Option<wie_winapi::port::DisplayMetrics>,
 }
 
 /// Guest CRT page layout constants (must match `wie_winapi::ucrt` and guest
@@ -142,11 +142,11 @@ pub struct RuntimeSession {
     /// Session-level heap shard — hot `HeapAlloc`/`HeapFree` stops lock only
     /// this `Mutex<GuestHeap>` next to the `Mutex<WinApiState>` in `process`.
     #[allow(dead_code)]
-    heap: Arc<Mutex<wie_winapi::GuestHeap>>,
+    heap: Arc<Mutex<wie_winapi::port::GuestHeap>>,
     /// Clone of the session's wake hub (`SyncState::wake_hub`): the outer
     /// run loop parks the primary thread's inbox through it without taking
     /// the WinAPI state lock (Painpoint 1).
-    wake_hub: wie_winapi::WakeHub,
+    wake_hub: wie_winapi::port::WakeHub,
     entry_point_va: GuestVa,
     initial_rsp: GuestStackPtr,
     next_api_index: usize,
@@ -180,10 +180,12 @@ pub struct RuntimeSession {
 /// other record — dialog boxes, controls, child windows — is excluded. The
 /// order is the `windows` record order, so the main window (created first) is
 /// the first row.
-fn top_level_window_rows(windows: &[wie_winapi::WindowRecord]) -> Vec<(u64, String, i32, i32)> {
+fn top_level_window_rows(
+    windows: &[wie_winapi::port::WindowRecord],
+) -> Vec<(u64, String, i32, i32)> {
     windows
         .iter()
-        .filter(|window| window.parent_handle == wie_winapi::handles::Hwnd::NULL)
+        .filter(|window| window.parent_handle == wie_winapi::port::Hwnd::NULL)
         .map(|window| {
             (
                 window.handle.as_u64(),
@@ -207,7 +209,7 @@ impl RuntimeSession {
     /// The outer run loop parks here while the message queue is empty;
     /// producers (PostMessage / SetTimer / teardown) deliver tokens.
     #[must_use]
-    pub fn primary_inbox(&self) -> wie_winapi::ThreadInbox {
+    pub fn primary_inbox(&self) -> wie_winapi::port::ThreadInbox {
         self.wake_hub.inbox_for(self.process.primary_tid())
     }
 
@@ -227,17 +229,20 @@ impl RuntimeSession {
     pub fn set_bottle_root(&mut self, root: Option<std::path::PathBuf>) {
         self.process.with_mut(|_, s| {
             if let Some(ref r) = root {
-                drop(wie_winapi::seed_default_skeleton(r));
+                drop(wie_winapi::port::seed_default_skeleton(r));
             }
-            s.file_io.bottle_root = root.clone();
-            s.file_io.volumes.bottle_root = root;
+            s.set_bottle_root(root.clone());
+            s.set_volumes({
+                let mut volumes = s.volumes().clone();
+                volumes.bottle_root = root;
+                volumes
+            });
         });
     }
 
     /// Sets optional host-bridge root for guest `D:\…` (`None` unmounts D:).
     pub fn set_drive_d(&mut self, root: Option<std::path::PathBuf>) {
-        self.process
-            .with_mut(|_, s| s.file_io.volumes.drive_d_root = root);
+        self.process.with_mut(|_, s| s.set_drive_d_root(root));
     }
 
     /// Replaces guest stdin buffer for console `ReadFile` on STD_INPUT_HANDLE.
@@ -246,13 +251,12 @@ impl RuntimeSession {
     /// next guest read.
     pub fn set_stdin_bytes(&mut self, bytes: Vec<u8>) {
         self.process.with_mut(|_, s| {
-            s.file_io.stdin_mode = if bytes.is_empty() {
-                wie_winapi::GuestStdinMode::LiveHost
+            let mode = if bytes.is_empty() {
+                wie_winapi::port::GuestStdinMode::LiveHost
             } else {
-                wie_winapi::GuestStdinMode::InjectOnly
+                wie_winapi::port::GuestStdinMode::InjectOnly
             };
-            s.file_io.stdin_bytes = bytes;
-            s.file_io.stdin_cursor = 0;
+            s.set_stdin(bytes, mode);
         });
     }
 
@@ -270,7 +274,7 @@ impl RuntimeSession {
         }
         let shared_winapi = self.process.winapi_arc();
         let mut state = crate::mt_runtime::lock_wait(&shared_winapi, &self.process.lock_wait_stats);
-        let environment = &mut state.process.environment;
+        let environment = state.environment_mut();
         match environment
             .iter()
             .position(|(key, _)| key.eq_ignore_ascii_case(name))
@@ -298,7 +302,10 @@ impl RuntimeSession {
     }
 
     /// Changes the behavior of `GetMessageA` when the queue is empty.
-    pub fn set_message_queue_idle_policy(&mut self, policy: wie_winapi::MessageQueueIdlePolicy) {
+    pub fn set_message_queue_idle_policy(
+        &mut self,
+        policy: wie_winapi::port::MessageQueueIdlePolicy,
+    ) {
         self.process
             .with_mut(|_, s| s.window_state().message_queue_idle_policy = policy);
     }
@@ -306,16 +313,25 @@ impl RuntimeSession {
     /// Adds one message to the guest message queue of the thread that owns
     /// the message's window (the primary thread's queue when the window is
     /// unknown — the caller supplies no "current thread").
-    pub fn post_message(&mut self, message: wie_winapi::QueuedWindowMessage) {
+    pub fn post_message(&mut self, message: wie_winapi::port::QueuedWindowMessage) {
         let hwnd = message.window_handle;
         let queue_arc = self.process.message_queue_arc();
-        let mut queue = queue_arc.lock().unwrap_or_else(|e| e.into_inner());
+        // The host posts while holding ONLY the queue mutex (never the big
+        // state), which is legal in the documented order — and asserted, so a
+        // host thread that reaches here holding the present channel fails here
+        // instead of deadlocking the UI thread.
+        let scope = wie_winapi::lock_order::enter(wie_winapi::lock_order::Lock::Queue);
+        let mut queue = wie_winapi::lock_order::Ordered::wrap(
+            scope,
+            queue_arc.lock().unwrap_or_else(|e| e.into_inner()),
+        );
         let tid = queue.queues.resolve_tid(hwnd, queue.primary_tid);
         // Direct push (the caller owns the full record shape) still owes
         // parked threads their wake token — `queue.push_to` broadcasts on its
         // own; this path must do it explicitly.
         queue.queues.push_message(tid, message);
-        self.wake_hub.broadcast(wie_winapi::Wake::MessagePosted);
+        self.wake_hub
+            .broadcast(wie_winapi::port::Wake::MessagePosted);
     }
 
     /// Returns the first window backed by a guest WndProc.
@@ -355,13 +371,13 @@ impl RuntimeSession {
 
     /// Take the latest published frame for `hwnd`, if any (channel read).
     #[must_use]
-    pub fn take_frame(&self, hwnd: u64) -> Option<wie_winapi::present::SurfaceFrame> {
+    pub fn take_frame(&self, hwnd: u64) -> Option<wie_winapi::port::SurfaceFrame> {
         self.process.with_winapi_ref(|state| {
             state
                 .try_present()
                 .map(|p| {
                     p.channel_arc()
-                        .take_frame(wie_winapi::handles::Hwnd::from(hwnd))
+                        .take_frame(wie_winapi::port::Hwnd::from(hwnd))
                 })
                 .unwrap_or(None)
         })
@@ -396,25 +412,28 @@ impl RuntimeSession {
     }
 
     /// Configures the next common file dialog outcome (`GetOpenFileName` / `GetSaveFileName`).
-    pub fn set_file_dialog_policy(&mut self, policy: wie_winapi::FileDialogPolicy) {
+    pub fn set_file_dialog_policy(&mut self, policy: wie_winapi::port::FileDialogPolicy) {
         self.process
             .with_mut(|_, s| s.window_state().file_dialog_policy = policy);
     }
 
     /// Configures the next common font dialog outcome (`ChooseFontW`).
-    pub fn set_font_dialog_policy(&mut self, policy: wie_winapi::FontDialogPolicy) {
+    pub fn set_font_dialog_policy(&mut self, policy: wie_winapi::port::FontDialogPolicy) {
         self.process
             .with_mut(|_, s| s.window_state().font_dialog_policy = policy);
     }
 
     /// Configures the next common print dialog outcome (`PrintDlgW`).
-    pub fn set_print_dialog_policy(&mut self, policy: wie_winapi::PrintDialogPolicy) {
+    pub fn set_print_dialog_policy(&mut self, policy: wie_winapi::port::PrintDialogPolicy) {
         self.process
             .with_mut(|_, s| s.window_state().print_dialog_policy = policy);
     }
 
     /// Configures the next common page-setup dialog outcome (`PageSetupDlgW`).
-    pub fn set_page_setup_dialog_policy(&mut self, policy: wie_winapi::PageSetupDialogPolicy) {
+    pub fn set_page_setup_dialog_policy(
+        &mut self,
+        policy: wie_winapi::port::PageSetupDialogPolicy,
+    ) {
         self.process
             .with_mut(|_, s| s.window_state().page_setup_dialog_policy = policy);
     }
@@ -435,22 +454,20 @@ impl RuntimeSession {
         host_path: impl AsRef<std::path::Path>,
     ) -> Result<()> {
         self.process
-            .with_mut(|_, st| wie_winapi::kernel32::mount_host_file(st, guest_path, host_path))
+            .with_mut(|_, st| wie_winapi::port::mount_host_file(st, guest_path, host_path))
     }
 
     /// Opens a guest path with the same rules as `CreateFile*` (for smoke tests).
     pub fn open_guest_path(&mut self, guest_path: &str) -> Result<u64> {
         self.process
-            .with_mut(|_, st| wie_winapi::kernel32::open_guest_path(st, guest_path))
+            .with_mut(|_, st| wie_winapi::port::open_guest_path(st, guest_path))
     }
 
     /// Returns the size of an open guest file handle.
     pub fn guest_file_size(&self, handle: u64) -> Result<u64> {
         self.process.with_winapi_ref(|st| {
             let file = st
-                .file_io
-                .open_files
-                .get(&handle)
+                .open_guest_file(handle)
                 .with_context(|| format!("unknown guest file handle {handle:#018x}"))?;
             u64::try_from(file.bytes.len()).context("guest file size does not fit u64")
         })
@@ -460,8 +477,7 @@ impl RuntimeSession {
     pub fn peek_guest_file(&self, handle: u64, offset: usize, len: usize) -> Result<Vec<u8>> {
         self.process.with_winapi_ref(|st| {
             let file = st
-                .file_io.open_files
-                .get(&handle)
+                .open_guest_file(handle)
                 .with_context(|| format!("unknown guest file handle {handle:#018x}"))?;
             let end = offset
                 .checked_add(len)
@@ -481,8 +497,7 @@ impl RuntimeSession {
     #[must_use]
     pub fn open_guest_files_snapshot(&self) -> Vec<(u64, String, u64)> {
         self.process.with_winapi_ref(|st| {
-            st.file_io
-                .open_files
+            st.open_guest_files()
                 .iter()
                 .filter_map(|(&handle, file)| {
                     let size = u64::try_from(file.bytes.len()).ok()?;
@@ -521,7 +536,7 @@ impl Drop for RuntimeSession {
     fn drop(&mut self) {
         // Wake any thread parked on an inbox (Painpoint 1) before reaping:
         // teardown must never leave a park loop blocked past session death.
-        self.wake_hub.broadcast(wie_winapi::Wake::Shutdown);
+        self.wake_hub.broadcast(wie_winapi::port::Wake::Shutdown);
         // Reap guest worker threads when the explicit ExitProcess path
         // (session/pump.rs) never ran: early CLI abort, headless idle exit,
         // budget exhaustion, or test teardown. Without this the JoinHandles
@@ -622,7 +637,7 @@ pub(crate) fn invalid_memory_diagnostic(
 #[cold]
 pub(crate) fn fault_capture(
     engine: &mut dyn wie_cpu::CpuEngine,
-    state: &wie_winapi::WinApiState,
+    state: &wie_winapi::port::WinApiState,
     tid: u32,
     access: &wie_cpu::InvalidMemoryAccess,
 ) {
@@ -641,13 +656,10 @@ pub(crate) fn fault_capture(
         16 => "exec",
         _ => "?",
     };
-    let mut module = String::from("?");
-    for m in state.module_state.loaded_modules.values() {
-        if rip >= m.image_base && rip < m.image_base.saturating_add(m.image_size as u64) {
-            module = format!("{} +0x{:x}", m.name, rip - m.image_base);
-            break;
-        }
-    }
+    let mut module = match state.module_for_va(rip) {
+        Some((name, offset)) => format!("{name} +0x{offset:x}"),
+        None => String::from("?"),
+    };
     // Main exe fallback: derive its base from the PE header found by walking
     // the standard high half (preferred base for PE32+ images).
     if module == "?" && rip >= 0x10000 {
@@ -661,12 +673,9 @@ pub(crate) fn fault_capture(
         .unwrap_or(0);
     let hex: Vec<String> = bytes[..n].iter().map(|b| format!("{b:02x}")).collect();
     let resolve = |va: u64| -> Option<String> {
-        for m in state.module_state.loaded_modules.values() {
-            if va >= m.image_base && va < m.image_base.saturating_add(m.image_size as u64) {
-                return Some(format!("{} +0x{:x}", m.name, va - m.image_base));
-            }
-        }
-        None
+        state
+            .module_for_va(va)
+            .map(|(name, offset)| format!("{name} +0x{offset:x}"))
     };
     let mut stack = String::new();
     for i in 0_u64..40 {
@@ -756,9 +765,9 @@ mod tests {
     use std::sync::{Arc, Mutex, RwLock};
     use wie_cpu::{CpuEngine, IcedCpu};
     use wie_pe::ProcessIdentity;
-    use wie_winapi::WindowRecord;
-    use wie_winapi::handles::Hwnd;
-    use wie_winapi::{HandlerContext, WinApiEnvironment, gdi32, user32};
+    use wie_winapi::port::Hwnd;
+    use wie_winapi::port::WindowRecord;
+    use wie_winapi::port::{HandlerContext, WinApiEnvironment, WinApiId, dispatch_winapi_id};
 
     fn record(handle: u64, parent: u64, title: &str, width: i32, height: i32) -> WindowRecord {
         WindowRecord {
@@ -788,7 +797,7 @@ mod tests {
         GuestHandle {
             state: Arc::new(Mutex::new(winapi_state)),
             present_channel,
-            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         }
@@ -913,7 +922,7 @@ mod tests {
         let handle = GuestHandle {
             state: Arc::clone(&__state_arc),
             present_channel: Arc::clone(&__present_channel),
-            queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+            queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
             menu_tree_cache: Arc::new(RwLock::new(None)),
             lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
         };
@@ -931,8 +940,15 @@ mod tests {
         let window_dc = {
             let mut st = handle.state.lock().expect("lock");
             write_regs(&mut engine, hwnd, 0, 0, 0);
-            let r = user32::handle_get_dc(&mut HandlerContext::new(&mut engine, env(), &mut st))
-                .expect("GetDC");
+            // Routed through the real dispatch table rather than
+            // `user32::handle_get_dc` directly (ADR-0006): a test that calls a
+            // handler by name exercises a path production never takes, and it
+            // makes a WinAPI handler part of this crate's public surface.
+            let r = dispatch_winapi_id(
+                &mut HandlerContext::new(&mut engine, env(), &mut st),
+                WinApiId::User32Getdc,
+            )
+            .expect("GetDC");
             assert_ne!(r.return_value, 0, "GetDC returns a window DC");
             r.return_value
         };
@@ -942,11 +958,10 @@ mod tests {
         let mem_dc = {
             let mut st = handle.state.lock().expect("lock");
             write_regs(&mut engine, 0, 0, 0, 0);
-            let r = gdi32::handle_create_compatible_dc(&mut HandlerContext::new(
-                &mut engine,
-                env(),
-                &mut st,
-            ))
+            let r = dispatch_winapi_id(
+                &mut HandlerContext::new(&mut engine, env(), &mut st),
+                WinApiId::Gdi32Createcompatibledc,
+            )
             .expect("CreateCompatibleDC");
             assert_ne!(r.return_value, 0, "memory DC");
             r.return_value
@@ -965,11 +980,10 @@ mod tests {
         let (hbitmap, dib_bits_va) = {
             let mut st = handle.state.lock().expect("lock");
             write_regs(&mut engine, mem_dc, bmi_va, 0, bits_out_va);
-            let r = gdi32::handle_create_dib_section(&mut HandlerContext::new(
-                &mut engine,
-                env(),
-                &mut st,
-            ))
+            let r = dispatch_winapi_id(
+                &mut HandlerContext::new(&mut engine, env(), &mut st),
+                WinApiId::Gdi32Createdibsection,
+            )
             .expect("CreateDIBSection");
             assert_ne!(r.return_value, 0, "DIB handle");
             let mut bits = [0_u8; 8];
@@ -982,9 +996,11 @@ mod tests {
         {
             let mut st = handle.state.lock().expect("lock");
             write_regs(&mut engine, mem_dc, hbitmap, 0, 0);
-            let _ =
-                gdi32::handle_select_object(&mut HandlerContext::new(&mut engine, env(), &mut st))
-                    .expect("SelectObject");
+            let _ = dispatch_winapi_id(
+                &mut HandlerContext::new(&mut engine, env(), &mut st),
+                WinApiId::Gdi32Selectobject,
+            )
+            .expect("SelectObject");
         }
 
         // The renderer painted the whole DIB: BGRA (A=FF, B=0, G=0, R=FF)
@@ -1018,8 +1034,11 @@ mod tests {
             engine
                 .mem_write(STACK_TOP + 0x48, &0x00CC_0020_u32.to_le_bytes())
                 .expect("SRCCOPY rop");
-            let r = gdi32::handle_bit_blt(&mut HandlerContext::new(&mut engine, env(), &mut st))
-                .expect("BitBlt");
+            let r = dispatch_winapi_id(
+                &mut HandlerContext::new(&mut engine, env(), &mut st),
+                WinApiId::Gdi32Bitblt,
+            )
+            .expect("BitBlt");
             assert_eq!(r.return_value, 1, "BitBlt succeeds");
         }
 

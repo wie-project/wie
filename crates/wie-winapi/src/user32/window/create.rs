@@ -3,6 +3,7 @@
 
 use super::class::find_window_mut;
 use crate::OuterReturn;
+use crate::capability::PresentAccess;
 use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::CreateStruct;
 use crate::user32::{
@@ -161,9 +162,7 @@ fn create_window_ex_impl(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<Win
     // their parent's surface and own no host window, so only parentless
     // windows register.
     if parent_handle == 0 {
-        state
-            .present()
-            .register_top_level(crate::handles::Hwnd::from(hwnd));
+        state.register_top_level(crate::handles::Hwnd::from(hwnd));
     }
 
     // Update the window record with client rect

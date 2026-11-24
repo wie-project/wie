@@ -1020,7 +1020,7 @@ fn gl_quad_resize_keeps_quad_center_readback() {
         if !resized && let Some(hwnd) = session.first_guest_window_handle() {
             session.guest_handle().resize_window(
                 wie_winapi::handles::Hwnd::from(hwnd),
-                wie_winapi::user32::Dimension {
+                wie_winapi::port::Dimension {
                     width: 900,
                     height: 700,
                 },

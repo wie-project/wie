@@ -38,7 +38,7 @@ use crate::asm_utils::{patch_rel8, patch_rel32};
 use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
-use wie_winapi::{WinApiId, encode_alias};
+use wie_winapi::port::{WinApiId, encode_alias};
 
 /// Maximum simultaneously accelerated open files.
 pub(crate) const GUEST_IO_MAX_SLOTS: usize = 128;

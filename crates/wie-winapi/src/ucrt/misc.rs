@@ -151,12 +151,11 @@ pub(crate) fn handle_rand(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 }
 /// `_kbhit()` — non-blocking key-press check (peek, does NOT consume).
 pub(crate) fn handle_kbhit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    ctx.state.flush_console();
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
-    crate::console::pump::ensure_input_ready(state);
-    let ready = crate::console::pump::peek_key_press(state);
-    finish(engine, u64::from(ready))
+    let cx = ctx.console();
+    cx.state.flush_console();
+    crate::console::pump::ensure_input_ready(cx.state.console());
+    let ready = crate::console::pump::peek_key_press(cx.state.console());
+    finish(cx.engine, u64::from(ready))
 }
 
 // Map a Windows VK code to the scan code MSVC `_getch` returns for
@@ -189,31 +188,30 @@ std::thread_local! {
 /// 1. First call returns 0 (signals an extended key).
 /// 2. Second call returns the scan code.
 pub(crate) fn handle_getch(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    ctx.state.flush_console();
-    let engine = &mut *ctx.engine;
-    let state = &mut *ctx.state;
+    let cx = ctx.console();
+    cx.state.flush_console();
 
     // If a scan code is pending from a previous extended-key prefix, return it.
     if let Some(scan) = PENDING_SCAN.get() {
         PENDING_SCAN.set(None);
-        return finish(engine, u64::from(scan));
+        return finish(cx.engine, u64::from(scan));
     }
 
-    crate::console::pump::ensure_input_ready(state);
-    let Some(key) = crate::console::pump::next_key_press(state, true) else {
-        return finish(engine, 0);
+    crate::console::pump::ensure_input_ready(cx.state.console());
+    let Some(key) = crate::console::pump::next_key_press(cx.state.console(), true) else {
+        return finish(cx.engine, 0);
     };
 
     if key.unit != 0 {
         // Regular key: return the character directly.
-        return finish(engine, u64::from(key.unit));
+        return finish(cx.engine, u64::from(key.unit));
     }
 
     // Extended key (no character): return 0 now, save scan code for next call.
     if let Some(scan) = vk_to_scan(key.virtual_key_code) {
         PENDING_SCAN.set(Some(scan));
     }
-    finish(engine, 0)
+    finish(cx.engine, 0)
 }
 /// `system(command)` — run a shell command on the host.
 ///
@@ -252,7 +250,7 @@ pub(crate) fn handle_system(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         // Route through the console buffer so the clear and the
         // subsequent fputs(frame) arrive at the terminal as one
         // atomic write on Sleep.
-        crate::kernel32::console::emit_text_from_bytes(ctx, b"\x1b[2J\x1b[H");
+        crate::console::api::emit_text_from_bytes(&mut *ctx.state, b"\x1b[2J\x1b[H");
         let eng = &mut *ctx.engine;
         return finish(eng, 0);
     }
@@ -434,12 +432,12 @@ pub(crate) fn handle_perror(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         } else {
             format!("{prefix}: {desc}\n")
         };
-        crate::kernel32::console::emit_text_from_bytes(ctx, msg.as_bytes());
+        crate::console::api::emit_text_from_bytes(&mut *ctx.state, msg.as_bytes());
     } else {
         // Can't read errno — still print the prefix.
         if !prefix.is_empty() {
             let msg = format!("{prefix}: Unknown error\n");
-            crate::kernel32::console::emit_text_from_bytes(ctx, msg.as_bytes());
+            crate::console::api::emit_text_from_bytes(&mut *ctx.state, msg.as_bytes());
         }
     }
     let engine = &mut *ctx.engine;

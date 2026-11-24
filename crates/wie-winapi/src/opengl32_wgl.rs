@@ -5,6 +5,7 @@
 //! parent module's `render` submodule.
 
 use super::*;
+use crate::capability::PresentAccess;
 use crate::gdi32::{ArgReg, read_arg};
 
 /// The stub's single pixel-format index (`wglChoosePixelFormat` / describe).
@@ -177,7 +178,7 @@ pub(crate) fn handle_wgl_swap_buffers(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let (hwnd, width, height) = match resolved {
         Some(dest) => (dest.hwnd, dest.width, dest.height),
         None => {
-            let Some(hwnd) = state.present().z_order.last().copied() else {
+            let Some(hwnd) = state.top_level_z_order().last().copied() else {
                 return ctx.finish(1);
             };
             let (w, h) = crate::user32::window_client_size(state, hwnd.as_u64());
@@ -193,45 +194,29 @@ pub(crate) fn handle_wgl_swap_buffers(ctx: &mut HandlerContext<'_>) -> Result<Wi
     // back via spare-buffer pooling) with no intermediate `Vec<u32>` copy. If
     // the GL framebuffer size differs from the surface, stretch_nearest writes
     // directly into the pooled slice (no temp).
-    state.present().ensure_surface(hwnd, width, height);
+    state.ensure_surface(hwnd, width, height);
     // Take the pooled surface Vec out (pointer move, no copy), hand its
     // mutable slice to the GL present as render target, then restore it.
     let (logical_w, h, padded_w) = {
-        let s = state
-            .present()
-            .surfaces
-            .get(&hwnd)
-            .expect("surface ensured");
+        let s = state.surface(hwnd).expect("surface ensured");
         (s.width, s.height, s.stride)
     };
-    let mut pooled = std::mem::take(
-        &mut state
-            .present()
-            .surfaces
-            .get_mut(&hwnd)
-            .expect("surface ensured")
-            .pixels,
-    );
+    let mut pooled = std::mem::take(&mut state.surface_mut(hwnd).expect("surface ensured").pixels);
     let did_blit = with_current_gl(|gl_ctx| {
         render::gl_frame_into(gl_ctx, &mut pooled, logical_w, h, padded_w, width, height)
     })
     .unwrap_or(false);
     // Restore the pooled allocation (capacity retained) for publish.
-    state
-        .present()
-        .surfaces
-        .get_mut(&hwnd)
-        .expect("surface ensured")
-        .pixels = pooled;
+    state.surface_mut(hwnd).expect("surface ensured").pixels = pooled;
     if did_blit {
-        state.present().publish(hwnd);
+        state.publish(hwnd);
     } else {
         // Fallback: no GL context — publish the (cleared) surface.
         let frame = with_current_gl(|gl_ctx| render::gl_frame_0rgb(gl_ctx, width, height));
         if let Some((fw, fh, pixels)) = frame {
-            state.present().blit_frame(hwnd, &pixels, fw, fh);
+            state.blit_frame(hwnd, &pixels, fw, fh);
         } else {
-            state.present().publish(hwnd);
+            state.publish(hwnd);
         }
     }
     tracing::trace!(target: "wiegui", hdc, width, height, "wglSwapBuffers published a rendered frame");

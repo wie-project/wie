@@ -331,41 +331,41 @@ fn socket_writable(ws2: &mut Ws2State, handle: u64) -> bool {
     }
 }
 
+crate::soft_dispatch::soft_exports! {
+    ("accept", handle_accept),
+    ("bind", handle_bind),
+    ("closesocket", handle_closesocket),
+    ("connect", handle_connect),
+    ("freeaddrinfo", handle_freeaddrinfo),
+    ("getaddrinfo", handle_getaddrinfo),
+    ("gethostbyname", handle_gethostbyname),
+    ("getpeername", handle_getpeername),
+    ("getsockname", handle_getsockname),
+    ("getsockopt", handle_getsockopt),
+    ("htons", handle_htons),
+    ("inet_addr", handle_inet_addr),
+    ("inet_ntoa", handle_inet_ntoa),
+    ("ioctlsocket", handle_ioctlsocket),
+    ("listen", handle_listen),
+    ("ntohs", handle_ntohs),
+    ("recv", handle_recv),
+    ("select", handle_select),
+    ("send", handle_send),
+    ("setsockopt", handle_setsockopt),
+    ("shutdown", handle_shutdown),
+    ("socket", handle_socket),
+    ("wsacleanup", handle_wsacleanup),
+    ("wsagetlasterror", handle_wsagetlasterror),
+    ("wsasetlasterror", handle_wsasetlasterror),
+    ("wsastartup", handle_wsastartup),
+}
+
 /// Dispatch a `WS2_32.dll` export by name (case-insensitive).
 pub fn dispatch_ws2(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let n = name.to_ascii_lowercase();
-    match n.as_str() {
-        "wsastartup" => Ok(Some(handle_wsastartup(ctx)?)),
-        "wsacleanup" => Ok(Some(handle_wsacleanup(ctx)?)),
-        "wsagetlasterror" => Ok(Some(handle_wsagetlasterror(ctx)?)),
-        "wsasetlasterror" => Ok(Some(handle_wsasetlasterror(ctx)?)),
-        "socket" => Ok(Some(handle_socket(ctx)?)),
-        "closesocket" => Ok(Some(handle_closesocket(ctx)?)),
-        "bind" => Ok(Some(handle_bind(ctx)?)),
-        "listen" => Ok(Some(handle_listen(ctx)?)),
-        "accept" => Ok(Some(handle_accept(ctx)?)),
-        "connect" => Ok(Some(handle_connect(ctx)?)),
-        "send" => Ok(Some(handle_send(ctx)?)),
-        "recv" => Ok(Some(handle_recv(ctx)?)),
-        "select" => Ok(Some(handle_select(ctx)?)),
-        "getaddrinfo" => Ok(Some(handle_getaddrinfo(ctx)?)),
-        "freeaddrinfo" => Ok(Some(handle_freeaddrinfo(ctx)?)),
-        "gethostbyname" => Ok(Some(handle_gethostbyname(ctx)?)),
-        "inet_addr" => Ok(Some(handle_inet_addr(ctx)?)),
-        "inet_ntoa" => Ok(Some(handle_inet_ntoa(ctx)?)),
-        "htons" => Ok(Some(handle_htons(ctx)?)),
-        "ntohs" => Ok(Some(handle_ntohs(ctx)?)),
-        "getsockname" => Ok(Some(handle_getsockname(ctx)?)),
-        "getpeername" => Ok(Some(handle_getpeername(ctx)?)),
-        "setsockopt" => Ok(Some(handle_setsockopt(ctx)?)),
-        "getsockopt" => Ok(Some(handle_getsockopt(ctx)?)),
-        "shutdown" => Ok(Some(handle_shutdown(ctx)?)),
-        "ioctlsocket" => Ok(Some(handle_ioctlsocket(ctx)?)),
-        _ => Ok(None),
-    }
+    crate::soft_dispatch::dispatch_soft_table(ctx, DISPATCH, name)
 }
 
 /// `int WSAStartup(WORD wVersionRequested, LPWSADATA lpWSAData)`

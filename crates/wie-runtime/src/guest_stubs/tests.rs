@@ -129,36 +129,36 @@ fn dialog_callee_vas_resolve_without_imports() {
     // loop's callees; their fake VAs must still decode to the right
     // WinApiIds (deterministic encode_export, stop-bit default host-stop).
     let cfg = GuestStubConfig::from_layout(&crate::memory::DEFAULT_LAYOUT);
-    let expect_export = |va: u64, id: wie_winapi::WinApiId| {
+    let expect_export = |va: u64, id: wie_winapi::port::WinApiId| {
         assert!(
-            va >= wie_winapi::FAKE_API_BASE,
+            va >= wie_winapi::port::FAKE_API_BASE,
             "callee VA {va:#x} outside fake-API window"
         );
         assert_eq!(
-            wie_winapi::decode_fake_va(va),
-            Some(wie_winapi::FakeVa::Export(id)),
+            wie_winapi::port::decode_fake_va(va),
+            Some(wie_winapi::port::FakeVa::Export(id)),
             "callee VA {va:#x} does not decode to {id:?}"
         );
     };
     expect_export(
         cfg.create_dialog_param_a_va,
-        wie_winapi::WinApiId::User32Createdialogparama,
+        wie_winapi::port::WinApiId::User32Createdialogparama,
     );
     expect_export(
         cfg.create_dialog_param_w_va,
-        wie_winapi::WinApiId::User32Createdialogparamw,
+        wie_winapi::port::WinApiId::User32Createdialogparamw,
     );
     expect_export(
         cfg.get_message_a_va,
-        wie_winapi::WinApiId::User32Getmessagea,
+        wie_winapi::port::WinApiId::User32Getmessagea,
     );
     expect_export(
         cfg.is_dialog_message_a_va,
-        wie_winapi::WinApiId::User32Isdialogmessagea,
+        wie_winapi::port::WinApiId::User32Isdialogmessagea,
     );
     expect_export(
         cfg.dispatch_message_a_va,
-        wie_winapi::WinApiId::User32Dispatchmessagea,
+        wie_winapi::port::WinApiId::User32Dispatchmessagea,
     );
     // The dialog-result slot lives inside the mapped stub data page.
     assert!(
@@ -175,13 +175,13 @@ fn dialog_callee_vas_resolve_without_imports() {
 
 #[test]
 fn metrics_table_matches_known_sm() {
-    let page = build_stub_data_page(wie_winapi::DisplayMetrics::default());
+    let page = build_stub_data_page(wie_winapi::port::DisplayMetrics::default());
     // SM_CXSCREEN = 0 → default width
     assert_eq!(&page[0..4], &1920_u32.to_le_bytes());
     // SM_CYSCREEN = 1 → default height
     assert_eq!(&page[4..8], &1080_u32.to_le_bytes());
     // Non-default metrics flow through: a 1728×1117 monitor is reported as-is.
-    let page = build_stub_data_page(wie_winapi::DisplayMetrics::new(1728, 1117));
+    let page = build_stub_data_page(wie_winapi::port::DisplayMetrics::new(1728, 1117));
     assert_eq!(&page[0..4], &1728_u32.to_le_bytes());
     assert_eq!(&page[4..8], &1117_u32.to_le_bytes());
 }

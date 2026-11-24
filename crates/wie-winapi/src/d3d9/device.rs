@@ -8,6 +8,7 @@
 //! `raster`, texture/surface lifecycle in `texture`, and blend/depth state in
 //! `blend`.
 
+use crate::capability::PresentAccess;
 use anyhow::{Context, Result};
 
 use super::buffer::{BufferKind, create_buffer_record};
@@ -373,9 +374,9 @@ pub fn handle_present(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
         let bb_slice: &[u32] = &backbuffer;
         // Hand the next pooled surface slice to the present as render target
         // (Q9/C). `blit_frame` writes directly into that pooled allocation.
-        state.present().ensure_surface(hwnd, win_w, win_h);
+        state.ensure_surface(hwnd, win_w, win_h);
         // Direct blit into the pooled slice — no temp Vec, no intermediate copy.
-        state.present().blit_frame(hwnd, bb_slice, bb_w, bb_h);
+        state.blit_frame(hwnd, bb_slice, bb_w, bb_h);
         // Restore the backbuffer Vec with its original capacity for the next draws.
         state.d3d9().d3d9_backbuffer = backbuffer;
     }

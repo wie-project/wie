@@ -1163,22 +1163,15 @@ pub struct QueuedWindowMessage {
 }
 
 /// Registered fake USER32 hook.
+///
+/// Only the handle. `SetWindowsHookExW`'s other four parameters (`idHook`,
+/// `lpfn`, `hmod`, `dwThreadId`) are validated at the handler but not kept:
+/// nothing in the emulator dispatches through a hook yet, so they were state
+/// with no reader. A field comes back when the code that reads it does.
 #[derive(Debug, Clone)]
 pub struct WindowsHookRecord {
     /// Fake hook handle returned to the guest.
     pub handle: u64,
-
-    /// Hook type such as `WH_CBT` or `WH_CALLWNDPROC`.
-    pub hook_type: i32,
-
-    /// Guest hook procedure address.
-    pub callback_address: u64,
-
-    /// Optional module handle supplied by the guest.
-    pub module_handle: u64,
-
-    /// Target thread identifier, or zero for a global hook.
-    pub thread_id: u32,
 }
 
 /// Fake global atom table entry.

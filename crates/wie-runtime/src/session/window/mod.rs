@@ -2,8 +2,8 @@
 
 use super::menu::{MenuNode, MenuTreeCache, build_menu_tree};
 use std::sync::Arc;
-use wie_winapi::user32::Dimension;
-use wie_winapi::{WindowFlags, handles::Hmenu, handles::Hwnd};
+use wie_winapi::port::Dimension;
+use wie_winapi::port::{Hmenu, Hwnd, WindowFlags};
 
 /// Host-side handle to the WinAPI state for cross-thread access.
 ///
@@ -13,14 +13,14 @@ use wie_winapi::{WindowFlags, handles::Hmenu, handles::Hwnd};
 /// execution — so input events never block on guest work.
 #[derive(Clone)]
 pub struct GuestHandle {
-    pub(super) state: std::sync::Arc<std::sync::Mutex<wie_winapi::WinApiState>>,
-    pub(super) queue: std::sync::Arc<std::sync::Mutex<wie_winapi::present::MessageQueue>>,
+    pub(super) state: std::sync::Arc<std::sync::Mutex<wie_winapi::port::WinApiState>>,
+    pub(super) queue: std::sync::Arc<std::sync::Mutex<wie_winapi::port::MessageQueue>>,
     /// The host-presenter frame channel (ADR-0003): latest-wins frame slot,
     /// spare pool, z/window revision mirrors, presenter timing. Per-frame
     /// reads/writes (`take_frame`, `store_spare_buffer`, `windows_rev`,
     /// `z_snapshot`, `record_present_time`) lock ONLY this — never the big
     /// `WinApiState` mutex the guest thread holds during paint handlers.
-    pub(super) present_channel: Arc<wie_winapi::present::PresentChannel>,
+    pub(super) present_channel: Arc<wie_winapi::port::PresentChannel>,
     /// Cached menu-bar tree, keyed by the menu handle it was built for.
     ///
     /// `window_menu_items` rebuilds only when `WindowState.menu_dirty` flips
@@ -42,8 +42,8 @@ pub struct GuestHandle {
 /// Wave 2 Step 2: runs over the presenter-side window mirror
 /// (`present::MirrorWindow`) — never the big `WinApiState` lock.
 fn hit_test_subtree(
-    windows: &[wie_winapi::present::MirrorWindow],
-    mut current: wie_winapi::handles::Hwnd,
+    windows: &[wie_winapi::port::MirrorWindow],
+    mut current: wie_winapi::port::Hwnd,
     mut rel_x: i32,
     mut rel_y: i32,
 ) -> Option<(u64, u32, u32)> {
@@ -73,7 +73,9 @@ impl GuestHandle {
     /// (fail soft) exactly like the previous `.lock().ok()?` patterns, so
     /// poison behavior is unchanged. Disabled path pays one relaxed atomic
     /// load before the plain lock.
-    pub(super) fn lock_state(&self) -> Option<std::sync::MutexGuard<'_, wie_winapi::WinApiState>> {
+    pub(super) fn lock_state(
+        &self,
+    ) -> Option<std::sync::MutexGuard<'_, wie_winapi::port::WinApiState>> {
         if !self.lock_wait_stats.enabled() {
             return self.state.lock().ok();
         }
@@ -90,9 +92,9 @@ impl GuestHandle {
     /// paint handler or D3D9 draw holding that lock cannot stall the
     /// presenter (and the macOS UI thread) — the whole point of the channel.
     #[must_use]
-    pub fn take_frame(&self, hwnd: u64) -> Option<wie_winapi::present::SurfaceFrame> {
+    pub fn take_frame(&self, hwnd: u64) -> Option<wie_winapi::port::SurfaceFrame> {
         self.present_channel
-            .take_frame(wie_winapi::handles::Hwnd::from(hwnd))
+            .take_frame(wie_winapi::port::Hwnd::from(hwnd))
     }
 
     /// Frames published but not yet taken — the presenter re-arms its redraw
@@ -105,7 +107,7 @@ impl GuestHandle {
 
     pub fn store_spare_buffer(&self, hwnd: u64, buffer: Vec<u32>) {
         self.present_channel
-            .store_spare(wie_winapi::handles::Hwnd::from(hwnd), buffer);
+            .store_spare(wie_winapi::port::Hwnd::from(hwnd), buffer);
     }
 
     /// The EDIT control's caret/selection for `hwnd`: `(caret, sel_start,
@@ -153,14 +155,14 @@ impl GuestHandle {
     /// Whether frame timing instrumentation is active (lock-free gate).
     #[must_use]
     pub fn frame_timing_enabled(&self) -> bool {
-        wie_winapi::present::frame_timing_enabled()
+        wie_winapi::port::frame_timing_enabled()
     }
 
     /// Record one host present (upload + present) wall time (ns).
     /// Channel-only (the internal gate makes this a no-op when timing is
     /// disabled) — never the big lock.
     pub fn record_present_time(&self, ns: u128) {
-        if !wie_winapi::present::frame_timing_enabled() {
+        if !wie_winapi::port::frame_timing_enabled() {
             return;
         }
         self.present_channel.record_present(ns);
@@ -216,7 +218,7 @@ impl GuestHandle {
             .mirror_windows(|windows| {
                 let top = windows
                     .iter()
-                    .find(|w| w.parent == wie_winapi::handles::Hwnd::NULL)?
+                    .find(|w| w.parent == wie_winapi::port::Hwnd::NULL)?
                     .handle;
                 Some((top, hit_test_subtree(windows, top, x, y)))
             })
@@ -238,7 +240,7 @@ impl GuestHandle {
     /// event runs this without ever taking the big `WinApiState` lock.
     #[must_use]
     pub fn window_at_in(&self, hwnd: u64, x: i32, y: i32) -> Option<(u64, u32, u32)> {
-        let root = wie_winapi::handles::Hwnd::from(hwnd);
+        let root = wie_winapi::port::Hwnd::from(hwnd);
         self.present_channel
             .mirror_windows(|windows| {
                 windows.iter().find(|w| w.handle == root)?;
@@ -263,7 +265,7 @@ impl GuestHandle {
     #[must_use]
     pub fn capture_target(&self, x: i32, y: i32) -> Option<(u64, u32, u32)> {
         let capture = self.present_channel.mirror_meta()?.1;
-        if capture == wie_winapi::handles::Hwnd::NULL {
+        if capture == wie_winapi::port::Hwnd::NULL {
             return None;
         }
         self.present_channel
@@ -272,7 +274,7 @@ impl GuestHandle {
                 let (mut offset_x, mut offset_y) = (0_i32, 0_i32);
                 let mut current = capture;
                 while let Some(w) = windows.iter().find(|w| w.handle == current) {
-                    if w.parent == wie_winapi::handles::Hwnd::NULL {
+                    if w.parent == wie_winapi::port::Hwnd::NULL {
                         break;
                     }
                     offset_x = offset_x.saturating_add(w.x);
@@ -335,14 +337,14 @@ impl GuestHandle {
     #[must_use]
     pub fn focused_top_level(&self) -> Option<u64> {
         let mut current = self.present_channel.mirror_meta()?.0;
-        if current == wie_winapi::handles::Hwnd::NULL {
+        if current == wie_winapi::port::Hwnd::NULL {
             return None;
         }
         self.present_channel
             .mirror_windows(|windows| {
                 loop {
                     let window = windows.iter().find(|w| w.handle == current)?;
-                    if window.parent == wie_winapi::handles::Hwnd::NULL {
+                    if window.parent == wie_winapi::port::Hwnd::NULL {
                         return Some(current.as_u64());
                     }
                     current = window.parent;
@@ -361,7 +363,7 @@ impl GuestHandle {
     pub fn focus_window(&self) -> Option<u64> {
         let state = self.lock_state()?;
         let focus = state.try_window_state()?.focus_window_handle;
-        (focus != wie_winapi::handles::Hwnd::NULL).then_some(focus.as_u64())
+        (focus != wie_winapi::port::Hwnd::NULL).then_some(focus.as_u64())
     }
 
     /// Whether `TrackMouseEvent` armed hover/leave tracking for `hwnd`.
@@ -375,7 +377,7 @@ impl GuestHandle {
     /// matching the lock-failure fallback it replaces.
     #[must_use]
     pub fn mouse_tracking(&self, hwnd: u64) -> bool {
-        let target = wie_winapi::handles::Hwnd::from(hwnd);
+        let target = wie_winapi::port::Hwnd::from(hwnd);
         self.present_channel
             .mirror_windows(|windows| {
                 windows
@@ -457,7 +459,7 @@ impl GuestHandle {
     /// guest window.
     #[must_use]
     pub fn top_level_origin(&self, hwnd: u64) -> Option<(i32, i32)> {
-        let start = wie_winapi::handles::Hwnd::from(hwnd);
+        let start = wie_winapi::port::Hwnd::from(hwnd);
         self.present_channel
             .mirror_windows(|windows| {
                 let mut current = start;
@@ -466,7 +468,7 @@ impl GuestHandle {
                 // cycle cannot spin the event loop.
                 for _ in 0..windows.len().saturating_add(1) {
                     let record = windows.iter().find(|w| w.handle == current)?;
-                    if record.parent == wie_winapi::handles::Hwnd::NULL {
+                    if record.parent == wie_winapi::port::Hwnd::NULL {
                         return Some((record.x, record.y));
                     }
                     current = record.parent;
@@ -522,20 +524,20 @@ impl GuestHandle {
         if let Some((focus, _, menu_dirty)) = self.present_channel.mirror_meta()
             && !menu_dirty
         {
-            let resolved: Option<wie_winapi::handles::Hmenu> = self
+            let resolved: Option<wie_winapi::port::Hmenu> = self
                 .present_channel
                 .mirror_windows(|windows| {
                     // The focused window's menu wins; a child window's
                     // menu slot holds its child id, so ascend to the
                     // focus's parentless top-level first.
                     let mut focus_top = focus;
-                    if focus_top != wie_winapi::handles::Hwnd::NULL {
+                    if focus_top != wie_winapi::port::Hwnd::NULL {
                         loop {
                             let Some(w) = windows.iter().find(|w| w.handle == focus_top) else {
-                                focus_top = wie_winapi::handles::Hwnd::NULL;
+                                focus_top = wie_winapi::port::Hwnd::NULL;
                                 break;
                             };
-                            if w.parent == wie_winapi::handles::Hwnd::NULL {
+                            if w.parent == wie_winapi::port::Hwnd::NULL {
                                 break;
                             }
                             focus_top = w.parent;
@@ -547,11 +549,11 @@ impl GuestHandle {
                         .map(|w| w.menu_handle)
                         .or_else(|| {
                             windows.iter().find_map(|w| {
-                                (w.parent == wie_winapi::handles::Hwnd::NULL && w.menu_handle != 0)
+                                (w.parent == wie_winapi::port::Hwnd::NULL && w.menu_handle != 0)
                                     .then_some(w.menu_handle)
                             })
                         })
-                        .map(wie_winapi::handles::Hmenu::from)
+                        .map(wie_winapi::port::Hmenu::from)
                 })
                 .flatten();
             let Some(menu_handle) = resolved else {
@@ -586,13 +588,13 @@ impl GuestHandle {
         // menu — a child window's slot holds its child id — so first ascend
         // to the focus's parentless top-level, then check ITS handle.
         let mut focus_top = ws.focus_window_handle;
-        if focus_top != wie_winapi::handles::Hwnd::NULL {
+        if focus_top != wie_winapi::port::Hwnd::NULL {
             loop {
                 let Some(w) = ws.windows.iter().find(|w| w.handle == focus_top) else {
-                    focus_top = wie_winapi::handles::Hwnd::NULL;
+                    focus_top = wie_winapi::port::Hwnd::NULL;
                     break;
                 };
-                if w.parent_handle == wie_winapi::handles::Hwnd::NULL {
+                if w.parent_handle == wie_winapi::port::Hwnd::NULL {
                     break;
                 }
                 focus_top = w.parent_handle;
@@ -605,7 +607,7 @@ impl GuestHandle {
             .map(|w| w.menu_handle)
             .or_else(|| {
                 ws.windows.iter().find_map(|w| {
-                    (w.parent_handle == wie_winapi::handles::Hwnd::NULL && w.menu_handle != 0)
+                    (w.parent_handle == wie_winapi::port::Hwnd::NULL && w.menu_handle != 0)
                         .then_some(w.menu_handle)
                 })
             })
@@ -662,7 +664,7 @@ impl GuestHandle {
     /// host path to a guest volume at accept — a pick outside the bottle
     /// cancels. When no bridge is registered the handlers keep the in-app
     /// emulated dialog, so headless runs and `trace` never hang.
-    pub fn set_file_dialog_bridge(&self, cb: wie_winapi::FileDialogBridge) {
+    pub fn set_file_dialog_bridge(&self, cb: wie_winapi::port::FileDialogBridge) {
         if let Some(mut state) = self.lock_state() {
             state.window_state().file_dialog_bridge = Some(cb);
         }
@@ -679,7 +681,7 @@ impl GuestHandle {
     /// until the user picks (the guest thread parks inside the handler),
     /// which is dialog semantics. When no bridge is registered the handler
     /// cancels, so headless runs and `trace` never hang.
-    pub fn set_print_dialog_bridge(&self, cb: wie_winapi::PrintDialogBridge) {
+    pub fn set_print_dialog_bridge(&self, cb: wie_winapi::port::PrintDialogBridge) {
         if let Some(mut state) = self.lock_state() {
             state.window_state().print_dialog_bridge = Some(cb);
         }
@@ -697,7 +699,7 @@ impl GuestHandle {
     /// until the user picks (the guest thread parks inside the handler),
     /// which is dialog semantics. When no bridge is registered the handler
     /// cancels, so headless runs and `trace` never hang.
-    pub fn set_page_setup_dialog_bridge(&self, cb: wie_winapi::PageSetupDialogBridge) {
+    pub fn set_page_setup_dialog_bridge(&self, cb: wie_winapi::port::PageSetupDialogBridge) {
         if let Some(mut state) = self.lock_state() {
             state.window_state().page_setup_dialog_bridge = Some(cb);
         }
@@ -714,7 +716,7 @@ impl GuestHandle {
     /// operation finishes (the guest thread parks inside the handler), which
     /// is print semantics. When no bridge is registered the handler keeps the
     /// `WIE_PRINT_TO` BMP oracle, so headless runs and `trace` never block.
-    pub fn set_print_job_bridge(&self, cb: wie_winapi::PrintJobBridge) {
+    pub fn set_print_job_bridge(&self, cb: wie_winapi::port::PrintJobBridge) {
         if let Some(mut state) = self.lock_state() {
             state.window_state().print_job_bridge = Some(cb);
         }
@@ -734,12 +736,7 @@ impl GuestHandle {
     /// render thread (see `wie_winapi::d3d9::capture` for the op model and
     /// the render-target/depth round-trip protocol).
     ///
-    /// The caller decides the opt-in policy: the GUI host only calls this
-    /// when `WIE_CAPTURE_STREAM=1` (default off during bring-up — flip to
-    /// default-on after the hash-equivalence gate passes). Headless runs and
-    /// the other micro-suite tests never call it, so the CI hashes exercise
-    /// the legacy in-handler raster path unchanged (the dedicated capture
-    /// test spawns it explicitly).
+    /// Opt-in policy: the GUI host arms this unless `WIE_CAPTURE_STREAM=0` (the default-on flip is `7c08ef3`); headless runs and the micro-suite never call it, and the capture test arms it explicitly.
     ///
     /// `wake` is the frame-arrival callback the render thread fires after a
     /// publish that passes the channel wake gate — the same closure shape
@@ -751,9 +748,9 @@ impl GuestHandle {
     pub fn enable_capture_stream(
         &self,
         wake: Box<dyn Fn() + Send + 'static>,
-    ) -> Option<wie_winapi::present::CaptureStreamerHandle> {
+    ) -> Option<wie_winapi::port::CaptureStreamerHandle> {
         let streamer =
-            wie_winapi::present::spawn_capture_streamer(Arc::clone(&self.present_channel), wake)?;
+            wie_winapi::port::spawn_capture_streamer(Arc::clone(&self.present_channel), wake)?;
         // Flip the gate only after the consumer exists.
         self.present_channel.set_capture_enabled(true);
         Some(streamer)
@@ -771,7 +768,7 @@ impl GuestHandle {
     /// alert is up), then the handler's re-entry returns the chosen id to the
     /// guest. When no bridge is registered the handlers keep the
     /// console-echo + IDOK fallback, so headless runs and `trace` never hang.
-    pub fn set_message_box_bridge(&self, cb: wie_winapi::present::MessageBoxBridge) {
+    pub fn set_message_box_bridge(&self, cb: wie_winapi::port::MessageBoxBridge) {
         if let Some(mut state) = self.lock_state() {
             state.present().message_box_bridge = Some(cb);
         }
@@ -795,10 +792,10 @@ impl GuestHandle {
         let Some(mut state) = self.lock_state() else {
             return 0;
         };
-        let volumes = state.file_io.volumes.clone();
+        let volumes = state.volumes().clone();
         let guest_paths: Vec<String> = paths
             .iter()
-            .filter_map(|p| wie_winapi::host_path_to_guest(&volumes, p))
+            .filter_map(|p| wie_winapi::port::host_path_to_guest(&volumes, p))
             .collect();
         if guest_paths.is_empty() {
             tracing::info!(
@@ -810,7 +807,7 @@ impl GuestHandle {
         }
         tracing::info!(target: "wiegui", guest_paths = ?guest_paths, "drop stored for WM_DROPFILES");
         state.drag_drop().set_drop(guest_paths, point);
-        wie_winapi::user32::dragdrop::FAKE_HDROP
+        wie_winapi::port::FAKE_HDROP
     }
 
     /// Update the guest-visible window size (host window was resized).
@@ -844,7 +841,7 @@ impl GuestHandle {
         // they repaint themselves — in real Windows those pixels persist in
         // the framebuffer; here the surface is rebuilt on resize, so the
         // children must be explicitly repainted via WM_PAINT synthesis.
-        let mut descendants: Vec<wie_winapi::handles::Hwnd> = Vec::new();
+        let mut descendants: Vec<wie_winapi::port::Hwnd> = Vec::new();
         let mut frontier = vec![hwnd];
         while let Some(parent) = frontier.pop() {
             for w in &ws.windows {

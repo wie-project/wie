@@ -1,6 +1,7 @@
 //! `ChooseColorA` handler (simulated accept with black).
 
 use super::CDERR_NONE;
+use crate::capability::WindowDialogAccess;
 use crate::gdi32::{ArgReg, read_arg};
 use crate::{HandlerContext, WinApiHandlerResult};
 use anyhow::Result;
@@ -11,7 +12,7 @@ pub fn handle_choose_color_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let state = &mut *ctx.state;
     let choose_color_va = read_arg(engine, ArgReg::Rcx, "ChooseColorA")?;
 
-    state.window_state().comm_dlg_extended_error = CDERR_NONE;
+    state.set_comm_dlg_extended_error(CDERR_NONE);
 
     // CHOOSECOLORA has rgbResult at offset 0x10 (after lStructSize + hwndOwner + hInstance).
     if choose_color_va != 0 {

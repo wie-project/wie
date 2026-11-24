@@ -242,7 +242,7 @@ pub(crate) fn handle_stdio_common_vfprintf(
     if is_stderr {
         write_host_console(FILE_STDERR, &out);
     } else {
-        crate::kernel32::console::emit_text_from_bytes(ctx, &out);
+        crate::console::api::emit_text_from_bytes(&mut *ctx.state, &out);
     }
     finish(&mut *ctx.engine, out.len() as u64)
 }
@@ -270,7 +270,7 @@ pub(crate) fn handle_vfprintf(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     if is_stderr {
         write_host_console(FILE_STDERR, &out);
     } else {
-        crate::kernel32::console::emit_text_from_bytes(ctx, &out);
+        crate::console::api::emit_text_from_bytes(&mut *ctx.state, &out);
     }
     finish(&mut *ctx.engine, out.len() as u64)
 }
@@ -639,7 +639,7 @@ pub(crate) fn handle_fputc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         return finish(engine, u64::from(u32::MAX)); // EOF
     }
     // stdout or unknown FILE* — route through console buffer.
-    crate::kernel32::console::emit_text_from_bytes(ctx, &[ch]);
+    crate::console::api::emit_text_from_bytes(&mut *ctx.state, &[ch]);
     let engine = &mut *ctx.engine;
     finish(engine, u64::from(ch))
 }
@@ -647,7 +647,7 @@ pub(crate) fn handle_fputc(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
 pub(crate) fn handle_putchar(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let c = ctx.engine.read_rcx()? & 0xff;
     let ch = u8::try_from(c).unwrap_or(0);
-    crate::kernel32::console::emit_text_from_bytes(ctx, &[ch]);
+    crate::console::api::emit_text_from_bytes(&mut *ctx.state, &[ch]);
     let engine = &mut *ctx.engine;
     finish(engine, u64::from(ch))
 }
@@ -754,7 +754,7 @@ pub(crate) fn handle_fputs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         write_host_console(FILE_STDERR, &bytes);
     } else {
         // Buffer through the console module — flushes atomically on Sleep.
-        crate::kernel32::console::emit_text_from_bytes(ctx, &bytes);
+        crate::console::api::emit_text_from_bytes(&mut *ctx.state, &bytes);
     }
     finish(&mut *ctx.engine, 0)
 }
@@ -779,7 +779,7 @@ pub(crate) fn handle_puts(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
         }
     }
     bytes.push(b'\n');
-    crate::kernel32::console::emit_text_from_bytes(ctx, &bytes);
+    crate::console::api::emit_text_from_bytes(&mut *ctx.state, &bytes);
     let engine = &mut *ctx.engine;
     finish(engine, 0) // non-negative = success
 }

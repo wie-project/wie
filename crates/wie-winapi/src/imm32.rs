@@ -9,27 +9,27 @@ use crate::gdi32::finish_after_discarding;
 use crate::gdi32::{ArgReg, read_arg};
 use crate::{HandlerContext, WinApiHandlerResult};
 
+crate::soft_dispatch::soft_exports! {
+    // Phase-3 stub wave: the remaining IME surface reports "no IME".
+    ("immassociatecontext", handle_imm_associate_context),
+    ("immgetcandidatelistw", handle_imm_get_candidate_list_w),
+    ("immgetcompositionstringw", handle_imm_get_composition_string_w),
+    ("immgetcontext", handle_imm_get_context),
+    ("immgetimefilenamea", handle_imm_get_ime_file_name_a),
+    ("immgetopenstatus", handle_imm_get_open_status),
+    ("immnotifyime", handle_imm_notify_ime),
+    ("immreleasecontext", handle_imm_release_context),
+    ("immsetcandidatewindow", handle_imm_set_false),
+    ("immsetcompositionstringw", handle_imm_set_false),
+    ("immsetcompositionwindow", handle_imm_set_false),
+}
+
 /// Dispatch an `IMM32.dll` export by name (case-insensitive).
 pub fn dispatch_imm32(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let n = name.to_ascii_lowercase();
-    match n.as_str() {
-        "immgetcontext" => Ok(Some(handle_imm_get_context(ctx)?)),
-        "immgetopenstatus" => Ok(Some(handle_imm_get_open_status(ctx)?)),
-        "immreleasecontext" => Ok(Some(handle_imm_release_context(ctx)?)),
-        "immgetcompositionstringw" => Ok(Some(handle_imm_get_composition_string_w(ctx)?)),
-        // Phase-3 stub wave: the remaining IME surface reports "no IME".
-        "immassociatecontext" => Ok(Some(handle_imm_associate_context(ctx)?)),
-        "immgetcandidatelistw" => Ok(Some(handle_imm_get_candidate_list_w(ctx)?)),
-        "immgetimefilenamea" => Ok(Some(handle_imm_get_ime_file_name_a(ctx)?)),
-        "immnotifyime" => Ok(Some(handle_imm_notify_ime(ctx)?)),
-        "immsetcandidatewindow" => Ok(Some(handle_imm_set_false(ctx)?)),
-        "immsetcompositionstringw" => Ok(Some(handle_imm_set_false(ctx)?)),
-        "immsetcompositionwindow" => Ok(Some(handle_imm_set_false(ctx)?)),
-        _ => Ok(None),
-    }
+    crate::soft_dispatch::dispatch_soft_table(ctx, DISPATCH, name)
 }
 
 /// `HIMC ImmGetContext(HWND hwnd)` — no IME, so always `NULL`.

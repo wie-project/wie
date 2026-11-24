@@ -32,6 +32,47 @@ const DISP_E_DIVBYZERO: u64 = 0x8002_0011;
 /// `DISP_E_MEMBERNOTFOUND` — fallback for an unsupported source VARTYPE.
 const DISP_E_MEMBERNOTFOUND: u64 = 0x8002_0003;
 
+/// The `oleaut32.dll` soft export census — the single list behind
+/// [`crate::is_winapi_implemented`] and `names::SOFT_EXPORT_CENSUS`.
+///
+/// Declared beside the arms it describes, so a name is added in one file.
+/// `dispatch_table::census_tests` proves every row here has a dispatch arm.
+///
+/// Not table-driven: `dispatch_oleaut32` normalises `ordinal N` and size aliases
+/// (`sysstringbytelen`, `sysallocstringbytelen`, `variantcopyind`, the `var*`
+/// operators) onto canonical handlers, so its keys are strictly wider than this
+/// list.
+pub(crate) const EXPORTS: &[&str] = &[
+    "dispgetidsofnames",
+    "dispinvoke",
+    "ordinal 10",
+    "ordinal 11",
+    "ordinal 149",
+    "ordinal 2",
+    "ordinal 4",
+    "ordinal 6",
+    "ordinal 7",
+    "ordinal 8",
+    "ordinal 9",
+    "safearrayaccessdata",
+    "safearraycreate",
+    "safearraydestroy",
+    "safearraygetdim",
+    "safearraygetelement",
+    "safearraygetlbound",
+    "safearraygetubound",
+    "safearrayputelement",
+    "safearrayunaccessdata",
+    "sysallocstring",
+    "sysallocstringlen",
+    "sysfreestring",
+    "sysstringbyteslen",
+    "sysstringlen",
+    "variantclear",
+    "variantcopy",
+    "variantinit",
+];
+
 /// Soft-dispatch path for OLEAUT32 (name or `ORDINAL N`).
 pub fn dispatch_oleaut32(
     ctx: &mut HandlerContext<'_>,

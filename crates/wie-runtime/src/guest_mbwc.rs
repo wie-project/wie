@@ -11,7 +11,7 @@ use crate::asm_utils::{patch_rel8, patch_rel32};
 use crate::hooks::RuntimeFakeApiEntry;
 use crate::memory::RuntimeMemoryLayout;
 use anyhow::{Context, Result};
-use wie_winapi::{WinApiId, encode_alias};
+use wie_winapi::port::{WinApiId, encode_alias};
 
 /// Guest `MultiByteToWideChar` helper placement for the single-byte path.
 #[derive(Debug, Clone)]

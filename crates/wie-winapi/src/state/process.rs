@@ -451,16 +451,6 @@ pub struct RegistryKey {
     pub subkey: String,
 }
 
-/// Fake heap allocation record.
-#[derive(Debug, Clone)]
-pub struct HeapAllocation {
-    /// Allocation base address.
-    pub address: u64,
-
-    /// Allocation size in bytes.
-    pub size: u64,
-}
-
 /// Fake `FLS` slot.
 #[derive(Debug, Clone)]
 pub struct FlsSlot {

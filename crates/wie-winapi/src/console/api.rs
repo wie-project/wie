@@ -1,15 +1,31 @@
-use super::{
-    Context, FAKE_STDERR_HANDLE, FAKE_STDIN_HANDLE, FAKE_STDOUT_HANDLE, HandlerContext,
-    INVALID_HANDLE_VALUE, MAX_HOST_STDIN_LINE, Result, STD_ERROR_HANDLE_ID, STD_INPUT_HANDLE_ID,
-    STD_OUTPUT_HANDLE_ID, WinApiHandlerResult, WinApiState, low_u32, read_guest_utf16_lossy,
-    ret_bool_true, ret_u64, write_guest_u32,
-};
+//! The `kernel32.dll` console API surface: mode words, code pages, titles,
+//! `WriteConsole`/`ReadConsole`, and the terminators that only change the
+//! frame boundary.
+//!
+//! This module used to be `kernel32::console`, which made `DllId::Console`'s
+//! owner (`crate::console`) different from its callers (`crate::kernel32`) —
+//! ADR-0005's second boundary error. It lives here now so owner and callers
+//! agree, and every entry point takes a [`ConsoleCall`] instead of a whole
+//! `HandlerContext`: the console capability is all these handlers may reach,
+//! and the compiler enforces it.
+//!
+//! The cell/frame APIs are in [`super::cells`], the input-record APIs in
+//! [`super::records`].
+
+use anyhow::Context;
+
+use crate::capability::{ConsoleAccess, ConsoleCall};
 use crate::console::{
     self, CP_OEM_437, CP_UTF8, CP_WINDOWS_1252, ConsoleState, PRIMARY_BUFFER_HANDLE,
     VALID_INPUT_MODE, VALID_OUTPUT_MODE, codepage, host_term,
 };
 use crate::guest_memory::read_bytes as read_guest_bytes;
 use crate::guest_string::read_ansi_bytes;
+use crate::kernel32::{
+    FAKE_STDERR_HANDLE, FAKE_STDIN_HANDLE, FAKE_STDOUT_HANDLE, INVALID_HANDLE_VALUE, Result,
+    STD_ERROR_HANDLE_ID, STD_INPUT_HANDLE_ID, STD_OUTPUT_HANDLE_ID, WinApiHandlerResult, low_u32,
+    read_guest_utf16_lossy, ret_bool_true, ret_u64, write_guest_u32,
+};
 
 /// `ERROR_INVALID_HANDLE` — returned for console calls on a non-console handle.
 const ERROR_INVALID_HANDLE: u32 = 6;
@@ -18,43 +34,6 @@ const ERROR_INVALID_HANDLE: u32 = 6;
 /// and outside the window-handle range `user32` hands out so it can never be
 /// mistaken for a real emulated window.
 const FAKE_CONSOLE_HWND: u64 = 0x0000_0000_6000_00F0;
-
-pub(crate) fn read_host_console_stdin_line() -> std::io::Result<Option<Vec<u8>>> {
-    use std::io::Read;
-
-    let mut out = Vec::with_capacity(256);
-    let mut byte = [0_u8; 1];
-    let mut stdin = std::io::stdin().lock();
-    loop {
-        if out.len() >= MAX_HOST_STDIN_LINE {
-            break;
-        }
-        if stdin.read(&mut byte)? == 0 {
-            break;
-        }
-        out.push(byte[0]);
-        if byte[0] == b'\n' {
-            break;
-        }
-    }
-    if out.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(out))
-    }
-}
-
-pub(crate) fn refill_stdin_from_host(state: &mut WinApiState) -> Result<bool, ()> {
-    match read_host_console_stdin_line() {
-        Ok(None) => Ok(false),
-        Ok(Some(line)) => {
-            state.file_io.stdin_bytes = line;
-            state.file_io.stdin_cursor = 0;
-            Ok(true)
-        }
-        Err(_) => Err(()),
-    }
-}
 
 /// True for the three fake std handles plus any allocated screen buffer.
 fn is_console_output_handle(state: &ConsoleState, handle: u64) -> bool {
@@ -69,7 +48,7 @@ fn is_console_output_handle(state: &ConsoleState, handle: u64) -> bool {
 /// changes only which buffer is *displayed*. Resolving stdout to "whichever
 /// buffer is active" would break the standard double-buffering idiom, where a
 /// game draws into the back buffer while stdout still names the front one.
-pub(crate) fn buffer_handle_for(state: &ConsoleState, handle: u64) -> Option<u64> {
+pub fn buffer_handle_for(state: &ConsoleState, handle: u64) -> Option<u64> {
     if handle == FAKE_STDOUT_HANDLE || handle == FAKE_STDERR_HANDLE {
         return Some(PRIMARY_BUFFER_HANDLE);
     }
@@ -77,16 +56,23 @@ pub(crate) fn buffer_handle_for(state: &ConsoleState, handle: u64) -> Option<u64
 }
 
 /// Return `FALSE` with `SetLastError(ERROR_INVALID_HANDLE)`.
-pub(crate) fn ret_invalid_handle(
-    ctx: &mut HandlerContext<'_>,
-    api: &str,
-) -> Result<WinApiHandlerResult> {
-    ctx.state.process.last_error = ERROR_INVALID_HANDLE;
-    ret_u64(ctx.engine, 0, api)
+fn ret_invalid_handle(cx: &mut ConsoleCall<'_>, api: &str) -> Result<WinApiHandlerResult> {
+    cx.state.set_process_last_error(ERROR_INVALID_HANDLE);
+    ret_u64(cx.engine, 0, api)
 }
 
 /// Handles `KERNEL32.dll!GetStdHandle`.
-pub fn handle_get_std_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+///
+/// The one console entry point that keeps a whole
+/// [`HandlerContext`](crate::state::HandlerContext): it reads RCX and nothing
+/// else — no state at all — but it returns through
+/// [`HandlerContext::finish`], the dispatch tail that refreshes the
+/// presenter-side window mirror. Narrowing it to a [`ConsoleCall`] would have
+/// to reproduce that tail, which is exactly the kind of silent behaviour
+/// difference a type-level change must not introduce.
+pub fn handle_get_std_handle(
+    ctx: &mut crate::state::HandlerContext<'_>,
+) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let std_handle_id_raw = engine
         .read_rcx()
@@ -105,36 +91,34 @@ pub fn handle_get_std_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     ctx.finish(return_value)
 }
 
-pub fn handle_set_console_ctrl_handler(
-    ctx: &mut HandlerContext<'_>,
-) -> Result<WinApiHandlerResult> {
-    let engine = &mut *ctx.engine;
+pub fn handle_set_console_ctrl_handler(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    let engine = &mut *cx.engine;
     let _handler = engine.read_rcx().context("SetConsoleCtrlHandler RCX")?;
     let _add = engine.read_rdx().context("SetConsoleCtrlHandler RDX")?;
     ret_bool_true(engine, "SetConsoleCtrlHandler")
 }
 
-pub fn handle_get_console_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let handle = ctx.engine.read_rcx().context("GetConsoleMode RCX")?;
-    let mode_va = ctx.engine.read_rdx().context("GetConsoleMode RDX")?;
+pub fn handle_get_console_mode(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    let handle = cx.engine.read_rcx().context("GetConsoleMode RCX")?;
+    let mode_va = cx.engine.read_rdx().context("GetConsoleMode RDX")?;
     if mode_va == 0 {
-        return ret_invalid_handle(ctx, "GetConsoleMode");
+        return ret_invalid_handle(cx, "GetConsoleMode");
     }
     let mode = if handle == FAKE_STDIN_HANDLE {
-        ctx.state.console().input_mode
-    } else if let Some(buffer) = buffer_handle_for(ctx.state.console(), handle) {
-        ctx.state.console().output_mode(buffer)
+        cx.state.console().input_mode
+    } else if let Some(buffer) = buffer_handle_for(cx.state.console(), handle) {
+        cx.state.console().output_mode(buffer)
     } else {
-        return ret_invalid_handle(ctx, "GetConsoleMode");
+        return ret_invalid_handle(cx, "GetConsoleMode");
     };
-    write_guest_u32(ctx.engine, mode_va, mode)?;
-    ret_bool_true(ctx.engine, "GetConsoleMode")
+    write_guest_u32(cx.engine, mode_va, mode)?;
+    ret_bool_true(cx.engine, "GetConsoleMode")
 }
 
-pub fn handle_set_console_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let handle = ctx.engine.read_rcx().context("SetConsoleMode RCX")?;
+pub fn handle_set_console_mode(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    let handle = cx.engine.read_rcx().context("SetConsoleMode RCX")?;
     let requested = low_u32(
-        ctx.engine.read_rdx().context("SetConsoleMode RDX")?,
+        cx.engine.read_rdx().context("SetConsoleMode RDX")?,
         "SetConsoleMode mode",
     )?;
 
@@ -143,28 +127,30 @@ pub fn handle_set_console_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
         // being silently dropped, so a guest probing for VT support gets a
         // truthful answer.
         if requested & !VALID_INPUT_MODE != 0 {
-            ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
-            return ret_u64(ctx.engine, 0, "SetConsoleMode");
+            cx.state
+                .set_process_last_error(crate::kernel32::ERROR_INVALID_PARAMETER);
+            return ret_u64(cx.engine, 0, "SetConsoleMode");
         }
-        let prev_mode = ctx.state.console().input_mode;
-        ctx.state.console().input_mode = requested;
-        apply_input_mode_to_host(ctx.state.console());
+        let prev_mode = cx.state.console().input_mode;
+        cx.state.console().input_mode = requested;
+        apply_input_mode_to_host(cx.state.console());
         // Toggle xterm mouse reporting when the guest changes ENABLE_MOUSE_INPUT
         if (prev_mode ^ requested) & console::ENABLE_MOUSE_INPUT != 0 {
             crate::console::pump::set_mouse_reporting(requested & console::ENABLE_MOUSE_INPUT != 0);
         }
-        return ret_bool_true(ctx.engine, "SetConsoleMode");
+        return ret_bool_true(cx.engine, "SetConsoleMode");
     }
 
-    let Some(buffer) = buffer_handle_for(ctx.state.console(), handle) else {
-        return ret_invalid_handle(ctx, "SetConsoleMode");
+    let Some(buffer) = buffer_handle_for(cx.state.console(), handle) else {
+        return ret_invalid_handle(cx, "SetConsoleMode");
     };
     if requested & !VALID_OUTPUT_MODE != 0 {
-        ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
-        return ret_u64(ctx.engine, 0, "SetConsoleMode");
+        cx.state
+            .set_process_last_error(crate::kernel32::ERROR_INVALID_PARAMETER);
+        return ret_u64(cx.engine, 0, "SetConsoleMode");
     }
-    ctx.state.console().set_output_mode(buffer, requested);
-    ret_bool_true(ctx.engine, "SetConsoleMode")
+    cx.state.console().set_output_mode(buffer, requested);
+    ret_bool_true(cx.engine, "SetConsoleMode")
 }
 
 /// Push the guest's input mode down to the host terminal.
@@ -173,7 +159,7 @@ pub fn handle_set_console_mode(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 /// the Unix equivalent is cbreak mode. Echo maps directly, and
 /// `ENABLE_PROCESSED_INPUT` decides whether Ctrl+C stays a signal or arrives as
 /// a key event.
-pub(crate) fn apply_input_mode_to_host(state: &ConsoleState) {
+pub fn apply_input_mode_to_host(state: &ConsoleState) {
     let line_mode = state.input_mode & console::ENABLE_LINE_INPUT != 0;
     let echo = state.input_mode & console::ENABLE_ECHO_INPUT != 0;
     if line_mode && echo {
@@ -207,28 +193,28 @@ const CSBI_MAX_SIZE_Y: usize = 20;
 const CSBI_SIZE: usize = 24;
 
 pub fn handle_get_console_screen_buffer_info(
-    ctx: &mut HandlerContext<'_>,
+    cx: &mut ConsoleCall<'_>,
 ) -> Result<WinApiHandlerResult> {
-    let handle = ctx
+    let handle = cx
         .engine
         .read_rcx()
         .context("GetConsoleScreenBufferInfo RCX")?;
-    let info_va = ctx
+    let info_va = cx
         .engine
         .read_rdx()
         .context("GetConsoleScreenBufferInfo RDX")?;
     if info_va == 0 {
-        return ret_invalid_handle(ctx, "GetConsoleScreenBufferInfo");
+        return ret_invalid_handle(cx, "GetConsoleScreenBufferInfo");
     }
-    let Some(buffer_handle) = buffer_handle_for(ctx.state.console(), handle) else {
-        return ret_invalid_handle(ctx, "GetConsoleScreenBufferInfo");
+    let Some(buffer_handle) = buffer_handle_for(cx.state.console(), handle) else {
+        return ret_invalid_handle(cx, "GetConsoleScreenBufferInfo");
     };
     // Adopt any terminal resize that happened since the last call, so a guest
     // that sizes its playfield from this struct tracks the real window.
-    let _ = ctx.state.console().sync_window_size();
+    let _ = cx.state.console().sync_window_size();
 
-    let Some(buffer) = ctx.state.console().buffer(buffer_handle) else {
-        return ret_invalid_handle(ctx, "GetConsoleScreenBufferInfo");
+    let Some(buffer) = cx.state.console().buffer(buffer_handle) else {
+        return ret_invalid_handle(cx, "GetConsoleScreenBufferInfo");
     };
     let columns = buffer.width;
     let rows = buffer.height;
@@ -251,10 +237,10 @@ pub fn handle_get_console_screen_buffer_info(
     write_le_u16(&mut buf, CSBI_WINDOW_BOTTOM, rows.saturating_sub(1));
     write_le_u16(&mut buf, CSBI_MAX_SIZE_X, columns);
     write_le_u16(&mut buf, CSBI_MAX_SIZE_Y, rows);
-    ctx.engine
+    cx.engine
         .mem_write(info_va, &buf)
         .context("GetConsoleScreenBufferInfo write")?;
-    ret_bool_true(ctx.engine, "GetConsoleScreenBufferInfo")
+    ret_bool_true(cx.engine, "GetConsoleScreenBufferInfo")
 }
 
 fn write_le_u16(buf: &mut [u8; CSBI_SIZE], offset: usize, value: u16) {
@@ -271,22 +257,22 @@ fn write_le_i16(buf: &mut [u8; CSBI_SIZE], offset: usize, value: i16) {
 ///
 /// Win64 ABI: `hConsoleOutput`, `lpBuffer`, `nNumberOfCharsToWrite`,
 /// `lpNumberOfCharsWritten`, `lpReserved` (stack).
-fn write_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
+fn write_console(cx: &mut ConsoleCall<'_>, wide: bool) -> Result<WinApiHandlerResult> {
     let api = if wide {
         "WriteConsoleW"
     } else {
         "WriteConsoleA"
     };
-    let handle = ctx.engine.read_rcx().context("WriteConsole RCX")?;
-    let buffer_va = ctx.engine.read_rdx().context("WriteConsole RDX")?;
+    let handle = cx.engine.read_rcx().context("WriteConsole RCX")?;
+    let buffer_va = cx.engine.read_rdx().context("WriteConsole RDX")?;
     let count = low_u32(
-        ctx.engine.read_r8().context("WriteConsole R8")?,
+        cx.engine.read_r8().context("WriteConsole R8")?,
         "WriteConsole count",
     )?;
-    let written_va = ctx.engine.read_r9().context("WriteConsole R9")?;
+    let written_va = cx.engine.read_r9().context("WriteConsole R9")?;
 
-    if !is_console_output_handle(ctx.state.console(), handle) {
-        return ret_invalid_handle(ctx, api);
+    if !is_console_output_handle(cx.state.console(), handle) {
+        return ret_invalid_handle(cx, api);
     }
 
     let count_usize = usize::try_from(count).unwrap_or(0);
@@ -295,8 +281,7 @@ fn write_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandl
     } else if wide {
         let byte_len = count_usize.saturating_mul(2);
         let mut bytes = vec![0_u8; byte_len];
-        read_guest_bytes(ctx.engine, buffer_va, &mut bytes)
-            .context("WriteConsoleW guest buffer")?;
+        read_guest_bytes(cx.engine, buffer_va, &mut bytes).context("WriteConsoleW guest buffer")?;
         bytes
             .as_chunks::<2>()
             .0
@@ -310,18 +295,17 @@ fn write_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandl
             .collect()
     } else {
         let mut bytes = vec![0_u8; count_usize];
-        read_guest_bytes(ctx.engine, buffer_va, &mut bytes)
-            .context("WriteConsoleA guest buffer")?;
-        let code_page = ctx.state.console().output_code_page;
+        read_guest_bytes(cx.engine, buffer_va, &mut bytes).context("WriteConsoleA guest buffer")?;
+        let code_page = cx.state.console().output_code_page;
         codepage::decode_to_units(code_page, &bytes)
     };
 
-    emit_console_text(ctx, handle, &units);
+    emit_console_text(cx, handle, &units);
 
     if written_va != 0 {
-        write_guest_u32(ctx.engine, written_va, count)?;
+        write_guest_u32(cx.engine, written_va, count)?;
     }
-    ret_bool_true(ctx.engine, api)
+    ret_bool_true(cx.engine, api)
 }
 
 /// Send decoded text to the terminal and advance the tracked cursor.
@@ -329,22 +313,22 @@ fn write_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandl
 /// In Stream mode the bytes go straight out, which preserves any VT escapes the
 /// guest emits itself. In Cells mode the text is folded into the grid instead,
 /// so it participates in the next diff rather than fighting it.
-fn emit_console_text(ctx: &mut HandlerContext<'_>, handle: u64, units: &[u16]) {
+fn emit_console_text(cx: &mut ConsoleCall<'_>, handle: u64, units: &[u16]) {
     if units.is_empty() {
         return;
     }
-    let Some(buffer_handle) = buffer_handle_for(ctx.state.console(), handle) else {
+    let Some(buffer_handle) = buffer_handle_for(cx.state.console(), handle) else {
         return;
     };
     // Always fold into the grid. The stream_buf/flush mechanism is no longer
     // needed — the grid diff renderer (screen::flush) emits only the changed
     // cells as targeted Ansi escapes, so the terminal never does full-frame
     // progressive painting.
-    ctx.state.console().render_mode = console::RenderMode::Cells;
-    fold_text_into_grid(ctx.state.console(), buffer_handle, units);
+    cx.state.console().render_mode = console::RenderMode::Cells;
+    fold_text_into_grid(cx.state.console(), buffer_handle, units);
     // Mark that the grid needs flushing — the diff will be emitted on Sleep,
     // _getch, or _kbhit via flush_stream_output.
-    ctx.state.console().needs_flush = true;
+    cx.state.console().needs_flush = true;
 }
 
 #[cfg(unix)]
@@ -403,7 +387,7 @@ fn advance_tracked_cursor(state: &mut ConsoleState, buffer_handle: u64, units: &
 /// Fold decoded text into the grid, interpreting CSI cursor positioning
 /// and clear-screen escapes so programs using Ansi via WriteConsole
 /// (like the snake game's `\033[H\033[2JScore:...`) render correctly.
-pub(crate) fn fold_text_into_grid(state: &mut ConsoleState, buffer_handle: u64, units: &[u16]) {
+pub fn fold_text_into_grid(state: &mut ConsoleState, buffer_handle: u64, units: &[u16]) {
     let Some(buffer) = state.buffer_mut(buffer_handle) else {
         return;
     };
@@ -528,19 +512,23 @@ pub(crate) fn fold_text_into_grid(state: &mut ConsoleState, buffer_handle: u64, 
     }
 }
 
-pub fn handle_write_console_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    write_console(ctx, true)
+pub fn handle_write_console_w(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    write_console(cx, true)
 }
 
-pub fn handle_write_console_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    write_console(ctx, false)
+pub fn handle_write_console_a(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    write_console(cx, false)
 }
 
 /// Buffer CRT `fputs` output through the console module so it flushes
 /// atomically on `Sleep` (or `_getch`), rather than writing directly to
 /// the host fd. This eliminates flicker from per-write rendering.
-pub fn emit_text_from_bytes(ctx: &mut HandlerContext<'_>, bytes: &[u8]) {
-    let console = ctx.state.console();
+///
+/// Takes the console capability, not a context: the `ucrt` printf family is
+/// the caller and it has no business reaching past the console to write a
+/// frame.
+pub fn emit_text_from_bytes(access: &mut dyn ConsoleAccess, bytes: &[u8]) {
+    let console = access.console();
     console.stream_buf.extend_from_slice(bytes);
     console.needs_flush = true;
 }
@@ -553,72 +541,67 @@ pub fn emit_text_from_bytes(ctx: &mut HandlerContext<'_>, bytes: &[u8]) {
 /// Only line input is implemented here; character-at-a-time reads arrive with
 /// Tier 2's `ReadConsoleInput`, which is the API programs actually use once
 /// they clear `ENABLE_LINE_INPUT`.
-fn read_console(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
+fn read_console(cx: &mut ConsoleCall<'_>, wide: bool) -> Result<WinApiHandlerResult> {
     let api = if wide { "ReadConsoleW" } else { "ReadConsoleA" };
-    let handle = ctx.engine.read_rcx().context("ReadConsole RCX")?;
-    let buffer_va = ctx.engine.read_rdx().context("ReadConsole RDX")?;
+    let handle = cx.engine.read_rcx().context("ReadConsole RCX")?;
+    let buffer_va = cx.engine.read_rdx().context("ReadConsole RDX")?;
     let capacity = low_u32(
-        ctx.engine.read_r8().context("ReadConsole R8")?,
+        cx.engine.read_r8().context("ReadConsole R8")?,
         "ReadConsole capacity",
     )?;
-    let read_va = ctx.engine.read_r9().context("ReadConsole R9")?;
+    let read_va = cx.engine.read_r9().context("ReadConsole R9")?;
 
     if handle != FAKE_STDIN_HANDLE {
-        return ret_invalid_handle(ctx, api);
+        return ret_invalid_handle(cx, api);
     }
     let capacity_usize = usize::try_from(capacity).unwrap_or(0);
     if buffer_va == 0 || capacity_usize == 0 {
         if read_va != 0 {
-            write_guest_u32(ctx.engine, read_va, 0)?;
+            write_guest_u32(cx.engine, read_va, 0)?;
         }
-        return ret_bool_true(ctx.engine, api);
+        return ret_bool_true(cx.engine, api);
     }
 
     // Reuse the existing stdin buffer so ReadConsole and ReadFile on the same
     // handle stay in step — a program may mix them across its lifetime.
-    if ctx.state.file_io.stdin_cursor >= ctx.state.file_io.stdin_bytes.len()
-        && refill_stdin_from_host(ctx.state).is_err()
-    {
-        ctx.state.process.last_error = super::ERROR_READ_FAULT;
-        return ret_u64(ctx.engine, 0, api);
+    if cx.state.stdin_available() == 0 && cx.state.stdin_refill().is_err() {
+        cx.state
+            .set_process_last_error(crate::kernel32::ERROR_READ_FAULT);
+        return ret_u64(cx.engine, 0, api);
     }
 
-    let cursor = ctx.state.file_io.stdin_cursor;
-    let available = ctx.state.file_io.stdin_bytes.get(cursor..).unwrap_or(&[]);
-    let take = available.len().min(capacity_usize);
-    let chunk: Vec<u8> = available.get(..take).unwrap_or(&[]).to_vec();
-    ctx.state.file_io.stdin_cursor = cursor.saturating_add(take);
+    let chunk = cx.state.stdin_take(capacity_usize);
 
     let written = if wide {
-        let units = codepage::decode_to_units(ctx.state.console().input_code_page, &chunk);
+        let units = codepage::decode_to_units(cx.state.console().input_code_page, &chunk);
         let units = units.get(..units.len().min(capacity_usize)).unwrap_or(&[]);
         let mut bytes = Vec::with_capacity(units.len().saturating_mul(2));
         for unit in units {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
-        ctx.engine
+        cx.engine
             .mem_write(buffer_va, &bytes)
             .context("ReadConsoleW guest buffer")?;
         u32::try_from(units.len()).unwrap_or(0)
     } else {
-        ctx.engine
+        cx.engine
             .mem_write(buffer_va, &chunk)
             .context("ReadConsoleA guest buffer")?;
         u32::try_from(chunk.len()).unwrap_or(0)
     };
 
     if read_va != 0 {
-        write_guest_u32(ctx.engine, read_va, written)?;
+        write_guest_u32(cx.engine, read_va, written)?;
     }
-    ret_bool_true(ctx.engine, api)
+    ret_bool_true(cx.engine, api)
 }
 
-pub fn handle_read_console_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    read_console(ctx, true)
+pub fn handle_read_console_w(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    read_console(cx, true)
 }
 
-pub fn handle_read_console_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    read_console(ctx, false)
+pub fn handle_read_console_a(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    read_console(cx, false)
 }
 
 /// Code pages the console accepts. Anything else fails, as on Windows without
@@ -627,60 +610,62 @@ fn is_supported_code_page(code_page: u32) -> bool {
     matches!(code_page, CP_OEM_437 | CP_WINDOWS_1252 | CP_UTF8)
 }
 
-pub fn handle_get_console_cp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let value = u64::from(ctx.state.console().input_code_page);
-    ret_u64(ctx.engine, value, "GetConsoleCP")
+pub fn handle_get_console_cp(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    let value = u64::from(cx.state.console().input_code_page);
+    ret_u64(cx.engine, value, "GetConsoleCP")
 }
 
-pub fn handle_get_console_output_cp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let value = u64::from(ctx.state.console().output_code_page);
-    ret_u64(ctx.engine, value, "GetConsoleOutputCP")
+pub fn handle_get_console_output_cp(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    let value = u64::from(cx.state.console().output_code_page);
+    ret_u64(cx.engine, value, "GetConsoleOutputCP")
 }
 
-pub fn handle_set_console_cp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+pub fn handle_set_console_cp(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
     let code_page = low_u32(
-        ctx.engine.read_rcx().context("SetConsoleCP RCX")?,
+        cx.engine.read_rcx().context("SetConsoleCP RCX")?,
         "SetConsoleCP",
     )?;
     if !is_supported_code_page(code_page) {
-        ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
-        return ret_u64(ctx.engine, 0, "SetConsoleCP");
+        cx.state
+            .set_process_last_error(crate::kernel32::ERROR_INVALID_PARAMETER);
+        return ret_u64(cx.engine, 0, "SetConsoleCP");
     }
-    ctx.state.console().input_code_page = code_page;
-    ret_bool_true(ctx.engine, "SetConsoleCP")
+    cx.state.console().input_code_page = code_page;
+    ret_bool_true(cx.engine, "SetConsoleCP")
 }
 
-pub fn handle_set_console_output_cp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+pub fn handle_set_console_output_cp(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
     let code_page = low_u32(
-        ctx.engine.read_rcx().context("SetConsoleOutputCP RCX")?,
+        cx.engine.read_rcx().context("SetConsoleOutputCP RCX")?,
         "SetConsoleOutputCP",
     )?;
     if !is_supported_code_page(code_page) {
-        ctx.state.process.last_error = super::ERROR_INVALID_PARAMETER;
-        return ret_u64(ctx.engine, 0, "SetConsoleOutputCP");
+        cx.state
+            .set_process_last_error(crate::kernel32::ERROR_INVALID_PARAMETER);
+        return ret_u64(cx.engine, 0, "SetConsoleOutputCP");
     }
-    ctx.state.console().output_code_page = code_page;
-    ret_bool_true(ctx.engine, "SetConsoleOutputCP")
+    cx.state.console().output_code_page = code_page;
+    ret_bool_true(cx.engine, "SetConsoleOutputCP")
 }
 
 /// `SetConsoleTitleA` / `SetConsoleTitleW`.
 ///
 /// Forwarded to the terminal as `OSC 2` so the window title actually changes,
 /// which is what the guest asked for.
-fn set_console_title(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
+fn set_console_title(cx: &mut ConsoleCall<'_>, wide: bool) -> Result<WinApiHandlerResult> {
     let api = if wide {
         "SetConsoleTitleW"
     } else {
         "SetConsoleTitleA"
     };
-    let title_va = ctx.engine.read_rcx().context("SetConsoleTitle RCX")?;
+    let title_va = cx.engine.read_rcx().context("SetConsoleTitle RCX")?;
     let title = if title_va == 0 {
         String::new()
     } else if wide {
-        read_guest_utf16_lossy(ctx.engine, title_va, MAX_CONSOLE_TITLE)?
+        read_guest_utf16_lossy(cx.engine, title_va, MAX_CONSOLE_TITLE)?
     } else {
-        let bytes = read_ansi_bytes(ctx.engine, title_va, MAX_CONSOLE_TITLE)?;
-        let code_page = ctx.state.console().output_code_page;
+        let bytes = read_ansi_bytes(cx.engine, title_va, MAX_CONSOLE_TITLE)?;
+        let code_page = cx.state.console().output_code_page;
         codepage::units_to_host_utf8(&codepage::decode_to_units(code_page, &bytes))
     };
 
@@ -690,37 +675,37 @@ fn set_console_title(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiH
     if host_term::is_tty() {
         host_term::write_stdout(format!("\u{1b}]2;{sanitised}\u{7}").as_bytes());
     }
-    ctx.state.console().title = title;
-    ret_bool_true(ctx.engine, api)
+    cx.state.console().title = title;
+    ret_bool_true(cx.engine, api)
 }
 
-pub fn handle_set_console_title_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    set_console_title(ctx, true)
+pub fn handle_set_console_title_w(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    set_console_title(cx, true)
 }
 
-pub fn handle_set_console_title_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    set_console_title(ctx, false)
+pub fn handle_set_console_title_a(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    set_console_title(cx, false)
 }
 
 /// `GetConsoleTitleA` / `GetConsoleTitleW` — returns the length in characters,
 /// excluding the terminator, and 0 on failure.
-fn get_console_title(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiHandlerResult> {
+fn get_console_title(cx: &mut ConsoleCall<'_>, wide: bool) -> Result<WinApiHandlerResult> {
     let api = if wide {
         "GetConsoleTitleW"
     } else {
         "GetConsoleTitleA"
     };
-    let buffer_va = ctx.engine.read_rcx().context("GetConsoleTitle RCX")?;
+    let buffer_va = cx.engine.read_rcx().context("GetConsoleTitle RCX")?;
     let capacity = low_u32(
-        ctx.engine.read_rdx().context("GetConsoleTitle RDX")?,
+        cx.engine.read_rdx().context("GetConsoleTitle RDX")?,
         "GetConsoleTitle size",
     )?;
     let capacity_usize = usize::try_from(capacity).unwrap_or(0);
     if buffer_va == 0 || capacity_usize == 0 {
-        return ret_u64(ctx.engine, 0, api);
+        return ret_u64(cx.engine, 0, api);
     }
 
-    let title = ctx.state.console().title.clone();
+    let title = cx.state.console().title.clone();
     let written = if wide {
         let mut units: Vec<u16> = title.encode_utf16().collect();
         units.truncate(capacity_usize.saturating_sub(1));
@@ -730,64 +715,64 @@ fn get_console_title(ctx: &mut HandlerContext<'_>, wide: bool) -> Result<WinApiH
         for unit in &units {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
-        ctx.engine
+        cx.engine
             .mem_write(buffer_va, &bytes)
             .context("GetConsoleTitleW write")?;
         count
     } else {
-        let code_page = ctx.state.console().output_code_page;
+        let code_page = cx.state.console().output_code_page;
         let units: Vec<u16> = title.encode_utf16().collect();
         let mut bytes = codepage::encode_from_units(code_page, &units);
         bytes.truncate(capacity_usize.saturating_sub(1));
         let count = bytes.len();
         bytes.push(0);
-        ctx.engine
+        cx.engine
             .mem_write(buffer_va, &bytes)
             .context("GetConsoleTitleA write")?;
         count
     };
-    ret_u64(ctx.engine, u64::try_from(written).unwrap_or(0), api)
+    ret_u64(cx.engine, u64::try_from(written).unwrap_or(0), api)
 }
 
-pub fn handle_get_console_title_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    get_console_title(ctx, true)
+pub fn handle_get_console_title_w(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    get_console_title(cx, true)
 }
 
-pub fn handle_get_console_title_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    get_console_title(ctx, false)
+pub fn handle_get_console_title_a(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    get_console_title(cx, false)
 }
 
 /// `AllocConsole` — WIE always has a console, so this succeeds without work.
-pub fn handle_alloc_console(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    ret_bool_true(ctx.engine, "AllocConsole")
+pub fn handle_alloc_console(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    ret_bool_true(cx.engine, "AllocConsole")
 }
 
 /// `FreeConsole` — detaching would orphan the terminal WIE itself runs on, so
 /// this reports success and keeps the console attached.
-pub fn handle_free_console(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    ret_bool_true(ctx.engine, "FreeConsole")
+pub fn handle_free_console(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    ret_bool_true(cx.engine, "FreeConsole")
 }
 
 /// `AttachConsole` — succeeds for `ATTACH_PARENT_PROCESS` and the emulated PID,
 /// which is the only console that exists.
-pub fn handle_attach_console(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    let _pid = ctx.engine.read_rcx().context("AttachConsole RCX")?;
-    ret_bool_true(ctx.engine, "AttachConsole")
+pub fn handle_attach_console(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    let _pid = cx.engine.read_rcx().context("AttachConsole RCX")?;
+    ret_bool_true(cx.engine, "AttachConsole")
 }
 
 /// `GetConsoleWindow` — a non-NULL pseudo-`HWND`.
 ///
 /// Returning NULL would tell the guest it has no console at all, which sends
 /// some programs down a "reattach or bail" path.
-pub fn handle_get_console_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
-    ret_u64(ctx.engine, FAKE_CONSOLE_HWND, "GetConsoleWindow")
+pub fn handle_get_console_window(cx: &mut ConsoleCall<'_>) -> Result<WinApiHandlerResult> {
+    ret_u64(cx.engine, FAKE_CONSOLE_HWND, "GetConsoleWindow")
 }
 
 /// `GetLargestConsoleWindowSize` — returns a packed `COORD` in EAX.
 pub fn handle_get_largest_console_window_size(
-    ctx: &mut HandlerContext<'_>,
+    cx: &mut ConsoleCall<'_>,
 ) -> Result<WinApiHandlerResult> {
-    let _handle = ctx
+    let _handle = cx
         .engine
         .read_rcx()
         .context("GetLargestConsoleWindowSize RCX")?;
@@ -797,45 +782,45 @@ pub fn handle_get_largest_console_window_size(
         i16::try_from(rows).unwrap_or(i16::MAX),
     )
     .to_packed();
-    ret_u64(ctx.engine, u64::from(packed), "GetLargestConsoleWindowSize")
+    ret_u64(cx.engine, u64::from(packed), "GetLargestConsoleWindowSize")
 }
 
 /// `GetNumberOfConsoleMouseButtons`.
 pub fn handle_get_number_of_console_mouse_buttons(
-    ctx: &mut HandlerContext<'_>,
+    cx: &mut ConsoleCall<'_>,
 ) -> Result<WinApiHandlerResult> {
-    let count_va = ctx
+    let count_va = cx
         .engine
         .read_rcx()
         .context("GetNumberOfConsoleMouseButtons RCX")?;
     if count_va == 0 {
-        return ret_invalid_handle(ctx, "GetNumberOfConsoleMouseButtons");
+        return ret_invalid_handle(cx, "GetNumberOfConsoleMouseButtons");
     }
     // Three: xterm-style mouse reporting distinguishes left, middle, right.
-    write_guest_u32(ctx.engine, count_va, 3)?;
-    ret_bool_true(ctx.engine, "GetNumberOfConsoleMouseButtons")
+    write_guest_u32(cx.engine, count_va, 3)?;
+    ret_bool_true(cx.engine, "GetNumberOfConsoleMouseButtons")
 }
 
 /// Dispatch console APIs that are cold enough not to warrant a dense id.
 pub fn dispatch_console_extra(
-    ctx: &mut HandlerContext<'_>,
+    cx: &mut ConsoleCall<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
     let result = match name {
-        "getconsolecp" => handle_get_console_cp(ctx)?,
-        "getconsoleoutputcp" => handle_get_console_output_cp(ctx)?,
-        "setconsolecp" => handle_set_console_cp(ctx)?,
-        "setconsoleoutputcp" => handle_set_console_output_cp(ctx)?,
-        "setconsoletitlew" => handle_set_console_title_w(ctx)?,
-        "setconsoletitlea" => handle_set_console_title_a(ctx)?,
-        "getconsoletitlew" => handle_get_console_title_w(ctx)?,
-        "getconsoletitlea" => handle_get_console_title_a(ctx)?,
-        "allocconsole" => handle_alloc_console(ctx)?,
-        "freeconsole" => handle_free_console(ctx)?,
-        "attachconsole" => handle_attach_console(ctx)?,
-        "getconsolewindow" => handle_get_console_window(ctx)?,
-        "getlargestconsolewindowsize" => handle_get_largest_console_window_size(ctx)?,
-        "getnumberofconsolemousebuttons" => handle_get_number_of_console_mouse_buttons(ctx)?,
+        "getconsolecp" => handle_get_console_cp(cx)?,
+        "getconsoleoutputcp" => handle_get_console_output_cp(cx)?,
+        "setconsolecp" => handle_set_console_cp(cx)?,
+        "setconsoleoutputcp" => handle_set_console_output_cp(cx)?,
+        "setconsoletitlew" => handle_set_console_title_w(cx)?,
+        "setconsoletitlea" => handle_set_console_title_a(cx)?,
+        "getconsoletitlew" => handle_get_console_title_w(cx)?,
+        "getconsoletitlea" => handle_get_console_title_a(cx)?,
+        "allocconsole" => handle_alloc_console(cx)?,
+        "freeconsole" => handle_free_console(cx)?,
+        "attachconsole" => handle_attach_console(cx)?,
+        "getconsolewindow" => handle_get_console_window(cx)?,
+        "getlargestconsolewindowsize" => handle_get_largest_console_window_size(cx)?,
+        "getnumberofconsolemousebuttons" => handle_get_number_of_console_mouse_buttons(cx)?,
         _ => return Ok(None),
     };
     Ok(Some(result))

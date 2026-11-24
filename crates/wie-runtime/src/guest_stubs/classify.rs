@@ -203,7 +203,7 @@ static CLASSIFY_TABLE: &[(&str, &str, StubKindBuilder)] = &[
     // Primary TID is fixed (`PRIMARY_THREAD_ID` / 0x5678). Host path reads
     // ThreadState when the stub is not planted (spawned workers).
     (NT_LIBRARY, "GetCurrentThreadId", |_| {
-        GuestStubKind::ReturnImm32(wie_winapi::PRIMARY_THREAD_ID)
+        GuestStubKind::ReturnImm32(wie_winapi::port::PRIMARY_THREAD_ID)
     }),
     (NT_LIBRARY, "IsDebuggerPresent", |_| {
         GuestStubKind::ReturnZero
@@ -249,7 +249,7 @@ pub(crate) fn classify_guest_stub(
     // Pre-computed group membership mirrors the original chain's guards:
     // the UCRT branch used `is_ucrt_library` and the last branch accepted
     // either KERNEL32.dll or ntdll.dll (case-insensitive).
-    let is_ucrt = wie_winapi::ucrt::is_ucrt_library(library);
+    let is_ucrt = wie_winapi::port::is_ucrt_library(library);
     let is_nt =
         library.eq_ignore_ascii_case("KERNEL32.dll") || library.eq_ignore_ascii_case("ntdll.dll");
 

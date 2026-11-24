@@ -21,5 +21,5 @@ pub(crate) struct GuestTid(pub(crate) u32);
 impl GuestTid {
     /// The primary (first) guest thread ID — a fixed magic value (0x5678)
     /// shared with `wie_winapi::PRIMARY_THREAD_ID`.
-    pub(crate) const PRIMARY: GuestTid = GuestTid(wie_winapi::PRIMARY_THREAD_ID);
+    pub(crate) const PRIMARY: GuestTid = GuestTid(wie_winapi::port::PRIMARY_THREAD_ID);
 }

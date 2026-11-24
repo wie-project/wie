@@ -397,7 +397,7 @@ fn new_clears_edit_visibly_on_same_frame() {
 /// status bar hugs its bottom edge, so a visible bar contributes thousands of
 /// BTNFACE pixels there, while a hidden bar (the EDIT repainted over the
 /// strip) contributes none (the EDIT background is COLOR_WINDOW-white).
-fn count_status_bar_face(frame: &wie_winapi::present::SurfaceFrame, rows: u32) -> u32 {
+fn count_status_bar_face(frame: &wie_winapi::port::SurfaceFrame, rows: u32) -> u32 {
     let mut face = 0_u32;
     let h = frame.height;
     for y in h.saturating_sub(rows)..h {

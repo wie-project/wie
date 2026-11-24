@@ -5,7 +5,7 @@ use anyhow::Result;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
-use wie_winapi::{
+use wie_winapi::port::{
     ComIface, ComMethod, FakeVa, WinApiId, WinApiTraits, decode_fake_va, encode_export,
     encode_unresolved, resolve_winapi_id, winapi_id_export,
 };
@@ -145,7 +145,7 @@ pub(crate) fn make_entry(
     let mut traits = winapi_id.map(WinApiId::traits).unwrap_or_default();
     // ExitProcess / CRT exit: handled specially in the session loop.
     if (library.eq_ignore_ascii_case("KERNEL32.dll") && name.eq_ignore_ascii_case("ExitProcess"))
-        || (wie_winapi::ucrt::is_ucrt_library(&library)
+        || (wie_winapi::port::is_ucrt_library(&library)
             && (name.eq_ignore_ascii_case("exit")
                 || name.eq_ignore_ascii_case("_exit")
                 || name.eq_ignore_ascii_case("abort")))
@@ -288,7 +288,7 @@ pub(crate) fn collect_stub_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wie_winapi::fake_va::{DInput8Iface, DirectInput8Method, DirectInputDevice8Method};
+    use wie_winapi::port::{DInput8Iface, DirectInput8Method, DirectInputDevice8Method};
 
     use crate::memory::build_default_environment_strings_w;
 
@@ -345,20 +345,20 @@ mod tests {
     /// a guest's `GetProcAddress` return NULL.
     #[test]
     fn the_served_directinput_methods_are_dispatchable_by_name() {
-        use wie_winapi::fake_va::{ComIface, ComMethod};
+        use wie_winapi::port::{ComIface, ComMethod};
 
         assert!(
-            wie_winapi::is_winapi_library("dinput8.dll"),
+            wie_winapi::port::is_winapi_library("dinput8.dll"),
             "dinput8.dll must be a WinAPI library or a guest importing it fails to load"
         );
         // The one real export does resolve, so both a static import and
         // `GetProcAddress` land on a handler.
         assert!(
-            wie_winapi::is_winapi_implemented("dinput8.dll", "DirectInput8Create"),
+            wie_winapi::port::is_winapi_implemented("dinput8.dll", "DirectInput8Create"),
             "DirectInput8Create must resolve to a real handler"
         );
         assert!(
-            !wie_winapi::is_winapi_implemented("dinput8.dll", "DllCanUnloadNow"),
+            !wie_winapi::port::is_winapi_implemented("dinput8.dll", "DllCanUnloadNow"),
             "dinput8.dll exports exactly one name; anything else must not be claimed"
         );
 
@@ -377,7 +377,7 @@ mod tests {
                 let slot = u8::try_from(slot).expect("slot fits u8");
                 let name = ComMethod::decode(iface, slot).name(iface);
                 assert!(
-                    !wie_winapi::is_winapi_implemented("dinput8.dll", name.as_ref()),
+                    !wie_winapi::port::is_winapi_implemented("dinput8.dll", name.as_ref()),
                     "{name} is a COM vtable slot, not a dll export; it must not be \
                      reported as a resolvable export name"
                 );

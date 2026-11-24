@@ -3,6 +3,7 @@
 
 use super::class::{find_window, find_window_mut};
 use crate::OuterReturn;
+use crate::capability::PresentAccess;
 use crate::gdi32::{ArgReg, read_arg};
 use crate::state::WindowFlags;
 use crate::user32::{
@@ -477,14 +478,12 @@ pub fn handle_destroy_window(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     // sync explicitly (the same wake the publish path fires). Children live
     // inside their parent's surface and have no host window of their own.
     if parent_handle == crate::handles::Hwnd::NULL {
-        state.present().request_host_sync();
+        state.request_host_sync();
         // The top-level also leaves the host-visible window set and z-order.
         // The window-set revision bumps so the presenter's Frame handler
         // reconciles the stale host window away on the wake above — the
         // destroy side of the reconcile-on-change latch.
-        state
-            .present()
-            .unregister_top_level(crate::handles::Hwnd::from(window_handle));
+        state.unregister_top_level(crate::handles::Hwnd::from(window_handle));
     }
 
     tracing::debug!(target: "wiegui", hwnd = window_handle, "DestroyWindow");

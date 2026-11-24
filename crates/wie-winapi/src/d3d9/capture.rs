@@ -46,11 +46,35 @@
 //!
 //! # Legacy parity
 //!
-//! With the pipeline off (headless, CI, `WIE_CAPTURE_STREAM` unset) no op is
-//! ever recorded and every handler takes the unchanged synchronous raster
-//! path — the CI frame hashes exercise that path byte-for-byte. Validation
-//! and return codes are identical on both paths (the capture branch sits
-//! behind the same checks the raster path runs).
+//! With the pipeline off — headless runs and CI, which never arm the gate, and
+//! a GUI session started with `WIE_CAPTURE_STREAM=0` — no op is ever recorded
+//! and every handler takes the unchanged synchronous raster path: the CI frame
+//! hashes exercise that path byte-for-byte. Validation and return codes are
+//! identical on both paths (the capture branch sits behind the same checks the
+//! raster path runs).
+//!
+//! # Two raster paths, on purpose (maintainability T4.3)
+//!
+//! This module deliberately does **not** own the only way a draw is
+//! rasterized. With the gate closed, `Draw*`/`Clear` rasterize inline in
+//! `d3d9/raster.rs` and publish through `PresentState::publish`; with it open,
+//! they record an op here and this module's replay does the rasterizing on
+//! `present/stream.rs`'s thread. The alternative T4.3 fix — deleting the
+//! in-handler path so this one is the only record path — was rejected: it
+//! would put every headless test on a render thread and delete the
+//! byte-identical oracle instead of widening coverage.
+//!
+//! What keeps the two from diverging silently:
+//!
+//! - `micro_gui_window::capture`'s
+//!   `gui_d3d9_capture_stream_frame_matches_legacy_hash` asserts a replayed
+//!   frame equals `D3D9_RESTING_FRAME_HASH`, the legacy path's hash for the
+//!   same exe. Coverage limit: one micro fixture; the notepad tests and the
+//!   rest of the micro-suite run headless, i.e. legacy-only.
+//! - `present::tests::default_present_path_spawns_no_render_thread` asserts
+//!   the gated-off default path spawns no render thread at all, so a
+//!   re-introduced second render thread fails a test rather than quietly
+//!   rasterizing a frame nobody compares.
 
 use std::sync::Arc;
 

@@ -15,32 +15,41 @@ const FAKE_DEVINFO_SET: u64 = 0x5200_0001;
 /// Win32 `ERROR_NO_MORE_ITEMS` (259) — the device list is empty.
 const ERROR_NO_MORE_ITEMS: u32 = 259;
 
+crate::soft_dispatch::soft_exports! {
+    // Phase-3 stub wave: devnode-level queries report no such device.
+    ("cm_get_device_ida", handle_cm_no_such_devnode),
+    ("cm_get_device_id_lista", handle_cm_get_device_id_list_a),
+    ("cm_get_device_id_listw", handle_cm_get_device_id_list_w),
+    ("cm_get_parent", handle_cm_no_such_devnode),
+    ("cm_locate_devnodea", handle_cm_no_such_devnode),
+    ("setupdidestroydeviceinfolist", handle_setup_di_destroy_device_info_list),
+    ("setupdienumdeviceinfo", handle_setup_di_enum_device_info),
+    ("setupdienumdeviceinterfaces", handle_setup_di_no_more_items),
+    ("setupdigetclassdevsa", handle_setup_di_get_class_devs),
+    ("setupdigetclassdevsw", handle_setup_di_get_class_devs),
+    ("setupdigetdeviceinterfacedetaila", handle_setup_di_no_more_items),
+    ("setupdigetdeviceregistrypropertya", handle_setup_di_no_more_items),
+}
+
 /// Dispatch a `SETUPAPI.dll` / `CFGMGR32.dll` export by name.
 ///
 /// CFGMGR32 exports arrive as `CM_Get_Device_ID_List*`, which lowercase to
-/// the `cm_*` arms below.
+/// the `cm_*` rows above.
 pub fn dispatch_setupapi(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let n = name.to_ascii_lowercase();
-    match n.as_str() {
-        "setupdigetclassdevsw" | "setupdigetclassdevsa" => {
-            Ok(Some(handle_setup_di_get_class_devs(ctx)?))
-        }
-        "setupdienumdeviceinfo" => Ok(Some(handle_setup_di_enum_device_info(ctx)?)),
-        "setupdidestroydeviceinfolist" => Ok(Some(handle_setup_di_destroy_device_info_list(ctx)?)),
-        "cm_get_device_id_listw" => Ok(Some(handle_cm_get_device_id_list(ctx, true)?)),
-        "cm_get_device_id_lista" => Ok(Some(handle_cm_get_device_id_list(ctx, false)?)),
-        // Phase-3 stub wave: devnode-level queries report no such device.
-        "cm_get_device_ida" => Ok(Some(handle_cm_no_such_devnode(ctx)?)),
-        "cm_get_parent" => Ok(Some(handle_cm_no_such_devnode(ctx)?)),
-        "cm_locate_devnodea" => Ok(Some(handle_cm_no_such_devnode(ctx)?)),
-        "setupdienumdeviceinterfaces" => Ok(Some(handle_setup_di_no_more_items(ctx)?)),
-        "setupdigetdeviceinterfacedetaila" => Ok(Some(handle_setup_di_no_more_items(ctx)?)),
-        "setupdigetdeviceregistrypropertya" => Ok(Some(handle_setup_di_no_more_items(ctx)?)),
-        _ => Ok(None),
-    }
+    crate::soft_dispatch::dispatch_soft_table(ctx, DISPATCH, name)
+}
+
+/// `CM_Get_Device_ID_ListW` — the wide half of the shared body.
+fn handle_cm_get_device_id_list_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_cm_get_device_id_list(ctx, true)
+}
+
+/// `CM_Get_Device_ID_ListA` — the ANSI half of the shared body.
+fn handle_cm_get_device_id_list_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_cm_get_device_id_list(ctx, false)
 }
 
 /// `HDEVINFO SetupDiGetClassDevsW/A(ClassGuid*, Enumerator, HWND, DWORD Flags)`.

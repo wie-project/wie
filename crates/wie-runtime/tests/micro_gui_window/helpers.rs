@@ -95,7 +95,7 @@ pub(crate) fn drive_gui_session(path: &Path, iterations_budget: usize) -> Option
 /// band with no text or child controls. Text pixels are font-dependent
 /// (real macOS system fonts vary by OS version), so any hash that includes
 /// them would be fragile; the gradient rows are font-independent and stable.
-pub(crate) fn frame_hash(frame: &wie_winapi::present::SurfaceFrame, top: u32, bottom: u32) -> u64 {
+pub(crate) fn frame_hash(frame: &wie_winapi::port::SurfaceFrame, top: u32, bottom: u32) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
     for row in top..bottom {
         for pixel in frame
@@ -193,7 +193,7 @@ pub(crate) const D3D9_RESTING_FRAME_HASH: u64 = 0x6AF4_799A_6168_2388;
 /// their fixed positions. The gradient formula matches gui_blit/main.c:
 /// r=(x*255)/1280, g=(y*255)/800, b=((x+y)*127)/2080.
 pub(crate) fn assert_frame_renders_gradient_text_and_controls(
-    frame: &wie_winapi::present::SurfaceFrame,
+    frame: &wie_winapi::port::SurfaceFrame,
 ) {
     let (w, h) = (frame.width, frame.height);
     assert!(
@@ -335,7 +335,7 @@ pub(crate) fn count_edit_ink(session: &wie_runtime::RuntimeSession, owner: u64) 
 /// (`present_us`) and the guest-side publish cost of that frame
 /// (`publish_us`, 0 when frame timing was not enabled for the session).
 pub(crate) struct ObservedFrame {
-    pub frame: wie_winapi::present::SurfaceFrame,
+    pub frame: wie_winapi::port::SurfaceFrame,
     pub publish_us: u128,
     pub present_us: u128,
 }
@@ -376,7 +376,7 @@ impl FrameWatcher {
     /// which `pred` returns true.
     pub(crate) fn spawn(
         handle: wie_runtime::GuestHandle,
-        pred: impl Fn(&wie_winapi::present::SurfaceFrame) -> bool + Send + 'static,
+        pred: impl Fn(&wie_winapi::port::SurfaceFrame) -> bool + Send + 'static,
     ) -> Self {
         use std::sync::atomic::{AtomicBool, Ordering};
         let stop = std::sync::Arc::new(AtomicBool::new(false));

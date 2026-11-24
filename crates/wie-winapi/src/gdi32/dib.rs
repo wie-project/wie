@@ -5,6 +5,7 @@
 //! parameter is ignored — matching real GDI, which ignores the DC for DIB
 //! sections, and the micro-exes, which pass NULL.
 
+use crate::capability::PresentAccess;
 use crate::gdi32::{ArgReg, read_arg};
 use anyhow::{Context, Result};
 
@@ -536,16 +537,12 @@ fn publish_device_dib_blit(
     let Some((image_w, image_h, bottom_up, bpp)) = read_bmi_geometry(engine, lpbi)? else {
         return Ok(false);
     };
-    state
-        .present()
-        .ensure_surface(info.hwnd, info.width, info.height);
+    state.ensure_surface(info.hwnd, info.width, info.height);
     let surface_x = dest_x.saturating_add(info.offset_x);
     let surface_y = dest_y.saturating_add(info.offset_y);
     {
         let Some((dest, surface_stride)) = state
-            .present()
-            .surfaces
-            .get_mut(&info.hwnd)
+            .surface_mut(info.hwnd)
             .map(|s| (&mut s.pixels[..], s.stride))
         else {
             return Ok(false);
@@ -579,7 +576,7 @@ fn publish_device_dib_blit(
     let right = surface_x.saturating_add(dst_cx).clamp(0, dirty_w);
     let bottom = surface_y.saturating_add(dst_cy).clamp(0, dirty_h);
     if right > left && bottom > top {
-        state.present().mark_dirty(
+        state.mark_dirty(
             info.hwnd,
             IRect {
                 left,
@@ -589,7 +586,7 @@ fn publish_device_dib_blit(
             },
         );
     }
-    state.present().publish_deferred(info.hwnd);
+    state.publish_deferred(info.hwnd);
     Ok(true)
 }
 

@@ -42,6 +42,16 @@ pub(crate) mod input;
 pub(crate) mod pump;
 pub(crate) mod screen;
 
+// The `kernel32.dll` console API surface. It lives here, not in `kernel32`,
+// because `DllId::Console` is this module's slot: owner and callers was the
+// second boundary error ADR-0005 measured, and this is where it is fixed.
+pub(crate) mod api;
+pub(crate) mod cells;
+pub(crate) mod records;
+// The console's stdin buffer, whose storage is a `FileIoState` field but whose
+// every reader is a console call.
+pub(crate) mod stdin;
+
 use std::collections::VecDeque;
 
 /// `ENABLE_PROCESSED_INPUT` (consoleapi.h).

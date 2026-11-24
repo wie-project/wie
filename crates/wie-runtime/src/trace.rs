@@ -94,7 +94,7 @@ pub enum EntryTraceTermination {
     /// Execution stopped before invoking a guest callback.
     GuestCallbackRequested {
         /// Description of the requested callback.
-        request: wie_winapi::GuestCallbackRequest,
+        request: wie_winapi::port::GuestCallbackRequest,
     },
 
     /// The HOST stopped the session: Ctrl+C arrived while
@@ -121,7 +121,7 @@ pub(crate) fn termination_exit_code(termination: &EntryTraceTermination) -> Opti
 
 fn run_session_to_summary(
     path: &std::path::Path,
-    idle_policy: wie_winapi::MessageQueueIdlePolicy,
+    idle_policy: wie_winapi::port::MessageQueueIdlePolicy,
     max_api: usize,
 ) -> Result<EntryTraceSummary> {
     let mut session = RuntimeSession::new(path, idle_policy)?;
@@ -149,7 +149,7 @@ fn run_session_to_summary(
 pub fn entry_trace(path: &std::path::Path, max_api: usize) -> Result<EntryTraceSummary> {
     run_session_to_summary(
         path,
-        wie_winapi::MessageQueueIdlePolicy::ExitOnIdle,
+        wie_winapi::port::MessageQueueIdlePolicy::ExitOnIdle,
         max_api,
     )
 }
@@ -224,7 +224,7 @@ pub fn run_micro_exe_with_options(
     let (cpu0_user, cpu0_sys) = wie_cpu::process_cpu_times_us();
     let mut session = RuntimeSession::new_with_options(
         path,
-        wie_winapi::MessageQueueIdlePolicy::ExitOnIdle,
+        wie_winapi::port::MessageQueueIdlePolicy::ExitOnIdle,
         crate::DEFAULT_LAYOUT,
         crate::SessionOptions {
             guest_args: options.guest_args,
@@ -295,12 +295,12 @@ pub fn run_persistent_until_yield_with_options(
     options: crate::SessionOptions,
 ) -> Result<EntryTraceSummary> {
     use std::time::Instant;
-    use wie_winapi::{IdleContext, IdlePolicy};
+    use wie_winapi::port::{IdleContext, IdlePolicy};
 
     let idle = IdlePolicy::from_env_for(IdleContext::Persistent);
     let mut session = RuntimeSession::new_with_options(
         path,
-        wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
+        wie_winapi::port::MessageQueueIdlePolicy::YieldOnIdle,
         crate::DEFAULT_LAYOUT,
         options,
     )?;

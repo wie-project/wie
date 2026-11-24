@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 use wie_cpu::{CpuEngine, GuestMemory, IcedCpu, JitCpu, RunUntilHook};
-use wie_winapi::{GuestHeap, PendingSpawn, WinApiState};
+use wie_winapi::port::{GuestHeap, PendingSpawn, WinApiState};
 
 // ── Lock helpers ───────────────────────────────────────────────────────
 
@@ -131,7 +131,23 @@ fn bump_max(slot: &AtomicU64, ns: u64) {
 /// Disabled path: one relaxed atomic load, then the plain [`lock`] — no
 /// clock read, no accumulation. Poison is recovered exactly like [`lock`],
 /// so lock ordering and poison behavior are unchanged.
-pub(crate) fn lock_wait<'a, T>(m: &'a Mutex<T>, stats: &LockWaitStats) -> MutexGuard<'a, T> {
+/// Lock the shared `WinApiState` mutex, timing the wait when runtime
+/// profiling is on.
+///
+/// Typed to `WinApiState` rather than generic on purpose: every caller passes
+/// the big state, and naming the type here is what lets the acquisition carry
+/// `Lock::State` (see [`wie_winapi::lock_order`]) instead of being able to
+/// mislabel some other mutex. The order is asserted *before* the blocking
+/// `lock`, so a channel→state cycle panics rather than parking the thread.
+pub(crate) fn lock_wait<'a>(m: &'a Mutex<WinApiState>, stats: &LockWaitStats) -> OrderedState<'a> {
+    let scope = wie_winapi::lock_order::enter(wie_winapi::lock_order::Lock::State);
+    wie_winapi::lock_order::Ordered::wrap(scope, lock_timed(m, stats))
+}
+
+/// [`lock_wait`] without the lock-order record: the timing half, generic over
+/// the guarded value so the wait-accounting tests can drive it with a plain
+/// mutex instead of standing up a whole `WinApiState`.
+pub(crate) fn lock_timed<'a, T>(m: &'a Mutex<T>, stats: &LockWaitStats) -> MutexGuard<'a, T> {
     if !stats.enabled() {
         return lock(m);
     }
@@ -140,6 +156,10 @@ pub(crate) fn lock_wait<'a, T>(m: &'a Mutex<T>, stats: &LockWaitStats) -> MutexG
     stats.record_guest(u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX));
     guard
 }
+
+/// The big `WinApiState` guard, carrying its lock-order record; see
+/// [`wie_winapi::lock_order`].
+pub(crate) use wie_winapi::lock_order::OrderedState;
 
 /// Process-wide registry of guest **worker** engine CPU-stat snapshots.
 ///
@@ -221,7 +241,7 @@ pub(crate) struct ProcessConfig {
     /// Hook table the fake-API stop range resolves through.
     pub soft_apis: SoftApiTable,
     /// Process-wide environment (paths, command line) served to WinAPI.
-    pub environment: wie_winapi::WinApiEnvironment,
+    pub environment: wie_winapi::port::WinApiEnvironment,
     /// Fixed guest memory layout (stack, heaps, fake-API range, stub pages).
     pub layout: RuntimeMemoryLayout,
     /// Bitmap marking which fake-API VAs stop the host vs pass through.
@@ -231,7 +251,7 @@ pub(crate) struct ProcessConfig {
     /// Statically-loaded guest DLLs awaiting `DllMain(PROCESS_ATTACH)`, in
     /// load order (dependencies before dependents). The session pump runs
     /// them before dispatching the exe entry point.
-    pub static_dll_mains: Vec<wie_winapi::dll_loader::StaticDllMain>,
+    pub static_dll_mains: Vec<wie_winapi::port::StaticDllMain>,
 }
 
 // ── Worker TEB pool ───────────────────────────────────────────────────
@@ -309,13 +329,13 @@ pub(crate) struct ProcessResources {
     /// Session-level heap shard — hot `HeapAlloc`/`HeapFree` stops lock only
     /// this `Mutex<GuestHeap>` and the engine, bypassing the global
     /// `WinApiState` mutex (order `global -> heap` when both are taken).
-    pub shared_heap: Arc<Mutex<wie_winapi::GuestHeap>>,
+    pub shared_heap: Arc<Mutex<wie_winapi::port::GuestHeap>>,
     /// Lock-free `shared_winapi` wait accumulators (Task 7). Shared with
     /// worker threads at spawn and with the presenter's `GuestHandle`.
     pub(crate) lock_wait_stats: Arc<LockWaitStats>,
     /// Guest message queue behind its own mutex — host input posts through
     /// this without ever locking `shared_winapi`.
-    pub shared_message_queue: Arc<Mutex<wie_winapi::present::MessageQueue>>,
+    pub shared_message_queue: Arc<Mutex<wie_winapi::port::MessageQueue>>,
     /// Join handles for spawned guest worker threads.
     pub worker_joins: Vec<JoinHandle<()>>,
     /// Distinct per-thread TEB pages for guest workers, shared with the
@@ -326,7 +346,7 @@ pub(crate) struct ProcessResources {
 /// Temporary exclusive access to engine + WinAPI.
 pub(crate) struct ProcessGuard<'a> {
     pub eng: &'a mut dyn CpuEngine,
-    pub win: MutexGuard<'a, WinApiState>,
+    pub win: OrderedState<'a>,
 }
 
 impl ProcessGuard<'_> {
@@ -414,7 +434,7 @@ impl ProcessResources {
         self.config.primary_tid.0
     }
 
-    pub(crate) fn static_dll_mains(&self) -> &[wie_winapi::dll_loader::StaticDllMain] {
+    pub(crate) fn static_dll_mains(&self) -> &[wie_winapi::port::StaticDllMain] {
         &self.config.static_dll_mains
     }
 
@@ -423,13 +443,13 @@ impl ProcessResources {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn heap_arc(&self) -> Arc<Mutex<wie_winapi::GuestHeap>> {
+    pub(crate) fn heap_arc(&self) -> Arc<Mutex<wie_winapi::port::GuestHeap>> {
         Arc::clone(&self.shared_heap)
     }
 
     /// Clone of the guest message-queue Arc — host posts without locking the
     /// big WinApiState mutex.
-    pub(crate) fn message_queue_arc(&self) -> Arc<Mutex<wie_winapi::present::MessageQueue>> {
+    pub(crate) fn message_queue_arc(&self) -> Arc<Mutex<wie_winapi::port::MessageQueue>> {
         Arc::clone(&self.shared_message_queue)
     }
 
@@ -570,21 +590,21 @@ fn join_workers_impl(
         }
         for obj in st.kernel.sync.objects.values() {
             match obj {
-                wie_winapi::KernelObject::Event(e) => e.set(),
-                wie_winapi::KernelObject::Semaphore(s) => s.notify_all(),
-                wie_winapi::KernelObject::Thread(t) => {
+                wie_winapi::port::KernelObject::Event(e) => e.set(),
+                wie_winapi::port::KernelObject::Semaphore(s) => s.notify_all(),
+                wie_winapi::port::KernelObject::Thread(t) => {
                     if !t.is_finished() {
                         t.finish(1);
                     }
                 }
                 // File mappings hold no waiters; nothing to wake at teardown.
-                wie_winapi::KernelObject::FileMapping(_) => {}
+                wie_winapi::port::KernelObject::FileMapping(_) => {}
                 // Directory watches: waking the parked waiter unblocks the
                 // join; the watcher itself stops when the object drops.
-                wie_winapi::KernelObject::DirectoryWatch(d) => d.deactivate(),
+                wie_winapi::port::KernelObject::DirectoryWatch(d) => d.deactivate(),
                 // Child-process objects: wake waiters so a parked
                 // WaitForSingleObject never blocks the teardown join.
-                wie_winapi::KernelObject::Process(p) => {
+                wie_winapi::port::KernelObject::Process(p) => {
                     if !p.is_finished() {
                         p.finish(1);
                     }
@@ -641,7 +661,7 @@ impl QuantumHooks for WorkerHooks {
         // Checked BEFORE the generic invalid-memory handler so the trampoline
         // fault is recognised as a normal thread completion.
         if run.invalid_memory.hit
-            && run.invalid_memory.address == wie_winapi::pthread_return_trampoline_va()
+            && run.invalid_memory.address == wie_winapi::port::pthread_return_trampoline_va()
         {
             let return_value = core.engine().read_rax().unwrap_or(0);
             if crate::knobs::mt_debug() {
@@ -651,8 +671,8 @@ impl QuantumHooks for WorkerHooks {
                 );
             }
             core.with_locked(|_, st| {
-                st.kernel.threads.activate(self.tid);
-                wie_winapi::thread::bind_current_tid(self.tid);
+                st.activate_thread(self.tid);
+                wie_winapi::port::bind_current_tid(self.tid);
                 if let Some(pt) = st.pthread().by_tid.get(&self.tid).copied()
                     && let Some(thread) = st.pthread().threads.get_mut(&pt)
                 {
@@ -873,7 +893,7 @@ fn run_worker(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::indexing_slicing, clippy::as_conversions)]
 mod tests {
-    use super::{LockWaitStats, WorkerTebPool, lock, lock_wait};
+    use super::{LockWaitStats, WorkerTebPool, lock, lock_timed, lock_wait};
     use crate::memory::DEFAULT_LAYOUT;
     use crate::mt_runtime::{ProcessConfig, ProcessResources};
     use crate::session::GuestTid;
@@ -881,7 +901,7 @@ mod tests {
     use wie_cpu::guest_layout::TEB_PAGE_SIZE;
     use wie_cpu::{CpuEngine, GuestMemory, IcedCpu, RwxPerms, ThreadContext};
     use wie_pe::ProcessIdentity;
-    use wie_winapi::PendingSpawn;
+    use wie_winapi::port::PendingSpawn;
 
     /// A fresh pool over the default layout's worker TEB range.
     fn test_pool() -> WorkerTebPool {
@@ -990,10 +1010,10 @@ mod tests {
             // Fake-API window bitmap: worker hook install validates its size
             // against the 4 MiB window before the worker can run a quantum.
             stop_bitmap: Arc::<[u8]>::from(vec![0_u8; DEFAULT_LAYOUT.fake_api.size / 8]),
-            primary_tid: GuestTid(wie_winapi::PRIMARY_THREAD_ID),
+            primary_tid: GuestTid(wie_winapi::port::PRIMARY_THREAD_ID),
             static_dll_mains: Vec::new(),
         };
-        let heap = Arc::clone(&winapi_state.heap_state.heap);
+        let heap = winapi_state.heap_arc();
         let mut resources = ProcessResources {
             config,
             engine,
@@ -1002,9 +1022,7 @@ mod tests {
             shared_winapi: Arc::new(Mutex::new(winapi_state)),
             shared_heap: heap,
             lock_wait_stats: Arc::new(LockWaitStats::new()),
-            shared_message_queue: Arc::new(
-                Mutex::new(wie_winapi::present::MessageQueue::default()),
-            ),
+            shared_message_queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
             worker_joins: Vec::new(),
             worker_teb_pool: Arc::new(Mutex::new(test_pool())),
         };
@@ -1135,6 +1153,54 @@ mod tests {
         assert_ne!(region.base, wie_cpu::GS_BASE);
     }
 
+    /// **The plan's assertion, through the real funnel.** `channel → state` is
+    /// the cycle the `PresentChannel` doc comment says cannot happen: a thread
+    /// holding the present channel must not be able to take the big
+    /// `WinApiState`, because the UI thread takes them the other way round.
+    ///
+    /// This goes through [`lock_wait`], not through `lock_order::enter`, so it
+    /// fails if the wiring is dropped — the assertion firing here is the whole
+    /// point, and an assertion nobody has seen fire is indistinguishable from a
+    /// no-op.
+    #[test]
+    fn lock_wait_panics_while_the_present_channel_is_held() {
+        use wie_winapi::lock_order::{Lock, enter};
+
+        let process = wie_pe::ProcessIdentity {
+            module_file_name: "lock-order-test.exe".to_owned(),
+            module_path: r"C:\lock-order-test.exe".to_owned(),
+            current_directory: r"C:\".to_owned(),
+            command_line: "lock-order-test.exe".to_owned(),
+        };
+        let state = crate::memory::default_winapi_state(
+            &crate::DEFAULT_LAYOUT,
+            Arc::new(Vec::new()),
+            &process,
+        )
+        .expect("winapi state");
+        let state = Mutex::new(state);
+        let stats = LockWaitStats::new();
+
+        // The guest side: state → channel is the documented order.
+        {
+            let _state = lock_wait(&state, &stats);
+            let channel = enter(Lock::Channel);
+            drop(channel);
+        }
+
+        // The presenter side, one step too far: holding the channel, reaching
+        // for the state. This is the deadlock, and it must panic before the
+        // blocking `lock`.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _channel = enter(Lock::Channel);
+            let _state = lock_wait(&state, &stats);
+        }));
+        assert!(
+            panicked.is_err(),
+            "channel → state through lock_wait must panic, not deadlock"
+        );
+    }
+
     /// `lock_wait` records total + max into the guest side of the stats
     /// while profiling is enabled; a held lock makes the recorded wait
     /// non-trivial so the max path is exercised.
@@ -1153,7 +1219,7 @@ mod tests {
             }
         });
         let _ = rx.recv();
-        let guard = lock_wait(&state, &stats);
+        let guard = lock_timed(&state, &stats);
         assert_eq!(*guard, 42);
         drop(guard);
         drop(holder.join());
@@ -1182,11 +1248,11 @@ mod tests {
         assert!(!stats.enabled(), "stats start disabled");
         let state = Arc::new(Mutex::new(7_u32));
         {
-            let guard = lock_wait(&state, &stats);
+            let guard = lock_timed(&state, &stats);
             assert_eq!(*guard, 7);
         }
         {
-            let guard = lock_wait(&state, &stats);
+            let guard = lock_timed(&state, &stats);
             assert_eq!(*guard, 7);
         }
         let snap = stats.snapshot();
@@ -1233,7 +1299,7 @@ mod tests {
         };
         let mut session = crate::session::RuntimeSession::new_with_options(
             &path,
-            wie_winapi::MessageQueueIdlePolicy::ExitOnIdle,
+            wie_winapi::port::MessageQueueIdlePolicy::ExitOnIdle,
             crate::DEFAULT_LAYOUT,
             crate::SessionOptions::default(),
         )

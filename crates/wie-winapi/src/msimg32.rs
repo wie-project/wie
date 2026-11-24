@@ -199,18 +199,18 @@ fn blend_pixel(src_px: u32, dst_px: u32, const_alpha: u32, use_src_alpha: bool) 
         | blend_channel(src_px & 0xFF, dst_px & 0xFF)
 }
 
+crate::soft_dispatch::soft_exports! {
+    ("alphablend", handle_alpha_blend),
+    ("gradientfill", handle_gradient_fill),
+    ("transparentblt", handle_transparent_blt),
+}
+
 /// Dispatch an `MSIMG32.dll` export by name (case-insensitive).
 pub fn dispatch_msimg32(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let n = name.to_ascii_lowercase();
-    match n.as_str() {
-        "alphablend" => Ok(Some(handle_alpha_blend(ctx)?)),
-        "transparentblt" => Ok(Some(handle_transparent_blt(ctx)?)),
-        "gradientfill" => Ok(Some(handle_gradient_fill(ctx)?)),
-        _ => Ok(None),
-    }
+    crate::soft_dispatch::dispatch_soft_table(ctx, DISPATCH, name)
 }
 
 /// Handles `MSIMG32.dll!TransparentBlt` — color-keyed copy.

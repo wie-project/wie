@@ -120,8 +120,8 @@ impl RuntimeMemoryLayout {
         let fake_api = LayoutRegion {
             name: "fake_api",
             kind: RegionKind::FakeApi,
-            base: wie_winapi::FAKE_API_BASE,
-            size: wie_winapi::FAKE_API_SIZE,
+            base: wie_winapi::port::FAKE_API_BASE,
+            size: wie_winapi::port::FAKE_API_SIZE,
             perms: RwxPerms::ALL,
         };
         // Must not collide with common PE ImageBase values (0x400000 and
@@ -151,7 +151,7 @@ impl RuntimeMemoryLayout {
             process_heap,
             process_heap_shadow_delta: 0x0000_0001_0000_0000,
             fake_api,
-            callback_return_trampoline_va: wie_winapi::callback_return_trampoline_va(),
+            callback_return_trampoline_va: wie_winapi::port::callback_return_trampoline_va(),
             fast_api_stub,
             guest_io_code: LayoutRegion {
                 name: "guest_io_code",
@@ -538,7 +538,7 @@ pub(crate) fn default_winapi_state(
     layout: &RuntimeMemoryLayout,
     executable_file_bytes: std::sync::Arc<Vec<u8>>,
     process: &wie_pe::ProcessIdentity,
-) -> Result<wie_winapi::WinApiState> {
+) -> Result<wie_winapi::port::WinApiState> {
     let heap_size_u64 =
         u64::try_from(layout.process_heap.size).context("heap size does not fit u64")?;
     let heap_end = layout
@@ -552,10 +552,10 @@ pub(crate) fn default_winapi_state(
 
     let (directinput_var, directinput_value) = SDL_DIRECTINPUT_ENV_PAIR;
 
-    Ok(wie_winapi::WinApiState {
-        display: wie_winapi::DisplayMetrics::default(),
-        heap_state: wie_winapi::HeapState {
-            heap: std::sync::Arc::new(std::sync::Mutex::new(wie_winapi::GuestHeap::new(
+    Ok(wie_winapi::port::WinApiState {
+        display: wie_winapi::port::DisplayMetrics::default(),
+        heap_state: wie_winapi::port::HeapState {
+            heap: std::sync::Arc::new(std::sync::Mutex::new(wie_winapi::port::GuestHeap::new(
                 layout.process_heap.base,
                 heap_end,
             ))),
@@ -563,9 +563,11 @@ pub(crate) fn default_winapi_state(
             fls_slots: Vec::new(),
             guest_fls_table_va: layout.guest_fls_table.base,
         },
-        process: wie_winapi::ProcessState {
+        process: wie_winapi::port::ProcessState {
             last_error: 0,
-            next_registry_key_handle: wie_winapi::RegistryKeyHandle::from(0x0000_0000_7000_0000),
+            next_registry_key_handle: wie_winapi::port::RegistryKeyHandle::from(
+                0x0000_0000_7000_0000,
+            ),
             registry_keys: Vec::new(),
             main_module_file_name: process.module_file_name.clone(),
             main_module_path: process.module_path.clone(),
@@ -589,22 +591,22 @@ pub(crate) fn default_winapi_state(
             main_module_strings: Vec::new(),
             main_module_accelerators: Vec::new(),
         },
-        kernel: wie_winapi::KernelState {
-            threads: wie_winapi::ThreadState::primary(),
-            sync: wie_winapi::SyncState::new(),
+        kernel: wie_winapi::port::KernelState {
+            threads: wie_winapi::port::ThreadState::primary(),
+            sync: wie_winapi::port::SyncState::new(),
             seh_pending: ahash::HashMap::new(),
         },
-        file_io: wie_winapi::FileIoState {
+        file_io: wie_winapi::port::FileIoState {
             executable_file_size,
             executable_file_bytes,
             executable_file_cursor: 0,
-            next_find_handle: wie_winapi::FindFileHandle::from(0x0000_0000_6200_0000),
+            next_find_handle: wie_winapi::port::FindFileHandle::from(0x0000_0000_6200_0000),
             find_handles: Vec::new(),
             host_file_mounts: Vec::new(),
             virtual_files: Vec::new(),
             open_files: ahash::HashMap::new(),
-            next_file_handle: wie_winapi::FileHandle::from(0x0000_0000_6700_0001),
-            next_resource_handle: wie_winapi::ResourceHandle::from(0x0000_0000_6300_0000),
+            next_file_handle: wie_winapi::port::FileHandle::from(0x0000_0000_6700_0001),
+            next_resource_handle: wie_winapi::port::ResourceHandle::from(0x0000_0000_6300_0000),
             resources: Vec::new(),
             current_directory_wide: process.current_directory.encode_utf16().collect(),
             bottle_root: crate::knobs::bottle_root_from_env(),
@@ -612,29 +614,29 @@ pub(crate) fn default_winapi_state(
                 let bottle = crate::knobs::bottle_root_from_env();
                 let drive_d = crate::knobs::drive_d_root_from_env();
                 if let Some(ref root) = bottle {
-                    drop(wie_winapi::seed_default_skeleton(root));
+                    drop(wie_winapi::port::seed_default_skeleton(root));
                 }
-                wie_winapi::VolumeConfig::from_parts(bottle, drive_d)
+                wie_winapi::port::VolumeConfig::from_parts(bottle, drive_d)
             },
             guest_file_data_next: layout.guest_file_data.base,
             guest_io: None,
             stdin_bytes: Vec::new(),
             stdin_cursor: 0,
-            stdin_mode: wie_winapi::GuestStdinMode::InjectOnly,
+            stdin_mode: wie_winapi::port::GuestStdinMode::InjectOnly,
             ucrt_files: ahash::HashMap::new(),
             ucrt_next_file_va: 0x0000_0000_6900_0000,
             cached_streams: ahash::HashMap::new(),
         },
-        dll_states: wie_winapi::DllStateMap::new(),
+        dll_states: wie_winapi::port::DllStateMap::new(),
         message_queue: std::sync::Arc::new(std::sync::Mutex::new(
-            wie_winapi::present::MessageQueue::default(),
+            wie_winapi::port::MessageQueue::default(),
         )),
-        module_state: wie_winapi::ModuleState {
+        module_state: wie_winapi::port::ModuleState {
             loaded_modules: ahash::HashMap::new(),
             import_resolver: None,
             get_proc_address_cache: ahash::HashMap::with_capacity(64),
-            next_module_handle: wie_winapi::ModuleHandle::from(
-                wie_winapi::dll_loader::REAL_MODULE_HANDLE_BASE,
+            next_module_handle: wie_winapi::port::ModuleHandle::from(
+                wie_winapi::port::REAL_MODULE_HANDLE_BASE,
             ),
         },
     })
@@ -648,8 +650,8 @@ pub(crate) fn default_winapi_environment(
     environment_strings_w_ptr: u64,
     module_file_name_a_ptr: u64,
     module_file_name_w_ptr: u64,
-) -> wie_winapi::WinApiEnvironment {
-    wie_winapi::WinApiEnvironment {
+) -> wie_winapi::port::WinApiEnvironment {
+    wie_winapi::port::WinApiEnvironment {
         image_base,
         command_line_a_ptr,
         command_line_w_ptr,

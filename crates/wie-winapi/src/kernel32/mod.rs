@@ -23,35 +23,14 @@ pub(crate) const FAKE_CURRENT_PROCESS_ID: u64 = 0x1234;
 const FIXED_TICK_COUNT: u64 = 12_345;
 const FIXED_PERFORMANCE_COUNTER: u64 = 1_000_000;
 const FLS_OUT_OF_INDEXES: u64 = 0xffff_ffff;
-const STD_INPUT_HANDLE_ID: u32 = 0xffff_fff6;
-const STD_OUTPUT_HANDLE_ID: u32 = 0xffff_fff5;
-const STD_ERROR_HANDLE_ID: u32 = 0xffff_fff4;
+pub(crate) const STD_INPUT_HANDLE_ID: u32 = 0xffff_fff6;
+pub(crate) const STD_OUTPUT_HANDLE_ID: u32 = 0xffff_fff5;
+pub(crate) const STD_ERROR_HANDLE_ID: u32 = 0xffff_fff4;
 
 /// Fake console handles returned by `GetStdHandle` (Microsoft Learn std ids).
 pub(crate) const FAKE_STDIN_HANDLE: u64 = 0x0000_0000_6000_0001;
 pub(crate) const FAKE_STDOUT_HANDLE: u64 = 0x0000_0000_6000_0002;
 pub(crate) const FAKE_STDERR_HANDLE: u64 = 0x0000_0000_6000_0003;
-
-/// Cap for a single host console line fill (safety against huge pastes).
-const MAX_HOST_STDIN_LINE: usize = 64 * 1024;
-
-// Read one line from host stdin (through `\n` or EOF), capped at
-// [`MAX_HOST_STDIN_LINE`].
-//
-// Models Microsoft Learn default console line input (`ENABLE_LINE_INPUT`):
-// `ReadFile` on a console handle does not complete until a carriage return
-// is entered. On Unix hosts we treat `\n` as the line terminator.
-//
-// Returns:
-// - `Ok(Some(bytes))` — non-empty fill (may omit `\n` if cap hit first)
-// - `Ok(None)` — host EOF with no bytes
-// - `Err(_)` — host I/O error
-//
-// When the inject/live buffer is empty and live mode is on, block on host
-// stdin for one line and store it in `state.file_io.stdin_bytes`.
-//
-// Returns `Ok(true)` if bytes were stored, `Ok(false)` on host EOF,
-// `Err(())` on host I/O failure (caller sets `ERROR_READ_FAULT`).
 
 const FILE_TYPE_UNKNOWN: u64 = 0x0000;
 const FILE_TYPE_DISK: u64 = 0x0001;
@@ -126,11 +105,11 @@ const LANG_EN_US: u64 = 0x0409;
 /// Win32 `ERROR_INVALID_HANDLE` — the handle is not open (fileapi.h).
 const ERROR_INVALID_HANDLE: u32 = 6;
 /// Win32 `ERROR_INVALID_PARAMETER` — an argument is malformed.
-const ERROR_INVALID_PARAMETER: u32 = 87;
+pub(crate) const ERROR_INVALID_PARAMETER: u32 = 87;
 /// Win32 `ERROR_INSUFFICIENT_BUFFER` — the caller's buffer is too small.
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 /// Win32 `ERROR_READ_FAULT` — host console stdin I/O failure.
-const ERROR_READ_FAULT: u32 = 30;
+pub(crate) const ERROR_READ_FAULT: u32 = 30;
 
 const TIME_ZONE_ID_UNKNOWN: u64 = 0;
 const TIME_ZONE_ID_INVALID: u64 = 0xffff_ffff;
@@ -354,9 +333,6 @@ const FAKE_DISK_CLUSTERS: u32 = 26_214_400;
 const LOGICAL_DRIVE_TCHARS: u32 = 4;
 
 pub mod clock;
-pub mod console;
-pub mod console_cells;
-pub mod console_input;
 pub mod environment;
 pub mod file_io;
 pub mod heap;
@@ -367,10 +343,16 @@ pub mod process_thread;
 pub mod string;
 pub mod sync;
 
+// The console API surface's owner is `crate::console` (`DllId::Console`), so the
+// handlers are imported rather than defined here (ADR-0005 stage 1). A glob
+// import, not a module: `dispatch_kernel32`'s arms keep naming
+// `handle_write_console_w(&mut ctx.console())` exactly as before, and the one place that can
+// reach a console handler is still visible in one line.
+pub use crate::console::api::*;
+pub use crate::console::cells::*;
+pub use crate::console::records::*;
+
 pub use clock::*;
-pub use console::*;
-pub use console_cells::*;
-pub use console_input::*;
 pub use environment::*;
 pub use file_io::*;
 pub use heap::*;
@@ -380,6 +362,211 @@ pub use module::*;
 pub use process_thread::*;
 pub use string::*;
 pub use sync::*;
+
+/// The `kernel32.dll` soft export census — the single list behind
+/// [`crate::is_winapi_implemented`] and `names::SOFT_EXPORT_CENSUS`.
+///
+/// Declared beside the arms it describes, so a name is added in one file.
+/// `dispatch_table::census_tests` proves every row here has a dispatch arm.
+///
+/// Not table-driven: `dispatch_kernel32_extra` also accepts process APIs
+/// (`createprocessa/w`, `openprocess`, `getexitcodeprocess`,
+/// `readdirectorychangesw`, the change-notification family), which are not
+/// censused.
+pub(crate) const EXPORTS: &[&str] = &[
+    "allocconsole",
+    "assignprocesstojobobject",
+    "attachconsole",
+    "backupread",
+    "backupseek",
+    "backupwrite",
+    "cancelio",
+    "comparefiletime",
+    "comparestringa",
+    "comparestringw",
+    "createconsolescreenbuffer",
+    "createeventa",
+    "createeventw",
+    "createfilemappingw",
+    "createhardlinkw",
+    "createjobobjecta",
+    "createjobobjectw",
+    "createmutexa",
+    "createsemaphorea",
+    "createsemaphorew",
+    "createthread",
+    "debugbreak",
+    "deviceiocontrol",
+    "dosdatetimetofiletime",
+    "duplicatehandle",
+    "enumresourcenamesw",
+    "exitthread",
+    "expandenvironmentstringsa",
+    "expandenvironmentstringsw",
+    "filetimetodosdatetime",
+    "fillconsoleoutputattribute",
+    "fillconsoleoutputcharactera",
+    "fillconsoleoutputcharacterw",
+    "findfirstfileexw",
+    "findfirststreamw",
+    "findnextstreamw",
+    "flushconsoleinputbuffer",
+    "flushinstructioncache",
+    "formatmessagew",
+    "freeconsole",
+    "getcompressedfilesizea",
+    "getcompressedfilesizew",
+    "getcomputernamea",
+    "getcomputernameexw",
+    "getcomputernamew",
+    "getconsolecp",
+    "getconsolecursorinfo",
+    "getconsolemode",
+    "getconsoleoutputcp",
+    "getconsolescreenbufferinfo",
+    "getconsoletitlea",
+    "getconsoletitlew",
+    "getconsolewindow",
+    "getcurrentthread",
+    "getdiskfreespaceexw",
+    "getdiskfreespacew",
+    "getenvironmentvariablea",
+    "getenvironmentvariablew",
+    "getexitcodethread",
+    "getfileattributesexa",
+    "getfileattributesexw",
+    "getlargepageminimum",
+    "getlargestconsolewindowsize",
+    "getlocaleinfoa",
+    "getlogicaldrivestringsw",
+    "getlongpathnamea",
+    "getlongpathnamew",
+    "getmodulehandleexw",
+    "getmodulehandlew",
+    "getnumberofconsoleinputevents",
+    "getnumberofconsolemousebuttons",
+    "getoverlappedresult",
+    "getprocessaffinitymask",
+    "getprocessid",
+    "getprocesstimes",
+    "getshortpathnamea",
+    "getshortpathnamew",
+    "getsysteminfo",
+    "getsystempowerstatus",
+    "getthreadpriority",
+    "gettickcount64",
+    "getusernamea",
+    "getusernamew",
+    "getuserprofiledirectorya",
+    "getuserprofiledirectoryw",
+    "getversion",
+    "getvolumeinformationa",
+    "getvolumeinformationw",
+    "globalmemorystatusex",
+    "initializecriticalsectionex",
+    "initializeslisthead",
+    "interlockedcompareexchange",
+    "interlockedcompareexchange64",
+    "interlockeddecrement",
+    "interlockeddecrement64",
+    "interlockedexchange",
+    "interlockedexchange64",
+    "interlockedexchangeadd",
+    "interlockedexchangeadd64",
+    "interlockedflushslist",
+    "interlockedincrement",
+    "interlockedincrement64",
+    "isdebuggerpresent",
+    "isprocessorfeaturepresent",
+    "localfiletimetofiletime",
+    "lockfile",
+    "lstrcatw",
+    "lstrcpyw",
+    "lstrlenw",
+    "mapviewoffile",
+    "movefileexw",
+    "movefilewithprogressw",
+    "openeventa",
+    "openeventw",
+    "openfilemappinga",
+    "openfilemappingw",
+    "openthread",
+    "outputdebugstringa",
+    "outputdebugstringw",
+    "peekconsoleinputw",
+    "peeknamedpipe",
+    "queryfullprocessimagenamea",
+    "queryfullprocessimagenamew",
+    "queryperformancefrequency",
+    "raiseexception",
+    "readconsolea",
+    "readconsoleinputw",
+    "readconsolew",
+    "releasemutex",
+    "releasesemaphore",
+    "resetevent",
+    "resumethread",
+    "rtlcapturecontext",
+    "rtllookupfunctionentry",
+    "rtlpctofileheader",
+    "rtlunwind",
+    "rtlunwindex",
+    "rtlvirtualunwind",
+    "scrollconsolescreenbufferw",
+    "setconsoleactivescreenbuffer",
+    "setconsolecp",
+    "setconsolectrlhandler",
+    "setconsolecursorinfo",
+    "setconsolecursorposition",
+    "setconsolemode",
+    "setconsoleoutputcp",
+    "setconsolescreenbuffersize",
+    "setconsoletitlea",
+    "setconsoletitlew",
+    "setconsolewindowinfo",
+    "setenvironmentvariablea",
+    "setenvironmentvariablew",
+    "seterrormode",
+    "setevent",
+    "setfileapistooem",
+    "setfileattributesw",
+    "setfiletime",
+    "setfilevaliddata",
+    "setnamedpipehandlestate",
+    "setprocessaffinitymask",
+    "setstdhandle",
+    "setthreadaffinitymask",
+    "setthreaderrormode",
+    "setthreadexecutionstate",
+    "setthreadpriority",
+    "signalobjectandwait",
+    "suspendthread",
+    "systemtimetotzspecificlocaltime",
+    "terminateprocess",
+    "terminatethread",
+    "tlsalloc",
+    "tlsfree",
+    "tlsgetvalue",
+    "tlssetvalue",
+    "tryentercriticalsection",
+    "unhandledexceptionfilter",
+    "unlockfile",
+    "unmapviewoffile",
+    "versetconditionmask",
+    "verifyversioninfow",
+    "virtualalloc",
+    "virtualfree",
+    "virtualprotect",
+    "virtualquery",
+    "waitformultipleobjects",
+    "waitforsingleobject",
+    "waitforsingleobjectex",
+    "writeconsolea",
+    "writeconsoleoutputattribute",
+    "writeconsoleoutputcharactera",
+    "writeconsoleoutputcharacterw",
+    "writeconsolew",
+];
 
 pub fn dispatch_kernel32_extra(
     ctx: &mut HandlerContext<'_>,
@@ -423,50 +610,78 @@ pub fn dispatch_kernel32_extra(
         "lstrcpyw" => Ok(Some(handle_lstrcpy_w(ctx)?)),
         "lstrcatw" => Ok(Some(handle_lstrcat_w(ctx)?)),
         // Console / process identity
-        "allocconsole" => Ok(Some(handle_alloc_console(ctx)?)),
-        "attachconsole" => Ok(Some(handle_attach_console(ctx)?)),
-        "createconsolescreenbuffer" => Ok(Some(handle_create_console_screen_buffer(ctx)?)),
-        "fillconsoleoutputattribute" => Ok(Some(handle_fill_console_output_attribute(ctx)?)),
-        "fillconsoleoutputcharactera" => Ok(Some(handle_fill_console_output_character_a(ctx)?)),
-        "fillconsoleoutputcharacterw" => Ok(Some(handle_fill_console_output_character_w(ctx)?)),
-        "flushconsoleinputbuffer" => Ok(Some(handle_flush_console_input_buffer(ctx)?)),
-        "freeconsole" => Ok(Some(handle_free_console(ctx)?)),
-        "getconsolecp" => Ok(Some(handle_get_console_cp(ctx)?)),
-        "getconsolecursorinfo" => Ok(Some(handle_get_console_cursor_info(ctx)?)),
-        "getconsoleoutputcp" => Ok(Some(handle_get_console_output_cp(ctx)?)),
-        "getconsolescreenbufferinfo" => Ok(Some(handle_get_console_screen_buffer_info(ctx)?)),
-        "getconsoletitlea" => Ok(Some(handle_get_console_title_a(ctx)?)),
-        "getconsoletitlew" => Ok(Some(handle_get_console_title_w(ctx)?)),
-        "getconsolewindow" => Ok(Some(handle_get_console_window(ctx)?)),
-        "getlargestconsolewindowsize" => Ok(Some(handle_get_largest_console_window_size(ctx)?)),
-        "getnumberofconsoleinputevents" => {
-            Ok(Some(handle_get_number_of_console_input_events(ctx)?))
+        "allocconsole" => Ok(Some(handle_alloc_console(&mut ctx.console())?)),
+        "attachconsole" => Ok(Some(handle_attach_console(&mut ctx.console())?)),
+        "createconsolescreenbuffer" => Ok(Some(handle_create_console_screen_buffer(
+            &mut ctx.console(),
+        )?)),
+        "fillconsoleoutputattribute" => Ok(Some(handle_fill_console_output_attribute(
+            &mut ctx.console(),
+        )?)),
+        "fillconsoleoutputcharactera" => Ok(Some(handle_fill_console_output_character_a(
+            &mut ctx.console(),
+        )?)),
+        "fillconsoleoutputcharacterw" => Ok(Some(handle_fill_console_output_character_w(
+            &mut ctx.console(),
+        )?)),
+        "flushconsoleinputbuffer" => {
+            Ok(Some(handle_flush_console_input_buffer(&mut ctx.console())?))
         }
-        "getnumberofconsolemousebuttons" => {
-            Ok(Some(handle_get_number_of_console_mouse_buttons(ctx)?))
-        }
-        "peekconsoleinputw" => Ok(Some(handle_peek_console_input_w(ctx)?)),
-        "readconsoleinputw" => Ok(Some(handle_read_console_input_w(ctx)?)),
-        "readconsolew" => Ok(Some(handle_read_console_w(ctx)?)),
-        "readconsolea" => Ok(Some(handle_read_console_a(ctx)?)),
-        "scrollconsolescreenbufferw" => Ok(Some(handle_scroll_console_screen_buffer_w(ctx)?)),
-        "setconsoleactivescreenbuffer" => Ok(Some(handle_set_console_active_screen_buffer(ctx)?)),
-        "setconsolecp" => Ok(Some(handle_set_console_cp(ctx)?)),
-        "setconsolecursorinfo" => Ok(Some(handle_set_console_cursor_info(ctx)?)),
-        "setconsolemode" => Ok(Some(handle_set_console_mode(ctx)?)),
-        "getconsolemode" => Ok(Some(handle_get_console_mode(ctx)?)),
-        "setconsoleoutputcp" => Ok(Some(handle_set_console_output_cp(ctx)?)),
-        "setconsolescreenbuffersize" => Ok(Some(handle_set_console_screen_buffer_size(ctx)?)),
-        "setconsolecursorposition" => Ok(Some(handle_set_console_cursor_position(ctx)?)),
-        "setconsolectrlhandler" => Ok(Some(handle_set_console_ctrl_handler(ctx)?)),
-        "setconsoletitlea" => Ok(Some(handle_set_console_title_a(ctx)?)),
-        "setconsoletitlew" => Ok(Some(handle_set_console_title_w(ctx)?)),
-        "setconsolewindowinfo" => Ok(Some(handle_set_console_window_info(ctx)?)),
-        "writeconsolew" => Ok(Some(handle_write_console_w(ctx)?)),
-        "writeconsolea" => Ok(Some(handle_write_console_a(ctx)?)),
-        "writeconsoleoutputcharactera" => Ok(Some(handle_write_console_output_character_a(ctx)?)),
-        "writeconsoleoutputcharacterw" => Ok(Some(handle_write_console_output_character_w(ctx)?)),
-        "writeconsoleoutputattribute" => Ok(Some(handle_write_console_output_attribute(ctx)?)),
+        "freeconsole" => Ok(Some(handle_free_console(&mut ctx.console())?)),
+        "getconsolecp" => Ok(Some(handle_get_console_cp(&mut ctx.console())?)),
+        "getconsolecursorinfo" => Ok(Some(handle_get_console_cursor_info(&mut ctx.console())?)),
+        "getconsoleoutputcp" => Ok(Some(handle_get_console_output_cp(&mut ctx.console())?)),
+        "getconsolescreenbufferinfo" => Ok(Some(handle_get_console_screen_buffer_info(
+            &mut ctx.console(),
+        )?)),
+        "getconsoletitlea" => Ok(Some(handle_get_console_title_a(&mut ctx.console())?)),
+        "getconsoletitlew" => Ok(Some(handle_get_console_title_w(&mut ctx.console())?)),
+        "getconsolewindow" => Ok(Some(handle_get_console_window(&mut ctx.console())?)),
+        "getlargestconsolewindowsize" => Ok(Some(handle_get_largest_console_window_size(
+            &mut ctx.console(),
+        )?)),
+        "getnumberofconsoleinputevents" => Ok(Some(handle_get_number_of_console_input_events(
+            &mut ctx.console(),
+        )?)),
+        "getnumberofconsolemousebuttons" => Ok(Some(handle_get_number_of_console_mouse_buttons(
+            &mut ctx.console(),
+        )?)),
+        "peekconsoleinputw" => Ok(Some(handle_peek_console_input_w(&mut ctx.console())?)),
+        "readconsoleinputw" => Ok(Some(handle_read_console_input_w(&mut ctx.console())?)),
+        "readconsolew" => Ok(Some(handle_read_console_w(&mut ctx.console())?)),
+        "readconsolea" => Ok(Some(handle_read_console_a(&mut ctx.console())?)),
+        "scrollconsolescreenbufferw" => Ok(Some(handle_scroll_console_screen_buffer_w(
+            &mut ctx.console(),
+        )?)),
+        "setconsoleactivescreenbuffer" => Ok(Some(handle_set_console_active_screen_buffer(
+            &mut ctx.console(),
+        )?)),
+        "setconsolecp" => Ok(Some(handle_set_console_cp(&mut ctx.console())?)),
+        "setconsolecursorinfo" => Ok(Some(handle_set_console_cursor_info(&mut ctx.console())?)),
+        "setconsolemode" => Ok(Some(handle_set_console_mode(&mut ctx.console())?)),
+        "getconsolemode" => Ok(Some(handle_get_console_mode(&mut ctx.console())?)),
+        "setconsoleoutputcp" => Ok(Some(handle_set_console_output_cp(&mut ctx.console())?)),
+        "setconsolescreenbuffersize" => Ok(Some(handle_set_console_screen_buffer_size(
+            &mut ctx.console(),
+        )?)),
+        "setconsolecursorposition" => Ok(Some(handle_set_console_cursor_position(
+            &mut ctx.console(),
+        )?)),
+        "setconsolectrlhandler" => Ok(Some(handle_set_console_ctrl_handler(&mut ctx.console())?)),
+        "setconsoletitlea" => Ok(Some(handle_set_console_title_a(&mut ctx.console())?)),
+        "setconsoletitlew" => Ok(Some(handle_set_console_title_w(&mut ctx.console())?)),
+        "setconsolewindowinfo" => Ok(Some(handle_set_console_window_info(&mut ctx.console())?)),
+        "writeconsolew" => Ok(Some(handle_write_console_w(&mut ctx.console())?)),
+        "writeconsolea" => Ok(Some(handle_write_console_a(&mut ctx.console())?)),
+        "writeconsoleoutputcharactera" => Ok(Some(handle_write_console_output_character_a(
+            &mut ctx.console(),
+        )?)),
+        "writeconsoleoutputcharacterw" => Ok(Some(handle_write_console_output_character_w(
+            &mut ctx.console(),
+        )?)),
+        "writeconsoleoutputattribute" => Ok(Some(handle_write_console_output_attribute(
+            &mut ctx.console(),
+        )?)),
         "gettickcount64" => Ok(Some(handle_get_tick_count_64(ctx)?)),
         "getenvironmentvariablew" => Ok(Some(handle_get_environment_variable_w(ctx)?)),
         "getenvironmentvariablea" => Ok(Some(handle_get_environment_variable_a(ctx)?)),
@@ -601,7 +816,7 @@ pub fn dispatch_kernel32_extra(
         "enumresourcenamesw" => Ok(Some(handle_enum_resource_names_w(ctx)?)),
         // Console surface: the hot calls have their own arms above; the rest
         // live in `console` so this match does not grow a fourth screenful.
-        _ => console::dispatch_console_extra(ctx, n.as_str()),
+        _ => crate::console::api::dispatch_console_extra(&mut ctx.console(), n.as_str()),
     }
 }
 

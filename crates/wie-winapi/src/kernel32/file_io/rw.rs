@@ -1,9 +1,11 @@
+use crate::console::stdin::refill_stdin_from_host;
+
 use super::{
     Context, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, ERROR_READ_FAULT, FAKE_STDERR_HANDLE,
     FAKE_STDIN_HANDLE, FAKE_STDOUT_HANDLE, HandlerContext, OpenGuestFile, Result,
     WinApiHandlerResult, find_open_file, find_open_file_mut, guest_basename, is_main_module_path,
     is_open_file_handle, maybe_promote_open_file_to_streaming, paths_match_guest,
-    persist_open_file_to_host, read_stack_u64, refill_stdin_from_host, write_guest_u32,
+    persist_open_file_to_host, read_stack_u64, write_guest_u32,
 };
 
 pub(crate) fn is_console_output_handle(handle: u64) -> bool {
@@ -48,7 +50,7 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
             .len()
             .saturating_sub(state.file_io.stdin_cursor);
         if available == 0 && state.file_io.stdin_mode == crate::GuestStdinMode::LiveHost {
-            match refill_stdin_from_host(state) {
+            match refill_stdin_from_host(&mut state.file_io) {
                 Ok(true) => {
                     available = state
                         .file_io

@@ -306,8 +306,8 @@ impl<'a> StubCtx<'a> {
 /// message (or unknown id) is ignored (`0`), matching DefDlgProc's
 /// pass-through.
 pub(crate) fn encode_file_dialog_proc(end_dialog_va: u64) -> Vec<u8> {
-    let strikeout_id = u32::try_from(wie_winapi::comdlg32::FONT_DLG_STRIKEOUT_ID).unwrap_or(0);
-    let underline_id = u32::try_from(wie_winapi::comdlg32::FONT_DLG_UNDERLINE_ID).unwrap_or(0);
+    let strikeout_id = u32::try_from(wie_winapi::port::FONT_DLG_STRIKEOUT_ID).unwrap_or(0);
+    let underline_id = u32::try_from(wie_winapi::port::FONT_DLG_UNDERLINE_ID).unwrap_or(0);
     let mut buf = Vec::with_capacity(140);
     // mov eax, edx (message)
     buf.extend_from_slice(&[0x89, 0xd0]);

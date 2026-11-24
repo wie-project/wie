@@ -113,6 +113,39 @@ fn read_guid(engine: &mut dyn wie_cpu::CpuEngine, va: u64) -> Result<[u8; 16]> {
     Ok(guid)
 }
 
+/// The `ole32.dll` soft export census — the single list behind
+/// [`crate::is_winapi_implemented`] and `names::SOFT_EXPORT_CENSUS`.
+///
+/// Declared beside the arms it describes, so a name is added in one file.
+/// `dispatch_table::census_tests` proves every row here has a dispatch arm.
+///
+/// Not table-driven: `dispatch_ole32` also serves the twelve `IDataObject::*` vtable slots,
+/// which are COM methods rather than PE exports.
+pub(crate) const EXPORTS: &[&str] = &[
+    "clsidfromstring",
+    "cocreateguid",
+    "cocreateinstance",
+    "cogetclassobject",
+    "coinitialize",
+    "coinitializeex",
+    "coregisterclassobject",
+    "corevokeclassobject",
+    "cotaskmemalloc",
+    "cotaskmemfree",
+    "cotaskmemrealloc",
+    "couninitialize",
+    "dodragdrop",
+    "oleflushclipboard",
+    "olegetclipboard",
+    "oleinitialize",
+    "oleuninitialize",
+    "olesetclipboard",
+    "propvariantclear",
+    "registerdragdrop",
+    "revokedragdrop",
+    "stringfromclsid",
+];
+
 /// Soft dispatch for `ole32.dll` exports used by real tools.
 pub fn dispatch_ole32(
     ctx: &mut HandlerContext<'_>,

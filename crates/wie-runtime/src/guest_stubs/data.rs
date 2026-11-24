@@ -11,7 +11,7 @@ use super::config::{
 /// Takes the session's [`wie_winapi::DisplayMetrics`] so the in-guest
 /// GetSystemMetrics accelerator reports the same dimensions as the host-side
 /// handler (the table previously hardcoded 1024×768 and drifted).
-pub(crate) fn build_stub_data_page(display: wie_winapi::DisplayMetrics) -> Vec<u8> {
+pub(crate) fn build_stub_data_page(display: wie_winapi::port::DisplayMetrics) -> Vec<u8> {
     let mut page = vec![0_u8; 0x500 + CWD_BLOB_SIZE];
     // Metrics
     for i in 0..METRICS_COUNT {
@@ -68,7 +68,7 @@ pub(crate) fn refresh_clock_table(
     clock_table_va: u64,
 ) -> Result<()> {
     let mut table = [0_u8; CLOCK_TABLE_SIZE];
-    let values = wie_winapi::kernel32::clock::clock_table_values();
+    let values = wie_winapi::port::clock_table_values();
     for (slot, value) in values.iter().enumerate() {
         let off = slot.saturating_mul(8);
         if let Some(dst) = table.get_mut(off..off.saturating_add(8)) {
@@ -81,7 +81,7 @@ pub(crate) fn refresh_clock_table(
 }
 
 /// Must match `wie_winapi::user32::fake_system_metric`.
-fn fake_system_metric(metric_index: u64, display: &wie_winapi::DisplayMetrics) -> u64 {
+fn fake_system_metric(metric_index: u64, display: &wie_winapi::port::DisplayMetrics) -> u64 {
     match metric_index {
         // SM_CXSCREEN / SM_CXFULLSCREEN
         0 | 16 => display.width_metric(),

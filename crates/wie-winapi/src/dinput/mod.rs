@@ -421,6 +421,10 @@ impl DInputState {
     }
 }
 
+crate::soft_dispatch::soft_exports! {
+    ("directinput8create", direct_input8_create),
+}
+
 /// Dispatch one `dinput8.dll` export by name (case-insensitive).
 ///
 /// `dinput8.dll` has exactly one real export, `DirectInput8Create` (also
@@ -433,8 +437,5 @@ pub fn dispatch_dinput8(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    if name.eq_ignore_ascii_case("DirectInput8Create") {
-        return Ok(Some(direct_input8_create(ctx)?));
-    }
-    Ok(None)
+    crate::soft_dispatch::dispatch_soft_table(ctx, DISPATCH, name)
 }

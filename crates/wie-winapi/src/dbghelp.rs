@@ -10,6 +10,24 @@ use crate::{HandlerContext, WinApiHandlerResult};
 /// Win32 `ERROR_INVALID_ADDRESS` (487) — SymFromAddr lookup miss.
 const ERROR_INVALID_ADDRESS: u32 = 487;
 
+crate::soft_dispatch::soft_exports! {
+    ("mapfileandchecksuma", handle_map_file_and_checksum),
+    ("mapfileandchecksumw", handle_map_file_and_checksum),
+    ("minidumpwritedump", handle_mini_dump_write_dump),
+    ("stackwalk64", handle_stack_walk),
+    ("symcleanup", handle_sym_cleanup),
+    ("symfromaddr", handle_sym_from_addr),
+    ("symfromaddrw", handle_sym_from_addr),
+    ("symfunctiontableaccess64", handle_sym_function_table_access),
+    ("symgetlinefromaddr64", handle_sym_get_line_from_addr),
+    ("symgetmodulebase64", handle_sym_get_module_base),
+    ("symgetmoduleinfo64", handle_sym_get_module_info),
+    ("syminitialize", handle_sym_initialize),
+    ("syminitializew", handle_sym_initialize),
+    // Phase-3 stub wave: crash-dump / stack-walk surface.
+    ("symsetoptions", handle_sym_set_options),
+}
+
 /// Dispatch a `DBGHELP.dll` / `IMAGEHLP.dll` export by name.
 ///
 /// IMAGEHLP contributes `MapFileAndCheckSum*`; everything else lives in
@@ -18,24 +36,7 @@ pub fn dispatch_dbghelp(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let n = name.to_ascii_lowercase();
-    match n.as_str() {
-        "syminitializew" | "syminitialize" => Ok(Some(handle_sym_initialize(ctx)?)),
-        "symcleanup" => Ok(Some(handle_sym_cleanup(ctx)?)),
-        "symfromaddrw" | "symfromaddr" => Ok(Some(handle_sym_from_addr(ctx)?)),
-        "mapfileandchecksumw" | "mapfileandchecksuma" => {
-            Ok(Some(handle_map_file_and_checksum(ctx)?))
-        }
-        // Phase-3 stub wave: crash-dump / stack-walk surface.
-        "symsetoptions" => Ok(Some(handle_sym_set_options(ctx)?)),
-        "symfunctiontableaccess64" => Ok(Some(handle_sym_function_table_access(ctx)?)),
-        "symgetmodulebase64" => Ok(Some(handle_sym_get_module_base(ctx)?)),
-        "symgetmoduleinfo64" => Ok(Some(handle_sym_get_module_info(ctx)?)),
-        "symgetlinefromaddr64" => Ok(Some(handle_sym_get_line_from_addr(ctx)?)),
-        "stackwalk64" => Ok(Some(handle_stack_walk(ctx)?)),
-        "minidumpwritedump" => Ok(Some(handle_mini_dump_write_dump(ctx)?)),
-        _ => Ok(None),
-    }
+    crate::soft_dispatch::dispatch_soft_table(ctx, DISPATCH, name)
 }
 
 /// `BOOL SymInitializeW/A(HANDLE hProcess, PCSTR/W UserSearchPath, BOOL fInvadeProcess)`.

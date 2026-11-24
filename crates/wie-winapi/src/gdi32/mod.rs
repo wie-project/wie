@@ -97,6 +97,43 @@ pub(crate) fn finish_after_discarding(
     ctx.finish(retval)
 }
 
+/// The `gdi32.dll` soft export census — the single list behind
+/// [`crate::is_winapi_implemented`] and `names::SOFT_EXPORT_CENSUS`.
+///
+/// Declared beside the arms it describes, so a name is added in one file.
+/// `dispatch_table::census_tests` proves every row here has a dispatch arm.
+///
+/// Not table-driven: `dispatch_gdi32_extra` also accepts the `enumfont*`, `addfontresource*` and
+/// `getglyphoutline*` names, which are dispatched but deliberately not
+/// advertised.
+pub(crate) const EXPORTS: &[&str] = &[
+    "choosepixelformat",
+    "combinergn",
+    "createbitmap",
+    "createellipticrgn",
+    "createpalette",
+    "createpolygonrgn",
+    "createrectrgn",
+    "describepixelformat",
+    "enumfontfamiliesexa",
+    "enumfontfamiliesexw",
+    "getdevicegammaramp",
+    "getdibits",
+    "geticmprofilew",
+    "getpixelformat",
+    "getrgnbox",
+    "getsystempaletteentries",
+    "realizepalette",
+    "setdevicegammaramp",
+    "setdibits",
+    "setdibitstodevice",
+    "setpixel",
+    "setpixelformat",
+    "setrectrgn",
+    "stretchdibits",
+    "swapbuffers",
+];
+
 /// Soft dispatch for GDI32 exports beyond the dense table (DIB round-trips,
 /// regions, font enumeration, SetPixel). String path only — hot APIs stay
 /// dense.

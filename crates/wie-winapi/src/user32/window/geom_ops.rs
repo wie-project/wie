@@ -3,6 +3,7 @@
 //! `window.rs`).
 
 use super::class::find_window_mut;
+use crate::capability::PresentAccess;
 use crate::gdi32::{ArgReg, read_arg};
 use crate::user32::{
     Context, FAKE_WINDOW_HANDLE, HandlerContext, Result, WinApiHandlerResult, low_i32, read_u32,
@@ -124,10 +125,10 @@ pub fn handle_set_window_pos(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         // not tracked here, keeping the minimal z-order model.
         match insert_after {
             0 | HWND_TOPMOST => {
-                state.present().z_order_to_top(hwnd);
+                state.z_order_to_top(hwnd);
             }
             1 | HWND_NOTOPMOST => {
-                state.present().z_order_to_bottom(hwnd);
+                state.z_order_to_bottom(hwnd);
             }
             _ => {}
         }

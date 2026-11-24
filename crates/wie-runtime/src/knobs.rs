@@ -123,13 +123,13 @@ pub(crate) fn guest_env_pairs() -> Option<std::ffi::OsString> {
 /// [`crate::trace::run_micro_exe`]). Re-reading it locally would let the bottle
 /// root and the volume config disagree.
 pub(crate) fn bottle_root_from_env() -> Option<std::path::PathBuf> {
-    wie_winapi::bottle_root_from_env()
+    wie_winapi::port::bottle_root_from_env()
 }
 
 /// `WIE_DRIVE_D` — host root for the guest `D:\` bridge (`auto` = host cwd),
 /// else `None`. See [`bottle_root_from_env`] for why this delegates.
 pub(crate) fn drive_d_root_from_env() -> Option<std::path::PathBuf> {
-    wie_winapi::drive_d_from_env()
+    wie_winapi::port::drive_d_from_env()
 }
 
 // ── Threading ─────────────────────────────────────────────────────────────────

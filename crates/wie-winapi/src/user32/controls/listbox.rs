@@ -2,6 +2,7 @@
 //! viewport scrolling) and the shared text-rendering helper (split from
 //! `controls.rs`).
 
+use crate::capability::PresentAccess;
 use anyhow::Result;
 
 use super::paint::fill_rect_clipped;
@@ -108,12 +109,12 @@ pub(super) fn render_control_text(
     if text.is_empty() {
         return Ok(());
     }
-    ctx.state.present().ensure_surface(
+    ctx.state.ensure_surface(
         top_hwnd,
         u32::try_from(rect.width()).unwrap_or(0),
         u32::try_from(rect.height()).unwrap_or(0),
     );
-    let Some(surface) = ctx.state.present().surfaces.get_mut(&top_hwnd) else {
+    let Some(surface) = ctx.state.surface_mut(top_hwnd) else {
         return Ok(());
     };
     render_text_into_surface(
@@ -478,7 +479,6 @@ pub(super) fn listbox_invalidate_appended(state: &mut WinApiState, hwnd: u64) {
         invalidate_control_rect(state, hwnd, rect);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::{

@@ -14,6 +14,7 @@ use super::{
     is_known_window, read_u32, with_typed_read, write_message_structure,
 };
 use crate::OuterReturn;
+use crate::capability::PresentAccess;
 use crate::gdi32::{ArgReg, read_arg};
 use crate::kernel32::low_u32;
 use crate::state::WindowFlags;
@@ -141,8 +142,8 @@ pub fn handle_peek_message_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         // coalesced frame stays unpublished and the host window shows its
         // initial fill forever. Same semantics as that drain: one frame per
         // full repaint cycle, then the pull-half reconcile.
-        state.present().drain_pending_publishes();
-        state.present().reconcile_and_publish();
+        state.drain_pending_publishes();
+        state.reconcile_and_publish();
         0
     };
 
@@ -624,7 +625,7 @@ fn erase_with_system_background(state: &mut WinApiState, hwnd: u64) {
         height,
         color,
     );
-    state.present().set_background_color(info.hwnd, color);
+    state.set_background_color(info.hwnd, color);
 }
 
 /// Handles `USER32.dll!DefWindowProcA`.
@@ -832,7 +833,6 @@ pub fn handle_dispatch_message_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiH
 pub fn handle_post_message_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     handle_post_message_a(ctx)
 }
-
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {

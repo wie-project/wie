@@ -71,27 +71,37 @@ fn handle_sh_add_to_recent_docs(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     finish(engine, 0)
 }
 
+crate::soft_dispatch::soft_exports! {
+    ("commandlinetoargvw", handle_command_line_to_argv_w),
+    ("shaddtorecentdocs", handle_sh_add_to_recent_docs),
+    ("shbrowseforfolderw", handle_sh_browse_for_folder_w),
+    // Phase-3 stub wave: the ANSI variants share the W logic.
+    ("shellexecutea", handle_shell_execute_a),
+    ("shellexecuteexa", handle_sh_execute_ex_a),
+    ("shellexecuteexw", handle_sh_execute_ex_w),
+    ("shgetfileinfoa", handle_sh_get_file_info_a),
+    ("shgetfileinfow", handle_sh_get_file_info_w),
+    ("shgetfolderpathw", handle_sh_get_folder_path_w),
+    ("shgetpathfromidlistw", handle_sh_get_path_from_id_list_w),
+    ("shgetspecialfolderpathw", handle_sh_get_special_folder_path_w),
+}
+
 /// Soft dispatch for `shell32.dll`.
 pub fn dispatch_shell32(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let n = name.to_ascii_lowercase();
-    match n.as_str() {
-        "shgetfolderpathw" => Ok(Some(handle_sh_get_folder_path_w(ctx)?)),
-        "shgetpathfromidlistw" => Ok(Some(handle_sh_get_path_from_id_list_w(ctx)?)),
-        "shbrowseforfolderw" => Ok(Some(handle_sh_browse_for_folder_w(ctx)?)),
-        "commandlinetoargvw" => Ok(Some(handle_command_line_to_argv_w(ctx)?)),
-        "shaddtorecentdocs" => Ok(Some(handle_sh_add_to_recent_docs(ctx)?)),
-        "shgetfileinfoa" => Ok(Some(handle_sh_get_file_info(ctx, false)?)),
-        "shgetfileinfow" => Ok(Some(handle_sh_get_file_info(ctx, true)?)),
-        "shgetspecialfolderpathw" => Ok(Some(handle_sh_get_special_folder_path_w(ctx)?)),
-        "shellexecuteexw" => Ok(Some(handle_sh_execute_ex_w(ctx)?)),
-        // Phase-3 stub wave: the ANSI variants share the W logic.
-        "shellexecutea" => Ok(Some(handle_shell_execute_a(ctx)?)),
-        "shellexecuteexa" => Ok(Some(handle_sh_execute_ex_a(ctx)?)),
-        _ => Ok(None),
-    }
+    crate::soft_dispatch::dispatch_soft_table(ctx, DISPATCH, name)
+}
+
+/// `SHGetFileInfoA` — the ANSI half of the shared body.
+fn handle_sh_get_file_info_a(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_sh_get_file_info(ctx, false)
+}
+
+/// `SHGetFileInfoW` — the wide half of the shared body.
+fn handle_sh_get_file_info_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
+    handle_sh_get_file_info(ctx, true)
 }
 
 /// Map a `CSIDL` folder id to the synthetic bottle path WIE exposes.

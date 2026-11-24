@@ -626,7 +626,7 @@ fn find_dialog_reopens_after_cancel_close() {
 /// Count pixels in the owner frame inside the dialog rect's rows
 /// `[top, bottom)` (dialog-client relative) that equal `color`.
 fn count_dialog_rows(
-    frame: &wie_winapi::present::SurfaceFrame,
+    frame: &wie_winapi::port::SurfaceFrame,
     dx: i32,
     dy: i32,
     top: i32,

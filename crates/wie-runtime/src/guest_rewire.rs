@@ -6,7 +6,7 @@
 use crate::asm_utils::clear_bit;
 use crate::hooks::RuntimeFakeApiEntry;
 use anyhow::{Context, Result};
-use wie_winapi::{encode_export, resolve_winapi_id};
+use wie_winapi::port::{encode_export, resolve_winapi_id};
 
 /// Context for rewriting one fake-API export to an in-guest implementation.
 pub(crate) struct FakeApiRewire<'a> {

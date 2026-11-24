@@ -29,15 +29,15 @@ use super::profile::RuntimeProfile;
 /// app-folder staging copied the WADs in), the copy is a no-op but the
 /// freedoom aliases still materialize from whatever is present.
 fn stage_wad_payload(
-    volumes: &wie_winapi::VolumeConfig,
+    volumes: &wie_winapi::port::VolumeConfig,
     exe: &Path,
     module_path: &str,
 ) -> Result<()> {
     let Some(host_exe_dir) = exe.parent() else {
         return Ok(());
     };
-    let guest_dir = wie_winapi::vfs::guest_parent(module_path);
-    let Some(map) = wie_winapi::vfs::guest_path_to_host(volumes, &guest_dir) else {
+    let guest_dir = wie_winapi::port::guest_parent(module_path);
+    let Some(map) = wie_winapi::port::guest_path_to_host(volumes, &guest_dir) else {
         return Ok(());
     };
     let dest_dir = map.host;
@@ -234,15 +234,15 @@ fn register_layout_regions(
 /// Bundle of fields produced by session initialization (avoids 8-arg constructors).
 pub(crate) struct SessionInit {
     pub(crate) engine: Box<dyn wie_cpu::CpuEngine>,
-    pub(crate) environment: wie_winapi::WinApiEnvironment,
-    pub(crate) winapi_state: wie_winapi::WinApiState,
-    pub(crate) heap: Arc<Mutex<wie_winapi::GuestHeap>>,
+    pub(crate) environment: wie_winapi::port::WinApiEnvironment,
+    pub(crate) winapi_state: wie_winapi::port::WinApiState,
+    pub(crate) heap: Arc<Mutex<wie_winapi::port::GuestHeap>>,
     pub(crate) soft_apis: SoftApiTable,
     pub(crate) layout: RuntimeMemoryLayout,
     pub(crate) stop_bitmap: Arc<[u8]>,
     pub(crate) shared_jit: Option<Arc<wie_cpu::JitShared>>,
     pub(crate) guest_mem: Option<Arc<RwLock<wie_cpu::GuestMemory>>>,
-    pub(crate) static_dll_mains: Vec<wie_winapi::dll_loader::StaticDllMain>,
+    pub(crate) static_dll_mains: Vec<wie_winapi::port::StaticDllMain>,
     pub(crate) entry_point_va: GuestVa,
     pub(crate) initial_rsp: GuestStackPtr,
 }
@@ -253,15 +253,15 @@ impl SessionInit {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         engine: Box<dyn wie_cpu::CpuEngine>,
-        environment: wie_winapi::WinApiEnvironment,
-        winapi_state: wie_winapi::WinApiState,
-        heap: Arc<Mutex<wie_winapi::GuestHeap>>,
+        environment: wie_winapi::port::WinApiEnvironment,
+        winapi_state: wie_winapi::port::WinApiState,
+        heap: Arc<Mutex<wie_winapi::port::GuestHeap>>,
         soft_apis: SoftApiTable,
         layout: RuntimeMemoryLayout,
         stop_bitmap: Arc<[u8]>,
         shared_jit: Option<Arc<wie_cpu::JitShared>>,
         guest_mem: Option<Arc<RwLock<wie_cpu::GuestMemory>>>,
-        static_dll_mains: Vec<wie_winapi::dll_loader::StaticDllMain>,
+        static_dll_mains: Vec<wie_winapi::port::StaticDllMain>,
         entry_point_va: GuestVa,
         initial_rsp: GuestStackPtr,
     ) -> Self {
@@ -286,7 +286,7 @@ impl super::RuntimeSession {
     fn from_init(init: SessionInit) -> Result<Self> {
         let profile_enabled = crate::knobs::runtime_profile();
         if profile_enabled {
-            wie_winapi::present::set_frame_timing_enabled(true);
+            wie_winapi::port::set_frame_timing_enabled(true);
         }
         let entry_point_va = init.entry_point_va;
         let initial_rsp = init.initial_rsp;
@@ -353,7 +353,7 @@ impl super::RuntimeSession {
         // locking the big WinApiState mutex.
         let shared_message_queue = {
             let guard = crate::mt_runtime::lock(&shared_winapi);
-            guard.message_queue.clone()
+            guard.message_queue_arc()
         };
 
         // Worker TEB pages come from a shared pool: distinct per worker, with
@@ -380,7 +380,7 @@ impl super::RuntimeSession {
     /// Creates and initializes a long-lived Lunar Magic runtime session.
     pub fn new(
         path: &std::path::Path,
-        idle_policy: wie_winapi::MessageQueueIdlePolicy,
+        idle_policy: wie_winapi::port::MessageQueueIdlePolicy,
     ) -> Result<Self> {
         // `new_with_options` applies `RuntimeMemoryLayout::with_env_overrides`.
         Self::new_with_options(path, idle_policy, DEFAULT_LAYOUT, SessionOptions::default())
@@ -389,7 +389,7 @@ impl super::RuntimeSession {
     /// Creates a session with guest argv / stdin bootstrap options.
     pub fn new_with_options(
         path: &std::path::Path,
-        idle_policy: wie_winapi::MessageQueueIdlePolicy,
+        idle_policy: wie_winapi::port::MessageQueueIdlePolicy,
         layout: RuntimeMemoryLayout,
         options: SessionOptions,
     ) -> Result<Self> {
@@ -410,7 +410,7 @@ impl super::RuntimeSession {
         let mut soft_apis = SoftApiTable::default();
         // Plant Interlocked* (and other soft-only GPA targets) at fixed soft
         // indices 0..N so GetProcAddress encode_unresolved matches.
-        for entry in wie_winapi::PREPLANTED_SOFT_APIS {
+        for entry in wie_winapi::port::PREPLANTED_SOFT_APIS {
             soft_apis
                 .intern(entry.library, entry.name, 0)
                 .with_context(|| {
@@ -489,8 +489,8 @@ impl super::RuntimeSession {
                     };
                     // Legacy msvcrt data imports: IAT must hold the variable address,
                     // not a callable fake VA (guest loads through the slot).
-                    if wie_winapi::ucrt::is_ucrt_library(&import.library)
-                        && let Some(data_va) = wie_winapi::ucrt::crt_data_import_va(&name)
+                    if wie_winapi::port::is_ucrt_library(&import.library)
+                        && let Some(data_va) = wie_winapi::port::crt_data_import_va(&name)
                     {
                         let entry = crate::hooks::make_entry(
                             data_va,
@@ -505,7 +505,7 @@ impl super::RuntimeSession {
                     // which loads the real DLL and overwrites the slot. The
                     // soft placeholder below keeps today's "unsupported API"
                     // stop if the DLL cannot be loaded (graceful degradation).
-                    if !wie_winapi::is_winapi_library(&import.library) {
+                    if !wie_winapi::port::is_winapi_library(&import.library) {
                         let slot = import.iat_slot_va;
                         deferred_guest_imports.push((import.library.clone(), name.clone(), slot));
                         let slot_end = slot.saturating_add(8);
@@ -529,7 +529,7 @@ impl super::RuntimeSession {
 
         let fake_api_entries = collect_stub_entries(&iat_entries, &soft_apis);
 
-        wie_winapi::dll_loader::apply_pe_section_protects(
+        wie_winapi::port::apply_pe_section_protects(
             engine.as_mut(),
             &pe_map_plan,
             pe_map_plan.image_base,
@@ -622,7 +622,7 @@ impl super::RuntimeSession {
             .mem_write(stub_cfg.file_dialog_loop_va, &file_dialog_loop)
             .context("failed to write file-dialog modal-loop body")?;
         let file_dialog_proc = crate::guest_stubs::encode_file_dialog_proc(
-            wie_winapi::encode_export(wie_winapi::WinApiId::User32Enddialog),
+            wie_winapi::port::encode_export(wie_winapi::port::WinApiId::User32Enddialog),
         );
         engine
             .mem_write(stub_cfg.file_dialog_proc_va, &file_dialog_proc)
@@ -899,7 +899,7 @@ impl super::RuntimeSession {
             .clone()
             .or_else(crate::knobs::drive_d_root_from_env);
         let volumes =
-            wie_winapi::VolumeConfig::from_parts(bottle_root.clone(), drive_d_root.clone());
+            wie_winapi::port::VolumeConfig::from_parts(bottle_root.clone(), drive_d_root.clone());
 
         let mut process =
             wie_pe::process_identity_from_host_path_with_args(path, &options.guest_args);
@@ -907,7 +907,7 @@ impl super::RuntimeSession {
         // The loader defaults the module path to `C:\{name}` (it has no volume
         // knowledge); remap through the volume config when the host path lives
         // under a mapped volume — the bottle's `drive_c` or the D: bridge.
-        if let Some(guest_path) = wie_winapi::host_path_to_guest(&volumes, path) {
+        if let Some(guest_path) = wie_winapi::port::host_path_to_guest(&volumes, path) {
             process.module_path = guest_path;
         }
         // The CLI stages external app folders beside the exe and sets the
@@ -1011,11 +1011,11 @@ impl super::RuntimeSession {
         let mut winapi_state = default_winapi_state(&layout, executable_file_bytes, &process)?;
         // Session-level heap shard: clone the Arc inside WinApiState so the
         // global `WinApiState` mutex and the heap mutex are distinct locks.
-        let heap = Arc::clone(&winapi_state.heap_state.heap);
+        let heap = winapi_state.heap_arc();
         // Real host display metrics when the GUI entry captured them; the
         // default fake desktop otherwise. Every dimension source on the
         // WinAPI surface reads `winapi_state.display`.
-        winapi_state.display = options.display_metrics.unwrap_or_default();
+        winapi_state.set_display_metrics(options.display_metrics.unwrap_or_default());
         t_phase = phase("winapi-state", t_phase);
         // `default_winapi_state` built its volume config from the environment;
         // re-apply the effective roots so the state's volumes agree with the
@@ -1025,10 +1025,10 @@ impl super::RuntimeSession {
         // volume — the override root OR the global app-data bottle (the
         // effective root is the C: the guest will see). Idempotent mkdirs
         // make re-seeding harmless.
-        let effective_root = wie_winapi::effective_bottle_root(&volumes);
-        winapi_state.file_io.volumes = volumes;
-        winapi_state.file_io.bottle_root = bottle_root;
-        drop(wie_winapi::seed_default_skeleton(&effective_root));
+        let effective_root = wie_winapi::port::effective_bottle_root(&volumes);
+        winapi_state.set_volumes(volumes);
+        winapi_state.set_bottle_root(bottle_root);
+        drop(wie_winapi::port::seed_default_skeleton(&effective_root));
         t_phase = phase("seed-skeleton", t_phase);
         // Register the primary thread kernel object so DuplicateHandle
         // can resolve GetCurrentThread/GetCurrentProcess pseudohandles.
@@ -1038,7 +1038,7 @@ impl super::RuntimeSession {
                 winapi_state
                     .kernel
                     .sync
-                    .register_thread(wie_winapi::PRIMARY_THREAD_ID, ctx),
+                    .register_thread(wie_winapi::port::PRIMARY_THREAD_ID, ctx),
             );
         }
 
@@ -1055,7 +1055,7 @@ impl super::RuntimeSession {
                 && sz > 0
                 && let Some(raw) = pe_bytes.get(off..off.saturating_add(sz))
             {
-                let entries = wie_winapi::exception::parse_pdata(raw);
+                let entries = wie_winapi::port::parse_pdata(raw);
                 if !entries.is_empty() {
                     winapi_state
                         .kernel
@@ -1071,21 +1071,24 @@ impl super::RuntimeSession {
         // RT_DIALOG templates are parsed here (mirroring the LoadedModule
         // construction site in dll_loader.rs). DialogBoxParam resolves
         // `hInstance == image base` against this list.
-        winapi_state.process.main_module_dialogs =
-            wie_pe::resources::parse_dialogs(&pe_bytes, &pe_map_plan.sections);
+        let main_dialogs = wie_pe::resources::parse_dialogs(&pe_bytes, &pe_map_plan.sections);
         // Main-module menus: same lifecycle as the dialogs above; LoadMenuW
         // resolves `hInstance == image base` against this list.
-        winapi_state.process.main_module_menus =
-            wie_pe::resources::parse_menus(&pe_bytes, &pe_map_plan.sections);
+        let main_menus = wie_pe::resources::parse_menus(&pe_bytes, &pe_map_plan.sections);
         // Main-module string table: same lifecycle as the menus above;
         // LoadStringA/W resolves `hInstance == image base` against this list.
-        winapi_state.process.main_module_strings =
-            wie_pe::resources::parse_strings(&pe_bytes, &pe_map_plan.sections);
+        let main_strings = wie_pe::resources::parse_strings(&pe_bytes, &pe_map_plan.sections);
         // Main-module accelerator tables: same lifecycle as the strings above;
         // LoadAcceleratorsA/W resolves `hInstance == image base` against this
         // list by table id.
-        winapi_state.process.main_module_accelerators =
+        let main_accelerators =
             wie_pe::resources::parse_accelerators(&pe_bytes, &pe_map_plan.sections);
+        winapi_state.set_main_module_resources(
+            main_dialogs,
+            main_menus,
+            main_strings,
+            main_accelerators,
+        );
         // Modal-dialog result slot: EndDialog writes, the in-guest stub reads.
         winapi_state.window_state().dialog_result_va = stub_cfg.dialog_result_va;
         engine
@@ -1097,22 +1100,23 @@ impl super::RuntimeSession {
         // the EndDialog write-back; zero when the runtime did not plant them.
         winapi_state.window_state().file_dialog_loop_va = stub_cfg.file_dialog_loop_va;
         winapi_state.window_state().file_dialog_proc_va = stub_cfg.file_dialog_proc_va;
-        winapi_state.file_io.guest_io = Some(wie_winapi::GuestIoRuntimeConfig {
-            table_va: guest_io_config.table_va,
-            file_data_base: guest_io_config.file_data_base,
-            file_data_size: guest_io_config.file_data_size,
-        });
-        winapi_state.file_io.guest_file_data_next = layout.guest_file_data.base;
-        winapi_state.heap_state.guest_fls_table_va = layout.guest_fls_table.base;
+        winapi_state.attach_guest_io(
+            wie_winapi::port::GuestIoRuntimeConfig {
+                table_va: guest_io_config.table_va,
+                file_data_base: guest_io_config.file_data_base,
+                file_data_size: guest_io_config.file_data_size,
+            },
+            layout.guest_file_data.base,
+        );
+        winapi_state.set_guest_fls_table_va(layout.guest_fls_table.base);
         // Empty inject ⇒ live host stdin on ReadFile(STD_INPUT); non-empty
         // inject is deterministic and never blocks on the TTY.
-        winapi_state.file_io.stdin_mode = if options.stdin_bytes.is_empty() {
-            wie_winapi::GuestStdinMode::LiveHost
+        let stdin_mode = if options.stdin_bytes.is_empty() {
+            wie_winapi::port::GuestStdinMode::LiveHost
         } else {
-            wie_winapi::GuestStdinMode::InjectOnly
+            wie_winapi::port::GuestStdinMode::InjectOnly
         };
-        winapi_state.file_io.stdin_bytes = options.stdin_bytes;
-        winapi_state.file_io.stdin_cursor = 0;
+        winapi_state.set_stdin(options.stdin_bytes, stdin_mode);
         heap.lock()
             .unwrap_or_else(|e| e.into_inner())
             .attach_guest_control(guest_heap_cfg.ctrl_va);
@@ -1120,19 +1124,19 @@ impl super::RuntimeSession {
         // Set the import resolver for dynamic DLL loading.
         {
             let mut soft = soft_apis.clone();
-            winapi_state.module_state.import_resolver = Some(wie_winapi::ImportResolver::new(
-                Box::new(move |lib, name, slot| {
+            winapi_state.install_import_resolver(wie_winapi::port::ImportResolver::new(Box::new(
+                move |lib, name, slot| {
                     let (va, _entry) =
                         crate::hooks::resolve_import_fake_va(lib, name, slot, &mut soft)
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
                     Ok(va)
-                }),
-            ));
+                },
+            )));
         }
 
         // Store the host directory for DLL search fallback.
         if let Some(parent) = path.parent() {
-            winapi_state.process.main_module_host_dir = Some(parent.to_owned());
+            winapi_state.set_main_module_host_dir(Some(parent.to_owned()));
         }
 
         // Pass 2: static guest-DLL imports. Pass 1 left soft placeholders in
@@ -1144,7 +1148,7 @@ impl super::RuntimeSession {
         // Statically-loaded deps are also pinned against FreeLibrary and
         // recorded (load order) for the DllMain(PROCESS_ATTACH) phase the
         // session pump runs before the exe entry.
-        let mut static_dll_mains: Vec<wie_winapi::dll_loader::StaticDllMain> = Vec::new();
+        let mut static_dll_mains: Vec<wie_winapi::port::StaticDllMain> = Vec::new();
         if let (Some(first_slot), Some(last_slot)) = (deferred_first_slot, deferred_last_slot) {
             let mut fake_resolve = |lib: &str, name: &str, slot: u64| -> anyhow::Result<u64> {
                 let (va, _entry) =
@@ -1166,7 +1170,7 @@ impl super::RuntimeSession {
                 .context("failed to relax IAT span for static guest import patching")?;
             let patch_result = (|| -> anyhow::Result<()> {
                 for (library, name, slot) in &deferred_guest_imports {
-                    match wie_winapi::dll_loader::resolve_static_guest_import(
+                    match wie_winapi::port::resolve_static_guest_import(
                         engine.as_mut(),
                         &mut winapi_state,
                         library,
@@ -1202,7 +1206,7 @@ impl super::RuntimeSession {
                 }
                 Ok(())
             })();
-            let restored = wie_winapi::dll_loader::apply_pe_section_protects(
+            let restored = wie_winapi::port::apply_pe_section_protects(
                 engine.as_mut(),
                 &pe_map_plan,
                 pe_map_plan.image_base,
@@ -1245,7 +1249,7 @@ impl super::RuntimeSession {
             );
             // Micro / default sessions: idle from env with Micro default (Yield).
             session.profile.set_idle_policy(
-                wie_winapi::IdlePolicy::from_env_for(wie_winapi::IdleContext::Micro)
+                wie_winapi::port::IdlePolicy::from_env_for(wie_winapi::port::IdleContext::Micro)
                     .as_str()
                     .to_owned(),
             );
@@ -1267,7 +1271,7 @@ impl super::RuntimeSession {
 #[allow(clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use wie_winapi::MessageQueueIdlePolicy;
+    use wie_winapi::port::MessageQueueIdlePolicy;
 
     struct TempDir(PathBuf);
 
@@ -1306,7 +1310,8 @@ mod tests {
         std::fs::write(src.path().join("readme.txt"), b"hi").expect("write readme");
 
         let bottle = TempDir::new("wad-bottle");
-        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
+        let volumes =
+            wie_winapi::port::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
         // The unbottled exe's guest module path is `C:\{name}` → exe dir `C:\`.
         super::stage_wad_payload(&volumes, &exe, r"C:\doomretro.exe").expect("stage");
 
@@ -1363,7 +1368,8 @@ mod tests {
         // the module path carries the on-disk casing — the exact mismatch that
         // used to send the copy loop down the self-copy path.
         let exe = app.join("doomretro").join("doomretro.exe");
-        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
+        let volumes =
+            wie_winapi::port::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
         super::stage_wad_payload(&volumes, &exe, r"C:\Program Files\DoomRetro\doomretro.exe")
             .expect("stage should succeed");
 
@@ -1416,7 +1422,7 @@ mod tests {
 
         let module_path = session
             .process
-            .with_winapi_ref(|s| s.process.main_module_path.clone());
+            .with_winapi_ref(|s| s.main_module_path().to_owned());
         assert_eq!(module_path, r"C:\Program Files\crt_hello\crt_hello.exe");
         drop(std::fs::remove_dir_all(&bottle));
     }
@@ -1453,13 +1459,13 @@ mod tests {
 
         let cwd = session
             .process
-            .with_winapi_ref(|s| String::from_utf16_lossy(&s.file_io.current_directory_wide));
+            .with_winapi_ref(|s| String::from_utf16_lossy(s.current_directory_wide()));
         assert_eq!(cwd, r"C:\Program Files\app");
         // The module path still derives through the volume config — the cwd
         // override must not disturb module identity.
         let module_path = session
             .process
-            .with_winapi_ref(|s| s.process.main_module_path.clone());
+            .with_winapi_ref(|s| s.main_module_path().to_owned());
         assert_eq!(module_path, r"C:\crt_hello.exe");
     }
 
@@ -1474,7 +1480,8 @@ mod tests {
         std::fs::create_dir_all(&app).expect("create app dir");
         std::fs::write(app.join("app.exe"), b"MZ").expect("write fake exe");
         std::fs::write(app.join("freedoom1.wad"), b"wad1").expect("write freedoom1");
-        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
+        let volumes =
+            wie_winapi::port::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
 
         // The in-bottle exe's module path is C:\App\app.exe → exe dir C:\App,
         // which equals the host app dir — the early-return (staged-folder)
@@ -1571,7 +1578,8 @@ mod tests {
         std::fs::write(drive_c.join("DOOM2.WAD"), b"").expect("write stale alias");
         std::fs::write(drive_c.join("DOOM1.WAD"), b"commercial").expect("write commercial IWAD");
 
-        let volumes = wie_winapi::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
+        let volumes =
+            wie_winapi::port::VolumeConfig::from_parts(Some(bottle.path().to_path_buf()), None);
         super::stage_wad_payload(&volumes, &exe, r"C:\doomretro.exe").expect("stage");
 
         assert_eq!(

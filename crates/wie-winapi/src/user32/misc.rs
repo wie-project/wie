@@ -487,18 +487,26 @@ pub fn handle_kill_timer(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
 pub fn handle_set_windows_hook_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
+    // Every argument is still read and validated — a malformed frame must fail
+    // here exactly as it did before — but only `lpfn` is *stored*. Nothing in
+    // the emulator dispatches through a hook yet: `SetWindowsHookExW`
+    // registers, `UnhookWindowsHookEx` removes, and no message ever reaches a
+    // hook procedure. Keeping the four parameters in `WindowsHookRecord` was
+    // state with no reader, so the record holds the handle alone. When hook
+    // dispatch is implemented, the fields come back *with* their consumer.
     let hook_type_raw = read_arg(engine, ArgReg::Rcx, "SetWindowsHookExW")?;
 
     let callback_address = read_arg(engine, ArgReg::Rdx, "SetWindowsHookExW")?;
 
-    let module_handle = read_arg(engine, ArgReg::R8, "SetWindowsHookExW")?;
+    let module_handle_raw = read_arg(engine, ArgReg::R8, "SetWindowsHookExW")?;
 
     let thread_id_raw = read_arg(engine, ArgReg::R9, "SetWindowsHookExW")?;
 
-    let hook_type = low_i32(hook_type_raw, "SetWindowsHookExW hook type")?;
+    let _hook_type = low_i32(hook_type_raw, "SetWindowsHookExW hook type")?;
+    let _module_handle = module_handle_raw;
 
     let thread_id_low = thread_id_raw & u64::from(u32::MAX);
-    let thread_id = u32::try_from(thread_id_low)
+    let _thread_id = u32::try_from(thread_id_low)
         .context("SetWindowsHookExW thread identifier does not fit u32")?;
 
     let return_value = if callback_address == 0 {
@@ -515,13 +523,10 @@ pub fn handle_set_windows_hook_ex_w(ctx: &mut HandlerContext<'_>) -> Result<WinA
                 .context("SetWindowsHookExW handle overflow")?,
         );
 
-        state.window_state().windows_hooks.push(WindowsHookRecord {
-            handle,
-            hook_type,
-            callback_address,
-            module_handle,
-            thread_id,
-        });
+        state
+            .window_state()
+            .windows_hooks
+            .push(WindowsHookRecord { handle });
 
         handle
     };

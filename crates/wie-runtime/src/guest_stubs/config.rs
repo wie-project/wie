@@ -98,18 +98,20 @@ impl GuestStubConfig {
             // The modal-loop callees are WinApiIds with deterministic dense
             // fake VAs; they resolve even when the guest never imported them
             // (the stop bitmap defaults to host-stop everywhere).
-            create_dialog_param_a_va: wie_winapi::encode_export(
-                wie_winapi::WinApiId::User32Createdialogparama,
+            create_dialog_param_a_va: wie_winapi::port::encode_export(
+                wie_winapi::port::WinApiId::User32Createdialogparama,
             ),
-            create_dialog_param_w_va: wie_winapi::encode_export(
-                wie_winapi::WinApiId::User32Createdialogparamw,
+            create_dialog_param_w_va: wie_winapi::port::encode_export(
+                wie_winapi::port::WinApiId::User32Createdialogparamw,
             ),
-            get_message_a_va: wie_winapi::encode_export(wie_winapi::WinApiId::User32Getmessagea),
-            is_dialog_message_a_va: wie_winapi::encode_export(
-                wie_winapi::WinApiId::User32Isdialogmessagea,
+            get_message_a_va: wie_winapi::port::encode_export(
+                wie_winapi::port::WinApiId::User32Getmessagea,
             ),
-            dispatch_message_a_va: wie_winapi::encode_export(
-                wie_winapi::WinApiId::User32Dispatchmessagea,
+            is_dialog_message_a_va: wie_winapi::port::encode_export(
+                wie_winapi::port::WinApiId::User32Isdialogmessagea,
+            ),
+            dispatch_message_a_va: wie_winapi::port::encode_export(
+                wie_winapi::port::WinApiId::User32Dispatchmessagea,
             ),
             dialog_result_va: base + DIALOG_RESULT_OFFSET,
             clock_table_va: layout.clock_table.base,

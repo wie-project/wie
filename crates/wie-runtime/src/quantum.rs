@@ -12,15 +12,15 @@
 
 use crate::hooks::{ResolvedFakeApi, resolve_fake_api_at};
 use crate::memory::RuntimeMemoryLayout;
-use crate::mt_runtime::{LockWaitStats, ProcessConfig, lock_wait};
+use crate::mt_runtime::{LockWaitStats, OrderedState, ProcessConfig, lock_wait};
 use crate::trace::EntryTraceTermination;
 use anyhow::{Context, Result};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use wie_cpu::{CodeHookOutcome, CpuEngine, CpuError, InvalidMemoryAccess, RunUntilHook};
-use wie_winapi::{
-    HandlerContext, HostParkReason, WinApiControlSignal, WinApiId, WinApiState,
-    kernel32::{resolve_cs_queue, resolve_wait_target},
+use wie_winapi::port::{
+    HandlerContext, HostParkReason, WinApiControlSignal, WinApiId, WinApiState, resolve_cs_queue,
+    resolve_wait_target,
 };
 
 /// Next action for the caller after one shared quantum.
@@ -151,7 +151,7 @@ pub(crate) trait QuantumHooks {
     fn on_callback_return(
         &mut self,
         _core: &mut QuantumCore<'_>,
-        _guard: MutexGuard<'_, WinApiState>,
+        _guard: OrderedState<'_>,
         _address: u64,
         _api_index: usize,
     ) -> Result<Step> {
@@ -176,7 +176,7 @@ pub(crate) trait QuantumHooks {
     fn dispatch(
         &mut self,
         core: &mut QuantumCore<'_>,
-        mut guard: MutexGuard<'_, WinApiState>,
+        mut guard: OrderedState<'_>,
         resolved: &ResolvedFakeApi,
         _hook_address: u64,
         _api_index: usize,
@@ -248,7 +248,7 @@ pub(crate) struct QuantumCore<'a> {
     /// Shared WinAPI state mutex.
     winapi: &'a Arc<Mutex<WinApiState>>,
     /// Session-level heap shard (`Arc<Mutex<GuestHeap>>` next to `winapi`).
-    heap: &'a Arc<Mutex<wie_winapi::GuestHeap>>,
+    heap: &'a Arc<Mutex<wie_winapi::port::GuestHeap>>,
     /// Lock-free `shared_winapi` wait accumulators (guest-side timing).
     lock_wait_stats: &'a LockWaitStats,
     /// Guest TID this executor drives.
@@ -262,7 +262,7 @@ impl<'a> QuantumCore<'a> {
         engine: &'a mut dyn CpuEngine,
         config: &'a ProcessConfig,
         winapi: &'a Arc<Mutex<WinApiState>>,
-        heap: &'a Arc<Mutex<wie_winapi::GuestHeap>>,
+        heap: &'a Arc<Mutex<wie_winapi::port::GuestHeap>>,
         tid: u32,
         lock_wait_stats: &'a LockWaitStats,
     ) -> Result<Self> {
@@ -309,12 +309,12 @@ impl<'a> QuantumCore<'a> {
         &mut self,
         st: &mut WinApiState,
         resolved: &ResolvedFakeApi,
-    ) -> Result<wie_winapi::WinApiHandlerResult> {
+    ) -> Result<wie_winapi::port::WinApiHandlerResult> {
         let mut ctx = HandlerContext::new(self.engine, self.config.environment, st);
         if let Some(id) = resolved.winapi_id {
-            wie_winapi::dispatch_winapi_id(&mut ctx, id)
+            wie_winapi::port::dispatch_winapi_id(&mut ctx, id)
         } else {
-            wie_winapi::dispatch_winapi(&mut ctx, &resolved.library, &resolved.name)
+            wie_winapi::port::dispatch_winapi(&mut ctx, &resolved.library, &resolved.name)
         }
     }
 
@@ -401,7 +401,7 @@ impl<'a> QuantumCore<'a> {
                 };
                 if !ok {
                     let mut st = lock_wait(self.winapi, self.lock_wait_stats);
-                    st.process.last_error = ERROR_INVALID_HANDLE;
+                    st.set_last_error(ERROR_INVALID_HANDLE);
                     st.publish_last_error_to_guest(engine);
                     engine.return_from_win64_api(0)?;
                     return Ok(Some(Step::Next));
@@ -483,18 +483,19 @@ impl<'a> QuantumCore<'a> {
         // TEB page (the primary's fixed `GS_BASE`; a worker's `PerThreadTeb`).
         {
             let mut st = lock_wait(self.winapi, self.lock_wait_stats);
-            if st.kernel.threads.active.tid != self.tid {
-                st.kernel.threads.activate(self.tid);
+            if st.active_tid() != self.tid {
+                st.activate_thread(self.tid);
             }
             // Bind the identity to THIS host thread, not to the shared
             // `active` slot: the mutex is about to be released for the guest
             // quantum, so a peer thread's activation must not change what
             // `current_tid()` reports here.
-            wie_winapi::thread::bind_current_tid(self.tid);
+            wie_winapi::port::bind_current_tid(self.tid);
             if let Some(step) = hooks.on_activated(self, &mut st)? {
                 return Ok(step);
             }
-            st.process.last_error = st.kernel.threads.active.last_error;
+            let active_last_error = st.active_last_error();
+            st.set_last_error(active_last_error);
             st.publish_last_error_to_guest(self.engine);
         }
 
@@ -582,10 +583,10 @@ impl<'a> QuantumCore<'a> {
         // reclaim this thread's identity before any dispatch that uses
         // `current_tid()` (CS owner, TLS, waits).
         let mut guard = lock_wait(self.winapi, self.lock_wait_stats);
-        if guard.kernel.threads.active.tid != self.tid {
-            guard.kernel.threads.activate(self.tid);
+        if guard.active_tid() != self.tid {
+            guard.activate_thread(self.tid);
         }
-        wie_winapi::thread::bind_current_tid(self.tid);
+        wie_winapi::port::bind_current_tid(self.tid);
 
         match run {
             Ok(result) => {
@@ -597,11 +598,11 @@ impl<'a> QuantumCore<'a> {
                     crate::session::fault_capture(
                         self.engine,
                         &guard,
-                        guard.kernel.threads.active.tid,
+                        guard.active_tid(),
                         &outcome.invalid_memory,
                     );
                     // Route through guest SEH before terminating.
-                    match wie_winapi::seh::dispatch_hardware_fault(
+                    match wie_winapi::port::dispatch_hardware_fault(
                         self.engine,
                         &mut guard,
                         outcome.invalid_memory.exception_code,
@@ -635,7 +636,7 @@ impl<'a> QuantumCore<'a> {
                 self.handle_hook(hooks, guard, outcome.code.address, api_index)
             }
             Err(CpuError::DivideByZero(div_rip)) => {
-                match wie_winapi::seh::dispatch_hardware_fault(
+                match wie_winapi::port::dispatch_hardware_fault(
                     self.engine,
                     &mut guard,
                     wie_cpu::exception_code::INT_DIVIDE_BY_ZERO,
@@ -666,7 +667,7 @@ impl<'a> QuantumCore<'a> {
     fn handle_hook<H: QuantumHooks>(
         &mut self,
         hooks: &mut H,
-        mut guard: MutexGuard<'_, WinApiState>,
+        mut guard: OrderedState<'_>,
         address: u64,
         api_index: usize,
     ) -> Result<Step> {
@@ -684,12 +685,12 @@ impl<'a> QuantumCore<'a> {
         }
         let st = &mut *guard;
         // SEH / C++ EH continuation (UnwindMap actions, MSVC catch funclets).
-        if address == wie_winapi::seh_continue_trampoline_va() {
+        if address == wie_winapi::port::seh_continue_trampoline_va() {
             // Uniform last-error discipline for every host stop: absorb the
             // ACTIVE engine's GS-relative TEB slot into the active thread
             // before host handling, publish back afterwards.
             st.absorb_guest_last_error(self.engine);
-            match wie_winapi::seh::continue_pending(self.engine, st) {
+            match wie_winapi::port::continue_pending(self.engine, st) {
                 Ok(result) => {
                     hooks.on_seh_continue(
                         self,
@@ -813,7 +814,7 @@ impl<'a> QuantumCore<'a> {
     /// Slice an infinite `WaitForSingleObject` so the caller can drain spawns
     /// and observe `process_dying`; finite timeouts wait once.
     fn wait_with_dying(
-        target: Option<wie_winapi::WaitTarget>,
+        target: Option<wie_winapi::port::WaitTarget>,
         timeout_ms: u32,
         winapi: &Arc<Mutex<WinApiState>>,
         stats: &LockWaitStats,
@@ -821,18 +822,18 @@ impl<'a> QuantumCore<'a> {
         on_dying: &mut dyn FnMut(),
     ) -> u32 {
         let Some(target) = target else {
-            return wie_winapi::WAIT_FAILED;
+            return wie_winapi::port::WAIT_FAILED;
         };
-        if timeout_ms == wie_winapi::INFINITE {
+        if timeout_ms == wie_winapi::port::INFINITE {
             loop {
                 let r = target.wait(50);
-                if r == wie_winapi::WAIT_OBJECT_0 {
+                if r == wie_winapi::port::WAIT_OBJECT_0 {
                     return r;
                 }
                 drain();
                 if Self::process_dying(winapi, stats) {
                     on_dying();
-                    return wie_winapi::WAIT_FAILED;
+                    return wie_winapi::port::WAIT_FAILED;
                 }
             }
         } else {
@@ -842,36 +843,36 @@ impl<'a> QuantumCore<'a> {
 
     /// Slice an infinite `WaitForMultipleObjects` like [`Self::wait_with_dying`].
     fn wait_multiple_with_dying(
-        req: Option<wie_winapi::MultiWaitRequest>,
+        req: Option<wie_winapi::port::MultiWaitRequest>,
         winapi: &Arc<Mutex<WinApiState>>,
         stats: &LockWaitStats,
         drain: &mut dyn FnMut(),
         on_dying: &mut dyn FnMut(),
     ) -> u32 {
         let Some(req) = req else {
-            return wie_winapi::WAIT_FAILED;
+            return wie_winapi::port::WAIT_FAILED;
         };
         let targets = {
             let st = lock_wait(winapi, stats);
             st.kernel.sync.wait_targets(&req.handles)
         };
         let Some(ts) = targets else {
-            return wie_winapi::WAIT_FAILED;
+            return wie_winapi::port::WAIT_FAILED;
         };
-        if req.timeout_ms == wie_winapi::INFINITE {
+        if req.timeout_ms == wie_winapi::port::INFINITE {
             loop {
-                let r = wie_winapi::wait_multiple(&ts, req.wait_all, 50);
-                if r != wie_winapi::WAIT_TIMEOUT {
+                let r = wie_winapi::port::wait_multiple(&ts, req.wait_all, 50);
+                if r != wie_winapi::port::WAIT_TIMEOUT {
                     return r;
                 }
                 drain();
                 if Self::process_dying(winapi, stats) {
                     on_dying();
-                    return wie_winapi::WAIT_FAILED;
+                    return wie_winapi::port::WAIT_FAILED;
                 }
             }
         } else {
-            wie_winapi::wait_multiple(&ts, req.wait_all, req.timeout_ms)
+            wie_winapi::port::wait_multiple(&ts, req.wait_all, req.timeout_ms)
         }
     }
 }
@@ -887,8 +888,8 @@ pub(crate) fn finish_tid(st: &WinApiState, tid: u32, code: u32) {
         .sync
         .objects
         .values()
-        .find(|obj| matches!(obj, wie_winapi::KernelObject::Thread(t) if t.tid == tid));
-    if let Some(wie_winapi::KernelObject::Thread(t)) = thread {
+        .find(|obj| matches!(obj, wie_winapi::port::KernelObject::Thread(t) if t.tid == tid));
+    if let Some(wie_winapi::port::KernelObject::Thread(t)) = thread {
         t.finish(code);
     }
 }
@@ -1098,7 +1099,7 @@ mod tests {
     fn test_env() -> (
         ProcessConfig,
         Arc<Mutex<WinApiState>>,
-        Arc<Mutex<wie_winapi::GuestHeap>>,
+        Arc<Mutex<wie_winapi::port::GuestHeap>>,
         crate::mt_runtime::LockWaitStats,
     ) {
         let process = ProcessIdentity {
@@ -1110,7 +1111,7 @@ mod tests {
         let winapi_state =
             crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
                 .expect("winapi state");
-        let heap = Arc::clone(&winapi_state.heap_state.heap);
+        let heap = winapi_state.heap_arc();
         let config = ProcessConfig {
             soft_apis: SoftApiTable::default(),
             environment: crate::memory::default_winapi_environment(
@@ -1124,7 +1125,7 @@ mod tests {
             ),
             layout: DEFAULT_LAYOUT,
             stop_bitmap: Arc::<[u8]>::from(Vec::<u8>::new()),
-            primary_tid: GuestTid(wie_winapi::PRIMARY_THREAD_ID),
+            primary_tid: GuestTid(wie_winapi::port::PRIMARY_THREAD_ID),
             static_dll_mains: Vec::new(),
         };
         (
@@ -1139,7 +1140,7 @@ mod tests {
         engine: &'a mut MockEngine,
         config: &'a ProcessConfig,
         winapi: &'a Arc<Mutex<WinApiState>>,
-        heap: &'a Arc<Mutex<wie_winapi::GuestHeap>>,
+        heap: &'a Arc<Mutex<wie_winapi::port::GuestHeap>>,
         stats: &'a crate::mt_runtime::LockWaitStats,
     ) -> QuantumCore<'a> {
         QuantumCore::new(engine, config, winapi, heap, config.primary_tid.0, stats).expect("core")
@@ -1207,7 +1208,7 @@ mod tests {
         fn on_callback_return(
             &mut self,
             _core: &mut QuantumCore<'_>,
-            _guard: MutexGuard<'_, WinApiState>,
+            _guard: OrderedState<'_>,
             _address: u64,
             _api_index: usize,
         ) -> Result<Step> {
@@ -1227,7 +1228,7 @@ mod tests {
         fn dispatch(
             &mut self,
             _core: &mut QuantumCore<'_>,
-            _guard: MutexGuard<'_, WinApiState>,
+            _guard: OrderedState<'_>,
             resolved: &ResolvedFakeApi,
             _hook_address: u64,
             api_index: usize,
@@ -1259,25 +1260,20 @@ mod tests {
         let primary = config.primary_tid.0;
         {
             let mut st = lock(&winapi);
-            st.kernel.threads.active.last_error = 0x2A;
+            st.set_active_last_error(0x2A);
         }
         let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = TestHooks::default();
         let step = core.step(&mut hooks).expect("step");
 
         assert!(matches!(step, Step::Next));
-        // Drop the core so the engine (borrowed by it) is inspectable again.
-        drop(core);
         assert_eq!(engine.run_calls.len(), 1);
         assert_eq!(
             engine.run_calls[0].0, 0x1400_1000,
             "runs from the stored RIP"
         );
         let st = lock(&winapi);
-        assert_eq!(
-            st.kernel.threads.active.tid, primary,
-            "primary stays active"
-        );
+        assert_eq!(st.active_tid(), primary, "primary stays active");
         drop(st);
         assert_eq!(
             engine.last_error_writes.last(),
@@ -1425,7 +1421,6 @@ mod tests {
             core.step(&mut hooks).expect("step"),
             Step::PureCompute
         ));
-        drop(core);
         assert_eq!(
             engine.gs_base,
             wie_cpu::GS_BASE,
@@ -1470,7 +1465,7 @@ mod tests {
         let mut engine = mock_engine();
         engine
             .script
-            .push_back(hook_run(wie_winapi::seh_continue_trampoline_va()));
+            .push_back(hook_run(wie_winapi::port::seh_continue_trampoline_va()));
         let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
         let mut hooks = TestHooks::default();
 
@@ -1539,7 +1534,6 @@ mod tests {
 
         let step = core.step(&mut hooks).expect("step");
         assert!(matches!(step, Step::ExitThread(42)));
-        drop(core);
         let st = lock(&winapi);
         assert!(st.kernel.sync.process_dying);
     }

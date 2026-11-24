@@ -2,6 +2,15 @@
 
 pub mod advapi32;
 pub mod bottle;
+// ADR-0005: the named capabilities a handler may ask for, and the narrowed
+// contexts that carry them. Private module: a capability is an in-crate seam
+// (`port`, ADR-0006, is the published surface), so the `pub` items below it are
+// `pub`-but-unreachable by design — the same shape as `mod state`.
+#[expect(
+    unreachable_pub,
+    reason = "capabilities are an in-crate seam; `port` is the published surface"
+)]
+mod capability;
 pub mod clipboard;
 pub mod color;
 pub mod comctl32;
@@ -29,6 +38,7 @@ pub mod handles;
 pub mod idle;
 pub mod imm32;
 pub mod kernel32;
+pub mod lock_order;
 pub mod mingw_dispatch;
 pub mod msimg32;
 pub mod msvc_eh;
@@ -41,6 +51,7 @@ mod registry;
 pub mod seh;
 pub mod setupapi;
 pub mod shell32;
+mod soft_dispatch;
 pub mod sync_obj;
 pub mod thread;
 pub mod ucrt;
@@ -83,25 +94,54 @@ pub use idle::{IdleContext, IdlePolicy};
 pub use kernel32::WinApiHandlerResult;
 pub use thread::{FIRST_WORKER_TID, GuestThread, PRIMARY_THREAD_ID, ThreadState};
 
+// `state` is crate-private now (ADR-0006): its types reach other crates only
+// through `port`. `pub` is still required on them for those re-exports, so
+// anything `port` does NOT publish is `pub`-but-unreachable — which is exactly
+// what this lint reports, and exactly the intended shape. Scoped `expect` (not
+// `allow`) so it has to keep being true: if a later edit makes one of them
+// reachable again, this fails to compile and the surface gets re-reviewed.
+#[expect(
+    unreachable_pub,
+    reason = "`state` is crate-private; `port` is the published surface"
+)]
 mod state;
+// The published surface (ADR-0006). Cross-crate consumers name `port::…`;
+// the two re-export blocks below are the legacy flat surface, kept only for
+// the names `wie-cli` still uses (`./scripts/check.sh --only winapi-port`
+// keeps `wie-runtime` off both).
+pub mod port;
+// `wie-cli`'s remaining root-level needs. Everything else from `state` is
+// crate-visible only; see `port`.
 pub use state::{
-    ClipboardState, D3D9State, DEFAULT_ENVIRONMENT, DisplayMetrics, DllId, DllStateMap,
-    FileDialogBridge, FileDialogFilter, FileDialogPick, FileDialogPolicy, FileDialogRequest,
-    FileHandle, FileIoState, FindFileHandle, FindHandle, FlsSlot, FontDialogPolicy,
-    GetProcAddressCacheEntry, GlobalAtomRecord, GuestCallbackRequest, GuestIoRuntimeConfig,
-    GuestStdinMode, HandlerContext, HeapAllocation, HeapState, HostFileMount, HostParkReason,
-    ImportResolver, KernelState, KeyboardState, MessageQueueIdlePolicy, ModuleHandle, ModuleState,
-    OpenGuestFile, OuterReturn, PTHREAD_RETURN_TRAMPOLINE_VA, PageSetupDialogBridge,
-    PageSetupDialogPick, PageSetupDialogPolicy, PageSetupDialogRequest, PendingNativePrintJob,
-    PrintDialogBridge, PrintDialogPick, PrintDialogPolicy, PrintDialogRequest, PrintJobBridge,
-    PrintJobRequest, ProcessState, QueuedWindowMessage, RegistryKey, RegistryKeyHandle,
-    ResourceHandle, ResourceRecord, TimerRecord, VirtualGuestFile, WinApiControlSignal,
-    WinApiEnvironment, WinApiState, WindowClassRecord, WindowFlags, WindowRecord, WindowState,
+    DisplayMetrics, FileDialogPick, FileDialogPolicy, FileDialogRequest, FontDialogPolicy,
+    MessageQueueIdlePolicy, PageSetupDialogPick, PageSetupDialogPolicy, PageSetupDialogRequest,
+    PrintDialogPick, PrintDialogPolicy, PrintDialogRequest, PrintJobRequest,
+};
+// Crate-internal shorthand (`crate::WinApiState`, …). Not part of the published
+// surface — `pub(crate)`, so a cross-crate name here fails to resolve. Only the
+// names this crate's own modules reach through the root are listed; everything
+// else `state` defines stays inside `state`.
+pub(crate) use state::{
+    DllId, FileHandle, FindFileHandle, FindHandle, FlsSlot, GetProcAddressCacheEntry,
+    GlobalAtomRecord, GuestCallbackRequest, GuestStdinMode, HandlerContext, HostFileMount,
+    HostParkReason, ModuleHandle, OpenGuestFile, OuterReturn, QueuedWindowMessage, RegistryKey,
+    RegistryKeyHandle, ResourceHandle, ResourceRecord, TimerRecord, VirtualGuestFile,
+    WinApiControlSignal, WinApiEnvironment, WinApiState, WindowClassRecord, WindowRecord,
     WindowsHookRecord, pthread_return_trampoline_va,
+};
+// Test-only: the shared fixtures below build a whole `WinApiState` by struct
+// literal, so the in-crate `#[cfg(test)]` blocks name these. Test builds only —
+// nothing here ships, and nothing outside the crate can see it.
+#[cfg(test)]
+pub(crate) use state::{
+    DEFAULT_ENVIRONMENT, DllStateMap, FileDialogBridge, FileIoState, GuestIoRuntimeConfig,
+    HeapState, KernelState, ModuleState, PageSetupDialogBridge, PrintDialogBridge, PrintJobBridge,
+    ProcessState,
 };
 
 mod dispatch_table;
-pub use dispatch_table::{
-    WINAPI_ID_COUNT, WinApiId, WinApiTraits, dispatch_winapi, dispatch_winapi_id,
-    is_winapi_implemented, is_winapi_library, resolve_winapi_id, winapi_id_export,
-};
+// `wie-cli` calls this one directly; `crate::port` publishes the rest.
+pub use dispatch_table::is_winapi_implemented;
+pub(crate) use dispatch_table::{WinApiId, resolve_winapi_id};
+#[cfg(test)]
+pub(crate) use dispatch_table::{dispatch_winapi, dispatch_winapi_id, is_winapi_library};

@@ -1,6 +1,7 @@
 //! Dialog rendering: the dialog window's face + border painted into the
 //! owner's present surface.
 
+use crate::capability::PresentAccess;
 use crate::gdi32::IRect;
 use crate::gdi32::fill_rect_surface;
 use crate::gdi32::resolve_window_ancestor;
@@ -119,5 +120,5 @@ pub(crate) fn paint_dialog(state: &mut WinApiState, hwnd: u64) {
     // the wake callback once per decomposed rect). B3.6: deferred — the
     // runtime drains pending publishes once per repaint cycle, so the
     // dialog face and the control paints that follow it emit one frame.
-    state.present().publish_deferred(info.hwnd);
+    state.publish_deferred(info.hwnd);
 }

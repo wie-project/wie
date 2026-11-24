@@ -672,6 +672,95 @@ fn reconcile_ignores_windows_without_a_content_revision() {
     assert_eq!(state.reconcile_and_publish(), 0);
 }
 
+/// T4.3 — the gated-off default path must not spawn a render thread.
+///
+/// The default path is the one every headless run takes (all `RuntimeSession`
+/// tests, the whole micro-suite, `trace`): `PresentState` is built through
+/// `Default` → `PresentChannel::new` → `CapturePipeline::new`, which starts the
+/// gate `AtomicBool::new(false)`, and `wie-winapi` reads no env var for it —
+/// the only write site is `set_capture_enabled(true)`, reachable from
+/// `GuestHandle::enable_capture_stream`, which only the GUI host and the
+/// dedicated capture test call. So the D3D9 handlers rasterize inline and this
+/// emu-thread sink publishes, with `present/` spawning nothing.
+///
+/// A second render thread reintroduced on this path (the commit thread removed
+/// 2026-09-25, or an always-on capture stream) trips the counter assertions —
+/// before this test, nothing asserted the absence. The reach of the assertion
+/// is `spawn_render_thread`: it sees every thread `present/` creates, so a
+/// thread created anywhere else would have to be counted there to be caught.
+#[test]
+fn default_present_path_spawns_no_render_thread() {
+    let spawned_before = super::render_threads_spawned();
+    let live_before = super::render_threads_live();
+
+    let mut state = PresentState::new();
+    assert!(
+        !state.channel.capture_enabled(),
+        "a fresh PresentState starts with the capture gate closed"
+    );
+    let hwnd = Hwnd::from(50);
+    state.ensure_surface(hwnd, 64, 64);
+    state.publish(hwnd);
+
+    assert!(
+        state.published.contains_key(&hwnd),
+        "the emu-thread sink published the frame"
+    );
+    assert_eq!(
+        state.channel.capture_frames(),
+        0,
+        "no frame was replayed on a render thread"
+    );
+    assert_eq!(
+        super::render_threads_spawned(),
+        spawned_before,
+        "the default present path must not spawn a render thread"
+    );
+    assert_eq!(
+        super::render_threads_live(),
+        live_before,
+        "and must leave none running"
+    );
+}
+
+/// The positive control for the absence assertion above: the counters do move
+/// when a streamer spawns, so `default_present_path_spawns_no_render_thread`
+/// cannot pass vacuously. One streamer is exactly one render thread — a second
+/// thread beside it would read as `live_before + 2`.
+#[test]
+fn spawned_streamer_is_one_counted_render_thread_and_leaves_the_gate_closed() {
+    let spawned_before = super::render_threads_spawned();
+    let live_before = super::render_threads_live();
+    let channel = Arc::new(super::PresentChannel::new());
+
+    let streamer = super::spawn_capture_streamer(Arc::clone(&channel), Box::new(|| {}))
+        .expect("the capture render thread spawns");
+
+    assert_eq!(
+        super::render_threads_spawned(),
+        spawned_before + 1,
+        "spawning a streamer is counted"
+    );
+    assert_eq!(
+        super::render_threads_live(),
+        live_before + 1,
+        "one streamer is exactly one render thread"
+    );
+    assert!(
+        !channel.capture_enabled(),
+        "spawning the thread must not arm the gate — the caller arms it"
+    );
+    channel.set_capture_enabled(true);
+    assert!(channel.capture_enabled(), "the armed gate is observable");
+
+    drop(streamer);
+    assert_eq!(
+        super::render_threads_live(),
+        live_before,
+        "dropping the handle stops and joins the thread"
+    );
+}
+
 /// A stale top-level with NO surface still catches up: the publish is a
 /// no-op, but the revision must not stay stale forever — an idle loop
 /// would otherwise republish it on every boundary.

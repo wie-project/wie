@@ -37,6 +37,74 @@ pub fn frame_timing_enabled() -> bool {
     FRAME_TIMING.load(Ordering::Relaxed)
 }
 
+/// Render threads this module has spawned in this process (monotonic).
+///
+/// Every thread `present/` creates starts inside [`spawn_render_thread`] — the
+/// only `thread::Builder` in the module — so this counter is a complete
+/// inventory of them, and a *second* render thread appearing (the commit
+/// thread removed 2026-09-25, or an always-on capture stream) shows up as a
+/// second increment. That is what makes the T4.3 assertion in
+/// `tests::default_present_path_spawns_no_render_thread` possible: a thread
+/// cannot exist without a spawn.
+static RENDER_THREADS_SPAWNED: AtomicU64 = AtomicU64::new(0);
+
+/// Render threads this module currently has running (spawned minus exited).
+static RENDER_THREADS_LIVE: AtomicU64 = AtomicU64::new(0);
+
+/// How many render threads `present/` has spawned (monotonic).
+#[must_use]
+pub fn render_threads_spawned() -> u64 {
+    RENDER_THREADS_SPAWNED.load(Ordering::Relaxed)
+}
+
+/// How many render threads `present/` currently has running.
+#[must_use]
+pub fn render_threads_live() -> u64 {
+    RENDER_THREADS_LIVE.load(Ordering::Relaxed)
+}
+
+/// Spawn a render thread — the single thread-creation site in `present/`.
+///
+/// The capture stream (`spawn_capture_streamer`) is the only render
+/// thread this module has today; routing any future one through here keeps
+/// [`render_threads_spawned`] / [`render_threads_live`] honest, which is what
+/// lets a test assert that the gated-off default path spawns none. `None` when
+/// the OS refuses the spawn (the caller keeps its in-handler path).
+pub(crate) fn spawn_render_thread(
+    name: &str,
+    body: impl FnOnce() + Send + 'static,
+) -> Option<std::thread::JoinHandle<()>> {
+    // Counted BEFORE the spawn so a caller holding the handle can never observe
+    // a running thread the counters missed (the thread may already be in
+    // `body` by the time `spawn` returns).
+    RENDER_THREADS_LIVE.fetch_add(1, Ordering::Relaxed);
+    let spawned = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let _exited = LiveRenderThread;
+            body();
+        });
+    match spawned {
+        Ok(join) => {
+            RENDER_THREADS_SPAWNED.fetch_add(1, Ordering::Relaxed);
+            Some(join)
+        }
+        Err(_refused) => {
+            RENDER_THREADS_LIVE.fetch_sub(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// Decrements [`RENDER_THREADS_LIVE`] when the thread it was created on exits.
+struct LiveRenderThread;
+
+impl Drop for LiveRenderThread {
+    fn drop(&mut self) {
+        RENDER_THREADS_LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// The default frame background: `COLOR_WINDOW`-white (0RGB). Used when the
 /// erase machinery has not yet recorded the owning window's class-brush
 /// color — notepad's client and the common case.
@@ -265,6 +333,22 @@ impl PresentChannel {
         }
     }
 
+    /// Lock the frame-slot mutex, recording the acquisition for the
+    /// debug-only lock-order assertion ([`crate::lock_order`]).
+    ///
+    /// Every acquisition of [`Self::inner`] goes through here so the record
+    /// cannot drift from the lock: the channel is innermost in the documented
+    /// order, and [`Lock::Channel`](crate::lock_order::Lock::Channel) is
+    /// attached exactly as long as the guard lives.
+    fn lock_inner(&self) -> crate::lock_order::Ordered<'_, ChannelInner> {
+        let scope = crate::lock_order::enter(crate::lock_order::Lock::Channel);
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::lock_order::Ordered::wrap(scope, guard)
+    }
+
     /// Replace the window-mirror projection wholesale (the sync point —
     /// called from `WinApiState::sync_window_mirror` under the big lock).
     pub(crate) fn sync_window_mirror(
@@ -452,10 +536,7 @@ impl PresentChannel {
         frame: SurfaceFrame,
     ) -> (Option<SurfaceFrame>, bool) {
         let prev = {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = self.lock_inner();
             inner.latest.insert(hwnd, frame)
         };
         let prev_seq = self.published_seq.fetch_add(1, Ordering::Relaxed);
@@ -468,10 +549,7 @@ impl PresentChannel {
     #[must_use]
     pub fn take_frame(&self, hwnd: crate::handles::Hwnd) -> Option<SurfaceFrame> {
         let frame = {
-            let inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inner = self.lock_inner();
             inner.latest.get(&hwnd).cloned()
         };
         if frame.is_some() {
@@ -492,19 +570,13 @@ impl PresentChannel {
 
     /// Recycle a superseded presented buffer into the spare pool (host side).
     pub fn store_spare(&self, hwnd: crate::handles::Hwnd, buffer: Vec<u32>) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self.lock_inner();
         inner.spare_buffers.insert(hwnd, buffer);
     }
 
     /// Take a recycled spare buffer for `hwnd` (guest paint side).
     pub(crate) fn take_spare(&self, hwnd: crate::handles::Hwnd) -> Option<Vec<u32>> {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self.lock_inner();
         inner.spare_buffers.remove(&hwnd)
     }
 
@@ -512,10 +584,7 @@ impl PresentChannel {
     /// Called under the big `WinApiState` lock after every z/window-set
     /// mutation; the channel lock section is a Vec clone.
     pub(crate) fn sync_z(&self, z_rev: u64, z_order: &[crate::handles::Hwnd], windows_rev: u64) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self.lock_inner();
         inner.z_rev = z_rev;
         inner.z_order.clear();
         inner.z_order.extend_from_slice(z_order);
@@ -525,10 +594,7 @@ impl PresentChannel {
     /// The mirrored `(z_rev, z_order)` pair — one lock, consistent snapshot.
     #[must_use]
     pub fn z_snapshot(&self) -> (u64, Vec<u64>) {
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self.lock_inner();
         (
             inner.z_rev,
             inner.z_order.iter().map(|h| h.as_u64()).collect(),
@@ -538,21 +604,18 @@ impl PresentChannel {
     /// The mirrored window-set revision.
     #[must_use]
     pub fn windows_rev(&self) -> u64 {
-        self.inner.lock().map_or(0, |inner| inner.windows_rev)
+        self.lock_inner().windows_rev
     }
 
     /// The mirrored z-order revision.
     #[must_use]
     pub fn z_rev(&self) -> u64 {
-        self.inner.lock().map_or(0, |inner| inner.z_rev)
+        self.lock_inner().z_rev
     }
 
     /// Record one host-present duration (ns) — presenter side, channel lock.
     pub fn record_present(&self, ns: u128) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut inner = self.lock_inner();
         inner.present_ns = inner.present_ns.saturating_add(ns);
         inner.present_ns_last = ns;
     }
@@ -560,13 +623,13 @@ impl PresentChannel {
     /// The most recent host-present duration (ns), for the profile dump.
     #[must_use]
     pub fn present_ns_last(&self) -> u128 {
-        self.inner.lock().map_or(0, |inner| inner.present_ns_last)
+        self.lock_inner().present_ns_last
     }
 
     /// Accumulated host-present wall time (ns), for the profile dump.
     #[must_use]
     pub fn present_ns(&self) -> u128 {
-        self.inner.lock().map_or(0, |inner| inner.present_ns)
+        self.lock_inner().present_ns
     }
 }
 

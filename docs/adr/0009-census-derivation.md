@@ -19,12 +19,12 @@ It needs ~1,050 hand-kept names across parallel registries:
 
 | Registry | Location |
 | --- | --- |
-| soft export census consts | `dispatch_table/names/mod.rs` — 650 names in 19 non-test consts (496 excluding `UCRT_CALLABLE`'s 154) |
-| `is_winapi_library` | `names/mod.rs:768-808` — 27 DLLs + 2 prefixes |
-| `is_winapi_implemented` | `names/mod.rs:810-855` — 22 arms |
+| soft export census consts | one `EXPORTS` const per dispatch module (650 names in 19 consts, 496 excluding UCRT's 154) — 11 of them generated from the dispatch rows, see Implementation status |
+| `is_winapi_library` | `names/mod.rs:49-89` — 27 DLLs + 2 prefixes |
+| `is_winapi_implemented` | `names/mod.rs:91-139` — 22 arms, each reading a module's `EXPORTS` |
 | `PREPLANTED_SOFT_APIS` | `dynamic_apis.rs:36` — 156 rows |
 | `DYNAMIC_FAKE_APIS` | `dynamic_apis.rs:209` — 22 rows |
-| per-DLL `*_EXPORTS` | `urlmon.rs:70`, `ntdll.rs:54`, `opengl32.rs:212`, `wininet` |
+| per-DLL `*_EXPORTS` | `urlmon.rs:70`, `ntdll.rs:54`, `opengl32.rs:212`, `wininet` — already the target shape |
 
 The two figures above differ by scope, not by error: 650 counts only
 `names/mod.rs`'s non-test consts, while the census test (below) exercises the
@@ -49,9 +49,17 @@ duplicate-name check and an `is_winapi_library ⊆ (census ∪ module-own ∪
 dense-only)` check landed with it.
 
 **Then derive each census from the dispatch it claims to describe** — the
-follow-up this ADR records. Each `dispatch_*_extra` exposes a
-`pub(crate) const EXPORTS` beside its match; the census is that constant. This is
-already the pattern `urlmon.rs:70` and `opengl32.rs:212` use.
+follow-up this ADR records. Each dispatch module owns a `pub(crate) const
+EXPORTS` beside the `dispatch_*` it describes, and both `is_winapi_implemented`
+and the census table read that constant instead of keeping a copy. How strong
+the derivation is depends on the module: where every export maps onto one
+`fn(&mut HandlerContext<'_>) -> Result<WinApiHandlerResult>`, the census is
+generated from the same `(name, handler)` rows the dispatcher scans, so the two
+cannot drift; where dispatch also accepts names that must stay out of the
+`wie inspect` output (`IDataObject::*` vtable slots, `ordinal N`, `enumfont*`
+aliases), the census is a distinguished **subset** of the accepted names and
+stays hand-written, with the reason stated at the list. This is the shape
+`urlmon.rs:70` and `opengl32.rs:212` already had for the first case.
 
 Three findings from the guard that shape the derivation:
 
@@ -66,6 +74,30 @@ Three findings from the guard that shape the derivation:
 3. **`comdlg32.dll`, `d3d9.dll`, `version.dll` are dense-only** with no soft
    census, while `wininet`/`urlmon`/`ntdll`/`opengl32` keep theirs in-module.
    Both are now explicit named sets rather than silent gaps.
+
+## Implementation status (2026-11-23)
+
+Option A has landed for the 650 names that lived in `dispatch_table/names/mod.rs`
+(the file went from 1088 to 368 lines; the lists moved verbatim, same names in
+the same order, so `wie inspect` output is unchanged). Each of the 19 consts now
+lives beside the dispatcher it describes, and both `is_winapi_implemented` and
+`SOFT_EXPORT_CENSUS` read it.
+
+Two strengths of derivation, by measurement:
+
+| Kind | Modules | Names | Property |
+| --- | --- | --- | --- |
+| single-source | 11: `shell32` 11, `winmm` 36, `ws2_32` 26, `crypt32` 8, `msimg32` 3, `imm32` 11, `uxtheme` 4, `winhttp` 9, `setupapi` 12, `dbghelp` 14, `dinput8` 1 | 135 | the `(name, handler)` rows in `soft_exports!` (`soft_dispatch.rs`) are the dispatch table *and* the census; a row is dispatched and advertised, and there is no second list |
+| distinguished subset | 8: `kernel32` 192, `ucrt` 154, `user32` 66, `oleaut32` 28, `gdi32` 25, `ole32` 22, `advapi32` 21, `comctl32` 7 | 515 | dispatch also accepts names that must not be advertised (7 modules: `IDataObject::*` slots, `ordinal N`, size aliases, `enumfont*`, `createprocess*`, …; `user32` composes three sub-dispatchers), so the census stays hand-written with a stated reason |
+
+Unchanged by this work: the four module-own lists (`ntdll` 27, `urlmon` 4,
+`wininet` 17, `opengl32` 134), `is_winapi_library`, and the 156 + 22 dynamic
+rows in `dynamic_apis.rs`.
+
+What this does **not** buy: for the 8 subset modules, `census ⊆ dispatch` is
+tested but `dispatch ⊆ census` is unstateable, because dispatch legitimately
+accepts more names than the census may report. Making it a compile-time fact
+there would change `wie inspect` output, so it stays a review responsibility.
 
 ## Alternatives considered
 

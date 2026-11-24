@@ -8,6 +8,13 @@ use anyhow::Result;
 
 use crate::{HandlerContext, WinApiHandlerResult};
 
+crate::soft_dispatch::soft_exports! {
+    ("closethemedata", handle_close_theme_data),
+    ("getwindowtheme", handle_get_window_theme),
+    ("isthemeactive", handle_is_theme_active),
+    ("openthemedata", handle_open_theme_data),
+}
+
 /// Soft dispatch for `uxtheme.dll` exports not in the dense `WinApiId` table.
 ///
 /// The dense path still owns `SetWindowTheme`; these are the fallback no-ops.
@@ -15,14 +22,7 @@ pub fn dispatch_uxtheme(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let n = name.to_ascii_lowercase();
-    match n.as_str() {
-        "openthemedata" => Ok(Some(handle_open_theme_data(ctx)?)),
-        "closethemedata" => Ok(Some(handle_close_theme_data(ctx)?)),
-        "isthemeactive" => Ok(Some(handle_is_theme_active(ctx)?)),
-        "getwindowtheme" => Ok(Some(handle_get_window_theme(ctx)?)),
-        _ => Ok(None),
-    }
+    crate::soft_dispatch::dispatch_soft_table(ctx, DISPATCH, name)
 }
 
 /// `HTHEME OpenThemeData(HWND hwnd, LPCWSTR pszClassList)` — NULL (no theme).

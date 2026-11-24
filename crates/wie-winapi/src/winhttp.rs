@@ -46,24 +46,24 @@ impl WinhttpState {
     }
 }
 
+crate::soft_dispatch::soft_exports! {
+    ("winhttpaddrequestheaders", handle_win_http_add_request_headers),
+    ("winhttpclosehandle", handle_win_http_close_handle),
+    ("winhttpconnect", handle_win_http_connect),
+    ("winhttpopen", handle_win_http_open),
+    ("winhttpopenrequest", handle_win_http_open_request),
+    ("winhttpquerydataavailable", handle_win_http_request_io),
+    ("winhttpreaddata", handle_win_http_request_io),
+    ("winhttpreceiveresponse", handle_win_http_request_io),
+    ("winhttpsendrequest", handle_win_http_request_io),
+}
+
 /// Dispatch a `WINHTTP.dll` export by name (case-insensitive).
 pub fn dispatch_winhttp(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let n = name.to_ascii_lowercase();
-    match n.as_str() {
-        "winhttpopen" => Ok(Some(handle_win_http_open(ctx)?)),
-        "winhttpconnect" => Ok(Some(handle_win_http_connect(ctx)?)),
-        "winhttpopenrequest" => Ok(Some(handle_win_http_open_request(ctx)?)),
-        "winhttpclosehandle" => Ok(Some(handle_win_http_close_handle(ctx)?)),
-        "winhttpaddrequestheaders" => Ok(Some(handle_win_http_add_request_headers(ctx)?)),
-        "winhttpsendrequest" => Ok(Some(handle_win_http_request_io(ctx)?)),
-        "winhttpreceiveresponse" => Ok(Some(handle_win_http_request_io(ctx)?)),
-        "winhttpquerydataavailable" => Ok(Some(handle_win_http_request_io(ctx)?)),
-        "winhttpreaddata" => Ok(Some(handle_win_http_request_io(ctx)?)),
-        _ => Ok(None),
-    }
+    crate::soft_dispatch::dispatch_soft_table(ctx, DISPATCH, name)
 }
 
 /// `HINTERNET WinHttpOpen(LPCWSTR, DWORD, LPCWSTR*, LPCWSTR*, DWORD)`.

@@ -785,6 +785,84 @@ pub(crate) fn is_known_window(state: &mut WinApiState, handle: u64) -> bool {
         || state.window_state().foreground_window_handle == crate::handles::Hwnd::from(handle)
 }
 
+/// The `user32.dll` soft export census — the single list behind
+/// [`crate::is_winapi_implemented`] and `names::SOFT_EXPORT_CENSUS`.
+///
+/// Declared beside the arms it describes, so a name is added in one file.
+/// `dispatch_table::census_tests` proves every row here has a dispatch arm.
+///
+/// Not table-driven: `dispatch_user32_extra` delegates to the `enum_caret`,
+/// `clipboard` and `raw_input` sub-dispatchers before its own arms, so those
+/// arms are only part of the accepted set.
+pub(crate) const EXPORTS: &[&str] = &[
+    "attachthreadinput",
+    "bringwindowtotop",
+    "changedisplaysettingsexw",
+    "charprevexa",
+    "charupperw",
+    "copyimage",
+    "createcaret",
+    "createiconfromresource",
+    "createiconindirect",
+    "defrawinputproc",
+    "destroycaret",
+    "dialogboxindirectparamw",
+    "dialogboxparamw",
+    "drawicona",
+    "drawiconex",
+    "drawiconw",
+    "enumchildwindows",
+    "enumdisplaysettingsa",
+    "enumdisplaysettingsw",
+    "enumwindows",
+    "findwindowa",
+    "findwindoww",
+    "flashwindowex",
+    "getcaretpos",
+    "getclassinfoexw",
+    "getclipboardsequencenumber",
+    "getdoubleclicktime",
+    "getkeyboardlayout",
+    "getmessageextrainfo",
+    "getmessagetime",
+    "getpropw",
+    "getrawinputbuffer",
+    "getrawinputdata",
+    "getrawinputdeviceinfoa",
+    "getrawinputdeviceinfow",
+    "getrawinputdevicelist",
+    "getregisteredrawinputdevices",
+    "getupdaterect",
+    "getwindowlongw",
+    "hidecaret",
+    "intersectrect",
+    "keybd_event",
+    "mapvirtualkeyw",
+    "monitorfromrect",
+    "msgwaitformultipleobjects",
+    "postthreadmessagew",
+    "ptinrect",
+    "registerdevicenotificationw",
+    "registerhotkey",
+    "registerrawinputdevices",
+    "removepropw",
+    "setcaretpos",
+    "setcursorpos",
+    "setlayeredwindowattributes",
+    "setprocessdefaultlayout",
+    "setpropw",
+    "setwindowrgn",
+    "showcaret",
+    "systemparametersinfoa",
+    "systemparametersinfow",
+    "tounicode",
+    "unregisterdevicenotification",
+    "unregisterhotkey",
+    "waitforinputidle",
+    "winhelpw",
+    "wsprintfw",
+];
+
 /// Soft dispatch for USER32 exports beyond the dense table (enumeration,
 /// caret, icon helpers, char/format helpers). String path only — hot APIs
 /// stay dense.

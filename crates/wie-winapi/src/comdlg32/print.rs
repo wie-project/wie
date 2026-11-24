@@ -2,6 +2,7 @@
 //! panel bridges.
 
 use super::state_comm_dlg_none;
+use crate::capability::WindowDialogAccess;
 use crate::gdi32::{ArgReg, paper_tenths_mm_to_mm, paper_tenths_mm_to_px, read_arg};
 use crate::guest_layout::{DevModeW, PageSetupDlgW, PrintDlgW};
 use crate::guest_memory::{with_typed_read, with_typed_write};
@@ -319,7 +320,7 @@ pub fn handle_print_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
 
     // Re-entry: the native panel ran; take the pending record and write its
     // pick back into the guest PRINTDLG.
-    if let Some(pending) = state.window_state().pending_native_print_dialog.take() {
+    if let Some(pending) = state.take_pending_native_print_dialog() {
         return finish_native_print_dialog(engine, state, pending);
     }
 
@@ -342,7 +343,7 @@ pub fn handle_print_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerR
     }
 
     // Clone the policy to avoid borrowing window_state() across the match.
-    let policy = state.window_state().print_dialog_policy.clone();
+    let policy = state.print_dialog_policy().clone();
     match policy {
         PrintDialogPolicy::Cancel => {
             state_comm_dlg_none(state);
@@ -440,8 +441,8 @@ fn open_native_print_dialog(
     let (paper_size_mm, orientation, copies, color) = dev_mode_seed_ui(seed.as_ref());
 
     let print_info_id = {
-        let id = state.window_state().next_print_info_id;
-        state.window_state().next_print_info_id = id.wrapping_add(1).max(1);
+        let id = state.next_print_info_id();
+        state.set_next_print_info_id(id.wrapping_add(1).max(1));
         u64::from(id)
     };
 
@@ -453,21 +454,22 @@ fn open_native_print_dialog(
         print_info_id,
     };
 
-    state.window_state().pending_native_print_dialog = Some(PendingNativePrintDialog {
+    // The native panel is a modal session: open the frame (depth up, the
+    // active window captured) so the re-entry's `NativePanelCtx::finish`
+    // restores it.
+    let frame = {
+        let mut native = NativePanelCtx::new(state, engine, NativePanelKind::Print);
+        native.open()?
+    };
+    state.set_pending_native_print_dialog(Some(PendingNativePrintDialog {
         print_dlg_ptr: pd_va,
         h_dev_mode_in: pd.h_dev_mode,
         h_dev_names_in: pd.h_dev_names,
         flags: pd.flags,
         print_info_id,
         pick: None,
-        // The native panel is a modal session: open the frame (depth up, the
-        // active window captured) so the re-entry's `NativePanelCtx::finish`
-        // restores it.
-        frame: Some({
-            let mut native = NativePanelCtx::new(state, engine, NativePanelKind::Print);
-            native.open()?
-        }),
-    });
+        frame: Some(frame),
+    }));
 
     tracing::info!(
         target: "wiegui",
@@ -654,7 +656,7 @@ pub fn handle_page_setup_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 
     // Re-entry: the native panel ran; take the pending record and write its
     // pick back into the guest PAGESETUPDLG.
-    if let Some(pending) = state.window_state().pending_native_page_setup.take() {
+    if let Some(pending) = state.take_pending_native_page_setup() {
         return finish_native_page_setup(engine, state, pending);
     }
 
@@ -669,7 +671,7 @@ pub fn handle_page_setup_dlg_w(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     }
 
     // Clone the policy to avoid borrowing window_state() across the match.
-    let policy = state.window_state().page_setup_dialog_policy.clone();
+    let policy = state.page_setup_dialog_policy().clone();
     match policy {
         PageSetupDialogPolicy::Cancel => {
             state_comm_dlg_none(state);
@@ -772,20 +774,21 @@ fn open_native_page_setup_dialog(
         orientation,
     };
 
-    state.window_state().pending_native_page_setup = Some(PendingNativePageSetup {
+    // The native panel is a modal session: open the frame (depth up, the
+    // active window captured) so the re-entry's `NativePanelCtx::finish`
+    // restores it.
+    let frame = {
+        let mut native = NativePanelCtx::new(state, engine, NativePanelKind::PageSetup);
+        native.open()?
+    };
+    state.set_pending_native_page_setup(Some(PendingNativePageSetup {
         page_setup_dlg_ptr: psd_va,
         h_dev_mode_in: psd.h_dev_mode,
         h_dev_names_in: psd.h_dev_names,
         flags: psd.flags,
         pick: None,
-        // The native panel is a modal session: open the frame (depth up, the
-        // active window captured) so the re-entry's `NativePanelCtx::finish`
-        // restores it.
-        frame: Some({
-            let mut native = NativePanelCtx::new(state, engine, NativePanelKind::PageSetup);
-            native.open()?
-        }),
-    });
+        frame: Some(frame),
+    }));
 
     tracing::info!(
         target: "wiegui",
@@ -883,7 +886,6 @@ fn paper_size_in_dialog_units(flags: u32, paper_mm: (u32, u32)) -> (u32, u32) {
         (width_mm.saturating_mul(100), height_mm.saturating_mul(100))
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::{

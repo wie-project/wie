@@ -428,48 +428,52 @@ impl WinmmState {
     }
 }
 
+crate::soft_dispatch::soft_exports! {
+    ("midioutgetdevcapsa", handle_midi_no_driver),
+    ("midioutgeterrortexta", handle_midi_out_get_error_text_a),
+    ("midioutprepareheader", handle_midi_no_driver),
+    ("midioutreset", handle_midi_no_driver),
+    ("midioutsetvolume", handle_midi_no_driver),
+    ("midioutshortmsg", handle_midi_no_driver),
+    ("midioutunprepareheader", handle_midi_no_driver),
+    ("midistreamclose", handle_midi_no_driver),
+    ("midistreamopen", handle_midi_no_driver),
+    ("midistreamout", handle_midi_no_driver),
+    ("midistreampause", handle_midi_no_driver),
+    ("midistreamproperty", handle_midi_no_driver),
+    ("midistreamrestart", handle_midi_no_driver),
+    ("midistreamstop", handle_midi_no_driver),
+    ("timebeginperiod", handle_time_begin_end_period),
+    ("timeendperiod", handle_time_begin_end_period),
+    ("timekillevent", handle_time_kill_event),
+    ("timesetevent", handle_time_set_event),
+    ("waveinaddbuffer", handle_wave_in_no_driver),
+    ("waveinclose", handle_wave_in_no_driver),
+    ("waveingetdevcapsw", handle_wave_in_no_driver),
+    ("waveingetnumdevs", handle_wave_in_get_num_devs),
+    ("waveinopen", handle_wave_in_no_driver),
+    ("waveinprepareheader", handle_wave_in_no_driver),
+    ("waveinreset", handle_wave_in_no_driver),
+    ("waveinstart", handle_wave_in_no_driver),
+    ("waveinunprepareheader", handle_wave_in_no_driver),
+    ("waveoutclose", handle_wave_out_close),
+    ("waveoutgetdevcapsw", handle_wave_out_get_dev_caps_w),
+    ("waveoutgeterrortextw", handle_wave_out_get_error_text_w),
+    ("waveoutgetnumdevs", handle_wave_out_get_num_devs),
+    ("waveoutopen", handle_wave_out_open),
+    ("waveoutprepareheader", handle_wave_out_prepare_header),
+    ("waveoutreset", handle_wave_out_reset),
+    ("waveoutunprepareheader", handle_wave_out_unprepare_header),
+    ("waveoutwrite", handle_wave_out_write),
+}
+
 /// Dispatch a `WINMM.dll` export by name (case-insensitive) — the string
 /// path for APIs beyond the dense `timeGetTime` row.
 pub fn dispatch_winmm_extra(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
-    let n = name.to_ascii_lowercase();
-    match n.as_str() {
-        "timesetevent" => Ok(Some(handle_time_set_event(ctx)?)),
-        "timekillevent" => Ok(Some(handle_time_kill_event(ctx)?)),
-        "waveoutopen" => Ok(Some(handle_wave_out_open(ctx)?)),
-        "waveoutclose" => Ok(Some(handle_wave_out_close(ctx)?)),
-        "waveoutprepareheader" => Ok(Some(handle_wave_out_prepare_header(ctx)?)),
-        "waveoutunprepareheader" => Ok(Some(handle_wave_out_unprepare_header(ctx)?)),
-        "waveoutwrite" => Ok(Some(handle_wave_out_write(ctx)?)),
-        "waveoutgetnumdevs" => Ok(Some(handle_wave_out_get_num_devs(ctx)?)),
-        "waveoutgetdevcapsw" => Ok(Some(handle_wave_out_get_dev_caps_w(ctx)?)),
-        "waveoutgeterrortextw" => Ok(Some(handle_wave_out_get_error_text_w(ctx)?)),
-        "waveoutreset" => Ok(Some(handle_wave_out_reset(ctx)?)),
-        "waveingetnumdevs" => Ok(Some(handle_wave_in_get_num_devs(ctx)?)),
-        "waveinopen"
-        | "waveinclose"
-        | "waveinaddbuffer"
-        | "waveinprepareheader"
-        | "waveinunprepareheader"
-        | "waveinstart"
-        | "waveinreset" => Ok(Some(handle_wave_in_no_driver(ctx)?)),
-        "waveingetdevcapsw" => Ok(Some(handle_wave_in_no_driver(ctx)?)),
-        "midioutgetdevcapsa"
-        | "midioutprepareheader"
-        | "midioutreset"
-        | "midioutsetvolume"
-        | "midioutshortmsg"
-        | "midioutunprepareheader" => Ok(Some(handle_midi_no_driver(ctx)?)),
-        "midioutgeterrortexta" => Ok(Some(handle_midi_out_get_error_text_a(ctx)?)),
-        "midistreamopen" | "midistreamclose" | "midistreamout" | "midistreampause"
-        | "midistreamproperty" | "midistreamrestart" | "midistreamstop" => {
-            Ok(Some(handle_midi_no_driver(ctx)?))
-        }
-        "timebeginperiod" | "timeendperiod" => Ok(Some(handle_time_begin_end_period(ctx)?)),
-        _ => Ok(None),
-    }
+    crate::soft_dispatch::dispatch_soft_table(ctx, DISPATCH, name)
 }
 
 /// Handles `WINMM.dll!timeSetEvent`.

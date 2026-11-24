@@ -27,7 +27,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # The canonical order. A space-separated string, not an array: bash 3.2 (the
 # macOS system bash) errors on expanding an empty array under `set -u`, and the
 # other two scripts this one absorbed had that hazard documented.
-ALL_STEPS="file-sizes dep-direction fmt clippy micro-exes nextest micro-suite perf"
+ALL_STEPS="file-sizes dep-direction winapi-port fmt clippy micro-exes nextest micro-suite perf"
 
 usage() {
   cat <<EOF
@@ -230,6 +230,167 @@ print("\n".join(sorted(rows)))
 }
 
 # ---------------------------------------------------------------------------
+# Step 2b — the `wie-winapi` port boundary (ADR-0006).
+#
+# `wie-winapi` publishes `wie_winapi::port`. `wie-runtime` is supposed to use it
+# and nothing else. Before this check, both statements were documentation: the
+# crate root re-exported ~60 names flat out of `state`, so "the runtime needs
+# this type" and "the runtime reaches into the emulator's guts" looked
+# identical, and a rename inside `state` was a breaking cross-crate change.
+#
+# Nothing in the test suite asserts this either — that is precisely why ADR-0006
+# calls the gate the artefact and the port module "documentation, not
+# enforcement". Two rules, both mechanical:
+#
+#   R1  no `wie_winapi::<module>::` path for a module the port re-exports from:
+#       user32 gdi32 present winmm kernel32 dll_loader pthread seh
+#   R2  no direct `WinApiState` field poke for a class the port has an accessor
+#       for: .heap_state .file_io .module_state .dll_states .message_queue
+#       .kernel.threads .display
+#
+# Comment lines are skipped: a doc comment naming a module cannot reach it.
+#
+# A deliberate exception is a ONE-LINE edit below. That is the intended cost —
+# it makes a new deep reach a reviewable decision rather than an accident. If
+# ALLOWED_DEEP ever approaches the size of the reference count (~400), the gate
+# is not constraining anything and the port surface needs widening instead.
+#
+# KNOWN WIDE SURFACE, not yet gated: `state.kernel.sync` (~45 sites — the
+# scheduler drives SyncState's fields directly) and the `WinApiState` struct
+# literal in `crates/wie-runtime/src/memory.rs`. Both need one opaque handle
+# apiece, which is a change of its own. Listing them here rather than silently
+# omitting them is the point: they are visible debt, not an oversight.
+#
+# Costs ~10ms (grep, no build), so it runs next to dep-direction, before
+# anything expensive.
+# ---------------------------------------------------------------------------
+check_winapi_port() {
+  # -------------------------------------------------------------------------
+  # THE ALLOW-LIST — the single source of truth for remaining deep reach.
+  # One line here = one deliberate exception. Entries are "path:why".
+  # -------------------------------------------------------------------------
+  local ALLOWED_DEEP=()
+
+  # Modules the port re-exports from; `wie_winapi::<mod>::` is no longer theirs.
+  local GATED_MODULES="user32|gdi32|present|winmm|kernel32|dll_loader|pthread|seh"
+
+  # `WinApiState` field classes the port has accessors for.
+  local GATED_FIELDS="heap_state|file_io|module_state|dll_states|message_queue"
+
+  # Both halves of the crate. An integration test that calls a WinAPI handler
+  # by name is the documented deadlock class and is the pattern a reader copies
+  # from, so it is gated exactly like `src` — leaving `tests/` out would hold
+  # the line in the harder place and drop it in the more influential one.
+  local srcs=(
+    "$ROOT/crates/wie-runtime/src"
+    "$ROOT/crates/wie-runtime/tests"
+  )
+  local fail=0 hits allowed extra
+
+  # Drop comment-only lines, keeping grep's "file:line:content" shape so a
+  # failure names the site. Then subtract the allow-list, which is why an
+  # exception has to be spelled out rather than tolerated by a regex.
+  strip_and_subtract() ( # stdin = raw grep hits, $1 = rule label
+    local rule="$1" line keep
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      # "file:line:   // ..." — indentation before the comment marker varies.
+      if [[ "$line" =~ ^[^:]+:[0-9]+:[[:space:]]*// ]]; then
+        continue
+      fi
+      keep=1
+      # `set -u` + empty array is an unbound-variable error on bash 3.2.
+      if (( ${#ALLOWED_DEEP[@]} > 0 )); then
+        for allowed in "${ALLOWED_DEEP[@]}"; do
+          case "$line" in
+            *"${allowed%%:*}"*) keep=0 ; break ;;
+          esac
+        done
+      fi
+      if (( keep )); then
+        printf '%s\n' "$line"
+      fi
+    done
+    # The subshell's status is the command substitution's, and `set -e` would
+    # read a "no surviving hits" exit code as a failure. Always succeed; the
+    # caller decides pass/fail from empty vs non-empty output.
+    return 0
+  )
+
+  # --- R1: module-qualified reach -------------------------------------------
+  # Two shapes, because both existed in the code ADR-0006 measured:
+  #
+  #   R1a  a path        `wie_winapi::present::frame_timing_enabled()`
+  #   R1b  a bare name inside an import group
+  #        `use wie_winapi::{HandlerContext, gdi32, user32};`
+  #
+  # R1b is the one that matters most: importing the module and calling
+  # `user32::handle_get_dc` by name is how a test reached a WinAPI handler
+  # directly, and a path-only grep misses it. So R1b first joins each
+  # `use [pub use] wie_winapi…;` statement (they wrap) into one line, then
+  # looks for a gated module name in item position.
+  hits=$(
+    {
+      grep -rnE "wie_winapi::($GATED_MODULES)(::|[,;}])" "${srcs[@]}" || true
+      # The same thing written as an inline group: `wie_winapi::{…, user32}`
+      # as an expression rather than a `use`. Legal Rust, and a path-only grep
+      # reads the `{` where it expects the module name.
+      grep -rnE "wie_winapi::\{[^}]*\b($GATED_MODULES)\b[^}]*\}" "${srcs[@]}" || true
+      find "${srcs[@]}" -name '*.rs' -print0 \
+        | xargs -0 awk '
+            function flush() {
+              if (buf != "") printf "%s:%d:%s\n", file, start, buf
+              buf = ""
+            }
+            FNR == 1 { flush() }
+            {
+              line = $0
+              sub(/^[[:space:]]+/, "", line)
+              if (line ~ /^\/\//) { flush(); next }
+              if (buf != "") { buf = buf " " line; if (line ~ /;/) flush(); next }
+              if (line ~ /^(pub )?use wie_winapi/) { buf = line; start = FNR; file = FILENAME }
+              if (line ~ /;/) flush()
+            }
+            END { flush() }
+          ' \
+        | grep -E "[{,[:space:]]($GATED_MODULES)[[:space:],;}]" || true
+    } | sort -u | strip_and_subtract R1
+  )
+  if [[ -n "$hits" ]]; then
+    echo "wie-runtime reaches into a gated wie_winapi module (use wie_winapi::port::… instead):"
+    printf '%s\n' "$hits" | sed 's/^/  /'
+    echo "  gated modules: ${GATED_MODULES//|/ }"
+    fail=1
+  fi
+
+  # --- R2: direct field pokes ----------------------------------------------
+  hits=$(
+    {
+      grep -rnE "\.($GATED_FIELDS)\b|\.kernel\.threads\b|\.display[[:space:]]*=[^=]" \
+        "${srcs[@]}" || true
+    } | sort -u | strip_and_subtract R2
+  )
+  if [[ -n "$hits" ]]; then
+    echo "wie-runtime pokes a WinApiState field directly (use the port accessor instead):"
+    printf '%s\n' "$hits" | sed 's/^/  /'
+    echo "  accessor table: docs/adr/0006-winapi-port-module.md / crates/wie-winapi/src/port.rs"
+    fail=1
+  fi
+
+  if (( fail )); then
+    echo "winapi port boundary violated (see check_winapi_port() in scripts/check.sh)"
+    echo "to accept a deep reach, add it to ALLOWED_DEEP at the top of check_winapi_port()."
+    exit 1
+  fi
+
+  extra=""
+  if (( ${#ALLOWED_DEEP[@]} > 0 )); then
+    extra=", ${#ALLOWED_DEEP[@]} allow-listed"
+  fi
+  echo "winapi port boundary ok (0 gated module paths, 0 field pokes${extra})"
+}
+
+# ---------------------------------------------------------------------------
 # Step 8 — `perf` budget: long_loop wall-clock.
 #
 # CONTRIBUTING rule 2 makes the long_loop pin a pass/fail condition, so it needs
@@ -374,6 +535,7 @@ step_header() {
   case "$1" in
     file-sizes)    echo "=== file sizes ===" ;;
     dep-direction) echo "=== crate dependency direction ===" ;;
+    winapi-port)   echo "=== wie-winapi port boundary (ADR-0006) ===" ;;
     fmt)           echo "=== cargo fmt ===" ;;
     clippy)        echo "=== cargo clippy (advisory; no -D warnings — clippy lints are not denied) ===" ;;
     micro-exes)    echo "=== micro-exes (fixtures for the integration tests) ===" ;;
@@ -387,6 +549,7 @@ run_step() {
   case "$1" in
     file-sizes)    check_file_sizes ;;
     dep-direction) check_deps ;;
+    winapi-port)   check_winapi_port ;;
     fmt)           cargo fmt --all --check --manifest-path "$ROOT/Cargo.toml" ;;
     clippy)        cargo clippy --workspace --all-targets --manifest-path "$ROOT/Cargo.toml" ;;
     micro-exes)    make -C "$ROOT/micro-exes" ;;

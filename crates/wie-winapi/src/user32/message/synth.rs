@@ -1,6 +1,7 @@
 //! Message-filter helpers and idle-message synthesis (timers, paint, erase)
 //! plus the class-brush background machinery (split from `message.rs`).
 
+use crate::capability::PresentAccess;
 use crate::gdi32::IRect;
 use crate::gdi32::brush_color;
 use crate::gdi32::fill_rect_surface;
@@ -373,7 +374,7 @@ pub(crate) fn erase_window_background(state: &mut WinApiState, hwnd: u64) -> boo
     // F2 no-black: record the erase color as the owning surface's background
     // so the presenter clears its surface with it — regions the frame does
     // not cover (resize seams, pre-first-paint) never read black.
-    state.present().set_background_color(info.hwnd, color);
+    state.set_background_color(info.hwnd, color);
     let (width, height) =
         find_window(state, hwnd).map_or((0, 0), |window| (window.width, window.height));
     if width <= 0 || height <= 0 {

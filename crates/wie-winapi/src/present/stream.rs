@@ -12,10 +12,18 @@
 //! through the flush-input / handback protocol documented in
 //! `d3d9/capture.rs`.
 //!
-//! Gate: off by default. The GUI host opts in via
-//! `GuestHandle::enable_capture_stream` (which spawns this thread and flips
-//! `capture_enabled`); headless runs and the micro-suite never spawn it, so
-//! the CI hashes exercise the unchanged legacy in-handler raster path.
+//! Gate: off by default. The gate is a single `AtomicBool`
+//! (`CapturePipeline::enabled`) with exactly ONE read site
+//! (`CapturePipeline::enabled()`) and one write site
+//! (`CapturePipeline::set_enabled`, reached only through
+//! `PresentChannel::set_capture_enabled`). A headless `RuntimeSession` — every
+//! `RuntimeSession`/micro-suite test and the `trace` runs — never arms it, so
+//! the CI hashes exercise the unchanged legacy in-handler raster path; the GUI
+//! host opts in via `GuestHandle::enable_capture_stream`. Keep it at one read
+//! site: a second one is a second way for the replay path to switch itself on
+//! without the coverage that the tested path has. `tests.rs` asserts both
+//! halves — the gated-off default path spawns no render thread at all, and a
+//! spawned streamer is exactly one counted thread.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,6 +38,9 @@ use crate::d3d9::capture::{CaptureFlush, CaptureHandback, ReplayTargets};
 pub(crate) struct CapturePipeline {
     /// Capture mode gate — handlers record + flush only when set. Flipped
     /// AFTER the render thread spawns so a flush always has a consumer.
+    ///
+    /// The ONE `AtomicBool` the T4.3 gate allows: written only by
+    /// `set_enabled`, read only by `enabled` — keep it that way.
     enabled: AtomicBool,
     /// Render-thread shutdown flag (checked alongside every condvar wait).
     stopped: AtomicBool,
@@ -78,6 +89,9 @@ impl CapturePipeline {
 
     /// Whether the D3D9 handlers should record ops + flush instead of
     /// rasterizing inline.
+    ///
+    /// The gate's ONE read site (see the module doc): every caller in
+    /// `d3d9/` reaches the flag through here.
     #[must_use]
     pub(crate) fn enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
@@ -243,16 +257,20 @@ impl Drop for CaptureStreamerHandle {
 /// `GuestHandle::enable_capture_stream`) after spawning, so an enqueued
 /// flush always has a live consumer. `None` when the thread cannot spawn
 /// (the legacy in-handler raster path stays active).
+///
+/// The thread itself is created through `super::spawn_render_thread` — the
+/// module's single creation site, which counts it, so `tests.rs` can assert
+/// that the gated-off default path spawns none and that this one is exactly
+/// one.
 #[must_use]
 pub fn spawn_capture_streamer(
     channel: Arc<super::PresentChannel>,
     wake: Box<dyn Fn() + Send>,
 ) -> Option<CaptureStreamerHandle> {
     let worker_channel = Arc::clone(&channel);
-    let join = std::thread::Builder::new()
-        .name("wie-d3d9-capture".into())
-        .spawn(move || capture_thread(worker_channel, wake))
-        .ok()?;
+    let join = super::spawn_render_thread("wie-d3d9-capture", move || {
+        capture_thread(worker_channel, wake);
+    })?;
     Some(CaptureStreamerHandle {
         channel,
         join: std::sync::Mutex::new(Some(join)),

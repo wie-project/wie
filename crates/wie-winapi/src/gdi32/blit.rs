@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 
+use crate::capability::PresentAccess;
 use crate::gdi32::{ArgReg, read_arg};
 use crate::guest_layout::Rect;
 use crate::guest_memory::{checked_address, read_i32, read_u64, with_typed_read};
@@ -539,8 +540,8 @@ pub(crate) fn fill_rect_surface(
     cy: i32,
     color: u32,
 ) {
-    state.present().ensure_surface(hwnd, dest_w, dest_h);
-    if let Some(surf) = state.present().surfaces.get_mut(&hwnd) {
+    state.ensure_surface(hwnd, dest_w, dest_h);
+    if let Some(surf) = state.surface_mut(hwnd) {
         // Row pitch vs logical width: the surface buffer is pitch-padded
         // (ADR-0001), so rows start at `row * stride`; the written-rect clip
         // below stays in LOGICAL coordinates.
@@ -574,14 +575,14 @@ pub(crate) fn fill_rect_surface(
                 right: i32::try_from(x1).unwrap_or(0),
                 bottom: i32::try_from(y1).unwrap_or(0),
             };
-            state.present().mark_dirty(hwnd, written);
+            state.mark_dirty(hwnd, written);
         }
     }
     // Always defer — the runtime drains pending
     // publishes once per repaint cycle at the empty-queue quiescence point,
     // so a WM_PAINT cycle's erase + BitBlt + control paints + captions emit a
     // single complete frame.
-    state.present().publish_deferred(hwnd);
+    state.publish_deferred(hwnd);
 }
 
 /// Handles `GDI32.dll!BitBlt` — real 32-bpp SRCCOPY blit to window surfaces.
@@ -693,9 +694,7 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     }
 
     // Ensure destination surface.
-    state
-        .present()
-        .ensure_surface(info.hwnd, info.width, info.height);
+    state.ensure_surface(info.hwnd, info.width, info.height);
 
     // B9(c): time the mask copy (copy ①) — only when frame timing is enabled.
     let blit_t0 = crate::present::frame_timing_enabled().then(std::time::Instant::now);
@@ -737,9 +736,7 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
         // The dest pitch is the surface stride (64-padded); `info.width` is
         // the LOGICAL width and must not be used to index rows.
         let (dest, dest_stride) = state
-            .present()
-            .surfaces
-            .get_mut(&info.hwnd)
+            .surface_mut(info.hwnd)
             .map(|s| (&mut s.pixels[..], s.stride))
             .unwrap_or((&mut [][..], 0));
         if dest.is_empty() {
@@ -795,19 +792,19 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
             })
         });
         if let Some(dirty) = dirty {
-            state.present().mark_dirty(info.hwnd, dirty);
+            state.mark_dirty(info.hwnd, dirty);
         }
     }
 
     if let Some(t0) = blit_t0 {
-        state.present().record_blit_copy(t0.elapsed().as_nanos());
+        state.record_blit_copy(t0.elapsed().as_nanos());
     }
 
     // B3.6: defer the publish to the repaint-cycle boundary (one frame per
     // full cycle). The surface buffer stays put and the dirty accumulator
     // keeps unioning until the drain, so the published frame is the
     // fully-painted composite with the union region.
-    state.present().publish_deferred(info.hwnd);
+    state.publish_deferred(info.hwnd);
 
     ctx.finish(1)
 }
@@ -913,7 +910,6 @@ pub fn handle_fill_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     let return_value = u64::from(filled);
     ctx.finish(return_value)
 }
-
 #[cfg(test)]
 mod tests {
     use super::{BLIT_SCRATCH, IRect, ancestor_offset, subtract_rect, with_blit_scratch};

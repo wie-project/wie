@@ -6,10 +6,10 @@ use super::GuestHandle;
 use crate::memory::DEFAULT_LAYOUT;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use wie_winapi::handles::Hwnd;
-use wie_winapi::user32::Dimension;
-use wie_winapi::user32::menu::{MenuEntry, MenuRecord};
-use wie_winapi::vfs::VolumeConfig;
+use wie_winapi::port::Dimension;
+use wie_winapi::port::Hwnd;
+use wie_winapi::port::VolumeConfig;
+use wie_winapi::port::{MenuEntry, MenuRecord};
 
 /// `window_menu_items` returns the cached tree while `menu_dirty` is
 /// false and rebuilds (seeing new items) once a mutation dirties it.
@@ -29,14 +29,14 @@ fn window_menu_items_cache_invalidates_on_dirty() {
     {
         let ws = winapi_state.window_state();
         ws.menus.push(MenuRecord {
-            handle: wie_winapi::handles::Hmenu::from(menu_handle),
+            handle: wie_winapi::port::Hmenu::from(menu_handle),
             items: vec![MenuEntry::Popup {
                 text: "File".to_owned(),
-                submenu: wie_winapi::handles::Hmenu::from(submenu),
+                submenu: wie_winapi::port::Hmenu::from(submenu),
             }],
         });
         ws.menus.push(MenuRecord {
-            handle: wie_winapi::handles::Hmenu::from(submenu),
+            handle: wie_winapi::port::Hmenu::from(submenu),
             items: vec![
                 MenuEntry::Item {
                     id: 100,
@@ -53,8 +53,8 @@ fn window_menu_items_cache_invalidates_on_dirty() {
                 },
             ],
         });
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(0x100),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(0x100),
             menu_handle,
             ..Default::default()
         });
@@ -70,7 +70,7 @@ fn window_menu_items_cache_invalidates_on_dirty() {
     let handle = GuestHandle {
         state: Arc::clone(&__state_arc),
         present_channel: Arc::clone(&__present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::new(RwLock::new(None)),
         lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
     };
@@ -98,7 +98,7 @@ fn window_menu_items_cache_invalidates_on_dirty() {
         let submenu_record = ws
             .menus
             .iter_mut()
-            .find(|m| m.handle == wie_winapi::handles::Hmenu::from(submenu))
+            .find(|m| m.handle == wie_winapi::port::Hmenu::from(submenu))
             .expect("submenu record");
         submenu_record.items.push(MenuEntry::Item {
             id: 300,
@@ -137,7 +137,7 @@ fn menu_node_state_reflects_guest_enable_check_mutations() {
     {
         let ws = winapi_state.window_state();
         ws.menus.push(MenuRecord {
-            handle: wie_winapi::handles::Hmenu::from(menu_handle),
+            handle: wie_winapi::port::Hmenu::from(menu_handle),
             items: vec![MenuEntry::Item {
                 id: 100,
                 text: "Paste".to_owned(),
@@ -145,8 +145,8 @@ fn menu_node_state_reflects_guest_enable_check_mutations() {
                 checked: false,
             }],
         });
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(0x100),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(0x100),
             menu_handle,
             ..Default::default()
         });
@@ -162,7 +162,7 @@ fn menu_node_state_reflects_guest_enable_check_mutations() {
     let handle = GuestHandle {
         state: Arc::clone(&__state_arc),
         present_channel: Arc::clone(&__present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::new(RwLock::new(None)),
         lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
     };
@@ -180,7 +180,7 @@ fn menu_node_state_reflects_guest_enable_check_mutations() {
         let record = ws
             .menus
             .iter_mut()
-            .find(|m| m.handle == wie_winapi::handles::Hmenu::from(menu_handle))
+            .find(|m| m.handle == wie_winapi::port::Hmenu::from(menu_handle))
             .expect("menu record");
         if let Some(MenuEntry::Item { enabled, .. }) = record.items.first_mut() {
             *enabled = false;
@@ -201,7 +201,7 @@ fn menu_node_state_reflects_guest_enable_check_mutations() {
         let record = ws
             .menus
             .iter_mut()
-            .find(|m| m.handle == wie_winapi::handles::Hmenu::from(menu_handle))
+            .find(|m| m.handle == wie_winapi::port::Hmenu::from(menu_handle))
             .expect("menu record");
         if let Some(MenuEntry::Item {
             enabled, checked, ..
@@ -246,7 +246,7 @@ fn window_menu_items_prefers_the_focused_windows_menu() {
     {
         let ws = winapi_state.window_state();
         ws.menus.push(MenuRecord {
-            handle: wie_winapi::handles::Hmenu::from(menu_a),
+            handle: wie_winapi::port::Hmenu::from(menu_a),
             items: vec![MenuEntry::Item {
                 id: 1,
                 text: "Exit".to_owned(),
@@ -255,7 +255,7 @@ fn window_menu_items_prefers_the_focused_windows_menu() {
             }],
         });
         ws.menus.push(MenuRecord {
-            handle: wie_winapi::handles::Hmenu::from(menu_b),
+            handle: wie_winapi::port::Hmenu::from(menu_b),
             items: vec![MenuEntry::Item {
                 id: 2,
                 text: "Paste".to_owned(),
@@ -263,27 +263,27 @@ fn window_menu_items_prefers_the_focused_windows_menu() {
                 checked: false,
             }],
         });
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(a),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(a),
             menu_handle: menu_a,
             ..Default::default()
         });
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(b),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(b),
             menu_handle: menu_b,
             ..Default::default()
         });
         // B's EDIT: its menu_handle slot holds the CHILD ID (5), not a
         // menu — the selection must not mistake it for one.
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(b_edit),
-            parent_handle: wie_winapi::handles::Hwnd::from(b),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(b_edit),
+            parent_handle: wie_winapi::port::Hwnd::from(b),
             menu_handle: 5,
             ..Default::default()
         });
         // A top-level with no menu at all.
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(c),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(c),
             ..Default::default()
         });
         winapi_state.sync_window_mirror();
@@ -298,7 +298,7 @@ fn window_menu_items_prefers_the_focused_windows_menu() {
     let handle = GuestHandle {
         state: Arc::clone(&__state_arc),
         present_channel: Arc::clone(&__present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::new(RwLock::new(None)),
         lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
     };
@@ -306,7 +306,7 @@ fn window_menu_items_prefers_the_focused_windows_menu() {
     // Focus sits on B's child EDIT → the bar mirrors B's menu.
     {
         let mut state = handle.state.lock().expect("lock state");
-        state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::from(b_edit);
+        state.window_state().focus_window_handle = wie_winapi::port::Hwnd::from(b_edit);
         state.sync_window_mirror();
     }
     assert_eq!(
@@ -318,7 +318,7 @@ fn window_menu_items_prefers_the_focused_windows_menu() {
     // Focus on A → A's menu.
     {
         let mut state = handle.state.lock().expect("lock state");
-        state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::from(a);
+        state.window_state().focus_window_handle = wie_winapi::port::Hwnd::from(a);
         state.sync_window_mirror();
     }
     assert_eq!(
@@ -331,7 +331,7 @@ fn window_menu_items_prefers_the_focused_windows_menu() {
     // top-level (A).
     {
         let mut state = handle.state.lock().expect("lock state");
-        state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::from(c);
+        state.window_state().focus_window_handle = wie_winapi::port::Hwnd::from(c);
         state.sync_window_mirror();
     }
     assert_eq!(
@@ -343,7 +343,7 @@ fn window_menu_items_prefers_the_focused_windows_menu() {
     // No focus at all → same fallback.
     {
         let mut state = handle.state.lock().expect("lock state");
-        state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::NULL;
+        state.window_state().focus_window_handle = wie_winapi::port::Hwnd::NULL;
         state.sync_window_mirror();
     }
     assert_eq!(
@@ -382,7 +382,7 @@ fn take_host_geometry_request_reads_and_clears_the_pending_slot() {
     let handle = GuestHandle {
         state: Arc::clone(&__state_arc),
         present_channel: Arc::clone(&__present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::new(RwLock::new(None)),
         lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
     };
@@ -423,15 +423,15 @@ fn window_at_in_hit_tests_the_named_top_level_subtree() {
     {
         let ws = winapi_state.window_state();
         // Top-level A (the main window) with a button at (10, 10, 120x40).
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(a),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(a),
             width: 360,
             height: 140,
             ..Default::default()
         });
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(a_button),
-            parent_handle: wie_winapi::handles::Hwnd::from(a),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(a_button),
+            parent_handle: wie_winapi::port::Hwnd::from(a),
             x: 10,
             y: 10,
             width: 120,
@@ -440,15 +440,15 @@ fn window_at_in_hit_tests_the_named_top_level_subtree() {
             ..Default::default()
         });
         // Top-level B (a dialog) with an edit at (5, 5, 50x50).
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(b),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(b),
             width: 200,
             height: 200,
             ..Default::default()
         });
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(b_edit),
-            parent_handle: wie_winapi::handles::Hwnd::from(b),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(b_edit),
+            parent_handle: wie_winapi::port::Hwnd::from(b),
             x: 5,
             y: 5,
             width: 50,
@@ -468,7 +468,7 @@ fn window_at_in_hit_tests_the_named_top_level_subtree() {
     let handle = GuestHandle {
         state: Arc::clone(&__state_arc),
         present_channel: Arc::clone(&__present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::new(RwLock::new(None)),
         lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
     };
@@ -522,11 +522,11 @@ fn focus_window_reflects_the_guest_focus_handle() {
             .expect("winapi state");
     {
         let ws = winapi_state.window_state();
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(0x201),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(0x201),
             ..Default::default()
         });
-        ws.focus_window_handle = wie_winapi::handles::Hwnd::from(0x201);
+        ws.focus_window_handle = wie_winapi::port::Hwnd::from(0x201);
     }
     let __state_arc = Arc::new(Mutex::new(winapi_state));
     let __present_channel = {
@@ -538,7 +538,7 @@ fn focus_window_reflects_the_guest_focus_handle() {
     let handle = GuestHandle {
         state: Arc::clone(&__state_arc),
         present_channel: Arc::clone(&__present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::new(RwLock::new(None)),
         lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
     };
@@ -550,7 +550,7 @@ fn focus_window_reflects_the_guest_focus_handle() {
     );
     {
         let mut state = handle.state.lock().expect("lock state");
-        state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::NULL;
+        state.window_state().focus_window_handle = wie_winapi::port::Hwnd::NULL;
     }
     assert_eq!(
         handle.focus_window(),
@@ -579,20 +579,20 @@ fn focused_top_level_ascends_to_the_parentless_ancestor() {
     let dialog_button = 0x201_u64;
     {
         let ws = winapi_state.window_state();
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(main),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(main),
             ..Default::default()
         });
         // The modal dialog is a CHILD of the owner (it composites into
         // the owner's surface), and the button is a child of the dialog.
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(dialog),
-            parent_handle: wie_winapi::handles::Hwnd::from(main),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(dialog),
+            parent_handle: wie_winapi::port::Hwnd::from(main),
             ..Default::default()
         });
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(dialog_button),
-            parent_handle: wie_winapi::handles::Hwnd::from(dialog),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(dialog_button),
+            parent_handle: wie_winapi::port::Hwnd::from(dialog),
             ..Default::default()
         });
         winapi_state.sync_window_mirror();
@@ -607,7 +607,7 @@ fn focused_top_level_ascends_to_the_parentless_ancestor() {
     let handle = GuestHandle {
         state: Arc::clone(&__state_arc),
         present_channel: Arc::clone(&__present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::new(RwLock::new(None)),
         lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
     };
@@ -615,7 +615,7 @@ fn focused_top_level_ascends_to_the_parentless_ancestor() {
     // Focus on the dialog's button → the owner top-level (main).
     {
         let mut state = handle.state.lock().expect("lock state");
-        state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::from(dialog_button);
+        state.window_state().focus_window_handle = wie_winapi::port::Hwnd::from(dialog_button);
         state.sync_window_mirror();
     }
     assert_eq!(
@@ -627,7 +627,7 @@ fn focused_top_level_ascends_to_the_parentless_ancestor() {
     // Focus on a top-level directly → itself.
     {
         let mut state = handle.state.lock().expect("lock state");
-        state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::from(main);
+        state.window_state().focus_window_handle = wie_winapi::port::Hwnd::from(main);
         state.sync_window_mirror();
     }
     assert_eq!(handle.focused_top_level(), Some(main));
@@ -635,7 +635,7 @@ fn focused_top_level_ascends_to_the_parentless_ancestor() {
     // No focus → None (the caller falls back to the primary window).
     {
         let mut state = handle.state.lock().expect("lock state");
-        state.window_state().focus_window_handle = wie_winapi::handles::Hwnd::NULL;
+        state.window_state().focus_window_handle = wie_winapi::port::Hwnd::NULL;
         state.sync_window_mirror();
     }
     assert_eq!(
@@ -668,15 +668,15 @@ fn resize_window_erases_background_of_the_resized_window() {
     let child = 0x101_u64;
     {
         let ws = winapi_state.window_state();
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(top),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(top),
             width: 640,
             height: 420,
             ..Default::default()
         });
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(child),
-            parent_handle: wie_winapi::handles::Hwnd::from(top),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(child),
+            parent_handle: wie_winapi::port::Hwnd::from(top),
             ..Default::default()
         });
     }
@@ -690,7 +690,7 @@ fn resize_window_erases_background_of_the_resized_window() {
     let handle = GuestHandle {
         state: Arc::clone(&__state_arc),
         present_channel: Arc::clone(&__present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::new(RwLock::new(None)),
         lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
     };
@@ -702,7 +702,7 @@ fn resize_window_erases_background_of_the_resized_window() {
     let top_record = ws
         .windows
         .iter()
-        .find(|w| w.handle == wie_winapi::handles::Hwnd::from(top))
+        .find(|w| w.handle == wie_winapi::port::Hwnd::from(top))
         .expect("top window record exists");
     assert_eq!(
         (top_record.width, top_record.height),
@@ -716,14 +716,14 @@ fn resize_window_erases_background_of_the_resized_window() {
     assert!(
         top_record
             .flags
-            .contains(wie_winapi::WindowFlags::ERASE_BACKGROUND),
+            .contains(wie_winapi::port::WindowFlags::ERASE_BACKGROUND),
         "the resized window must request a class-brush erase (the DIB was \
          reallocated zeroed — without the erase the background stays black)"
     );
     let child_record = ws
         .windows
         .iter()
-        .find(|w| w.handle == wie_winapi::handles::Hwnd::from(child))
+        .find(|w| w.handle == wie_winapi::port::Hwnd::from(child))
         .expect("child window record exists");
     assert!(
         child_record.invalidated,
@@ -732,7 +732,7 @@ fn resize_window_erases_background_of_the_resized_window() {
     assert!(
         !child_record
             .flags
-            .contains(wie_winapi::WindowFlags::ERASE_BACKGROUND),
+            .contains(wie_winapi::port::WindowFlags::ERASE_BACKGROUND),
         "descendants paint their own background — no erase flag on the child"
     );
 }
@@ -751,10 +751,10 @@ fn set_drop_files_maps_host_paths_to_guest_paths() {
     let mut winapi_state =
         crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
             .expect("winapi state");
-    winapi_state.file_io.volumes = VolumeConfig {
+    winapi_state.set_volumes(VolumeConfig {
         bottle_root: Some(PathBuf::from("/tmp/bottle")),
         drive_d_root: Some(PathBuf::from("/Users/me/data")),
-    };
+    });
     let __state_arc = Arc::new(Mutex::new(winapi_state));
     let __present_channel = {
         let mut __guard = __state_arc
@@ -765,7 +765,7 @@ fn set_drop_files_maps_host_paths_to_guest_paths() {
     let handle = GuestHandle {
         state: Arc::clone(&__state_arc),
         present_channel: Arc::clone(&__present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::new(RwLock::new(None)),
         lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
     };
@@ -781,7 +781,7 @@ fn set_drop_files_maps_host_paths_to_guest_paths() {
     );
     assert_eq!(
         hdrop,
-        wie_winapi::user32::dragdrop::FAKE_HDROP,
+        wie_winapi::port::FAKE_HDROP,
         "set_drop_files returns the fake HDROP"
     );
 
@@ -811,10 +811,10 @@ fn set_drop_files_returns_zero_when_nothing_maps() {
     let mut winapi_state =
         crate::memory::default_winapi_state(&DEFAULT_LAYOUT, Arc::new(Vec::new()), &process)
             .expect("winapi state");
-    winapi_state.file_io.volumes = VolumeConfig {
+    winapi_state.set_volumes(VolumeConfig {
         bottle_root: Some(PathBuf::from("/tmp/bottle")),
         drive_d_root: Some(PathBuf::from("/Users/me/data")),
-    };
+    });
     let __state_arc = Arc::new(Mutex::new(winapi_state));
     let __present_channel = {
         let mut __guard = __state_arc
@@ -825,7 +825,7 @@ fn set_drop_files_returns_zero_when_nothing_maps() {
     let handle = GuestHandle {
         state: Arc::clone(&__state_arc),
         present_channel: Arc::clone(&__present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::new(RwLock::new(None)),
         lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
     };
@@ -864,11 +864,11 @@ fn z_snapshot_reads_rev_and_order_under_one_lock() {
             .expect("winapi state");
     {
         let present = winapi_state.present();
-        present.register_top_level(wie_winapi::handles::Hwnd::from(0x100));
-        present.register_top_level(wie_winapi::handles::Hwnd::from(0x200));
-        present.register_top_level(wie_winapi::handles::Hwnd::from(0x300));
+        present.register_top_level(wie_winapi::port::Hwnd::from(0x100));
+        present.register_top_level(wie_winapi::port::Hwnd::from(0x200));
+        present.register_top_level(wie_winapi::port::Hwnd::from(0x300));
         // HWND_TOP: 0x100 to the front → back-to-front [0x200, 0x300, 0x100].
-        present.z_order_to_top(wie_winapi::handles::Hwnd::from(0x100));
+        present.z_order_to_top(wie_winapi::port::Hwnd::from(0x100));
     }
     let __state_arc = Arc::new(Mutex::new(winapi_state));
     let __present_channel = {
@@ -880,7 +880,7 @@ fn z_snapshot_reads_rev_and_order_under_one_lock() {
     let handle = GuestHandle {
         state: Arc::clone(&__state_arc),
         present_channel: Arc::clone(&__present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::new(RwLock::new(None)),
         lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
     };
@@ -895,7 +895,7 @@ fn z_snapshot_reads_rev_and_order_under_one_lock() {
         let mut state = handle.state.lock().expect("lock state");
         state
             .present()
-            .z_order_to_bottom(wie_winapi::handles::Hwnd::from(0x300));
+            .z_order_to_bottom(wie_winapi::port::Hwnd::from(0x300));
     }
     let (rev2, order2) = handle.z_snapshot();
     assert!(rev2 > rev, "the z-change bumps the revision");
@@ -927,7 +927,7 @@ fn handle_with_stats() -> (GuestHandle, Arc<crate::mt_runtime::LockWaitStats>) {
     let handle = GuestHandle {
         state: Arc::clone(&__state_arc),
         present_channel: Arc::clone(&__present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::new(RwLock::new(None)),
         lock_wait_stats: Arc::clone(&stats),
     };
@@ -1010,7 +1010,7 @@ fn handle_with_seeded_mirror() -> (GuestHandle, u64, u64) {
     {
         let ws = winapi_state.window_state();
         ws.menus.push(MenuRecord {
-            handle: wie_winapi::handles::Hmenu::from(menu_handle),
+            handle: wie_winapi::port::Hmenu::from(menu_handle),
             items: vec![MenuEntry::Item {
                 id: 7,
                 text: "Exit".to_owned(),
@@ -1018,16 +1018,16 @@ fn handle_with_seeded_mirror() -> (GuestHandle, u64, u64) {
                 checked: false,
             }],
         });
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(a),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(a),
             menu_handle,
             width: 360,
             height: 140,
             ..Default::default()
         });
-        ws.windows.push(wie_winapi::WindowRecord {
-            handle: wie_winapi::handles::Hwnd::from(a_button),
-            parent_handle: wie_winapi::handles::Hwnd::from(a),
+        ws.windows.push(wie_winapi::port::WindowRecord {
+            handle: wie_winapi::port::Hwnd::from(a_button),
+            parent_handle: wie_winapi::port::Hwnd::from(a),
             x: 10,
             y: 10,
             width: 120,
@@ -1035,7 +1035,7 @@ fn handle_with_seeded_mirror() -> (GuestHandle, u64, u64) {
             visible: true,
             ..Default::default()
         });
-        ws.focus_window_handle = wie_winapi::handles::Hwnd::from(a);
+        ws.focus_window_handle = wie_winapi::port::Hwnd::from(a);
         winapi_state.sync_window_mirror();
     }
     let __state_arc = Arc::new(Mutex::new(winapi_state));
@@ -1048,7 +1048,7 @@ fn handle_with_seeded_mirror() -> (GuestHandle, u64, u64) {
     let handle = GuestHandle {
         state: Arc::clone(&__state_arc),
         present_channel: Arc::clone(&__present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::new(RwLock::new(None)),
         lock_wait_stats: Arc::new(crate::mt_runtime::LockWaitStats::new()),
     };
@@ -1069,7 +1069,7 @@ fn probe_without_big_lock<R: Send + 'static>(
     let handle = GuestHandle {
         state: Arc::clone(&handle.state),
         present_channel: Arc::clone(&handle.present_channel),
-        queue: Arc::new(Mutex::new(wie_winapi::present::MessageQueue::default())),
+        queue: Arc::new(Mutex::new(wie_winapi::port::MessageQueue::default())),
         menu_tree_cache: Arc::clone(&handle.menu_tree_cache),
         lock_wait_stats: Arc::clone(&handle.lock_wait_stats),
     };
@@ -1147,7 +1147,7 @@ fn capture_target_resolves_while_the_big_lock_is_held() {
     let (handle, _a, a_button) = handle_with_seeded_mirror();
     {
         let mut state = handle.state.lock().expect("lock state");
-        state.window_state().capture_window_handle = wie_winapi::handles::Hwnd::from(a_button);
+        state.window_state().capture_window_handle = wie_winapi::port::Hwnd::from(a_button);
         state.sync_window_mirror();
     }
     // The button sits at (10, 10) inside A: a (15, 20) point in capture

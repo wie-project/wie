@@ -533,10 +533,20 @@ impl WinApiState {
     }
 
     /// Lock the guest message queue, recovering from a poisoned mutex.
-    pub fn lock_message_queue(&self) -> std::sync::MutexGuard<'_, present::MessageQueue> {
-        self.message_queue
+    ///
+    /// Records the acquisition for the debug-only lock-order assertion
+    /// ([`crate::lock_order`]). The guest-side route is always taken with the
+    /// big `WinApiState` already held (`&self`), which is what makes
+    /// `State → Queue` the order rather than a convention; the host-side post
+    /// takes the bare `Arc` instead (`RuntimeSession::post_message`) and so
+    /// records only `Queue`, which is legal.
+    pub fn lock_message_queue(&self) -> crate::lock_order::Ordered<'_, present::MessageQueue> {
+        let scope = crate::lock_order::enter(crate::lock_order::Lock::Queue);
+        let guard = self
+            .message_queue
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::lock_order::Ordered::wrap(scope, guard)
     }
 
     /// Guest thread that owns `window_handle` — the queue its posted messages
@@ -886,6 +896,217 @@ impl WinApiState {
     }
 }
 
+// ── Cross-crate accessors (ADR-0006) ───────────────────────────────────────
+//
+// `wie-runtime` builds one `WinApiState` per session and then configures it.
+// Before ADR-0006 that configuration was ~23 direct field writes
+// (`state.file_io.volumes = …`, `state.process.main_module_dialogs = …`, …),
+// which made every field of the five state structs part of the published
+// surface whether or not anyone meant it. These methods are the replacement:
+// one narrow verb per need, so a field can be renamed inside this module
+// without touching another crate.
+//
+// Deliberately absent: a general `&mut FileIoState` / `&mut ProcessState`
+// escape hatch. That is the shape that produced the problem. If a new need
+// does not fit one of these verbs, add a verb — see `crate::port`'s table.
+impl WinApiState {
+    /// The session heap shard, cloned out of the state.
+    ///
+    /// The heap lives behind its own mutex so lock ordering is
+    /// `global -> heap`, never the reverse; a caller that holds this must not
+    /// take the `WinApiState` lock while holding it.
+    #[must_use]
+    pub fn heap_arc(&self) -> Arc<Mutex<crate::GuestHeap>> {
+        Arc::clone(&self.heap_state.heap)
+    }
+
+    /// Install the guest VA of the FLS value table (`TlsAlloc`/`FlsAlloc` use it).
+    pub fn set_guest_fls_table_va(&mut self, table_va: u64) {
+        self.heap_state.guest_fls_table_va = table_va;
+    }
+
+    /// Replace the session's volume table (guest drive → host root mapping).
+    pub fn set_volumes(&mut self, volumes: crate::vfs::VolumeConfig) {
+        self.file_io.volumes = volumes;
+    }
+
+    /// The session's volume table.
+    #[must_use]
+    pub fn volumes(&self) -> &crate::vfs::VolumeConfig {
+        &self.file_io.volumes
+    }
+
+    /// Replace the legacy single C: bottle root.
+    ///
+    /// Predates [`Self::set_volumes`]; both are still written because VFS
+    /// consumers refresh the shared view from it. Prefer `set_volumes` in new
+    /// code.
+    pub fn set_bottle_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.file_io.bottle_root = root;
+    }
+
+    /// Publish the guest I/O layout and the first free file-data arena slot.
+    ///
+    /// One call because the two are set together at session init and a
+    /// half-configured pair would let the guest's handle table point into an
+    /// arena the host had not placed yet.
+    pub fn attach_guest_io(&mut self, config: GuestIoRuntimeConfig, file_data_next: u64) {
+        self.file_io.guest_io = Some(config);
+        self.file_io.guest_file_data_next = file_data_next;
+    }
+
+    /// Install the console stdin buffer and its source policy.
+    ///
+    /// Cursor starts at zero: this is the session-init entry point, not a
+    /// mid-run refill.
+    pub fn set_stdin(&mut self, bytes: Vec<u8>, mode: GuestStdinMode) {
+        self.file_io.stdin_bytes = bytes;
+        self.file_io.stdin_cursor = 0;
+        self.file_io.stdin_mode = mode;
+    }
+
+    /// Replace the guest-visible display geometry (logical points on Retina).
+    pub fn set_display_metrics(&mut self, metrics: DisplayMetrics) {
+        self.display = metrics;
+    }
+
+    /// Install the main module's parsed resource tables.
+    ///
+    /// The main EXE does not go through `dll_loader::load_dll`, so its
+    /// RT_DIALOG/RT_MENU/RT_STRING/RT_ACCELERATOR templates are parsed by the
+    /// runtime at session init and handed over here. One call rather than four
+    /// writes: `DialogBoxParam` can arrive between two of them in principle,
+    /// and an empty-but-parsed table is indistinguishable from "not parsed yet".
+    pub fn set_main_module_resources(
+        &mut self,
+        dialogs: Vec<wie_pe::resources::DialogTemplate>,
+        menus: Vec<wie_pe::resources::MenuTemplate>,
+        strings: Vec<wie_pe::resources::StringBlock>,
+        accelerators: Vec<wie_pe::resources::AccelTemplate>,
+    ) {
+        self.process.main_module_dialogs = dialogs;
+        self.process.main_module_menus = menus;
+        self.process.main_module_strings = strings;
+        self.process.main_module_accelerators = accelerators;
+    }
+
+    /// Set the host directory searched for the main module's DLL dependencies.
+    pub fn set_main_module_host_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.process.main_module_host_dir = dir;
+    }
+
+    /// Guest path of the main module, as the identity APIs report it.
+    #[must_use]
+    pub fn main_module_path(&self) -> &str {
+        &self.process.main_module_path
+    }
+
+    /// The Win32 process environment block, as `(name, value)` in insertion order.
+    pub fn environment_mut(&mut self) -> &mut Vec<(String, String)> {
+        &mut self.process.environment
+    }
+
+    /// Overwrite the active thread's last-error value (and its process alias).
+    pub fn set_last_error(&mut self, error: u32) {
+        self.kernel.threads.active.last_error = error;
+        self.process.last_error = error;
+    }
+
+    /// Guest TID of the thread currently owning the engine.
+    #[must_use]
+    pub fn active_tid(&self) -> u32 {
+        self.kernel.threads.active.tid
+    }
+
+    /// The active thread's own last-error slot (authoritative per-thread store).
+    #[must_use]
+    pub fn active_last_error(&self) -> u32 {
+        self.kernel.threads.active.last_error
+    }
+
+    /// Overwrite the active thread's last-error slot only.
+    ///
+    /// Unlike [`Self::set_last_error`] this does not touch the process alias —
+    /// for the activation seam, where the alias deliberately still holds the
+    /// PREVIOUS thread's value.
+    pub fn set_active_last_error(&mut self, error: u32) {
+        self.kernel.threads.active.last_error = error;
+    }
+
+    /// Switch the active guest thread, saving the outgoing one's registers.
+    pub fn activate_thread(&mut self, tid: u32) {
+        self.kernel.threads.activate(tid);
+    }
+
+    /// Spill the active thread's registers back into its `by_tid` slot.
+    pub fn save_active_thread(&mut self) {
+        self.kernel.threads.save_active();
+    }
+
+    /// The active thread's TID as the guest sees it (`GetCurrentThreadId`).
+    #[must_use]
+    pub fn current_tid(&self) -> u32 {
+        self.kernel.threads.current_tid()
+    }
+
+    /// The loaded module whose image contains `va`, as `(name, offset)`.
+    ///
+    /// Replaces iterating `module_state.loaded_modules` to answer "which
+    /// module is this address in" — the runtime's only reason to look at the
+    /// module table directly.
+    #[must_use]
+    pub fn module_for_va(&self, va: u64) -> Option<(&str, u64)> {
+        self.module_state
+            .loaded_modules
+            .values()
+            .find(|module| {
+                va >= module.image_base
+                    && va < module.image_base.saturating_add(module.image_size as u64)
+            })
+            .map(|module| (module.name.as_str(), va - module.image_base))
+    }
+
+    /// Install the guest IAT resolver used by dynamic `LoadLibrary` imports.
+    pub fn install_import_resolver(&mut self, resolver: ImportResolver) {
+        self.module_state.import_resolver = Some(resolver);
+    }
+
+    /// Replace the legacy D: root (both the volume table and its own field).
+    pub fn set_drive_d_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.file_io.volumes.drive_d_root = root;
+    }
+
+    /// The open guest file for `handle`, if any.
+    ///
+    /// Replaces reading `file_io.open_files` directly — the runtime's guest-file
+    /// helpers (size / peek / cursor) are the only outside readers.
+    #[must_use]
+    pub fn open_guest_file(&self, handle: u64) -> Option<&OpenGuestFile> {
+        self.file_io.open_files.get(&handle)
+    }
+
+    /// Every open guest file, for a diagnostic snapshot.
+    #[must_use]
+    pub fn open_guest_files(&self) -> &ahash::HashMap<u64, OpenGuestFile> {
+        &self.file_io.open_files
+    }
+
+    /// The guest message queue shard, cloned out of the state.
+    ///
+    /// Its own mutex: the host posts input through this without ever taking
+    /// the `WinApiState` lock the guest holds during a handler.
+    #[must_use]
+    pub fn message_queue_arc(&self) -> Arc<Mutex<present::MessageQueue>> {
+        Arc::clone(&self.message_queue)
+    }
+
+    /// The guest current directory as UTF-16 code units (Windows form).
+    #[must_use]
+    pub fn current_directory_wide(&self) -> &[u16] {
+        &self.file_io.current_directory_wide
+    }
+}
+
 /// Bundle of everything a WinAPI handler may need.
 ///
 /// Passed as `HandlerContext` to every handler so adding new context
@@ -918,6 +1139,39 @@ impl<'a> HandlerContext<'a> {
             state,
             heap,
         }
+    }
+
+    /// The console capability: the console's own state, its stdin buffer, and
+    /// the CPU port — and nothing else (ADR-0005).
+    ///
+    /// Returned with the engine attached rather than as a bare `&mut dyn
+    /// ConsoleAccess` because a console handler reads its arguments from
+    /// registers; keeping the two as separate fields of the returned struct is
+    /// what lets `cx.engine.read_rcx()?` and `cx.state.console()` coexist under
+    /// the borrow checker, exactly as `ctx.engine` / `ctx.state` did.
+    ///
+    /// This is the seam the console handlers are type-checked against: inside
+    /// [`crate::console`] there is no `HandlerContext`, so
+    /// `cx.state.window_state()` or `cx.state.process` is a compile error
+    /// rather than a review comment.
+    pub fn console(&mut self) -> crate::capability::ConsoleCall<'_> {
+        crate::capability::ConsoleCall {
+            engine: &mut *self.engine,
+            state: &mut *self.state,
+        }
+    }
+
+    /// The common-dialog capability: the dialog session plumbing `comdlg32`
+    /// needs off `WindowState`, and nothing else (ADR-0005).
+    ///
+    /// A plain `&mut dyn` rather than a context struct like
+    /// [`Self::console`], because no `comdlg32` handler is dialog-only: each one
+    /// also builds or writes guest windows, which is `user32`'s machinery and
+    /// stays on `state`. Handlers therefore bind `ctx.state` and pass it to the
+    /// capability-typed helpers below it, and *those* are what the compiler
+    /// holds to the dialog surface.
+    pub fn dialogs(&mut self) -> &mut dyn crate::capability::WindowDialogAccess {
+        self.state
     }
 
     /// Canonical handler tail: pop the guest return address, write `value`

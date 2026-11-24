@@ -15,13 +15,15 @@ use crate::trace::{EntryTraceEvent, EntryTraceTermination, RuntimeRunSummary};
 use ahash::HashMap;
 use anyhow::{Context, Result};
 use std::borrow::Cow;
-use std::sync::{Arc, MutexGuard};
+use std::sync::Arc;
+
+use crate::mt_runtime::OrderedState;
 use std::time::Instant;
 use wie_cpu::CpuError;
-use wie_winapi::winmm::{DueTimer, DueTimerKind, WOM_DONE, WaveOutCallbackKind};
-use wie_winapi::{
-    GuestCallbackRequest, HostParkReason, KernelHandle, KernelObject, WinApiControlSignal,
-    WinApiState, dll_loader,
+use wie_winapi::port::{
+    DLL_PROCESS_ATTACH, DueTimer, DueTimerKind, GuestCallbackRequest, HostParkReason, KernelHandle,
+    KernelObject, StaticDllMain, WOM_DONE, WaveOutCallbackKind, WinApiControlSignal, WinApiState,
+    prepare_dll_main_call,
 };
 
 /// Primary-thread hook state for one `run_until_stop` segment.
@@ -52,7 +54,7 @@ struct SessionPumpHooks<'a> {
     events: &'a mut Vec<EntryTraceEvent>,
     /// Statically-loaded guest DLLs awaiting `DllMain(PROCESS_ATTACH)`, in
     /// load order (dependencies before dependents).
-    static_dll_mains: Vec<dll_loader::StaticDllMain>,
+    static_dll_mains: Vec<StaticDllMain>,
     /// Index of the next static DllMain to run.
     dll_main_index: usize,
     /// Trampoline each static DllMain returns through.
@@ -76,7 +78,7 @@ impl<'a> SessionPumpHooks<'a> {
     /// callback event, and a vanished device delivers nothing — all three
     /// return `None` and the caller falls through to normal dispatch.
     fn due_callback_request(
-        guard: &mut MutexGuard<'_, WinApiState>,
+        guard: &mut OrderedState<'_>,
         due: DueTimer,
     ) -> Result<Option<GuestCallbackRequest>> {
         match due.kind {
@@ -105,10 +107,10 @@ impl<'a> SessionPumpHooks<'a> {
                         // The callback HWND is a fake handle with no window
                         // record, so the message lands on the calling
                         // thread's queue — the one running this pump.
-                        let tid = guard.kernel.threads.current_tid();
+                        let tid = guard.current_tid();
                         guard.lock_message_queue().push_to(
                             tid,
-                            wie_winapi::handles::Hwnd::from(due.callback_va),
+                            wie_winapi::port::Hwnd::from(due.callback_va),
                             WOM_DONE,
                             due.handle,
                             0,
@@ -144,7 +146,7 @@ impl<'a> SessionPumpHooks<'a> {
     fn dispatch_native_bridge<B, P>(
         &self,
         core: &mut QuantumCore<'_>,
-        mut guard: MutexGuard<'_, WinApiState>,
+        mut guard: OrderedState<'_>,
         take_bridge: impl FnOnce(&mut WinApiState) -> Option<B>,
         invoke: impl FnOnce(Option<&B>) -> P,
         finish: impl FnOnce(&mut WinApiState, Option<B>, P),
@@ -153,10 +155,10 @@ impl<'a> SessionPumpHooks<'a> {
         drop(guard);
         let outcome = invoke(bridge.as_ref());
         core.with_locked(|_, winapi_state| {
-            if winapi_state.kernel.threads.active.tid != self.primary_tid {
-                winapi_state.kernel.threads.activate(self.primary_tid);
+            if winapi_state.active_tid() != self.primary_tid {
+                winapi_state.activate_thread(self.primary_tid);
             }
-            wie_winapi::thread::bind_current_tid(self.primary_tid);
+            wie_winapi::port::bind_current_tid(self.primary_tid);
             finish(winapi_state, bridge, outcome);
         });
         Step::Next
@@ -173,7 +175,7 @@ impl<'a> SessionPumpHooks<'a> {
         profile_enabled: bool,
         profile: &'a mut RuntimeProfile,
         events: &'a mut Vec<EntryTraceEvent>,
-        static_dll_mains: Vec<dll_loader::StaticDllMain>,
+        static_dll_mains: Vec<StaticDllMain>,
         dll_main_return_va: u64,
         primary_tid: u32,
     ) -> Self {
@@ -209,10 +211,10 @@ impl<'a> SessionPumpHooks<'a> {
     fn publish_last_error_to_guest(&mut self, core: &mut QuantumCore<'_>) {
         let primary_tid = self.primary_tid;
         core.with_locked(|engine, st| {
-            if st.kernel.threads.active.tid != primary_tid {
-                st.kernel.threads.activate(primary_tid);
+            if st.active_tid() != primary_tid {
+                st.activate_thread(primary_tid);
             }
-            wie_winapi::thread::bind_current_tid(primary_tid);
+            wie_winapi::port::bind_current_tid(primary_tid);
             st.absorb_guest_last_error(engine);
             st.publish_last_error_to_guest(engine);
         });
@@ -333,11 +335,7 @@ impl<'a> SessionPumpHooks<'a> {
             && lresult != 0
         {
             let next = core.with_locked(|engine, winapi_state| {
-                wie_winapi::gdi32::enumerate::advance_enumeration(
-                    engine,
-                    winapi_state,
-                    enumeration_id,
-                )
+                wie_winapi::port::advance_enumeration(engine, winapi_state, enumeration_id)
             })?;
             if let Some(next_request) = next {
                 // Re-enter with the next item, preserving the ORIGINAL outer
@@ -405,7 +403,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
         // observe advancing values with no host stop. Frozen under
         // `WIE_FIXED_CLOCK=1` — the table was written once at session init,
         // so a guest busy-waiting on a constant never spins.
-        if !wie_winapi::kernel32::clock::clock_is_fixed() {
+        if !wie_winapi::port::clock_is_fixed() {
             let clock_table_va = core.layout().clock_table.base;
             drop(crate::guest_stubs::refresh_clock_table(
                 core.engine(),
@@ -424,11 +422,11 @@ impl QuantumHooks for SessionPumpHooks<'_> {
         // budget is zero (preparing would push a return address nothing ever
         // pops) — the caller gates on `max_api > 0`.
         if let Some(first) = self.static_dll_mains.first() {
-            dll_loader::prepare_dll_main_call(
+            prepare_dll_main_call(
                 core.engine(),
                 first.image_base,
                 first.entry_rva,
-                dll_loader::DLL_PROCESS_ATTACH,
+                DLL_PROCESS_ATTACH,
                 1, // lpvReserved: non-zero marks a static (loader) call.
                 self.dll_main_return_va,
             )
@@ -481,11 +479,11 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                 .checked_add(1)
                 .context("static DllMain index overflow")?;
             if let Some(next) = self.static_dll_mains.get(self.dll_main_index) {
-                dll_loader::prepare_dll_main_call(
+                prepare_dll_main_call(
                     core.engine(),
                     next.image_base,
                     next.entry_rva,
-                    dll_loader::DLL_PROCESS_ATTACH,
+                    DLL_PROCESS_ATTACH,
                     1,
                     self.dll_main_return_va,
                 )
@@ -505,7 +503,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
     fn on_callback_return(
         &mut self,
         core: &mut QuantumCore<'_>,
-        guard: MutexGuard<'_, WinApiState>,
+        guard: OrderedState<'_>,
         _address: u64,
         api_index: usize,
     ) -> Result<Step> {
@@ -651,7 +649,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
     fn dispatch(
         &mut self,
         core: &mut QuantumCore<'_>,
-        mut guard: MutexGuard<'_, WinApiState>,
+        mut guard: OrderedState<'_>,
         resolved: &ResolvedFakeApi,
         hook_address: u64,
         api_index: usize,
@@ -691,7 +689,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
         // quantum.
         if self.pending_callbacks.is_empty() {
             let now = {
-                let raw = wie_winapi::kernel32::clock::tick_count_32();
+                let raw = wie_winapi::port::tick_count_32();
                 u32::try_from(raw & u64::from(u32::MAX)).unwrap_or(0)
             };
             let due = guard.pop_next_due_timer(now);
@@ -777,7 +775,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                 .kernel
                 .sync
                 .wake_hub
-                .broadcast(wie_winapi::Wake::Shutdown);
+                .broadcast(wie_winapi::port::Wake::Shutdown);
             // Flush buffered CRT console output (printf/puts buffer in the
             // guest stream; fwrite bypasses it). Windows flushes stdout at
             // process exit — without this, trailing printf output is silently
@@ -892,7 +890,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                         // poll above; at most one timer per boundary.
                         if self.pending_callbacks.is_empty() {
                             let now = {
-                                let raw = wie_winapi::kernel32::clock::tick_count_32();
+                                let raw = wie_winapi::port::tick_count_32();
                                 u32::try_from(raw & u64::from(u32::MAX)).unwrap_or(0)
                             };
                             let due = guard.pop_next_due_timer(now);
@@ -1147,8 +1145,8 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                         let (bottle_root, drive_d_root) = {
                             let st = &mut *guard;
                             (
-                                st.file_io.volumes.bottle_root.clone(),
-                                st.file_io.volumes.drive_d_root.clone(),
+                                st.volumes().bottle_root.clone(),
+                                st.volumes().drive_d_root.clone(),
                             )
                         };
                         drop(guard);
@@ -1161,7 +1159,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                         // per-process cache).
                         let build = crate::RuntimeSession::new_with_options(
                             &host_path,
-                            wie_winapi::MessageQueueIdlePolicy::ExitOnIdle,
+                            wie_winapi::port::MessageQueueIdlePolicy::ExitOnIdle,
                             crate::DEFAULT_LAYOUT,
                             crate::SessionOptions {
                                 bottle_root,
@@ -1251,10 +1249,10 @@ impl QuantumHooks for SessionPumpHooks<'_> {
 
                         if let Some((h_process, h_thread, pid, tid)) = spawn_outcome {
                             let recorded = core.with_locked(|_, winapi_state| {
-                                if winapi_state.kernel.threads.active.tid != self.primary_tid {
-                                    winapi_state.kernel.threads.activate(self.primary_tid);
+                                if winapi_state.active_tid() != self.primary_tid {
+                                    winapi_state.activate_thread(self.primary_tid);
                                 }
-                                wie_winapi::thread::bind_current_tid(self.primary_tid);
+                                wie_winapi::port::bind_current_tid(self.primary_tid);
                                 winapi_state
                                     .window_state()
                                     .set_child_spawn_result(h_process, h_thread, pid, tid)
@@ -1279,7 +1277,7 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                         // Per-thread engine: primary regs are already in
                         // `engine`; only persist thread bookkeeping for TLS
                         // tracking.
-                        guard.kernel.threads.save_active();
+                        guard.save_active_thread();
                         // The guest is about to block on a wait — flush any
                         // coalesced publishes so the frame reaches the host
                         // before the park. Skipped while a guest callback is
@@ -1335,8 +1333,8 @@ impl super::RuntimeSession {
     /// or processes `max_api` additional API calls.
     pub fn run_until_stop(&mut self, max_api: usize) -> Result<RuntimeRunSummary> {
         let primary_tid = self.process.primary_tid();
-        let dll_main_return_va = wie_winapi::dll_main_return_trampoline_va();
-        let static_dll_mains: Vec<dll_loader::StaticDllMain> = if self.entry_reached {
+        let dll_main_return_va = wie_winapi::port::dll_main_return_trampoline_va();
+        let static_dll_mains: Vec<StaticDllMain> = if self.entry_reached {
             Vec::new()
         } else {
             self.process.static_dll_mains().to_vec()
@@ -1401,7 +1399,7 @@ impl super::RuntimeSession {
             // responsiveness is bounded by one quantum/API-stop boundary;
             // gate-off cost is a single cached-bool load (no env access in
             // this hot loop).
-            if wie_winapi::console::take_ctrlc_for_profile_stop() {
+            if wie_winapi::port::take_ctrlc_for_profile_stop() {
                 termination = EntryTraceTermination::HostInterrupt;
                 break 'outer;
             }
@@ -1462,16 +1460,16 @@ impl super::RuntimeSession {
                             let t0 = Instant::now();
                             let q = self
                                 .process
-                                .with_mut(|_, st| wie_winapi::kernel32::resolve_cs_queue(st, cs));
+                                .with_mut(|_, st| wie_winapi::port::resolve_cs_queue(st, cs));
                             q.park_brief();
                             park_residency_ns =
                                 park_residency_ns.saturating_add(t0.elapsed().as_nanos());
                             // Retry Enter: per-thread engine keeps primary
                             // regs; only restore TLS.
                             self.process.with_mut(|_eng, st| {
-                                st.kernel.threads.activate(primary_tid);
+                                st.activate_thread(primary_tid);
                             });
-                            wie_winapi::thread::bind_current_tid(primary_tid);
+                            wie_winapi::port::bind_current_tid(primary_tid);
                             // Do not charge API index again — undo increment.
                             *hooks.next_api_index = hooks.next_api_index.saturating_sub(1);
                         }
@@ -1481,7 +1479,7 @@ impl super::RuntimeSession {
                             // CreateThread.
                             drop(self.process.drain_spawns());
                             let target = self.process.with_mut(|_, st| {
-                                wie_winapi::kernel32::resolve_wait_target(st, handle)
+                                wie_winapi::port::resolve_wait_target(st, handle)
                             });
                             // Event-driven infinite wait (Painpoint 1):
                             // register on the object's waiter registry FIRST,
@@ -1499,12 +1497,12 @@ impl super::RuntimeSession {
                             let mut timer_wake = false;
                             let result = match target {
                                 Some(target) => {
-                                    if timeout_ms == wie_winapi::INFINITE {
+                                    if timeout_ms == wie_winapi::port::INFINITE {
                                         target.enter_wait(&inbox);
-                                        let mut result = wie_winapi::WAIT_FAILED;
+                                        let mut result = wie_winapi::port::WAIT_FAILED;
                                         loop {
                                             if target.try_wait() {
-                                                result = wie_winapi::WAIT_OBJECT_0;
+                                                result = wie_winapi::port::WAIT_OBJECT_0;
                                                 break;
                                             }
                                             drop(self.process.drain_spawns());
@@ -1525,7 +1523,7 @@ impl super::RuntimeSession {
                                             // boundary dispatches the timer,
                                             // and the handler re-parks.
                                             let now = u32::try_from(
-                                                wie_winapi::kernel32::clock::tick_count_32()
+                                                wie_winapi::port::tick_count_32()
                                                     & u64::from(u32::MAX),
                                             )
                                             .unwrap_or(0);
@@ -1548,7 +1546,7 @@ impl super::RuntimeSession {
                                             );
                                             let due = self.process.with_winapi_ref(|st| {
                                                 let now2 = u32::try_from(
-                                                    wie_winapi::kernel32::clock::tick_count_32()
+                                                    wie_winapi::port::tick_count_32()
                                                         & u64::from(u32::MAX),
                                                 )
                                                 .unwrap_or(0);
@@ -1565,14 +1563,14 @@ impl super::RuntimeSession {
                                         target.wait(timeout_ms)
                                     }
                                 }
-                                None => wie_winapi::WAIT_FAILED,
+                                None => wie_winapi::port::WAIT_FAILED,
                             };
                             park_residency_ns =
                                 park_residency_ns.saturating_add(t0.elapsed().as_nanos());
                             if !timer_wake {
                                 self.process.with_mut(|eng, st| {
-                                    st.kernel.threads.activate(primary_tid);
-                                    wie_winapi::thread::bind_current_tid(primary_tid);
+                                    st.activate_thread(primary_tid);
+                                    wie_winapi::port::bind_current_tid(primary_tid);
                                     let _ =
                                         eng.return_from_win64_api(u64::from(result)).map_err(|e| {
                                             tracing::error!(
@@ -1598,7 +1596,7 @@ impl super::RuntimeSession {
                             let t0 = Instant::now();
                             let park = self
                                 .process
-                                .with_mut(|_, st| wie_winapi::pthread::take_park(st, primary_tid));
+                                .with_mut(|_, st| wie_winapi::port::take_park(st, primary_tid));
                             match park {
                                 Some(park) => {
                                     let deadline = Instant::now() + park.slice;
@@ -1647,7 +1645,7 @@ impl super::RuntimeSession {
                                     });
                                     match targets {
                                         Some(targets) => {
-                                            if req.timeout_ms == wie_winapi::INFINITE {
+                                            if req.timeout_ms == wie_winapi::port::INFINITE {
                                                 // Event-driven multi-wait:
                                                 // register on EVERY target's
                                                 // waiter registry, then
@@ -1655,10 +1653,10 @@ impl super::RuntimeSession {
                                                 for target in &targets {
                                                     target.enter_wait(&inbox);
                                                 }
-                                                let mut result = wie_winapi::WAIT_FAILED;
+                                                let mut result = wie_winapi::port::WAIT_FAILED;
                                                 loop {
                                                     if let Some(code) =
-                                                        wie_winapi::wait_multiple_step(
+                                                        wie_winapi::port::wait_multiple_step(
                                                             &targets,
                                                             req.wait_all,
                                                         )
@@ -1686,23 +1684,23 @@ impl super::RuntimeSession {
                                                 }
                                                 result
                                             } else {
-                                                wie_winapi::wait_multiple(
+                                                wie_winapi::port::wait_multiple(
                                                     &targets,
                                                     req.wait_all,
                                                     req.timeout_ms,
                                                 )
                                             }
                                         }
-                                        None => wie_winapi::WAIT_FAILED,
+                                        None => wie_winapi::port::WAIT_FAILED,
                                     }
                                 }
-                                None => wie_winapi::WAIT_FAILED,
+                                None => wie_winapi::port::WAIT_FAILED,
                             };
                             park_residency_ns =
                                 park_residency_ns.saturating_add(t0.elapsed().as_nanos());
                             self.process.with_mut(|eng, st| {
-                                st.kernel.threads.activate(primary_tid);
-                                wie_winapi::thread::bind_current_tid(primary_tid);
+                                st.activate_thread(primary_tid);
+                                wie_winapi::port::bind_current_tid(primary_tid);
                                 let _ = eng.return_from_win64_api(u64::from(result)).map_err(|e| {
                                     tracing::error!("guest stack corrupted on wait park: {e}")
                                 });
@@ -1733,7 +1731,7 @@ impl super::RuntimeSession {
                 | EntryTraceTermination::UnsupportedApi(_)
                 | EntryTraceTermination::HostInterrupt
         ) {
-            self.wake_hub.broadcast(wie_winapi::Wake::Shutdown);
+            self.wake_hub.broadcast(wie_winapi::port::Wake::Shutdown);
         }
 
         // Per-frame timing sample — sync present accumulators into the
