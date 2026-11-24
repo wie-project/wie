@@ -488,12 +488,13 @@ pub(super) fn refill_tlb_probe(
 // (`docs/architecture/scaled-blit-block-attribution.md` §8.3, §9.4).
 //
 // The functions below publish those facts once, in the prologue, as a
-// [`HomeSpan`] — a guest interval plus a host bias — and validate an access
-// against it with two compares. The bias costs nothing per access either: the
-// backend folds `addr + bias` into the access's own addressing mode, which is what
-// makes the published form 4 host instructions per operand where today's probe is
-// 15–16 (measured on the scratch functions in `mem_hoist_tests.rs`; see the
-// report accompanying this change). Nothing here weakens the probe: on
+// [`HomeSpan`] — a guest base, a length and a host bias — and validate an access
+// against it with one subtract and one compare. The bias costs nothing per access
+// either: the backend folds `addr + bias` into the access's own addressing mode.
+// Measured on a real four-operand guest block (`0x1800cef0b`), the emitted guard
+// is 6 host instructions per operand against today's 15 — and 5 for the
+// single-compare form here, because the two bounds now cost one register each
+// instead of four instructions of testing. Nothing here weakens the probe: on
 // any failed predicate the caller jumps into the **unchanged** chain
 // (`hoisted_pin_probe` → `refill_tlb_probe` → `wie_jit_load`/`wie_jit_store`),
 // which re-derives everything from scratch and reports faults exactly as it does
@@ -517,54 +518,61 @@ pub(super) fn refill_tlb_probe(
 // the pins and refill slots the prologue read are all suspect, not just one
 // operand's.
 
-/// A published stage translation: every guest address in the closed interval
-/// `[lo, hi]` maps to the host address `guest + bias`.
+/// A published stage translation: every guest address in `[lo, lo + len)` maps to
+/// the host address `guest + bias`, and every access of the span's `size` bytes
+/// starting there is inside the stage.
 ///
-/// `hi` is **already clamped by the access size** — `hi = stage_end - size`, so
-/// `addr <= hi` is exactly today's `addr + size <= stage_end` — which also
-/// subsumes today's `no_wrap` term: `addr + size` cannot overflow when it is
-/// `<= stage_end <= u64::MAX`.
+/// `len` is a **count of valid start addresses**, not an upper bound:
+/// `len = stage_end - size - stage_lo + 1`, so `addr - lo < len` is exactly
+/// today's `addr >= stage_lo && addr + size <= stage_end`. Folding the two
+/// bounds into one length is what makes the per-access test a single unsigned
+/// compare ([`home_span_probe`]): `t = addr - lo`, fail unless `t < len`.
 ///
-/// An **empty** span ([`SPAN_EMPTY_LO`], [`SPAN_EMPTY_HI`]) encodes "this stage
-/// may not answer this operand at all" — a dead pin, a denied permission bit, or
-/// a stage shorter than the access. No address satisfies `1 <= addr <= 0`, so
-/// every access takes the fallback chain. That is what keeps the loop body
-/// single-copy: the *decision* is taken once, in the prologue, and the body
-/// carries the answer.
+/// That form also subsumes today's `no_wrap` term without a separate test. A
+/// wrapped `addr + size` is an `addr` near `u64::MAX`, which is `>= len - 1`
+/// above `lo` for any span that fits in the address space, so it fails the same
+/// compare — and `len` itself cannot wrap, because it is only non-zero when
+/// `stage_end >= stage_lo + size`.
 ///
-/// `bias` is `host_base - stage_lo`, computed for the non-empty case; on an empty
-/// span it is meaningless, and unreachable, because the interval cannot match.
+/// An **empty** span is simply `len == 0` ([`SPAN_EMPTY_LEN`]): no `t` satisfies
+/// `t < 0`, so every access takes the fallback chain. That covers a dead pin, a
+/// denied permission bit and a stage shorter than the access, and it is what
+/// keeps the loop body single-copy: the *decision* is taken once, in the
+/// prologue, and the body carries the answer in one register pair.
+///
+/// `bias` is `host_base - stage_lo`; on an empty span it is meaningless and
+/// unreachable, because no access can match.
 #[derive(Clone, Copy)]
 pub(super) struct HomeSpan {
-    /// Inclusive lower bound — the stage's guest base.
+    /// Guest base of the stage.
     pub(super) lo: Value,
-    /// Inclusive upper bound — `stage_end - size`, or `0` for an empty span.
-    pub(super) hi: Value,
+    /// Number of valid start addresses from `lo`; `0` for an empty span.
+    pub(super) len: Value,
     /// `host_base - stage_lo`: `guest + bias` is the host address of `guest`.
     pub(super) bias: Value,
 }
 
 /// `lo` of a span that cannot match any address (see [`HomeSpan`]).
 ///
-/// Paired with [`SPAN_EMPTY_HI`] it is unreachable by construction: the access
-/// test is `addr >= lo && addr <= hi`, i.e. `addr >= 1 && addr <= 0`.
-pub(super) const SPAN_EMPTY_LO: i64 = 1;
-/// `hi` of a span that cannot match any address (see [`HomeSpan`]).
-pub(super) const SPAN_EMPTY_HI: i64 = 0;
+/// Only `len` decides emptiness, so `lo` is set to zero purely so the pair is
+/// readable in a CLIF dump; `addr - 0 < 0` is false for every `addr`.
+pub(super) const SPAN_EMPTY_LO: i64 = 0;
+/// `len` of a span that cannot match any address (see [`HomeSpan`]).
+pub(super) const SPAN_EMPTY_LEN: i64 = 0;
 
 /// Publish one pin descriptor as a [`HomeSpan`] — the prologue half of the hoist
 /// for a stack or data pin operand.
 ///
 /// Folds every term of [`hoisted_pin_probe`] that does not depend on the address
-/// into the span, so the per-access form is two compares (the `bias` add folds
-/// into the access's addressing mode):
+/// into the span, so the per-access form is one `sub`, one compare and the
+/// `bias` add — which folds into the access's addressing mode:
 ///
 /// | [`hoisted_pin_probe`] term | here |
 /// | --- | --- |
 /// | `live` (`host_base != 0 && pin_gen == mem_gen`) | entry-time `select` |
 /// | `allow & need != 0` (the R/W bit) | entry-time `select` |
-/// | `no_wrap` (`addr + size` did not overflow) | subsumed by `hi` |
-/// | `lo_ok` / `hi_ok` | retained: the two compares in [`home_span_probe`] |
+/// | `no_wrap` (`addr + size` did not overflow) | subsumed by `len` |
+/// | `lo_ok` / `hi_ok` | retained: the folded interval test in [`home_span_probe`] |
 ///
 /// Folding `live` and the R/W bit is exact, not an approximation: both are
 /// functions of values the current probe reads once per block anyway, and a
@@ -584,10 +592,10 @@ pub(super) fn span_of_pin(
     let size_v = iconst_u64(bcx, u64::from(size));
     let lo = pin.guest_base;
     let end = pin.guest_end;
-    // `end >= lo + size` ⇔ `hi = end - size >= lo`, i.e. the stage can hold the
-    // whole access. Without it a degenerate stage (`end < size`) would compute
-    // `hi` by wrapping, and a wrapped `hi` is a *huge* upper bound — the one
-    // direction that must never be wrong.
+    // `end >= lo + size` ⇔ `len = end - size - lo + 1 >= 1`, i.e. the stage can
+    // hold the whole access. Without it a degenerate stage (`end < size`) would
+    // compute `len` by wrapping, and a wrapped length is a huge accept window —
+    // the one direction that must never be wrong.
     let span = bcx.ins().isub(end, lo);
     let long_enough = bcx
         .ins()
@@ -597,10 +605,13 @@ pub(super) fn span_of_pin(
     let prot_ok = bcx.ins().icmp_imm(IntCC::NotEqual, bits, 0);
     let ok = bcx.ins().band(pin.live, long_enough);
     let ok = bcx.ins().band(ok, prot_ok);
-    let hi = bcx.ins().isub(end, size_v);
+    // `len = end - size - lo + 1`, derived from `span` so the prologue pays one
+    // subtract and one increment rather than a second bound.
+    let len = bcx.ins().isub(span, size_v);
+    let len = bcx.ins().iadd_imm(len, 1);
     HomeSpan {
         lo: select_or_empty(bcx, ok, lo, SPAN_EMPTY_LO),
-        hi: select_or_empty(bcx, ok, hi, SPAN_EMPTY_HI),
+        len: select_or_empty(bcx, ok, len, SPAN_EMPTY_LEN),
         bias: bcx.ins().isub(pin.host_base, lo),
     }
 }
@@ -680,20 +691,25 @@ pub(super) struct HoistedSlot {
 
 /// Turn a [`HoistedSlot`] into a [`HomeSpan`] for an access of `size` bytes.
 ///
-/// `hi = page_base + PAGE_SIZE - size`, so the interval is exactly "inside this
-/// page with room for the access" — today's `in_page` term — and `bias` is the
-/// page's host base minus its guest base.
+/// The interval is exactly "inside this page with room for the access" — today's
+/// `in_page` term — and `bias` is the page's host base minus its guest base.
+///
+/// A slot home is one page wide, so its `len` is a **compile-time constant**
+/// (`PAGE_SIZE - size + 1`): the per-access guard carries no bound computation
+/// at all, just the compare against the loaded `lo`.
 #[cfg_attr(not(test), expect(dead_code))]
 pub(super) fn span_of_slot(
     bcx: &mut FunctionBuilder<'_>,
     slot: &HoistedSlot,
     size: u32,
 ) -> HomeSpan {
-    let room = i64::try_from(PAGE_SIZE.saturating_sub(u64::from(size))).unwrap_or(0);
-    let hi = bcx.ins().iadd_imm(slot.page_base, room);
+    let len = iconst_u64(
+        bcx,
+        PAGE_SIZE.saturating_sub(u64::from(size)).saturating_add(1),
+    );
     HomeSpan {
         lo: select_or_empty(bcx, slot.ok, slot.page_base, SPAN_EMPTY_LO),
-        hi: select_or_empty(bcx, slot.ok, hi, SPAN_EMPTY_HI),
+        len: select_or_empty(bcx, slot.ok, len, SPAN_EMPTY_LEN),
         bias: bcx.ins().isub(slot.base, slot.page_base),
     }
 }
@@ -707,23 +723,29 @@ fn select_or_empty(bcx: &mut FunctionBuilder<'_>, ok: Value, v: Value, empty: i6
 
 /// Validate one access against a published [`HomeSpan`]; returns the host address.
 ///
-/// Two compares and an add, as guarded exits to `fail` — the *unchanged* probe
-/// chain for this operand, which re-derives the translation from scratch:
+/// One subtract, one unsigned compare and an add, as a guarded exit to `fail` —
+/// the *unchanged* probe chain for this operand, which re-derives the translation
+/// from scratch:
 ///
 /// ```text
-/// ok1 = addr >= lo            ; guest below the stage
-/// ok2 = addr <= hi            ; `addr + size` past the stage, or a page crossing
+/// t    = addr - lo            ; unsigned distance from the stage base
+/// ok   = t < len              ; inside the stage, with room for the access
 /// host = addr + bias          ; only meaningful on the true edge
 /// ```
 ///
-/// Both compares are unsigned and the interval is closed, so this accepts exactly
-/// the addresses [`hoisted_pin_probe`] accepts (`addr >= guest_base &&
-/// addr + size <= guest_end`, with `end` folded into `hi`) and exactly the
-/// addresses [`refill_tlb_probe`] accepts (`page_off + size <= PAGE_SIZE` with
-/// `page_off` folded out). The earlier conditions — `live` and the R/W bit — are
-/// in the span; see [`span_of_pin`].
+/// The single compare accepts exactly the addresses [`hoisted_pin_probe`]
+/// accepts (`addr >= guest_base && addr + size <= guest_end`, with the width
+/// folded into `len`) and exactly the addresses [`refill_tlb_probe`] accepts
+/// (`page_off + size <= PAGE_SIZE`, with the page folded out). It also subsumes
+/// the wrap check: a `addr + size` overflow puts `addr` more than `len - 1` above
+/// `lo`, which is the same `ok == false`. The earlier conditions — `live` and the
+/// R/W bit — are in the span; see [`span_of_pin`].
 ///
-/// `host` is defined in the block the guards return in, so it dominates the
+/// Two instructions per access plus the two the bounds cost to load, and one
+/// fewer branch than the two-sided form it replaces: `sub`, `cmp`, `brif` against
+/// `cmp`, `brif`, `cmp`, `brif`.
+///
+/// `host` is defined in the block the guard returns in, so it dominates the
 /// caller's hit block, the same contract as [`hoisted_pin_probe`].
 pub(super) fn home_span_probe(
     bcx: &mut FunctionBuilder<'_>,
@@ -731,15 +753,10 @@ pub(super) fn home_span_probe(
     addr: Value,
     fail: Block,
 ) -> Value {
-    let lo_ok = bcx
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, addr, span.lo);
-    let hi_ok = bcx
-        .ins()
-        .icmp(IntCC::UnsignedLessThanOrEqual, addr, span.hi);
+    let dist = bcx.ins().isub(addr, span.lo);
+    let ok = bcx.ins().icmp(IntCC::UnsignedLessThan, dist, span.len);
     let host = bcx.ins().iadd(addr, span.bias);
-    guard_exit(bcx, lo_ok, fail);
-    guard_exit(bcx, hi_ok, fail);
+    guard_exit(bcx, ok, fail);
     host
 }
 

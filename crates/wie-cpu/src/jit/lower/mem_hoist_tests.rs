@@ -1036,3 +1036,244 @@ fn hoisted_guard_instruction_counts() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The shape of the block that motivated the hoist: **four** width-4 stores in
+// one block, guarded from one pin. `0x1800cef0b` (a dword fill in SDL2, the
+// block §9 of the scaled-blit attribution measured) is exactly this — its last
+// compile carries eight `store region0`, four per path, and every guarded
+// operand reads pin slot 0.
+//
+// One span per `(width, direction)` is published at entry and each access
+// re-validates against it, so the property that matters is not "the block is on
+// the fast path" but "each of the four is checked on its own": one address
+// outside the span must not ride on its neighbours' pass. A fast path wrongly
+// taken is a memory-safety bug in the emulator, so the third test makes the
+// wrong answer *land* somewhere observable instead of faulting the process.
+// ---------------------------------------------------------------------------
+
+/// `(ctx, a0, a1, a2, a3, value) -> u64`: four stores, one span, four checks.
+type Probe4Fn = extern "C" fn(*mut JitCtx, u64, u64, u64, u64, u64) -> u64;
+
+/// A compiled four-store block and its laid-out host instruction count.
+struct Probe4 {
+    run: Probe4Fn,
+    insns: usize,
+}
+
+/// One span published at entry (what `block_homes` publishes per `(width,
+/// direction)`), then four stores that each re-validate against it and fall into
+/// today's chain — alone, on their own failure. This is the phase-1 wiring's
+/// shape with the operand count the real block has.
+fn build_four_stores() -> Probe4 {
+    let mut module = scratch_module();
+    let ptr_ty = module.target_config().pointer_type();
+    let mut sig = module.make_signature();
+    sig.params.push(AbiParam::new(ptr_ty));
+    for _ in 0..4 {
+        sig.params.push(AbiParam::new(types::I64));
+    }
+    sig.params.push(AbiParam::new(types::I64));
+    sig.returns.push(AbiParam::new(types::I64));
+    let id = module
+        .declare_function("probe4", Linkage::Export, &sig)
+        .expect("declare probe4");
+    let mut func = Function::new();
+    func.signature = sig;
+
+    let mut ctx = module.make_context();
+    let mut fctx = FunctionBuilderContext::new();
+    {
+        let mut bcx = FunctionBuilder::new(&mut func, &mut fctx);
+        let entry = bcx.create_block();
+        bcx.append_block_params_for_function_params(entry);
+        bcx.switch_to_block(entry);
+        bcx.seal_block(entry);
+        let params = bcx.block_params(entry).to_vec();
+        let ctx_ptr = params[0];
+        let addr: Vec<Value> = params[1..5].to_vec();
+        let val = params[5];
+        let flags = MemFlagsData::trusted();
+
+        // Prologue: the descriptor loads and *one* span for the whole block —
+        // the point of the hoist, and the reason four operands cost one guard's
+        // worth of prologue rather than four.
+        let pin = hoist_pin_slot(&mut bcx, ctx_ptr, flags, 0);
+        let refill = hoist_refill(&mut bcx, ctx_ptr, flags);
+        let span = span_of_pin(&mut bcx, &pin, 4, true);
+
+        let done = bcx.create_block();
+        bcx.append_block_param(done, types::I64);
+        let fails: Vec<Block> = (0..4).map(|_| bcx.create_block()).collect();
+
+        for (i, fail) in fails.iter().enumerate() {
+            let host = home_span_probe(&mut bcx, &span, addr[i], *fail);
+            let distinct = bcx
+                .ins()
+                .iadd_imm(val, i64::try_from(i).expect("operand index fits"));
+            store_guest_bytes(&mut bcx, flags, host, 4, distinct);
+        }
+        let d = iconst_u64(&mut bcx, DONE);
+        bcx.ins().jump(done, &[BlockArg::Value(d)]);
+
+        // Each fallback is today's chain, byte for byte, entered only from its
+        // own operand's failed predicate.
+        for (i, fail) in fails.iter().enumerate() {
+            bcx.switch_to_block(*fail);
+            bcx.seal_block(*fail);
+            today_chain(&mut bcx, done, addr[i], 4, true, val, &pin, &refill, false);
+        }
+
+        bcx.switch_to_block(done);
+        bcx.seal_block(done);
+        let r = bcx.block_params(done)[0];
+        bcx.ins().return_(&[r]);
+        bcx.seal_all_blocks();
+        bcx.finalize();
+    }
+    ctx.func = func;
+    module.define_function(id, &mut ctx).expect("define probe4");
+    let insns = {
+        let cc = ctx.compiled_code().expect("compiled");
+        usize::try_from(cc.code_info().total_size).expect("code size fits") / 4
+    };
+    module.clear_context(&mut ctx);
+    module.finalize_definitions().expect("finalize");
+    let ptr = module.get_finalized_function(id);
+    // SAFETY: `ptr` is the entry point of the function just defined above, and
+    // its signature is the five-parameter one declared for it.
+    let run: Probe4Fn = unsafe { std::mem::transmute(ptr) };
+    std::mem::forget(module);
+    Probe4 { run, insns }
+}
+
+/// [`fixture`], except the pin covers **page 0 only**.
+///
+/// That is what makes a wrongly-taken fast path observable instead of fatal: an
+/// address in page 1 is outside the span but still mapped and RW, so the span
+/// accepting it would write page 1's host memory — which the canary catches —
+/// rather than faulting the test process.
+fn narrow_fixture(gen_offset: u64) -> Fixture {
+    let mut fx = bare_pages();
+    let stamp = fx.cpu.thread.ctx.mem_gen ^ gen_offset;
+    fx.cpu.thread.ctx.pins[0] = MemPin {
+        guest_base: GuestVa::new(fx.data),
+        guest_end: GuestVa::new(fx.data.saturating_add(0x1000)),
+        host_base: HostAddr::from_ptr(fx.host),
+        mem_gen: stamp,
+        allow: TLB_PROT_R | TLB_PROT_W,
+    };
+    fx.cpu
+        .mem_write(fx.data.saturating_add(0x1040), &CANARY.to_ne_bytes())
+        .expect("stamp the page-1 canary");
+    fx
+}
+
+/// Four in-span stores share the one published span and all four are done
+/// inline, each writing its own word.
+#[test]
+fn four_stores_share_one_span_and_all_take_it() {
+    let mut fx = narrow_fixture(0);
+    let p = build_four_stores();
+    let data = fx.data;
+    let addrs = [0x100_u64, 0x200, 0x300, 0x380];
+    let out = (p.run)(
+        std::ptr::from_mut(&mut fx.cpu.thread.ctx),
+        data.saturating_add(addrs[0]),
+        data.saturating_add(addrs[1]),
+        data.saturating_add(addrs[2]),
+        data.saturating_add(addrs[3]),
+        0xaaaa_0000,
+    );
+    assert_eq!(
+        out, DONE,
+        "all four in-span stores must be done inline (function lays out to {} host instructions)",
+        p.insns
+    );
+    for (i, off) in addrs.iter().enumerate() {
+        assert_eq!(
+            read_sized(&mut fx.cpu, data.saturating_add(*off), 4),
+            0xaaaa_0000 + u64::try_from(i).expect("index fits"),
+            "operand {i} must have written its own word"
+        );
+    }
+    assert_eq!(
+        read_u64(&mut fx.cpu, data.saturating_add(0x1040)),
+        CANARY,
+        "nothing may write page 1"
+    );
+}
+
+/// The operand outside the span goes to the chain and is refused there, while
+/// the three inside it are still served — the per-access check, not a
+/// block-wide one.
+///
+/// If the span were applied to all four unconditionally, operand 3 would write
+/// page 1 at `host + 0x1000` and the canary would come back changed.
+#[test]
+fn one_operand_outside_the_span_does_not_ride_on_its_neighbours() {
+    let mut fx = narrow_fixture(0);
+    let p = build_four_stores();
+    let data = fx.data;
+    let inside = [0x100_u64, 0x200, 0x300];
+    let out = (p.run)(
+        std::ptr::from_mut(&mut fx.cpu.thread.ctx),
+        data.saturating_add(inside[0]),
+        data.saturating_add(inside[1]),
+        data.saturating_add(inside[2]),
+        // Page 1, outside the pin — and aimed at the canary, so a span wrongly
+        // applied to this operand destroys a word we read back.
+        data.saturating_add(0x1040),
+        0xbbbb_0000,
+    );
+    // The memory-safety assertion comes first: under a block-wide span this is
+    // the one that fires, and its message names the corruption rather than a
+    // return value.
+    assert_eq!(
+        read_u64(&mut fx.cpu, data.saturating_add(0x1040)),
+        CANARY,
+        "a span wrongly taken for the fourth operand would have written page 1"
+    );
+    assert_eq!(
+        out, MISS,
+        "the out-of-span operand must reach the chain, which refuses it"
+    );
+    for (i, off) in inside.iter().enumerate() {
+        assert_eq!(
+            read_sized(&mut fx.cpu, data.saturating_add(*off), 4),
+            0xbbbb_0000 + u64::try_from(i).expect("index fits"),
+            "operand {i} is inside the span and must still be served"
+        );
+    }
+}
+
+/// A descriptor whose generation does not match the frame publishes an empty
+/// span, so all four operands take the chain and nothing is written.
+#[test]
+fn a_dead_pin_descriptor_sends_all_four_to_the_chain() {
+    let mut fx = narrow_fixture(1);
+    let p = build_four_stores();
+    let data = fx.data;
+    let addrs = [0x100_u64, 0x200, 0x300, 0x380];
+    let out = (p.run)(
+        std::ptr::from_mut(&mut fx.cpu.thread.ctx),
+        data.saturating_add(addrs[0]),
+        data.saturating_add(addrs[1]),
+        data.saturating_add(addrs[2]),
+        data.saturating_add(addrs[3]),
+        0xcccc_0000,
+    );
+    assert_eq!(out, MISS, "an empty span must never be taken");
+    for off in addrs {
+        assert_eq!(
+            read_sized(&mut fx.cpu, data.saturating_add(off), 4),
+            0,
+            "no operand may write through a dead descriptor"
+        );
+    }
+    assert_eq!(
+        read_u64(&mut fx.cpu, data.saturating_add(0x1040)),
+        CANARY,
+        "page 1 must be untouched"
+    );
+}
