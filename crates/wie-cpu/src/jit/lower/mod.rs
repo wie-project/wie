@@ -907,6 +907,9 @@ pub(super) fn compile_block(
     // does not depend on how the previous attempt ended.
     eng.module.clear_context(&mut eng.ctx);
     eng.func_ctx = FunctionBuilderContext::new();
+    // Value indices restart at 0 in a fresh function, so the mask memo must not
+    // survive the previous block.
+    flags::reset_mask_cache();
 
     eng.ctx.func.signature = eng.block_sig.clone();
     eng.ctx.func.name = UserFuncName::user(0, func_id.as_u32());
@@ -1499,12 +1502,16 @@ pub(super) fn compile_block(
 }
 
 /// How many blocks `WIE_JIT_DUMP_IR` writes before it stops.
-///
-/// A cap rather than a filter: two thousand blocks (~2 MB of text) include
-/// enough distinct shapes to count them — the first two hundred turned out to be
-/// start-up code with no 32-bit ALU form in it at all, which is exactly the kind
-/// of thing a capped sample should be big enough to expose.
 const IR_DUMP_BLOCKS: u32 = 2000;
+
+/// Dump one block in this many.
+///
+/// A stride, not a head: the first two thousand blocks of a real guest are
+/// start-up code, and both 7-Zip and DOOM Retro produced *zero* 32-bit masks
+/// from them while their steady-state loops are a different population
+/// entirely. Sampling across the whole run is what makes the dump represent the
+/// program instead of its prologue.
+const IR_DUMP_STRIDE: u32 = 50;
 
 /// Append one block's CLIF to `WIE_JIT_DUMP_IR`, if that knob names a file.
 ///
@@ -1514,9 +1521,14 @@ const IR_DUMP_BLOCKS: u32 = 2000;
 /// the only place a redundant-mask question can be answered directly.
 fn dump_ir_if_requested(start_rip: u64, insn_count: usize, func: &cranelift_codegen::ir::Function) {
     static WRITTEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let Some(path) = crate::jit::config::JitConfig::get().ir_dump_path() else {
         return;
     };
+    let seen = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !seen.is_multiple_of(IR_DUMP_STRIDE) {
+        return;
+    }
     let n = WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n >= IR_DUMP_BLOCKS {
         return;
