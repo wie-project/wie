@@ -43,7 +43,58 @@ pub fn handle_file_time_to_local_file_time(
 
     ctx.finish(return_value)
 }
+/// Convert `filetime` and write the resulting `SYSTEMTIME` to guest memory.
+///
+/// `false` (and no write) when the instant is one Windows' own
+/// `FileTimeToSystemTime` refuses: past 30827-08-31 the civil year no longer
+/// fits a `SYSTEMTIME`'s `WORD`, and the API reports `ERROR_INVALID_PARAMETER`
+/// instead of wrapping.
+fn write_file_time_as_system_time(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    system_time_va: u64,
+    filetime: u64,
+) -> Result<bool> {
+    let Some(fields) = crate::kernel32::misc::filetime_to_system_time(filetime) else {
+        return Ok(false);
+    };
+    let [
+        year,
+        month,
+        day_of_week,
+        day,
+        hour,
+        minute,
+        second,
+        milliseconds,
+    ] = fields;
+    // One typed write covers all eight WORD fields (the view starts zeroed,
+    // which is what the per-field writes used to produce).
+    with_typed_write::<SystemTime, _, _>(engine, system_time_va, |st| {
+        st.w_year = year;
+        st.w_month = month;
+        st.w_day_of_week = day_of_week;
+        st.w_day = day;
+        st.w_hour = hour;
+        st.w_minute = minute;
+        st.w_second = second;
+        st.w_milliseconds = milliseconds;
+        Ok(())
+    })
+    .context("failed to write SYSTEMTIME")?;
+    Ok(true)
+}
+
 /// Handles `KERNEL32.dll!FileTimeToSystemTime`.
+///
+/// UTC in, UTC out — Windows performs **no** timezone shift here (that is
+/// `FileTimeToLocalFileTime`, which every caller runs first; this emulator's
+/// guest zone has `Bias = 0`, see `GetTimeZoneInformation`).
+///
+/// This used to be a stub that ignored its input and wrote a fixed
+/// `2026-07-09 12:00:00`, so every date any guest formatted came out as that
+/// date. 7-Zip's `l` reaches it once per listed item: `7za l` on an archive
+/// showed the same fabricated row date for every file while the timestamps
+/// stored in the archive were correct.
 pub fn handle_file_time_to_system_time(
     ctx: &mut HandlerContext<'_>,
 ) -> Result<WinApiHandlerResult> {
@@ -56,30 +107,19 @@ pub fn handle_file_time_to_system_time(
         .read_rdx()
         .context("failed to read RDX for FileTimeToSystemTime")?;
 
-    let success = input_file_time_va != 0 && system_time_va != 0;
-
-    if success {
-        // Deterministic fake converted time — one typed write covers all eight
-        // WORD fields (the view starts zeroed, matching the old per-field
-        // writes that explicitly set every field).
-        with_typed_write::<SystemTime, _, _>(engine, system_time_va, |st| {
-            st.w_year = 2026;
-            st.w_month = 7;
-            st.w_day_of_week = 4;
-            st.w_day = 9;
-            st.w_hour = 12;
-            st.w_minute = 0;
-            st.w_second = 0;
-            st.w_milliseconds = 0;
-            Ok(())
-        })
-        .context("failed to write SYSTEMTIME")?;
-
-        ctx.last_error().set_process_last_error(0);
-    } else {
-        ctx.last_error()
-            .set_process_last_error(ERROR_INVALID_PARAMETER);
+    let mut success = false;
+    if input_file_time_va != 0 && system_time_va != 0 {
+        let mut bytes = [0_u8; 8];
+        // A FILETIME that cannot be read is the same failure as a bad pointer:
+        // FALSE + ERROR_INVALID_PARAMETER, not a raise.
+        if engine.mem_read(input_file_time_va, &mut bytes).is_ok() {
+            success =
+                write_file_time_as_system_time(engine, system_time_va, u64::from_le_bytes(bytes))?;
+        }
     }
+
+    ctx.last_error()
+        .set_process_last_error(if success { 0 } else { ERROR_INVALID_PARAMETER });
 
     let return_value = u64::from(success);
 
@@ -276,7 +316,10 @@ pub fn handle_local_file_time_to_file_time(
     if local == 0 || file == 0 {
         return ret_u64(engine, 0, "LocalFileTimeToFileTime");
     }
-    // Prototype: treat local == UTC (no timezone conversion).
+    // Guest zone is UTC: `GetTimeZoneInformation` reports `Bias = 0` with no
+    // daylight dates, so the local↔UTC shift is the identity here by policy
+    // rather than by omission. A guest that asks for its zone gets the same
+    // answer this applies.
     let t = read_u64(engine, local)?;
     write_guest_u64(engine, file, t)?;
     ret_bool_true(engine, "LocalFileTimeToFileTime")
@@ -316,4 +359,90 @@ pub fn handle_dos_date_time_to_file_time(
     }
     write_guest_u64(engine, ft, FIXED_SYSTEM_FILETIME)?;
     ret_bool_true(engine, "DosDateTimeToFileTime")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_file_time_as_system_time;
+    use wie_cpu::{CpuEngine, IcedCpu, RwxPerms};
+
+    /// Where the SYSTEMTIME lands in the test guest's mapped page.
+    const SYSTEM_TIME_VA: u64 = 0x3000;
+    /// 2024-01-01T00:00:00Z — the FILETIME the VFS reports for every file
+    /// (`FIXED_SYSTEM_FILETIME`), i.e. what an archive listing formats.
+    const FIXED_FILETIME: u64 = 133_485_408_000_000_000;
+
+    fn test_engine() -> IcedCpu {
+        let mut cpu = IcedCpu::open_x86_64();
+        cpu.mem_map(0x1000, 0x10_0000, RwxPerms::ALL)
+            .expect("map test memory");
+        cpu
+    }
+
+    fn read_system_time(cpu: &mut IcedCpu) -> [u16; 8] {
+        let mut bytes = [0_u8; 16];
+        cpu.mem_read(SYSTEM_TIME_VA, &mut bytes)
+            .expect("read SYSTEMTIME");
+        let mut fields = [0_u16; 8];
+        for (index, slot) in fields.iter_mut().enumerate() {
+            let low = bytes[index * 2];
+            let high = bytes[index * 2 + 1];
+            *slot = u16::from_le_bytes([low, high]);
+        }
+        fields
+    }
+
+    /// The conversion must depend on its **input**. The handler this was
+    /// extracted from ignored it and wrote `2026-07-09 12:00:00` for every
+    /// FILETIME, which is what made every row of `7za l` show one fabricated
+    /// date while the archive's stored timestamps were correct.
+    #[test]
+    fn converts_the_input_instant_not_a_constant() {
+        let mut cpu = test_engine();
+
+        assert!(
+            write_file_time_as_system_time(&mut cpu, SYSTEM_TIME_VA, FIXED_FILETIME)
+                .expect("write SYSTEMTIME"),
+            "a representable instant converts"
+        );
+        assert_eq!(
+            read_system_time(&mut cpu),
+            [2024, 1, 1, 1, 0, 0, 0, 0],
+            "2024-01-01T00:00:00Z, Monday (wDayOfWeek 1)"
+        );
+
+        // A different instant must produce a different date: 1970-01-01Z.
+        let unix_epoch = 11_644_473_600_u64.saturating_mul(10_000_000);
+        assert!(
+            write_file_time_as_system_time(&mut cpu, SYSTEM_TIME_VA, unix_epoch)
+                .expect("write SYSTEMTIME"),
+            "the epoch converts"
+        );
+        assert_eq!(
+            read_system_time(&mut cpu),
+            [1970, 1, 4, 1, 0, 0, 0, 0],
+            "1970-01-01T00:00:00Z, Thursday"
+        );
+    }
+
+    /// Windows refuses instants past 30827-08-31 rather than wrapping the year,
+    /// and leaves the output buffer untouched on failure. The handler turns the
+    /// `false` into `ERROR_INVALID_PARAMETER`.
+    #[test]
+    fn refuses_an_unrepresentable_instant_and_writes_nothing() {
+        let mut cpu = test_engine();
+        cpu.mem_write(SYSTEM_TIME_VA, &[0xAA_u8; 16])
+            .expect("seed SYSTEMTIME");
+
+        assert!(
+            !write_file_time_as_system_time(&mut cpu, SYSTEM_TIME_VA, u64::MAX)
+                .expect("conversion is not an error"),
+            "u64::MAX is far past the last accepted instant"
+        );
+        assert_eq!(
+            read_system_time(&mut cpu),
+            [0xAAAA; 8],
+            "the output SYSTEMTIME must not be touched on failure"
+        );
+    }
 }

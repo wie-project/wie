@@ -343,6 +343,12 @@ hottest path in the emulator, and the pointer it protects cannot change while
 the session runs. `sample` cannot separate it because it inlines into
 `finish_compiled`'s self time — it needs a dedicated A/B, not a profile.
 
+> **Done, next round: 3.47 ns/entry.** The lock is gone (the pointer is captured
+> once per engine and stamped into the frame like the other raw pointers), worth
+> ~0.6% of `7za a -mx9` — below this host's per-pair resolution, which is why it
+> was measured on an entry-dominated guest. The same round attributed the rest of
+> the entry: [`dispatcher-entry-attribution.md`](dispatcher-entry-attribution.md).
+
 Beyond that, L1 does not stack with anything cheap: the ceiling doc's L7
 (region formation) is what multiplies this win, and the entry count
 (190–210 M on this corpus) is now the whole remaining cost of the dispatcher.

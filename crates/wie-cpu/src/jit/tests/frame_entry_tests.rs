@@ -107,6 +107,11 @@ struct FrameView {
     xmm: [u128; 16],
     shadow_sp: u64,
     shadow_ret: [u64; SHADOW_DEPTH],
+    /// The guest-memory pointer the block was handed: captured once per engine
+    /// at construction and re-stamped from the frame on every entry, so both
+    /// entry paths must see the engine's canonical address (a stale one here
+    /// means a chained block reads guest memory through a dead pointer).
+    mem: usize,
     /// Chain edges taken by this arm — compared separately, never for equality
     /// across arms (that is the point of the positive control).
     hops: u64,
@@ -123,6 +128,7 @@ impl FrameView {
             xmm: std::array::from_fn(|i| ctx.xmm[i].to_u128()),
             shadow_sp: ctx.shadow_sp,
             shadow_ret: ctx.shadow_ret,
+            mem: ctx.mem as usize,
             hops: cpu.stats().chain.hops,
         }
     }
@@ -149,6 +155,11 @@ impl FrameView {
         }
         assert_eq!(self.shadow_sp, other.shadow_sp, "{a} vs {b}: shadow_sp");
         assert_eq!(self.shadow_ret, other.shadow_ret, "{a} vs {b}: shadow_ret");
+        assert_eq!(
+            self.mem, other.mem,
+            "{a} vs {b}: the guest-memory pointer differs ({:#x} vs {:#x})",
+            self.mem, other.mem
+        );
     }
 }
 
@@ -218,6 +229,14 @@ fn arm(cpu: &mut JitCpu, entry_rip: u64) -> FrameView {
     );
     let mut view = FrameView::take(cpu);
     view.hops = view.hops.saturating_sub(hops_before);
+    let canonical = cpu.thread.guest_mem as usize;
+    assert_ne!(canonical, 0, "the engine must be bound to guest memory");
+    assert_eq!(
+        view.mem, canonical,
+        "arm at {entry_rip:#x}: the frame must carry the engine's canonical \
+         guest-memory pointer ({canonical:#x}), not {:#x}",
+        view.mem
+    );
     // Per-arm guest-visible results. These fail if the frame reached the block
     // with the wrong contents, whichever path delivered control.
     assert_eq!(

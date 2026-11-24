@@ -88,10 +88,10 @@ impl JitCpu {
     /// Open hybrid JIT on the host ISA (ARM64 on Apple Silicon).
     #[must_use]
     pub fn open_x86_64() -> Self {
-        let shared = JitShared::new();
+        let shared = Arc::new(JitShared::new());
         Self {
-            shared: Arc::new(shared),
-            thread: PerThreadJitState::new(),
+            thread: PerThreadJitState::new(&shared),
+            shared,
             fast_api: Vec::new(),
             stats: JitStats::default(),
             last_mem_gen: 0,
@@ -111,8 +111,8 @@ impl JitCpu {
     #[must_use]
     pub fn new_shared(shared: Arc<JitShared>) -> Self {
         Self {
+            thread: PerThreadJitState::new(&shared),
             shared,
-            thread: PerThreadJitState::new(),
             fast_api: Vec::new(),
             stats: JitStats::default(),
             last_mem_gen: 0,
@@ -1213,13 +1213,16 @@ impl JitCpu {
             self.stats.mem.pin_heap_bytes = data_bytes;
             self.stats.mem.pin_allow_bits = bits;
         }
-        let mem_guard = read_unpoisoned(&self.shared.mem);
-        let mem_ptr = (&raw const *mem_guard).cast_mut();
+        // No lock here: the guest-memory address is captured once per engine
+        // (see `PerThreadJitState::guest_mem`) because it is a field of the
+        // `Arc<JitShared>` payload and cannot move or be replaced. Reading its
+        // *contents* still takes the guard at each site that needs it.
+        let mem_ptr = self.thread.guest_mem;
         let ctx = &mut self.thread.ctx;
         let regs = &mut self.thread.regs;
         // Entry state, and *only* entry state. This used to build a whole
-        // `JitCtx` by value — 2.3 KB `tlb` + `pins` + `shadow_ret` + 16 GPRs +
-        // 16 XMM slots, ~4.6 KB copied in here and copied back out below, on
+        // `JitCtx` by value — 3,744 B in all (`tlb` 2.3 KB + `pins` + `shadow_ret`
+        // + 16 GPRs + 16 XMM slots) copied in here and copied back out below, on
         // every dispatcher entry (≈8.9% of the guest thread on `7za a -mx9`
         // came from `_platform_memmove` alone). The frame is now owned by this
         // engine, so the state that must persist between entries (`tlb`,
@@ -1289,7 +1292,6 @@ impl JitCpu {
         ctx.heap_ctrl_va = self.shared.heap[0].load(Ordering::Acquire);
         ctx.heap_base = self.shared.heap[1].load(Ordering::Acquire);
         ctx.heap_end = self.shared.heap[2].load(Ordering::Acquire);
-        drop(mem_guard); // GuestMemory read lock already released; compiled block runs on TLB/pins.
         // SAFETY: func is a finalized Cranelift block, and `ctx` is this
         // engine's one persistent frame: `&mut` here is the only outstanding
         // borrow for the duration of the call, the engine is owned by this host

@@ -27,7 +27,7 @@ were made free and nothing else changed: `1 / (1 - measured share)`.
 | **L4** | First-execution compiles: a block executed **once** is compiled anyway | eager compiles: 7592 (`mx9`), 7173 (`mx1`), 5784 (`x`), 1893 (`h`); `h` compiles 2087 blocks to retire 5.5M instructions | bounded by the stall it removes: **1.11x `h`**, ~1.1x `x`, ≈1.005x mx9 | S–M | Low | Yes | Patch-ish (needs a "compile on 2nd execution" decision, not a knob) |
 | **L5** | Emitted-code quality: base tier compiles at Cranelift `opt_level=none` | emitted code = **58% of mx9's guest thread**; `WIE_JIT_OPT=speed` on mx9 (below) | see §4.5 measurement | S (default flip) | Medium: compile cost per block ~1.5–1.7x (already measured in `docs/status.md`) | Yes (knob) | Patch |
 | **L6** | Chain-hop machinery | chain edges are already winning: `WIE_JIT_CHAIN=0` costs **1.53x** on `mx1` (median of 2 interleaved pairs) | no gain available by *removing* work; the gain is in making entries cheap (L1) and fewer (L7) | — | — | — | Landed |
-| **L7** | Region/trace formation: entries per guest instruction | 41.6 guest insns/entry on mx9; 19.9 on `x`; **226M entries on mx9** | multiplies L1: 400-insn regions would cut the 32% entry share to ~3%, i.e. **≈1.4x alone** | L (region discovery + exit stubs) | High (exactness on faults/SMC) | Yes | Architecture |
+| **L7** | Region/trace formation: entries per guest instruction | **81.2M entries on mx9 (93.9 insns/entry), measured 2026-11-25** — chaining + the persistent frame already removed two thirds of the 226M/41.6 this row was costed with; `x` 26.8 insns/entry. `WIE_JIT_SUPER=all` does **not** form regions (it is a per-block memory path) and measured 1.008 on mx9 — see §4.7 | multiplies a share L1 already cut: 400-insn regions would divide entries ~10x, but the entry path is **≈5–6% of the guest thread now** (85 ns/entry), so **≈1.05x, not the ≈1.4x this was costed at** — §4.7 | L (region discovery + exit stubs) | High (exactness on faults/SMC) | Yes | Architecture |
 | **L8** | Host stops / API resolution / handler dispatch | `handler_ms` ≤ **1.2%** of wall on every measured class (0.11% mx9, 0.22% mx1, 1.18% `x`, 0.50% `h`); `resolve_ms` ≤ 0.54 ms | **≤1.2%** — dead end for load-heavy guests | S | Low | Yes | Patch |
 | **L9** | Threading / N guest threads | 4 compile workers are **85–90% idle** while the guest blocks on the compile mutex 24% of the time; the mutex, not CPU, is the serialising resource | bounded by L2; not independently measurable here | L | High | — | Architecture (peer-owned measurement) |
 
@@ -469,18 +469,68 @@ more time on the hop; spend it on the *entry* (L1) and on *fewer entries* (L7).
 
 ### 4.7 L7 — Fewer entries: the multiplier on L1
 
-Entries per guest instruction on mx9 is 41.6; on `x` it is 19.9. Entry cost ~145–180 ns
-means mx9 pays ~40 s and `x` pays ~1.6 s of its 7.6 s in dispatcher entries. Region
-formation (superblocks/traces) attacks the *count*:
+Entries per guest instruction on mx9 is **93.9** — 81.2M entries for 7.62G instructions,
+measured 2026-11-25; the round that wrote this table measured 41.6/226M, so the count has
+already fallen 2.3x. What an entry *costs* has moved even further: per
+[`dispatcher-entry-attribution.md`](dispatcher-entry-attribution.md) it is 85 ns and the
+whole entry path is now **≈5–6% of the guest thread, down from the 32%** this lever was
+costed against, because L1 landed. Region formation (superblocks/traces) attacks the
+*count*, which L1 did not touch:
 
-* A 400-instruction region would cut entries ~10x: dispatch 32% → ~3%, i.e. **≈1.4x
-  on mx9 by itself, and it stacks with L1** (1.45x × 1.4x ≈ 2.0x, bounded by the
-  emitted 58% that neither lever touches).
+* A 400-instruction region still divides the entry count by ~10, but 10x of a 5–6% share
+  is ~5 points, i.e. **≈1.05x on mx9 — not the ≈1.4x this row was costed at**, and not
+  the multiplier on L1 that made it interesting (L1 is already in). At the attribution
+  doc's 85 ns/entry the 81.2M entries are ~7 s of mx9's 76 s: real, no longer dominant.
+* Reconcile the count before costing anything here: the attribution doc projects its
+  percentages with "≈220 M entries per run", this harness measures 81.2M for the same
+  7.62G instructions. Whichever is right, one of the two is a stale binary or a
+  different workload, and the L7 ceiling moves with it.
 * `WIE_JIT_SUPER` today only turns *self-loops* into a super path (`SUPER=all` measured
   below in §4.5's batch). Turning general straight-line runs into regions needs block
   discovery across edges plus exact exit stubs for faults/SMC/protect — that is why it
   is an architecture change, and it is the one that also makes the code cache more
   effective (fewer, larger units to persist).
+
+> **Measured 2026-11-25 — `SUPER=all` is not a region lever, and the candidate win was
+> noise.** With the eligibility bug in §4.5 fixed, the earlier "0.86–0.90x on mx9"
+> reading (n=1, small corpus) needed confirmation on the calibrated full corpus and
+> proper reps before anyone flipped a default on it:
+>
+> ```
+> ./scripts/real-guest-perf.sh --classes mx9,mx1,x,h --arms def,super_all --reps 3 \
+>     --max-load 6 --out /tmp/perf-A          # host load at rep start 3.07-4.10
+> ```
+>
+> | class | `def` wall (median) | `all`/`def` ratio (median, min..max) | entries `def` → `all` |
+> |---|---|---|---|
+> | mx9 | 76.35 s | **1.008** (0.968..1.133) | 81.2M → 85.1M |
+> | mx1 | 36.10 s | **0.971** (0.938..1.053) | 25.7M → 26.2M |
+> | `x` | 10.29 s | **0.992** (0.980..1.080) | 4.52M → 4.06M |
+> | `h` | 3.27 s | **1.061** (1.014..1.287) | 4350 → 4271 |
+>
+> Every spread straddles 1.0, so the rule stated before the run — flip the default only
+> if *both* load-heavy classes improve ≥5% with no class regressing — is **not** met,
+> and the default stays `loop`. Archives are byte-identical either way (`a -mx1`
+> `e136e4ea…`, `a -mx9` `04c96f0f…`, same MD5 under both arms).
+>
+> The reason the ratio cannot move is in the mechanism, and it corrects this section:
+> **`WIE_JIT_SUPER` forms no regions.** It emits *two* paths inside one block — a
+> "super" path using bare host loads when a block-wide entry guard proves the whole
+> stack range, and the normal sticky/pin path otherwise — so it removes the per-access
+> probe inside a block but cannot change how often a block is *entered*
+> (`jit/lower/mod.rs`, `dual_super`). The only measured side effect is compile cost:
+> mx9 `compile_us` 26.8M → 19.5M (−27%, less CLIF per block, no wall benefit because
+> compile is background there). The entry count — the quantity L7 is about — is
+> untouched on the load-heavy class (and 4% *higher*, within noise).
+>
+> Consequence for planning: L7 must be attacked with real region discovery across
+> edges (block discovery + exit stubs), not by making `all` the default. The knob is
+> worth keeping as a byte-exactness arm (a different memory lowering for every
+> stack-pin-shaped block, identical archives, micro-suite green under it).
+>
+> Regression side, same protocol: `long_loop` is 0.40 s under `all` vs 0.42 s at
+> defaults (median of 6 interleaved pairs, load 2.1; budget 0.55), and the whole
+> micro-suite passes under `all` — so the arm is safe, it just does not buy wall clock.
 
 ### 4.8 L8 — Host stops, resolution, handlers (≤1.2%)
 
@@ -607,6 +657,12 @@ has a provable mechanism, and its measured share is 32% of the heaviest real wor
   the lowering: a block that assigns its own base register was accepted, so the
   entry-value guard proved the wrong address. `scripts/real-guest-perf.sh --arms
   def,super_all` is the harness L7 needs.
+* ~~**The fixed super path is a candidate 0.86–0.90x win on mx9**~~ **Refuted
+  2026-11-25.** With reps and the calibrated full corpus it is 1.008 (0.968..1.133) on
+  mx9, 0.971 on mx1, 0.992 on `x`, 1.061 on `h`: noise, not a win, and the entry count
+  it was supposed to attack does not move because the knob is a per-block memory path,
+  not region formation — §4.7 has the table and the mechanism. The default stays
+  `loop`; record the number, do not flip it.
 * **The gates were run with a peer's in-flight edits in the tree** (`jit/lower/*`,
   `jit/block.rs`). They are green as reported in §6, but a peer's next edit can change
   that; my own change this round was a Markdown file.
@@ -625,9 +681,14 @@ has a provable mechanism, and its measured share is 32% of the heaviest real wor
 3. **A first-execution compile policy (L4).** Never compile a block on its first
    execution. Measured ceiling 1.11x on `h`, and it removes the eager compile storm
    that makes short guests expensive.
-4. **Region formation (L7)** — but only after the `WIE_JIT_SUPER=all` segfault above is
-   fixed, and only because it multiplies L1: entries per guest instruction is the
-   number that turns a 145 ns entry cost into (or out of) a wall-clock problem.
+4. **Region formation (L7)** — real region discovery across edges (plus exit stubs for
+   faults/SMC/protect). Measure before dispatching it: the premise that made it third
+   has moved twice. Entries fell from 226M to 81.2M per mx9 run, and the entry path fell
+   from 32% to ≈5–6% of the guest thread once L1 landed
+   ([`dispatcher-entry-attribution.md`](dispatcher-entry-attribution.md)), so a 10x
+   entry cut is now **≈1.05x**, not ≈1.4x. Not `WIE_JIT_SUPER=all`: the segfault that
+   used to gate this is fixed (§4.5), but the knob is a per-block memory path rather than
+   region formation and measured 1.008 on mx9 (§4.7).
 5. **A real-guest perf harness.** `./scripts/run-micro-suite.sh` and `--only perf` gate
    `long_loop`, a compute micro that tells us nothing about file I/O, compilation or
    allocation. Everything in this document came from ad-hoc scripts plus the
@@ -702,10 +763,13 @@ measurement and this document does not claim it is. Two consequences:
 * The curve below is a **1 → 2–3 thread** curve, which is exactly where an emulator's
   threading either works or does not.
 * An honest 8-thread ceiling needs a corpus large enough (or `-ms` small enough) that
-  7-Zip really starts 8 encoders, *and* a host that can give 8 cores. Neither was
-  available: this Mac is **4 performance + 4 efficiency cores** and peers held it at
-  load 3.3–7.4 for the whole session. The native control quantifies what the host was
-  actually willing to give: **1.57–1.69x at 8**, never more.
+  7-Zip really starts 8 encoders. That was not available: this Mac is **4 performance +
+  4 efficiency cores** and peers held it at load 3.3–7.4 for the whole session.
+  **Correction, §10.9:** the native control's 1.57–1.69x is *7-Zip's own* block-level
+  parallelism ceiling on a 2.9 MB corpus, **not** the host's. Measured separately, the
+  host delivers **2.00x at 2 threads and 7.7x at 8** on pure compute. Reading the native
+  arm as a host capacity was wrong; it is a like-for-like workload control, and that is
+  all it is used for below.
 
 ### 10.2 The curve
 
@@ -828,12 +892,15 @@ The three candidate explanations, and what rules each in or out:
 |---|---|
 | Lock contention | **Ruled out.** 0.81% of samples, 1.43 ms of instrumented wait (§10.3). |
 | Compile serialisation on `JitShared::engine` | **Ruled out as the main term.** Cranelift is 0.03% of samples at N=8 and `bg_stall` is 4.9% of wall at `-mx9`. It *is* the dominant term at `-mx1` (32% of wall) — see §10.5. |
-| Host-core heterogeneity + shared-cache pressure | **Consistent with everything.** 4P+4E: the second guest thread lands on an E-core and costs ~2.5–3x the cycles per instruction for the same work. It also predicts the saturation at 2 threads and the flatness beyond it, and it is the same wall the *native* control hit (1.69x of a nominal 8). |
+| Host-core heterogeneity | ~~**Consistent with everything.**~~ **Refuted in §10.9.** The host delivers a clean **2.00x at 2 threads** and 7.7x at 8 on pure compute, and no QoS class changes it; there is no placement penalty at the thread counts where the CPU inflation appears. |
+| Shared-cache pressure | **Still open, but not where it looked.** The one per-entry shared write (`JitShared::guest_insns`) was removed in a scratch build and is **neutral** (§10.9). What *is* measurable is that the spawned worker spends **~3.9x the host CPU per unit of work** than the pump, 4x of it on the guest-memory helper path — a cold per-thread translation path, not contention. |
 
-This is a hypothesis with a mechanism, not a measurement: separating "E-core placement"
-from "shared-cache pressure on the guest arena" needs either thread pinning or a
-homogeneous host, and neither was available. **That experiment is the first thing the
-next round should run** (§10.8).
+Those two were hypotheses when this section was written; **both have since been tested**
+(§10.9): placement is refuted by the host capacity curve, and removing the one per-entry
+shared write is measured neutral. What the same measurement *does* isolate is that the
+spawned worker thread costs ~3.9x the host CPU per unit of work it takes off the pump,
+which points at per-thread translation warmth rather than at either hypothesis — see
+§10.9 for the per-thread split and §10.8 for the next experiment.
 
 ### 10.5 The compile serialisation, bounded under real N
 
@@ -897,10 +964,12 @@ sample says that price is paid in cycles, not in waits.
    encoders (or `-ms` small enough), on a host with 8 idle *comparable* cores. Until
    then "the emulator does not scale to 8" is **not** what was measured; "it does not
    scale to 2–3, where the native control gets 1.57–1.69x" is.
-2. **E-core vs cache pressure**, which is the §10.4 hypothesis. Pin the guest's host
-   threads to the 4 performance cores (`thread_policy_set` / `taskpolicy -c 1`) and
-   re-run the same 1→2 comparison: if the +51% CPU collapses, the emulator's threading is
-   not the problem and "full multithreading" is bounded by the scheduler, not by WIE.
+2. ~~**E-core vs cache pressure.** Pin the guest's host threads to the 4 performance
+   cores and re-run the 1→2 comparison.~~ **Done — §10.9.** Placement is refuted (the host
+   gives 2.00x at 2 threads and QoS does not pin), and the per-entry shared write is
+   measured neutral. The replacement lead is per-thread translation warmth: seed the new
+   engine's TLB from its entry block, or reuse a retired engine, then re-run the same
+   `-mmt=1` vs `-mmt=2` pair.
 3. **The handoff path itself.** `WaitForSingleObject(INFINITE)` is sliced into 50 ms
    chunks (`quantum.rs:824`), each re-check taking `WinApiState`. At 244 handoffs per run
    that is invisible; on a workload with millions of handoffs it would not be.
@@ -915,3 +984,119 @@ sample says that price is paid in cycles, not in waits.
 respectively, and the non-`lock_order` locks are further down than that. The one thing
 this section produced for the tree is the instrument, `scripts/mt-scaling.sh`, so the
 next round can re-run the curve — including the native control — instead of trusting it.
+
+### 10.9 The E-core hypothesis: tested, and refuted — plus the cache line that looked guilty
+
+§10.4 left one mechanism untested: "the second guest thread lands on an E-core and costs
+~2.5–3x the cycles per instruction". That is now measured, three ways. **It is wrong**,
+and so is the reading of the native control it rested on.
+
+#### The lever, and why it cannot even pose the question
+
+macOS offers two candidate knobs. Built outside the repo (`/tmp/qos/qos_exec.c`), since
+`wie-runtime`/`wie-cli` do not own `unsafe`:
+
+```c
+// qos_exec <ui|uin|def|util|bg> <prog> [args...]
+pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE /* or BACKGROUND */, 0);
+execv(argv[2], argv + 2);        // new threads inherit the creator's class
+```
+
+QoS survives the `exec` and new threads inherit it — validated on a native 8-thread
+integer burn, where the arms are indistinguishable:
+
+| QoS arm | `def` | `ui` | `uin` | `util` | `bg` |
+|---|---|---|---|---|---|
+| 8 threads, 2e9 iters each (wall) | 3.36 s | 3.40 s | 3.38 s | 3.05 s | 3.59 s |
+
+**QoS does not pin on this machine.** `BACKGROUND` — which is documented to prefer
+efficiency cores — costs 7% where a real cluster restriction would cost 2–3x. So the
+lever cannot force placement, and any conclusion drawn from it would be an artefact of
+the OS ignoring the hint.
+
+#### The premise fails anyway: the host delivers a clean 2.00x at 2 threads
+
+Which is the control the hypothesis actually needed — the host's own capacity curve,
+same binary, fixed work per thread:
+
+| threads | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| wall (s) | 2.77 | 2.77 | 2.63 | 2.89–3.41 |
+| total work / wall | 1.00x | **2.00x** | **4.21x** | **7.7x** |
+
+Two threads get **2.00x**, not 1.2x. Efficiency cores cost ~4% at 8 threads. At the
+thread counts where the emulator loses 51% of its CPU, **the host has no placement
+penalty to explain it**.
+
+So: *is forcing QoS ours to fix?* The question dissolves — placement is not the
+mechanism, so there is nothing to force. It would also be the **wrong** thing to ship:
+a user deliberately spreading 8 threads over a 4P+4E part is a scheduling reality, and
+an emulator overriding QoS process-wide would silently outrank the guest's own intent
+and starve interactive guests. If this ever becomes a real effect, the answer is a knob,
+not a default.
+
+#### The line that looked guilty, and the negative result
+
+With placement gone, the remaining suspect was shared-memory coherence, and there is
+exactly one shared line **written once per compiled-block execution by every engine**:
+`JitShared::guest_insns`, an `AtomicU64` in `shared.rs`, `fetch_add`ed from
+`run_compiled` (93 M dispatcher entries at `-mmt=2`, 225 M per the peer's count) purely
+to answer `is_boot_mode()` — a question whose answer stops changing after 5 M
+instructions. That is one contended RMW per ~41 guest instructions, on the one line every
+engine shares.
+
+Tested in a **scratch clone** (never the shared tree — `shared.rs`/`pipeline.rs` were
+being rewritten by a peer throughout this experiment), as the *upper bound* of the idea:
+skip the RMW entirely once the gate closes.
+
+| `-mx1` | base median | exp median | paired median | verdict |
+|---|---|---|---|---|
+| `-mmt=1` | 15.87 s | 16.11 s | 1.00 (4/4 within ±2%) | neutral, as designed |
+| `-mmt=2` | 18.18 s | 18.26 s | **0.99** | **negative** |
+| `-mmt=8` | 22.90 s | 21.63 s | 1.09 (3/4 pairs, p=0.31) | inside the noise |
+
+Executed work is provably identical (`insns` = 949 150 672 in **both** arms), and the
+`-mmt=8` window had `cpu_sys` swinging 5.5–10.0 s run to run, so 9% at 3/4 pairs is not a
+result. **The per-entry shared write costs nothing measurable.** Nothing was shipped.
+
+#### Where the extra cycles actually are: one thread is 3.9x less efficient than the other
+
+Per-thread `ps -M` and `sample` of the same `-mx9 -mmt=2` run, mid-flight:
+
+| | pump (thread 0) | guest worker (thread 6) |
+|---|---|---|
+| busy | 96.3% of a core | 67.8% of a core |
+| emitted code | 38.0% | 33.0% |
+| `_platform_memmove` | 30.7% | 14.0% |
+| JIT memory helper | **3.6%** | **14.5%** |
+| condvar (parked/waking) | 0.0% | 25.6% |
+| mutex | 1.5% | 1.2% |
+
+The pump gives up 11.3 s of its own work (emu 64.07 s alone → 52.81 s) and the worker
+burns ~43.9 s of CPU to absorb it: **the worker spends ~3.9x the host CPU per unit of the
+job it takes**. That is the inflation, and it is not contention *with* the pump — mutex
+holds are 1.2–1.5% for both. It is the worker's own execution being 4x more expensive on
+the guest-memory helper path (14.5% vs 3.6% of its time), which is the soft-translate /
+TLB-miss path, i.e. **per-thread state that a freshly spawned engine has not warmed**.
+
+That is now the leading hypothesis, and unlike the last one it is testable in a contained
+way: per-thread TLB warm-up on engine start (seed the TLB from the entry block), or
+reusing a retired engine instead of building a cold one. Both are `wie-cpu`-local. Note
+this is also *consistent* with the aggregate composition being flat
+(`-mmt=1` vs `-mmt=8` differ by ≤2 points in every bucket): the emulator does the same
+mix of work, but a third of it runs through a colder translation path.
+
+#### What changed since §10.2, and one honest caveat about that table
+
+All of §10.2's numbers are from `2e0a1dd`. HEAD is now `94621e2` ("Persistent JIT frame:
+1.33x on a real app"), which makes the single-threaded path much faster — measured here at
+`-mx1 -mmt=1`, **27.3 s → 15.8 s (1.73x)** on the same corpus and comparable load. Its
+multithreaded numbers improve too, but by less (`-mmt=8`: 25.3 s → 22.9 s, 1.10x), so the
+*relative* multithread penalty got **worse**, not better: at HEAD, `-mx1` goes
+15.93 → 17.38 → 22.06 → 22.87 s for `-mmt` 1/2/4/8, i.e. **adding threads now costs 44% of
+wall clock**, where on `2e0a1dd` it cost 18%. A cross-commit comparison under a load that
+moved between the arms (4.2–5.1 for HEAD, 4.6–16.3 for `2e0a1dd`) is weak evidence, and
+this one is flagged as such — but the direction is worth a proper A/B on a quiet host,
+because it says the frame change bought its 1.73x single-threaded and paid some of it
+back at N threads. It also means §10.6's ceilings should be re-derived on HEAD before
+anyone acts on them.

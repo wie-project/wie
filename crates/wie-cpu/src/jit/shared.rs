@@ -1545,6 +1545,35 @@ pub struct PerThreadJitState {
     pub ctx: JitCtx,
     /// Generation at which the frame's pins were last rebuilt.
     pub pins_gen: u64,
+    /// The session's one [`GuestMemory`], captured **once** at engine
+    /// construction and stamped into [`JitCtx::mem`] on every entry.
+    ///
+    /// It exists because the pointer used to be taken per dispatcher entry:
+    /// `run_compiled` acquired a read guard on [`JitShared::mem`] purely to
+    /// derive `&raw const *guard`, dropped it before the call, and handed the
+    /// pointer to compiled code that ran *without* the guard anyway (guest
+    /// loads/stores translate through the TLB/pins, and the helpers take
+    /// `mem` from the frame). A `std::sync::RwLock::read` costs 11.4 ns in
+    /// isolation on this host but **3.47 ns** in situ (it overlaps with the
+    /// rest of the entry), measured on an entry-dominated guest — see
+    /// `docs/architecture/dispatcher-entry-attribution.md`. At ~200 M entries
+    /// per `7za a -mx9` run that is ~0.6% of the run, for an address that
+    /// cannot change.
+    ///
+    /// It cannot change because `GuestMemory` is a *field* of the
+    /// `RwLock<GuestMemory>` inside `JitShared`, which this engine holds by
+    /// `Arc` for its whole life: nothing replaces the payload (every writer
+    /// takes the guard and calls a method on it — `map_image`,
+    /// `virtual_alloc`, `write`, … — none assigns a new `GuestMemory`), and an
+    /// `Arc` allocation never moves. Capturing it under one read guard at
+    /// construction is therefore a *one-time* acquisition rather than a
+    /// weakening of the lock: metadata edits still require the write guard,
+    /// and every field read (`generation`, `jit_region_pins`) still takes the
+    /// read guard at its own site.
+    ///
+    /// Non-null from construction on; `JitCtx::new_persistent` starts null and
+    /// `PerThreadJitState::new` stamps both this and the frame.
+    pub guest_mem: *mut GuestMemory,
     /// Open-addressing guest VA → host block fn (late-bound block chaining).
     pub chain_slots: Box<[lower::ChainSlot; CHAIN_SLOTS]>,
     /// Sampling counter for the iced-residue opcode histogram (increments
@@ -1586,7 +1615,17 @@ pub struct PerThreadJitState {
 unsafe impl Send for PerThreadJitState {}
 
 impl PerThreadJitState {
-    pub(super) fn new() -> Self {
+    /// Bind a fresh engine to the session whose shared state it will use.
+    ///
+    /// This is the **only** place the guest-memory pointer is acquired: one
+    /// read guard, once per engine, at construction (see
+    /// [`Self::guest_mem`] for why the address cannot change afterwards).
+    /// Stamping it here rather than in `run_compiled` is what removes a
+    /// lock acquisition (measured 3.47 ns in situ) from every dispatcher entry.
+    pub(super) fn new(shared: &JitShared) -> Self {
+        let guest_mem = std::ptr::from_ref(&*read_unpoisoned(&shared.mem)).cast_mut();
+        let mut ctx = JitCtx::new_persistent();
+        ctx.mem = guest_mem;
         Self {
             regs: RegFile::new(),
             hooks: None,
@@ -1594,8 +1633,9 @@ impl PerThreadJitState {
             rip_trace_i: 0,
             rip_trace_n: 0,
             iced_steps: 0,
-            ctx: JitCtx::new_persistent(),
+            ctx,
             pins_gen: u64::MAX,
+            guest_mem,
             chain_slots: Box::new([lower::ChainSlot::empty(); CHAIN_SLOTS]),
             opcode_sample_i: 0,
             pending_promote_thr: 0,
