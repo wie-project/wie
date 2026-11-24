@@ -4,7 +4,9 @@
 use super::analysis::{ensure_gprs_loaded, ensure_xmm_loaded};
 use super::flags::{FlagState, decompose_packed, iconst_u64, pack_once, packed_word, resync_state};
 use super::gpr::mark_dirty;
-use super::insn::{PendingFlags, flush_pending, flush_pending_deferred, lower_insn};
+use super::insn::{
+    PendingFlags, flush_pending, flush_pending_deferred, flush_pending_impl, lower_insn,
+};
 use super::mem::call_load;
 use super::string::lower_string;
 use super::{
@@ -742,6 +744,11 @@ pub(super) fn lower_fast_ucrt(
     rflags: Value,
     mem: &mut MemEnv,
 ) -> Result<(), LowerError> {
+    // No opt-out needed here: `emit_body_and_term` records the terminator's
+    // snapshot (`fault_flags` after the body flush) before this arm runs, so a
+    // fault inside the inline fast-API import packs exactly the state `pack_once`
+    // already handed to the call. Measured: removing an explicit clear here
+    // changes no test and no word, because the two agree by construction.
     let rcx = gpr[1];
     let rdx = gpr[2];
     let r8 = gpr[8];
@@ -875,10 +882,39 @@ pub(super) fn check_fault_after_ucrt(
     let fault = bcx.ins().load(types::I64, mem.flags, fault_ptr, 0);
     let is_fault = bcx.ins().icmp_imm(IntCC::NotEqual, fault, 0);
     let cont = bcx.create_block();
-    let args = exit_args(gpr, rflags);
-    bcx.ins().brif(is_fault, mem.exit, &args, cont, &[]);
+    let fault_blk = bcx.create_block();
+    bcx.ins().brif(is_fault, fault_blk, &[], cont, &[]);
+
+    // The word the guest observes at a fault is built *here*, on the edge that
+    // leaves, and nowhere else: `fault_flags`/`fault_pending` describe the
+    // pre-instruction architectural state, so the same CLIF predicates the hot
+    // path would have materialised are available in this block, dominating it.
+    bcx.switch_to_block(fault_blk);
+    bcx.seal_block(fault_blk);
+    let word = fault_word(bcx, mem, rflags);
+    jump_exit(bcx, mem.exit, gpr, word);
+
     bcx.switch_to_block(cont);
     bcx.seal_block(cont);
+}
+
+/// The RFLAGS word to hand out at a fault edge.
+///
+/// `rflags` is the carrier the caller holds. When `mem.fault_flags` is `Some`,
+/// the caller's carrier may predate a flag writer that is still pending, so the
+/// pending flags are applied to a *copy* of the state and the result is packed —
+/// all of it in the fault block, so nothing is paid on the path that takes the
+/// access. `None` means the carrier is already authoritative (no SSA state, or a
+/// caller that materialised it itself).
+fn fault_word(bcx: &mut FunctionBuilder<'_>, mem: &MemEnv, rflags: Value) -> Value {
+    let Some(fs) = mem.fault_flags else {
+        return rflags;
+    };
+    let mut state = Some(fs);
+    let mut pending = mem.fault_pending;
+    let mut carrier = rflags;
+    flush_pending_impl(bcx, &mut carrier, &mut pending, &mut state, false);
+    packed_word(bcx, state.as_ref(), carrier)
 }
 
 /// Pin fields loaded once per block (loop-invariant for the `run_compiled` lifetime).
@@ -963,6 +999,26 @@ pub(super) struct MemEnv {
     pub(super) refill: Option<RefillProbe>,
     /// When set, load/store use `bias + addr` with **no** per-access bounds checks.
     pub(super) super_stack: Option<SuperStack>,
+    /// The architectural flags to hand the guest if **this** instruction's
+    /// memory access faults: the SSA state as it stood before the instruction.
+    ///
+    /// A fault observes EFLAGS, and it observes the *pre-instruction* state (a
+    /// faulting instruction does not retire), so this is recorded by
+    /// `lower_insn` at the top of every instruction and applied + packed only in
+    /// [`check_fault_after_ucrt`]'s fault block. That is what keeps a block's
+    /// hot path free of the pack for a flag writer that nothing in the block
+    /// reads: the word is built where it is observed, on the cold edge, instead
+    /// of before every probe guard.
+    ///
+    /// `None` means no SSA state is live (the carrier in `rflags` is already the
+    /// word, as on the interpreter-shaped path), and the paths that hand
+    /// `check_fault_after_ucrt` a carrier they materialised themselves — the
+    /// string helpers, which reload the word the helper wrote — clear this first.
+    pub(super) fault_flags: Option<FlagState>,
+    /// The flag writer that has been recorded in `fault_flags` but not yet
+    /// applied to it (`PendingFlags`), so the fault edge can apply exactly what
+    /// the flush points would have applied.
+    pub(super) fault_pending: PendingFlags,
 }
 
 pub(super) fn jump_exit(
@@ -1084,12 +1140,27 @@ pub(super) fn emit_body_and_term(
         // the block — and each of those packs it where it is used
         // (`packed_word`). A block whose flags are consumed only by its own
         // terminator therefore never builds one.
+        //
+        // A terminator that touches memory itself — `call`/`ret` push and pop
+        // the return address — is not a hole in this, because `lower_term` is
+        // handed the word from `pack_once` at the arm below: it packs from the
+        // state *before* that store/load, which is exactly the fault edge's
+        // requirement. (Measured: making this flush eager for those terminators
+        // changes no observable, because `pack_once` already packs there.)
         if flag_state.is_some() {
             flush_pending_deferred(bcx, rflags_val, &mut pending, &mut flag_state);
         } else {
             flush_pending(bcx, rflags_val, &mut pending, &mut flag_state);
         }
     }
+
+    // The terminator's own memory access (`call` pushes, `ret` pops) has a fault
+    // edge too, and it is not covered by `lower_insn`'s per-instruction snapshot:
+    // record the state *after* the body, which is what a fault on the terminator
+    // observes. The pending writer was just applied to `flag_state` above, so
+    // nothing is left pending at this point.
+    mem_env.fault_flags = flag_state;
+    mem_env.fault_pending = PendingFlags::None;
 
     // One pack per block, built at the first exit edge that needs the word and
     // reused by any later one: the edges below all observe the same architectural

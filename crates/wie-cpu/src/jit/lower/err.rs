@@ -299,6 +299,8 @@ mod tests {
             data_pins: Vec::new(),
             refill: None,
             super_stack: None,
+            fault_flags: None,
+            fault_pending: PendingFlags::None,
         };
         f(&mut bcx, &mut env)
     }

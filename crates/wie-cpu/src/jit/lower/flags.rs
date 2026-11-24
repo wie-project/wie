@@ -105,12 +105,20 @@ pub(super) fn iconst_u64(bcx: &mut FunctionBuilder<'_>, v: u64) -> Value {
         .iconst(types::I64, i64::from_ne_bytes(v.to_ne_bytes()))
 }
 
-// Per-block memo for `mask_width`: `(value index, width) -> masked value`.
+// Per-block memo for `mask_width`: `(cfg block, value index, width) -> masked
+// value`.
 // Thread-local because lowering runs on whichever thread owns the engine
-// (foreground or a compile worker), and cleared at the start of every block so a
-// `Value` index from one function can never be mistaken for another's.
+// (foreground or a compile worker), and cleared at the start of every compiled
+// unit so a `Value` index from one function can never be mistaken for another's.
+//
+// The CFG block is part of the key because emission is *not* one straight line
+// through one block: a cold side block is emitted mid-body (the probe miss chain,
+// and `check_fault_after_ucrt`'s fault block, which packs the flags there). A
+// value computed in such a block does not dominate the blocks emitted after it,
+// so reusing it from one of those would be a non-dominating use — which the
+// verifier rejects, and which would have been a miscompile if it hadn't.
 thread_local! {
-    static MASK_CACHE: RefCell<HashMap<(u32, u32), Value>> = RefCell::new(HashMap::new());
+    static MASK_CACHE: RefCell<HashMap<(u32, u32, u32), Value>> = RefCell::new(HashMap::new());
 }
 
 /// Forget the mask memo. Called once per block, before lowering it.
@@ -119,7 +127,7 @@ pub(super) fn reset_mask_cache() {
 }
 
 /// Truncate `v` to `bits`, reusing an identical mask already computed in this
-/// block.
+/// CFG block.
 ///
 /// The memo is not a micro-optimisation in search of a problem — it was counted
 /// first. `opt_level = none` means the emitter is the optimiser, so every mask
@@ -137,7 +145,8 @@ pub(super) fn mask_width(bcx: &mut FunctionBuilder<'_>, v: Value, bits: u32) -> 
     if bits >= 64 {
         return v;
     }
-    let key = (v.as_u32(), bits);
+    let cur = bcx.current_block().expect("lowering runs inside a block");
+    let key = (cur.as_u32(), v.as_u32(), bits);
     if let Some(hit) = MASK_CACHE.with(|cache| cache.borrow().get(&key).copied()) {
         return hit;
     }
@@ -190,7 +199,7 @@ pub(super) fn select_flag(bcx: &mut FunctionBuilder<'_>, cond: Value, bit: Rflag
     bcx.ins().ishl_imm(widened, i64::from(pos))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(super) struct FlagState {
     pub zf: Value,
     pub sf: Value,
@@ -574,7 +583,14 @@ pub(super) fn pack_once(
             if let Some(v) = *cache {
                 return v;
             }
-            let v = fs.pack(bcx);
+            // `FlagState::packed` is the state's own memo: a word produced by
+            // `pack_state` over exactly these fields is still exact, so an exit
+            // edge that follows a flush (the `call`/`ret` arms, where the flush
+            // precedes `pack_once`) reuses it instead of rebuilding it.
+            let v = match fs.packed {
+                Some(packed) => packed,
+                None => fs.pack(bcx),
+            };
             *cache = Some(v);
             v
         }

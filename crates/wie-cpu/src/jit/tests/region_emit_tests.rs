@@ -708,3 +708,368 @@ fn a_loop_is_folded_once_even_with_two_backward_edges_into_it() {
         "the region at the header is untouched by the later latch"
     );
 }
+
+// ── 6. the self-loop arm ────────────────────────────────────────────────
+
+/// `add rax, 1; sub rcx, 1; jne` — a **one-block self-loop** that writes both of
+/// its own live-ins.
+///
+/// ```text
+/// +0x00: add rax, 1     ; 48 83 C0 01   reads AND writes RAX (live-in clobbered)
+/// +0x04: sub rcx, 1     ; 48 FF C9      reads AND writes RCX, defines flags
+/// +0x07: jne +0x00      ; 75 F7         the back edge, consuming RCX's flags
+/// +0x09: ud2            ; 0F 0B          the exit target
+/// ```
+///
+/// This is DOOM Retro's scaled-blit shape reduced to three instructions: the
+/// hottest block in that guest is a self-loop, and while `backward_targets`
+/// excluded `to == rip` it could never become a region and so never got the
+/// once-per-entry memory hoist.
+const SELF_LOOP: [u8; 0x0B] = [
+    0x48, 0x83, 0xC0, 0x01, // add rax, 1
+    0x48, 0xFF, 0xC9, // sub rcx, 1
+    0x75, 0xF7, // jne +0x00
+    0x0F, 0x0B, // ud2
+];
+const SELF_LOOP_ENTRY: u64 = 0x10b6_0000;
+const SELF_LOOP_EXIT: u64 = SELF_LOOP_ENTRY + 0x09;
+
+/// The tier the per-block path would pick for `rip`, which is also the only tier
+/// a region that replaces it may use.
+fn expected_tier(cpu: &JitCpu) -> OptTier {
+    let counters = cpu.shared.tier_counters();
+    assert!(
+        counters.armed,
+        "precondition: tiering is armed in this build"
+    );
+    OptTier::Speed
+}
+
+/// A self-loop is proposed as a region and folds at its **own** header, at the
+/// tier the block would have had.
+///
+/// The shape a self-loop produces is one block either way, so `insn_count` and
+/// `guest_end` cannot tell the two paths apart — the discriminating facts are that
+/// a formation was attempted at all (`region_probe` records it, and the knob-off
+/// arm records nothing) and that the region compiled at the block's own tier
+/// rather than being downgraded to `Base`.
+#[test]
+fn a_self_loop_folds_at_its_own_header() {
+    for region in [true, false] {
+        let mut cpu = jit_with(SELF_LOOP_ENTRY, &SELF_LOOP, region);
+        let block_tier = expected_tier(cpu.as_ref());
+        let block = install_boot_block(cpu.as_mut(), SELF_LOOP_ENTRY);
+        assert_eq!(block.insn_count, 3, "the whole loop is one block");
+        assert_eq!(
+            block.tier, block_tier,
+            "the block path compiles a self-loop at the earned tier"
+        );
+
+        // The fold happens inside `install_boot_block`, on the same compile.
+        let compiled = ready_entry(cpu.as_ref(), SELF_LOOP_ENTRY);
+        assert_eq!(
+            compiled.guest_start, SELF_LOOP_ENTRY,
+            "keyed by its own header"
+        );
+        assert_eq!(
+            compiled.guest_end, SELF_LOOP_EXIT,
+            "and it owns the loop's bytes"
+        );
+        assert_eq!(
+            compiled.tier, block_tier,
+            "a region must never replace a `speed` block with a `base` one: the \
+             tier is `decide_tier`'s answer for the same RIP, not a default"
+        );
+        if region {
+            assert!(
+                cpu.region_probe.tried.contains(&SELF_LOOP_ENTRY),
+                "the latch seam must have asked formation about this header"
+            );
+        } else {
+            assert!(
+                cpu.region_probe.tried.is_empty(),
+                "knob off: no formation is attempted, so the block path is \
+                 untouched"
+            );
+        }
+    }
+}
+
+/// The self-loop region, run, against the interpreter — including the property
+/// that makes this fixture interesting: the loop **clobbers both of its own
+/// live-ins**, so an entry that loads them once and a body that rewrites them is
+/// the case where a live-in/`written` mistake would show up as a wrong answer
+/// rather than a crash.
+#[test]
+fn a_self_loop_region_matches_the_interpreter() {
+    for rcx in [1_u64, 3, 17] {
+        let mut results: Vec<ThreadContext> = Vec::new();
+        for backend in [Backend::Iced, Backend::Jit] {
+            let mut engine = open(backend);
+            if let Engine::Jit(cpu) = &mut engine {
+                cpu.shared_jit()
+                    .region_force
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            {
+                let cpu = engine.cpu();
+                cpu.virtual_alloc(
+                    SELF_LOOP_ENTRY,
+                    0x1000,
+                    MEM_RESERVE | MEM_COMMIT,
+                    protect::PAGE_EXECUTE_READWRITE,
+                )
+                .expect("map the fixture page");
+                cpu.mem_write(SELF_LOOP_ENTRY, &SELF_LOOP)
+                    .expect("write the fixture");
+                let mut ctx = cpu.snapshot_thread_context();
+                ctx.gpr[0] = 0; // RAX accumulates
+                ctx.gpr[1] = rcx; // RCX counts down
+                ctx.rip = SELF_LOOP_ENTRY;
+                cpu.restore_thread_context(&ctx);
+            }
+            if let Engine::Jit(cpu) = &mut engine {
+                let compiled = compile_and_install(cpu.as_mut(), SELF_LOOP_ENTRY);
+                assert_eq!(
+                    compiled.insn_count, 3,
+                    "precondition: this RIP came out as a region, not a block"
+                );
+            }
+            results.push(run_to_exit(&mut engine, SELF_LOOP_EXIT, SELF_LOOP_ENTRY));
+        }
+        let (iced, jit) = (&results[0], &results[1]);
+        assert_eq!(jit.rip, iced.rip, "rcx={rcx}: exit RIP differs");
+        assert_eq!(
+            jit.gpr, iced.gpr,
+            "rcx={rcx}: a self-loop body that rewrites its own live-ins is where \
+             an entry-load/exit-writeback mistake becomes a wrong answer"
+        );
+        assert_eq!(jit.rflags, iced.rflags, "rcx={rcx}: flags leaving the loop");
+        assert_eq!(jit.gpr[0], rcx, "RAX counted the iterations");
+        assert_eq!(jit.gpr[1], 0, "RCX reached zero");
+    }
+}
+
+/// The self-loop plus one block **outside** it that jumps back into its entry:
+///
+/// ```text
+/// A +0x00: add rax, 1 ; sub rcx, 1 ; jne A      (the self-loop)
+///   +0x09: ud2
+/// E +0x0B: jmp A                                ; EB F3
+/// ```
+///
+/// `E` is the case where the candidate header is **not** the block being compiled,
+/// so the emitter has to ask the header's own terminator whether it is a self-loop
+/// rather than assume it. That answer decides the tier, and `decide_tier` memoises
+/// it per VA — so a wrong `false` here does not just compile this region at the
+/// base tier, it downgrades the block path's `speed` compile for the same RIP.
+const SELF_LOOP_OUTSIDE_JMP: [u8; 0x0D] = [
+    0x48, 0x83, 0xC0, 0x01, // add rax, 1
+    0x48, 0xFF, 0xC9, // sub rcx, 1
+    0x75, 0xF7, // jne +0x00
+    0x0F, 0x0B, // ud2
+    0xEB, 0xF3, // jmp +0x00  (a backward edge from outside the loop)
+];
+const SELF_LOOP_OUTSIDE_ENTRY: u64 = 0x10b8_0000;
+
+/// A fold proposed by a **latch that is not the header** still finds the header's
+/// real tier.
+///
+/// The latch here is `E`, whose backward successor is the self-loop's entry. If the
+/// emitter assumed "not the latch ⇒ not a self-loop" it would record `Base` for that
+/// VA, and the region — and the block the block path would later compile there —
+/// would lose the `speed` tier that `earns_tier` promises a self-loop.
+#[test]
+fn a_fold_from_an_outside_latch_keeps_the_headers_earned_tier() {
+    let mut cpu = jit_with(SELF_LOOP_OUTSIDE_ENTRY, &SELF_LOOP_OUTSIDE_JMP, true);
+    let entry = SELF_LOOP_OUTSIDE_ENTRY;
+    let latch = SELF_LOOP_OUTSIDE_ENTRY + 0x0B;
+    let block_tier = expected_tier(cpu.as_ref());
+
+    // Compile the outside block only: it is the latch, and the loop it branches
+    // back into is the one-block loop at `entry`.
+    let outside = install_boot_block(cpu.as_mut(), latch);
+    assert_eq!(outside.insn_count, 1, "the `jmp` block itself");
+    assert_eq!(
+        outside.tier,
+        OptTier::Base,
+        "a plain `jmp` block earns no tier"
+    );
+
+    let folded = ready_entry(cpu.as_ref(), entry);
+    assert_eq!(folded.insn_count, 3, "the whole self-loop, as one region");
+    assert_eq!(
+        folded.tier, block_tier,
+        "the header's own terminator says it is a self-loop, so the region must \
+         carry the tier `earns_tier` gives that block — not `Base`"
+    );
+}
+
+// ── 7. self-loop shapes that must fold or refuse, never panic ───────────
+
+/// Every self-loop shape here must come out as a region, a plain block, or a
+/// refusal — never a Cranelift panic.
+///
+/// This exists because a self-loop is the one shape where the entry and the back
+/// edge are the same guest block, and a release-only `register allocation:
+/// EntryLivein` panic (a vreg live-in on the function entry, which cranelift
+/// forbids) would be silent in a dev-only suite if the IR that triggers it is
+/// merely *unusual* rather than obviously malformed. The region's Cranelift entry
+/// block is sealed with no predecessors and every internal edge targets a state
+/// block, so no shape should reach it — this test is what proves that claim over
+/// the shapes a guest actually emits.
+#[test]
+fn self_loop_shapes_fold_or_refuse_without_panicking() {
+    // `jmp $` — an unconditional one-instruction infinite loop: a one-block region
+    // with **no exit at all**, so the emitted function's only exits are its
+    // invalidation guard. Compile-only (running it is an infinite loop by design).
+    let jmp_self = [0xEB_u8, 0xFE];
+    // `jne $` — conditional, both a taken side and a fallthrough out.
+    let jne_self = [0x75_u8, 0xFE, 0x0F, 0x0B];
+    for (base, bytes) in [
+        (SELF_LOOP_ENTRY + 0x2000, &jmp_self[..]),
+        (SELF_LOOP_ENTRY + 0x3000, &jne_self[..]),
+    ] {
+        let mut cpu = jit_with(base, bytes, true);
+        // `try_compile` is the promotion entry point: whatever it decides, it must
+        // return rather than abort.
+        let compiled = cpu.try_compile(base).expect("a lowerable block");
+        assert!(
+            compiled.insn_count >= 1,
+            "shape at {base:#x} compiled to nothing"
+        );
+    }
+}
+
+/// A self-loop whose body **faults** must leave the region with the guest's own
+/// fault frame, exactly like a multi-block region does.
+///
+/// ```text
+/// +0x00: inc qword [rdi]   ; 48 FF 07   the faulting access
+/// +0x03: dec rcx           ; 48 FF C9
+/// +0x06: jne +0x00         ; 75 F8
+/// +0x08: ud2
+/// ```
+///
+/// The fault path is the one place a one-block region emits blocks the body never
+/// reaches, which is why it is worth its own run: with RDI pointing at readable
+/// memory the loop counts down, and with RDI unmapped the same region must report
+/// the fault at the `inc`'s IP with the register file the interpreter has.
+const FAULTING_SELF_LOOP: [u8; 0x0A] = [
+    0x48, 0xFF, 0x07, // inc qword [rdi]
+    0x48, 0xFF, 0xC9, // dec rcx
+    0x75, 0xF8, // jne +0x00
+    0x0F, 0x0B, // ud2
+];
+const FAULTING_ENTRY: u64 = 0x10b9_0000;
+const FAULTING_DATA: u64 = 0x10ba_0000;
+
+/// The readable arm: the loop runs, counts down, and leaves at the exit.
+#[test]
+fn a_faulting_self_loop_runs_when_its_address_is_mapped() {
+    let mut results: Vec<ThreadContext> = Vec::new();
+    for backend in [Backend::Iced, Backend::Jit] {
+        let mut engine = open(backend);
+        if let Engine::Jit(cpu) = &mut engine {
+            cpu.shared_jit()
+                .region_force
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        {
+            let cpu = engine.cpu();
+            cpu.virtual_alloc(
+                FAULTING_ENTRY,
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                protect::PAGE_EXECUTE_READWRITE,
+            )
+            .expect("map code");
+            cpu.virtual_alloc(
+                FAULTING_DATA,
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                protect::PAGE_READWRITE,
+            )
+            .expect("map data");
+            cpu.mem_write(FAULTING_ENTRY, &FAULTING_SELF_LOOP)
+                .expect("write bytes");
+            cpu.mem_write(FAULTING_DATA, &[0_u8; 8]).expect("zero data");
+            let mut ctx = cpu.snapshot_thread_context();
+            ctx.gpr[7] = FAULTING_DATA; // RDI
+            ctx.gpr[1] = 3; // RCX
+            ctx.rip = FAULTING_ENTRY;
+            cpu.restore_thread_context(&ctx);
+        }
+        if let Engine::Jit(cpu) = &mut engine {
+            let compiled = compile_and_install(cpu.as_mut(), FAULTING_ENTRY);
+            assert_eq!(compiled.insn_count, 3, "the whole self-loop, one region");
+        }
+        results.push(run_to_exit(
+            &mut engine,
+            FAULTING_ENTRY + 0x08,
+            FAULTING_ENTRY,
+        ));
+    }
+    let (iced, jit) = (&results[0], &results[1]);
+    assert_eq!(jit.rip, iced.rip, "exit RIP differs");
+    assert_eq!(jit.gpr, iced.gpr, "register file differs");
+    assert_eq!(jit.rflags, iced.rflags, "flags differ");
+}
+
+/// And the unmapped arm: the same region must report the fault at the guest's own
+/// instruction, with the frame the interpreter has.
+#[test]
+fn a_fault_inside_a_self_loop_region_matches_the_interpreter() {
+    let mut results: Vec<String> = Vec::new();
+    for backend in [Backend::Iced, Backend::Jit] {
+        let mut engine = open(backend);
+        if let Engine::Jit(cpu) = &mut engine {
+            cpu.shared_jit()
+                .region_force
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        {
+            let cpu = engine.cpu();
+            cpu.virtual_alloc(
+                FAULTING_ENTRY,
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                protect::PAGE_EXECUTE_READWRITE,
+            )
+            .expect("map code");
+            cpu.mem_write(FAULTING_ENTRY, &FAULTING_SELF_LOOP)
+                .expect("write bytes");
+            let mut ctx = cpu.snapshot_thread_context();
+            ctx.gpr[7] = 0xdead_0000; // RDI: unmapped
+            ctx.gpr[1] = 3; // RCX
+            ctx.rip = FAULTING_ENTRY;
+            cpu.restore_thread_context(&ctx);
+        }
+        if let Engine::Jit(cpu) = &mut engine {
+            let _ = compile_and_install(cpu.as_mut(), FAULTING_ENTRY);
+        }
+        let mut steps = 0_usize;
+        let outcome = loop {
+            steps = steps.saturating_add(1);
+            assert!(steps < 4096, "fixture neither faulted nor finished");
+            let before = engine.cpu().snapshot_thread_context();
+            match engine.run_rmw() {
+                StepResult::InvalidMemory(fault) => {
+                    break format!("fault {fault:?} rip={:#x}", before.rip);
+                }
+                _ => {
+                    let now = engine.cpu().snapshot_thread_context();
+                    if now.rip == FAULTING_ENTRY + 0x08 {
+                        break "completed".to_string();
+                    }
+                }
+            }
+        };
+        results.push(outcome);
+    }
+    assert_eq!(
+        results[0], results[1],
+        "the faulting self-loop must leave the same guest outcome as the \
+         interpreter (interpreter vs JIT)"
+    );
+}

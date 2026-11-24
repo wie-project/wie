@@ -64,25 +64,34 @@ pub(super) fn is_baseline_eligible(kind: &BlockKind) -> bool {
 
 /// Record one backward successor, deduplicated.
 fn push_backward(slots: &mut [u64; 2], len: &mut usize, from: u64, to: u64) {
-    // `to >= from` also excludes a **self-loop** — a block branching to its own
-    // entry. That shape is already served: the block path emits its back edge
-    // in-frame (`lower_self_loop_term`) and `earns_tier` gives it the whole
-    // tier-up budget, so folding it into a region would replace a working
-    // in-frame loop with a compile that costs more than the block it replaces.
-    if to >= from || slots[..*len].contains(&to) {
+    // **`to == from` is included**, i.e. a block that branches to its own entry
+    // is a loop header of a one-block loop. That is the same cycle as any other,
+    // and it is where the hottest blocks in a real guest are: DOOM Retro's
+    // SDL2 scaled-blit block (`0x1800d8fb0`, 54.1 % of guest time) is one, and
+    // while it was excluded here it could not get the region's once-per-entry
+    // memory hoist at all.
+    //
+    // The tier is what made this safe to include rather than a gamble: a region
+    // compiles at the tier the block path would have picked for the same RIP
+    // (`JitShared::decide_tier`, which returns `Speed` for exactly this shape),
+    // so folding a self-loop replaces a `speed` block with a `speed` region, not
+    // with a `Base` one. See `pipeline::try_compile_region`.
+    if to > from || slots[..*len].contains(&to) {
         return;
     }
     slots[*len] = to;
     *len += 1;
 }
 
-/// The successors of the block at `rip` that are **backward edges**: strictly
-/// below the block's own entry VA.
+/// The successors of the block at `rip` that are **backward edges**: at or below
+/// the block's own entry VA.
 ///
 /// Such a successor is the head of a cycle — control reaches `rip`, and `rip`
 /// branches back into it — so it is a **loop header**, which is precisely what
-/// [`form_loop_region`](super::lower::region) folds. This is the whole of the
-/// per-block cost of finding loops the compiler was not already pointed at: two
+/// [`form_loop_region`](super::lower::region) folds. `rip` itself is included:
+/// a block that branches back to its own entry is the header of a one-block
+/// loop, the commonest loop shape there is. This is the whole of the per-block
+/// cost of finding loops the compiler was not already pointed at: two
 /// comparisons over the two successor slots of a [`BlockKind`] that has already
 /// been decoded.
 ///
@@ -214,11 +223,11 @@ mod tests {
         assert!(slots(&kind, 0x1000).is_empty());
     }
 
-    /// A block branching to its own entry is a **self-loop**, which the block
-    /// path already emits in-frame and gives the tier-up budget to. Folding it
-    /// would replace a working native loop with a compile that costs more.
+    /// The DOOM-blit shape: a block whose `jne` targets itself. It **is** a loop
+    /// header — of a one-block loop — and it must be proposed, or the hottest
+    /// block in a real guest can never become a region.
     #[test]
-    fn a_self_loop_is_left_to_the_block_path() {
+    fn a_self_loop_is_a_loop_header() {
         let kind = pure_at(
             Some(BlockTerm::Jcc {
                 mnemonic: iced_x86::Mnemonic::Jne,
@@ -227,7 +236,23 @@ mod tests {
             }),
             0x1000,
         );
-        assert!(slots(&kind, 0x1000).is_empty());
+        assert_eq!(slots(&kind, 0x1000), vec![0x1000]);
+    }
+
+    /// Both sides of a `jcc` landing on its own entry is still **one**
+    /// candidate, not two: the two slots are deduplicated, so a self-loop costs
+    /// one formation attempt rather than two.
+    #[test]
+    fn a_two_sided_self_loop_yields_one_candidate() {
+        let kind = pure_at(
+            Some(BlockTerm::Jcc {
+                mnemonic: iced_x86::Mnemonic::Jle,
+                taken: 0x1000,
+                not_taken: 0x1000,
+            }),
+            0x1000,
+        );
+        assert_eq!(slots(&kind, 0x1000), vec![0x1000]);
     }
 
     /// A `call`'s successor is the callee: control resumes at the return site,
@@ -245,17 +270,22 @@ mod tests {
     }
 
     /// `ret` and an indirect call have no static successor; nor does a
-    /// `NotPure` block (nothing was decoded to ask about).
+    /// `NotPure` block (nothing was decoded to ask about). A block with no
+    /// terminator falls through, and the decoder walks strictly forward, so its
+    /// only edge is never a candidate.
     #[test]
     fn terminators_without_a_static_successor_yield_nothing() {
         for term in [
             Some(BlockTerm::Ret),
             Some(BlockTerm::CallDyn { return_ip: 0x2005 }),
-            None,
         ] {
             let kind = pure_at(term, 0x2000);
             assert!(slots(&kind, 0x2000).is_empty(), "term={term:?}");
         }
+        assert!(
+            slots(&pure_at(None, 0x2010), 0x2000).is_empty(),
+            "fallthrough"
+        );
         assert!(slots(&BlockKind::NotPure, 0x2000).is_empty());
     }
 }

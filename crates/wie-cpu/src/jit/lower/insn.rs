@@ -115,7 +115,7 @@ pub(super) fn flush_pending(
     flush_pending_impl(bcx, rflags, pending, flag_state, true);
 }
 
-fn flush_pending_impl(
+pub(super) fn flush_pending_impl(
     bcx: &mut FunctionBuilder<'_>,
     rflags: &mut Value,
     pending: &mut PendingFlags,
@@ -327,6 +327,19 @@ pub(super) fn lower_insn(
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
 ) -> Result<(), LowerError> {
+    // A fault on this instruction's memory operand hands the guest its
+    // architectural flags, and that hands them over as a *value*: the fault edge
+    // is `check_fault_after_ucrt`'s branch into the exit block, whose `rflags`
+    // parameter is the word. A faulting instruction does not retire, so the word
+    // it observes is the **pre-instruction** state — including a flag writer
+    // that is still pending (`FlagState` assigned but not materialised).
+    //
+    // Recording the state here and packing it in the fault block (rather than
+    // flushing before the access) is what keeps the pack off the hot path: the
+    // block that a fault never takes pays nothing, and a writer whose flags nothing
+    // in the block reads no longer materialises a word for the guard to skip over.
+    mem.fault_flags = *flag_state;
+    mem.fault_pending = *pending;
     match instr.mnemonic() {
         // True no-ops: NOP/endbranch, PAUSE and the prefetch cache hints
         // (no arch state). PAUSE (F3 90) is a pipeline hint: iced reports

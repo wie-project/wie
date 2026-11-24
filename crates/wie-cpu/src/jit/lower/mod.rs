@@ -1211,7 +1211,7 @@ pub(super) fn compile_block(
     let func_id = eng
         .module
         .declare_anonymous_function(&eng.block_sig)
-        .map_err(|e| LowerError::verifier(e.to_string()))?;
+        .map_err(|e| LowerError::verifier(format!("{e:?}")))?;
 
     // The shared `ctx.func` / `func_ctx` outlive one compile. The success path
     // finalizes the builder and clears the context at the end, but a lowering
@@ -1618,6 +1618,9 @@ pub(super) fn compile_block(
                     } else {
                         None
                     },
+                    // Set per instruction by `lower_insn`; nothing to carry in.
+                    fault_flags: None,
+                    fault_pending: PendingFlags::None,
                 };
 
                 emit_body_and_term(
@@ -1741,6 +1744,8 @@ pub(super) fn compile_block(
                 data_pins,
                 refill,
                 super_stack: None,
+                fault_flags: None,
+                fault_pending: PendingFlags::None,
             };
 
             emit_body_and_term(

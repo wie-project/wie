@@ -122,11 +122,15 @@
 //!   recorded exit belongs to no block edge, formation and emission disagree
 //!   about the same loop: that is [`LowerError::verifier`], and the caller
 //!   compiles the per-block path instead of emitting a transfer nobody described.
-//! * **A region does not consume the tier-up budget.** It compiles at the tier
-//!   the caller names, and `pipeline.rs` names `OptTier::Base`. `decide_tier`'s
-//!   rule is "self-loop", shaped for a single block; giving a whole region a tier
-//!   decision is a separate policy question with its own measurements, so it is
-//!   not smuggled in here.
+//! * **The caller names the tier, and it names the one the block path would have
+//!   picked.** `pipeline.rs` asks `JitShared::decide_tier` for the RIP, whose rule
+//!   is "a self-loop earns `speed`", so a region over a *one-block* loop folds a
+//!   `speed` block into a `speed` region and a multi-block loop's region compiles
+//!   at the base tier. That matters because the `speed` tier has a measurement
+//!   behind it (`long_loop` repays it 1.37x) and a `Base` region replacing such a
+//!   block would be trading measured code for unmeasured code. This module still
+//!   never decides a tier for itself — it does not know which of its blocks is a
+//!   loop header and which is a body.
 //!
 //! # Status
 //!
@@ -664,6 +668,7 @@ pub(in crate::jit) fn try_compile_region(
                     .iter()
                     .map(|b| format!("{:#x}", b.start()))
                     .collect::<Vec<_>>(),
+                tier = ?tier,
                 blocks = region.blocks().len(),
                 insns = region.insn_count(),
                 live_in = live.reg_count(),
@@ -906,6 +911,8 @@ pub(super) fn compile_region(
             data_pins,
             refill,
             super_stack: None,
+            fault_flags: None,
+            fault_pending: PendingFlags::None,
         };
 
         // Guard chaining on the same knob the block path uses: with

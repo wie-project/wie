@@ -23,7 +23,6 @@ use super::lower::{
     chain_table_clear, chain_table_insert, refill_clear,
 };
 use super::shared::{BgEnqueueOutcome, BgWaitCell, BgWaitState, JitShared, PerThreadJitState};
-use super::tier::OptTier;
 use super::{CacheEntry, JitCpu};
 use crate::CpuError;
 use crate::exec::{self, StepResult};
@@ -87,9 +86,13 @@ pub(crate) struct RegionProbe {
     /// path that is about to do a compile.
     epoch: u64,
     /// Loop headers formation has already been asked about at `epoch`.
-    tried: std::collections::HashSet<u64>,
+    ///
+    /// `pub(crate)` only so `jit::tests` can assert that a self-loop header was
+    /// actually *proposed* to formation — the one observable difference between
+    /// the two paths when both produce a single block.
+    pub(crate) tried: std::collections::HashSet<u64>,
     /// Formation attempts that produced no region, this epoch.
-    misses: u32,
+    pub(crate) misses: u32,
 }
 
 /// Queue depth at or above which waiting for this entry's compile is futile:
@@ -713,9 +716,6 @@ impl JitCpu {
                     // which is the proof that nothing but the duplicate compile
                     // was removed. `long_loop` is flat (median ratio 1.000, 1/5),
                     // i.e. the self-loop tier-up path is intact.
-                    if is_loop {
-                        drop(self.enqueue_bg(rip, &kind, inv_gen, false));
-                    }
                     // `WIE_JIT_REGION=1`: this block is a latch of every loop it
                     // branches back into, and this is the **only** look those
                     // headers get. A baseline compile installs `Ready` on the
@@ -725,11 +725,26 @@ impl JitCpu {
                     // loop now, while the guest thread's hook window (which
                     // formation decodes against) is in hand.
                     //
-                    // Ordered after the self-loop enqueue above and before the
-                    // install: a self-loop's successor is excluded from
-                    // `backward_targets`, so the two paths never claim the same
-                    // RIP here.
-                    self.promote_loop_headers(rip, baseline::backward_targets(rip, &kind), inv_gen);
+                    // **Before** the tier-up enqueue and the block install, and that
+                    // ordering is load-bearing: for a self-loop the candidate *is*
+                    // `rip`, so folding it and then installing the block would
+                    // overwrite the region on the spot, and the non-urgent tier-up
+                    // job would overwrite it again when it landed. When the fold
+                    // takes this RIP, `Some(region)` comes back and the region is
+                    // what runs.
+                    if let Some(region) = self.promote_loop_headers(
+                        rip,
+                        baseline::backward_targets(rip, &kind),
+                        inv_gen,
+                    ) {
+                        let meta = CompiledRunMeta::from(&region);
+                        self.stats.profile.eager_compiles =
+                            self.stats.profile.eager_compiles.saturating_add(1);
+                        return Ok(self.finish_compiled(rip, meta));
+                    }
+                    if is_loop {
+                        drop(self.enqueue_bg(rip, &kind, inv_gen, false));
+                    }
                     let meta = CompiledRunMeta::from(&baseline);
                     self.insert_ready(rip, baseline);
                     self.stats.profile.eager_compiles =
@@ -937,7 +952,10 @@ impl JitCpu {
         // exactly right. The one counter whose reading shifts is `promo.hit_ready`
         // ("the worker beat us to it"), which now also counts a promotion resolved
         // on the spot — it is a diagnostic, and the knob is off by default.
-        if urgent && let Some(compiled) = self.try_compile_region(rip, inv_gen) {
+        if urgent
+            && let Some(compiled) =
+                self.try_compile_region(rip, inv_gen, pure_is_self_loop(kind, rip))
+        {
             self.insert_ready(rip, compiled);
             return BgEnqueueOutcome::Ready;
         }
@@ -1214,18 +1232,25 @@ impl JitCpu {
         // Bake-before-decode (see `step_one`): snapshot the generation before
         // the block's bytes are read.
         let inv_gen = self.shared.invalidate_gen.load(Ordering::Acquire);
-        // A hot RIP may be a **loop header**: try the whole loop as one function
-        // before decoding a single block (`WIE_JIT_REGION=1`). `None` — not a
-        // loop, refused at formation, or refused at lower time — falls through to
-        // the per-block path below, which is the same code this function ran
-        // before regions existed.
-        if let Some(compiled) = self.try_compile_region(rip, inv_gen) {
-            return Some(compiled);
-        }
         let kind = {
             let mem_guard = read_unpoisoned(&self.shared.mem);
             decode_pure_gpr_block(&mem_guard, self.thread.hooks.as_ref(), rip)
         };
+        // A hot RIP may be a **loop header**: try the whole loop as one function
+        // before compiling a single block (`WIE_JIT_REGION=1`). `None` — not a
+        // loop, refused at formation, or refused at lower time — falls through to
+        // the per-block path below, which is the same code this function ran
+        // before regions existed.
+        //
+        // The block is decoded *before* the attempt (it used to be decoded after)
+        // so the region is compiled at the tier this RIP would be: `decide_tier`
+        // is a question about the block's own terminator, i.e. whether it is a
+        // self-loop. One decode is 1–2 µs against formation's 42 µs, and the
+        // region still precedes the *compile* either way.
+        if let Some(compiled) = self.try_compile_region(rip, inv_gen, pure_is_self_loop(&kind, rip))
+        {
+            return Some(compiled);
+        }
         self.try_compile_from_kind(rip, kind, inv_gen)
     }
 
@@ -1238,25 +1263,44 @@ impl JitCpu {
     /// and its only effect is that the per-block path compiles the same RIP, so
     /// it must not change what the *caller* does with the RIP.
     ///
-    /// # Why a region does not consume the tier-up budget
+    /// # The tier a region compiles at
     ///
-    /// It compiles at [`OptTier::Base`], the same tier the per-block path would
-    /// pick for this RIP (a non-self-loop block earns no tier), so the decision
-    /// is unchanged — this only removes `decide_tier`'s memoisation from the path.
-    /// A region that *did* earn a tier would need its own budget rule ("is one
-    /// region worth four blocks' worth of compile?"), and inventing that here
-    /// would silently starve the self-loops the budget was sized for.
+    /// The same one the per-block path would pick for this RIP,
+    /// [`JitShared::decide_tier`]: `Speed` for a block that is a **self-loop**
+    /// (when `WIE_JIT_TIER` is armed and the run's budget allows), `Base`
+    /// otherwise. `self_loop` is the caller's answer for `rip`, because the
+    /// caller has the decoded block.
+    ///
+    /// Deciding it here rather than defaulting to `Base` is what makes folding a
+    /// self-loop safe rather than a gamble: `earns_tier` gives a self-loop the
+    /// whole tier-up budget because `micro-exes/long_loop` repays it 1.37x, so a
+    /// region that replaced such a block at `Base` would be trading a measured
+    /// `speed` compile for an unmeasured `none` one. A region on a *multi-block*
+    /// loop is not a self-loop, gets `Base`, and charges nothing.
+    ///
+    /// This costs no extra budget in the common case: `decide_tier` is memoised
+    /// per guest VA, and the RIP being folded has usually been decided already by
+    /// the block compile that made it hot. When it has not (a header folded before
+    /// anything compiled it), the decision is the one that block would have taken
+    /// — one slot, for one function that replaces it.
     ///
     /// # Locks
     ///
     /// Held at once: the guest-memory read guard and the engine mutex. See
     /// [`lower::try_compile_region`]'s doc for why that order cannot cycle (no
     /// path in this crate holds a `mem` guard across another lock acquisition).
-    fn try_compile_region(&mut self, rip: u64, inv_gen: u64) -> Option<CompiledBlock> {
+    /// `decide_tier` is taken **before** either, so the tier ledger's lock never
+    /// nests inside the engine mutex.
+    fn try_compile_region(
+        &mut self,
+        rip: u64,
+        inv_gen: u64,
+        self_loop: bool,
+    ) -> Option<CompiledBlock> {
         if !self.shared.region_enabled_here() {
             return None;
         }
-        let tier = OptTier::Base;
+        let tier = self.shared.decide_tier(rip, self_loop);
         let start = Instant::now();
         let compiled = {
             let mem_guard = read_unpoisoned(&self.shared.mem);
@@ -1301,10 +1345,21 @@ impl JitCpu {
     /// (`WIE_JIT_REGION=1`).
     ///
     /// `backward` is [`baseline::backward_targets`] of that block: its
-    /// successors that sit *below* it, each of which is by definition a loop
-    /// header. For every candidate this asks [`form_loop_region`] to describe the
-    /// loop and compiles the answer as one native function, then installs it over
-    /// whatever translation the header had.
+    /// successors at or below it, each of which is by definition a loop header —
+    /// including `latch` itself, which makes a block that branches to its own
+    /// entry the header of a one-block loop. For every candidate this asks
+    /// [`form_loop_region`] to describe the loop and compiles the answer as one
+    /// native function, then installs it over whatever translation the header had.
+    ///
+    /// # The return value
+    ///
+    /// `Some` only when the fold took the **latch's own** RIP — i.e. a self-loop,
+    /// where the caller is holding a translation of the same instructions the
+    /// region now covers. The caller must install *that* instead of the block it
+    /// just compiled: installing the block afterwards would overwrite the region on
+    /// the spot, and a queued tier-up for the same RIP would overwrite it again
+    /// when it landed. Folds of *other* headers change no RIP the caller holds, so
+    /// they return `None` and the caller's block install is unaffected.
     ///
     /// # The gap this closes
     ///
@@ -1343,10 +1398,15 @@ impl JitCpu {
     /// [`RegionProbe`] check runs inside. When it is on, one formation per
     /// distinct loop header per invalidation epoch, with
     /// [`REGION_PROBE_MISSES_PER_EPOCH`] bounding the attempts that find nothing.
-    fn promote_loop_headers(&mut self, latch: u64, backward: ([u64; 2], usize), inv_gen: u64) {
+    fn promote_loop_headers(
+        &mut self,
+        latch: u64,
+        backward: ([u64; 2], usize),
+        inv_gen: u64,
+    ) -> Option<CompiledBlock> {
         let (slots, len) = backward;
         if len == 0 || !self.shared.region_enabled_here() {
-            return;
+            return None;
         }
         if self.region_probe.epoch != inv_gen {
             self.region_probe.epoch = inv_gen;
@@ -1369,9 +1429,42 @@ impl JitCpu {
                 continue;
             }
             if self.region_probe.misses >= REGION_PROBE_MISSES_PER_EPOCH {
-                return;
+                // Loud the first time only: past here, loops keep the per-block
+                // path for the rest of the epoch, which is a missed fold and never
+                // a wrong one. The line exists because "why is this loop still
+                // hopping?" has two very different answers — refused at formation,
+                // or out of probe budget.
+                tracing::debug!(
+                    attempts = self.region_probe.tried.len(),
+                    misses = self.region_probe.misses,
+                    "region probe budget exhausted for this invalidation epoch"
+                );
+                return None;
             }
-            match self.try_compile_region(header, inv_gen) {
+            // Whether the candidate is a **self-loop** decides its tier, and it has
+            // to be *asked*, not assumed. `decide_tier` memoises one decision per
+            // guest VA, so answering `false` for a header that is really a
+            // self-loop would not merely compile this region at the base tier: it
+            // would record `Base` for that VA and downgrade the **block path's**
+            // `speed` compile for the rest of the run. Measured on `long_loop`
+            // before this was fixed: the hot self-loop block went from `tier=Speed`
+            // to `tier=Base` under `WIE_JIT_REGION=1`, which is the one thing a
+            // region must never cost.
+            //
+            // `header == latch` is exact without a decode: a candidate equal to the
+            // block being compiled means that block's own terminator branches to its
+            // own entry. Otherwise the header is a different block, and its own
+            // terminator is the answer.
+            let self_loop = if header == latch {
+                true
+            } else {
+                let mem = read_unpoisoned(&self.shared.mem);
+                pure_is_self_loop(
+                    &block::decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), header),
+                    header,
+                )
+            };
+            match self.try_compile_region(header, inv_gen, self_loop) {
                 Some(compiled) => {
                     tracing::debug!(
                         header = format_args!("{header:#x}"),
@@ -1379,11 +1472,21 @@ impl JitCpu {
                         insns = compiled.insn_count,
                         "jit loop region folded from its latch"
                     );
+                    // Handed back only when the loop *is* this block, because then
+                    // the caller is holding a translation of the same RIP that the
+                    // region supersedes — installing the block afterwards would
+                    // overwrite the region, and enqueueing a tier-up for it would
+                    // overwrite it later.
+                    let at_latch = (header == latch).then_some(compiled);
                     self.insert_ready(header, compiled);
+                    if at_latch.is_some() {
+                        return at_latch;
+                    }
                 }
                 None => self.region_probe.misses = self.region_probe.misses.saturating_add(1),
             }
         }
+        None
     }
 
     /// Whether `header` already sits inside a **folded region**, which makes a
@@ -1490,8 +1593,13 @@ impl JitCpu {
             chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
             self.stats.chain.inline_inserts = self.stats.chain.inline_inserts.saturating_add(1);
         }
-        // This block is a latch of any loop its backward edges lead into.
-        self.promote_loop_headers(rip, backward, inv_gen);
+        // This block is a latch of any loop its backward edges lead into. If the
+        // loop is this block (a self-loop), the region supersedes the block that
+        // was just compiled — return it so the caller installs and runs the region
+        // rather than the block it would otherwise overwrite it with.
+        if let Some(region) = self.promote_loop_headers(rip, backward, inv_gen) {
+            return Some(region);
+        }
         tracing::debug!(
             start = format_args!("{rip:#x}"),
             insns = compiled.insn_count,

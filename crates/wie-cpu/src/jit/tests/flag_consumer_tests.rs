@@ -23,6 +23,7 @@
 // dual-engine harness instead of duplicating it.
 use super::chain_tests::chain_dual;
 use super::simd_parity_tests::{assert_same_regs, simd_dual};
+use crate::exec::StepResult;
 use crate::regs::{RegFile, Rflags};
 
 /// Condition codes in encoding order: `0x70 | cc` is `jcc`, `0x40 | cc` is
@@ -543,5 +544,181 @@ fn self_loop_exit_into_the_interpreter_packs_the_word() {
                 &format!("loop exit into the interpreter, eax={eax:#x}, rflags={rflags:#x}"),
             );
         }
+    }
+}
+
+// ── The fault edge: EFLAGS as the guest observes them at a fault ────────
+//
+// A faulting memory access hands the guest its architectural flags, and the
+// compiled block hands them over as a *value* (the exit block's `rflags`
+// parameter). That makes a fault the one place where a flag writer that is still
+// pending — assigned to `FlagState`, not yet materialised into the carrier —
+// would be observable as a **wrong answer** rather than a missing optimisation:
+// an SEH handler, a debugger, or a `pushfq` after the fault is handled would see
+// the flags of whatever last happened to be packed.
+//
+// Every shape below puts the writer *before* the faulting access and its only
+// consumer *after* it, so the consumer never runs and nothing in the block forces
+// the carrier to exist for the block's own reasons. That is the leak, and each
+// test also asserts the block really ran compiled (`iced_insns == 0`) so a silent
+// interpreter fallback cannot make it pass for the wrong reason.
+
+use super::harness::alloc_code;
+use crate::{CpuEngine, IcedCpu, JitCpu};
+
+/// An address no test engine maps: the fault has to come from the guest access,
+/// not from a permission the harness happened to set up.
+const UNMAPPED: u64 = 0xdead_0000_0000;
+
+/// A `ThreadContext` for one fault case: operands for the flag writer, the
+/// faulting base register, and an incoming word whose CF is the *opposite* of
+/// what the writer produces — so a carrier left over from the entry state shows
+/// up as a wrong CF rather than as a coincidentally equal one.
+fn fault_ctx(code_va: u64, eax: u64, edx: u64, rsp: u64) -> crate::ThreadContext {
+    let mut gpr = [0_u64; 16];
+    gpr[0] = eax; // RAX — `add eax, edx` dst
+    gpr[2] = edx; // RDX — `add eax, edx` src
+    gpr[3] = UNMAPPED; // RBX — the explicit faulting base
+    gpr[4] = rsp; // RSP — for the implicit stack shapes
+    crate::ThreadContext {
+        rip: code_va,
+        gpr,
+        rflags: Rflags::from(LOOP_FLAGS[1]), // CF=1: `add 0, 0` clears it
+        ..crate::ThreadContext::default()
+    }
+}
+
+/// Both engines, set up on the same bytes (each at its own code VA — the decode
+/// cache rule), and run to the fault.
+///
+/// iced steps `pre` + 1 instructions so it stops *on* the faulting one; the JIT
+/// runs the block once, which is the whole sequence. Returns the RFLAGS word and
+/// the fault from each engine.
+fn fault_dual(
+    code: &[u8],
+    eax: u64,
+    edx: u64,
+    rsp: u64,
+    iced_steps: usize,
+    what: &str,
+) -> (Rflags, Rflags, StepResult, StepResult) {
+    let mut iced = IcedCpu::open_x86_64();
+    let mut jit = JitCpu::open_x86_64();
+    let iced_va = alloc_code(&mut iced, code);
+    let jit_va = alloc_code(&mut jit, code);
+    iced.restore_thread_context(&fault_ctx(iced_va, eax, edx, rsp));
+    jit.restore_thread_context(&fault_ctx(jit_va, eax, edx, rsp));
+    jit.on_thread_switch();
+
+    let mut iced_fault = StepResult::Continue;
+    for _ in 0..=iced_steps {
+        iced_fault = match iced.step_once_result() {
+            Ok(r) => r,
+            Err(e) => panic!("{what}: iced step: {e}"),
+        };
+        if !matches!(iced_fault, StepResult::Continue) {
+            break;
+        }
+    }
+    let (jit_fault, _retired) = match jit.step_one() {
+        Ok(v) => v,
+        Err(e) => panic!("{what}: jit step: {e}"),
+    };
+    assert_eq!(
+        jit.stats().exec.iced_insns,
+        0,
+        "{what}: the JIT fell back to the interpreter, so this case proves nothing"
+    );
+
+    assert!(
+        matches!(iced_fault, StepResult::InvalidMemory(_)),
+        "{what}: iced did not fault, got {iced_fault:?}"
+    );
+    assert!(
+        matches!(jit_fault, StepResult::InvalidMemory(_)),
+        "{what}: the JIT did not fault, got {jit_fault:?}"
+    );
+    let iced_regs = iced.snapshot_thread_context();
+    let jit_regs = jit.snapshot_thread_context();
+    for i in 0..16 {
+        assert_eq!(
+            iced_regs.gpr[i], jit_regs.gpr[i],
+            "{what}: gpr[{i}] at the fault"
+        );
+    }
+    (iced_regs.rflags, jit_regs.rflags, iced_fault, jit_fault)
+}
+
+/// Assert the two words agree, naming the case. Split out because every shape
+/// below compares exactly this and nothing else.
+fn assert_fault_word(iced: Rflags, jit: Rflags, what: &str) {
+    assert_eq!(
+        u64::from(iced),
+        u64::from(jit),
+        "{what}: RFLAGS at the fault must be the writer's, not a stale carrier \
+         (iced {:#x}, jit {:#x})",
+        u64::from(iced),
+        u64::from(jit)
+    );
+}
+
+/// A pending writer whose flags nothing in the block consumes: `add eax, edx`
+/// then a faulting `mov ecx, [rbx]`.
+#[test]
+fn a_fault_after_a_pending_writer_reports_that_writers_flags() {
+    // add eax, edx · mov ecx,[rbx] · ud2
+    let code = [0x01, 0xD0, 0x8B, 0x0B, 0x0F, 0x0B];
+    for (case, eax, edx) in ARITH_CASES {
+        let (iced, jit, _, _) = fault_dual(&code, eax, edx, 0, 1, case);
+        assert_fault_word(iced, jit, &format!("pending add, never consumed, {case}"));
+    }
+}
+
+/// The same, with the writer's only consumer *after* the faulting instruction:
+/// the `setb cl` would read CF, and the fault means it never runs.
+#[test]
+fn a_fault_between_a_writer_and_its_consumer_reports_the_writers_flags() {
+    // add eax, edx · mov ecx,[rbx] · setb cl · ud2
+    let code = [0x01, 0xD0, 0x8B, 0x0B, 0x0F, 0x92, 0xC1, 0x0F, 0x0B];
+    for (case, eax, edx) in ARITH_CASES {
+        let (iced, jit, _, _) = fault_dual(&code, eax, edx, 0, 1, case);
+        assert_fault_word(
+            iced,
+            jit,
+            &format!("pending add, consumer after the fault, {case}"),
+        );
+    }
+}
+
+/// A `push` after a pending writer: the stack access is implicit (no memory
+/// operand kind), so this is the case an explicit-operand rule would miss.
+#[test]
+fn a_fault_on_an_implicit_stack_access_reports_the_writers_flags() {
+    // add eax, edx · push rbx · ud2
+    let code = [0x01, 0xD0, 0x53, 0x0F, 0x0B];
+    for (case, eax, edx) in ARITH_CASES {
+        let (iced, jit, _, _) = fault_dual(&code, eax, edx, UNMAPPED, 1, case);
+        assert_fault_word(
+            iced,
+            jit,
+            &format!("pending add, then a stack fault, {case}"),
+        );
+    }
+}
+
+/// A fault on the **terminator's** memory access: `ret` pops the return address,
+/// so a pending writer before it is the case where a deferred body flush would
+/// hand the fault a stale word.
+#[test]
+fn a_fault_on_the_terminators_stack_access_reports_the_writers_flags() {
+    // add eax, edx · ret
+    let code = [0x01, 0xD0, 0xC3];
+    for (case, eax, edx) in ARITH_CASES {
+        let (iced, jit, _, _) = fault_dual(&code, eax, edx, UNMAPPED, 1, case);
+        assert_fault_word(
+            iced,
+            jit,
+            &format!("pending add, then the ret's fault, {case}"),
+        );
     }
 }

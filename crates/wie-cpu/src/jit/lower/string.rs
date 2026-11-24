@@ -201,6 +201,9 @@ pub(super) fn try_lower_inline_rep(
         slow_gpr[i] = bcx.ins().load(types::I64, mem.flags, p, 0);
     }
     let slow_flags = bcx.ins().load(types::I64, mem.flags, rflags_ptr, 0);
+    // The helper rewrote `ctx.rflags` and we just reloaded it, so this carrier is
+    // authoritative and the pre-instruction snapshot must not override it.
+    mem.fault_flags = None;
     check_fault_after_ucrt(bcx, mem, &slow_gpr, slow_flags);
     let stay_nz = bcx.ins().icmp_imm(IntCC::NotEqual, stay, 0);
     let cur_ip = iconst_u64(bcx, instr.ip());
@@ -470,7 +473,11 @@ pub(super) fn lower_string(
     }
     *rflags = bcx.ins().load(types::I64, mem.flags, rflags_ptr, 0);
 
-    // Fault check (exit_args now hold post-helper state).
+    // Fault check (exit_args now hold post-helper state) — which is why the
+    // pre-instruction flag snapshot is cleared here: the string helper already
+    // wrote the architectural flags it reached, and that word is the one a fault
+    // must hand out.
+    mem.fault_flags = None;
     check_fault_after_ucrt(bcx, mem, gpr, *rflags);
 
     let next = iconst_u64(bcx, instr.next_ip());
