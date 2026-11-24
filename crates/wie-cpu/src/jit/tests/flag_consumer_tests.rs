@@ -23,7 +23,7 @@
 // dual-engine harness instead of duplicating it.
 use super::chain_tests::chain_dual;
 use super::simd_parity_tests::{assert_same_regs, simd_dual};
-use crate::regs::RegFile;
+use crate::regs::{RegFile, Rflags};
 
 /// Condition codes in encoding order: `0x70 | cc` is `jcc`, `0x40 | cc` is
 /// `cmovcc`, `0x90 | cc` is `setcc`. Names are the iced mnemonics.
@@ -400,5 +400,148 @@ fn the_packed_word_is_rebuilt_after_a_second_writer() {
         let code = [0x01, 0xD8, 0x9C, 0x59, 0x29, 0xD8, 0x9C, 0x5A];
         let (iced, jit) = simd_dual(&code, &[], setup_with_stack(eax, ebx));
         assert_same_regs(&iced, &jit, &format!("two packs, one block, {case}"));
+    }
+}
+
+// ── Where the word is *built*: the block's exit edges ────────────────────
+//
+// `FlagState` is the authority inside a block, so the packed word is an
+// observation that only has to exist where it can be seen: a helper call, a
+// `pushfq`, or an edge out of the compiled code. A block that writes flags
+// before it reads them therefore carries nothing across its own backedge, and a
+// self-loop rebuilds the word once — on the edge that leaves the loop — instead
+// of once per iteration. The tests below pin the two places that could go wrong
+// when the word stops being maintained eagerly: the exit edge, and the loop
+// header parameter that a *reader* at the top of the body depends on.
+
+/// [`setup`] plus a valid RSP and an explicit incoming RFLAGS, so the bits the
+/// loop body does not define (CF for `dec`, DF/IF/reserved for everything) can be
+/// given a value the body cannot produce.
+/// The harness's default word (IF + the reserved bit 1) and the same word with
+/// CF set — CF is the bit the loop bodies below either define or must preserve,
+/// so it has to differ between rows.
+const LOOP_FLAGS: [u64; 2] = [0x202, 0x203];
+
+fn setup_loop_with_flags(eax: u64, ebx: u64, rflags: u64) -> impl Fn(&mut RegFile) + Copy {
+    move |r: &mut RegFile| {
+        setup_with_stack(eax, ebx)(r);
+        r.rflags = Rflags::from(rflags);
+    }
+}
+
+/// A self-loop whose body **writes** the flags before anything reads them.
+///
+/// `dec eax` · `jne` back to itself. Nothing reads the incoming word, so the SSA
+/// state starts from the word loaded once at entry and the backedge carries no
+/// carrier at all — the only pack is on the edge that leaves the loop. Two
+/// things are observable: `jne` must read the *last* `dec` (so the loop exits
+/// after the right number of iterations), and the word at the exit must be the
+/// loop's, with CF preserved from before the loop (which `dec` does not define)
+/// and ZF/SF/OF/PF/AF from the final iteration. That last part is what a
+/// `FlagState` started from a constant zero would get wrong.
+///
+/// `sub` is the second row because it *does* define CF, so the same fixture
+/// pins the direction the two writers move CF in.
+#[test]
+fn self_loop_that_writes_flags_packs_on_the_exit_edge() {
+    // Always an architectural word: bit 1 is reserved-1, so injecting a bare
+    // `1` would test the harness's writeback (`set_rflags_checked` re-asserts it)
+    // instead of the lowering.
+    for (writer, bytes, rflags) in [
+        // `dec eax` (FF C8) keeps CF; `sub eax, 1` (83 E8 01) borrows.
+        ("dec", &[0xFF_u8, 0xC8][..], LOOP_FLAGS[1]),
+        ("sub", &[0x83, 0xE8, 0x01][..], LOOP_FLAGS[1]),
+        ("dec-no-carry-in", &[0xFF, 0xC8][..], LOOP_FLAGS[0]),
+    ] {
+        let mut code = Vec::from(bytes);
+        // jne back to the loop head: the body is `bytes` long, then `75 rel8`.
+        let body = u8::try_from(bytes.len()).expect("short body");
+        let rel = 0_u8.wrapping_sub(body).wrapping_sub(2);
+        code.extend_from_slice(&[0x75, rel]);
+        code.extend_from_slice(&[0x90, 0x0F, 0x0B]); // nop, ud2
+        let exit = u64::try_from(code.len() - 3).expect("len");
+        let stop = super::SIMD_BASE + exit;
+        // Small counters only: `chain_dual` steps iced once per instruction with
+        // a 500-step cap, so a loop body has to fit inside it.
+        for eax in [1_u64, 2, 5] {
+            let (iced, jit) =
+                chain_dual(&code, stop, setup_loop_with_flags(eax, 0, rflags), |_| {});
+            assert_same_regs(
+                &iced,
+                &jit,
+                &format!("self-loop {writer}, eax={eax:#x}, rflags={rflags:#x}"),
+            );
+        }
+    }
+}
+
+/// A self-loop whose body **reads** the flags before it writes them: the loop
+/// header parameter exists for exactly this shape.
+///
+/// `setb dl` reads the incoming CF; `xor ecx,ecx` then `cmp ecx, 1` leave CF=1
+/// for the *next* iteration; `dec ebx` counts down (it does not define CF) and
+/// `jne` leaves on ZF. So iteration 1 reads the CF the *dispatch* handed the
+/// block (0 here, from [`LOOP_FLAGS`][0]) and every later iteration reads the CF
+/// the previous iteration's `cmp` left (1). With the carrier crossing the
+/// backedge, DL ends at 1; without it, `setb` would read the loop's entry CF
+/// every iteration and DL would end at 0. DL is compared, so the difference is
+/// the assertion. Measured: removing the carrier (`flags_live_in` forced false)
+/// flips the JIT's DL to 0 while iced stays at 1 — this is the mutation that
+/// makes the test earn its keep.
+#[test]
+fn self_loop_that_reads_flags_carries_them_across_the_backedge() {
+    let code = [
+        0x0F, 0x92, 0xC2, // setb dl        reads the incoming CF
+        0x31, 0xC9, // xor ecx, ecx   CF = 0
+        0x83, 0xF9, 0x01, // cmp ecx, 1     CF = 1 for the next iteration
+        0xFF, 0xCB, // dec ebx        (keeps CF)
+        0x75, 0xF4, // jne back to the `setb`
+        0x90, // nop
+        0x0F, 0x0B, // ud2
+    ];
+    let stop = super::SIMD_BASE + 12;
+    for ebx in [1_u64, 2, 3, 7] {
+        for rflags in LOOP_FLAGS {
+            let (iced, jit) =
+                chain_dual(&code, stop, setup_loop_with_flags(0, ebx, rflags), |_| {});
+            assert_same_regs(
+                &iced,
+                &jit,
+                &format!("flag-reading self-loop, ebx={ebx}, rflags={rflags:#x}"),
+            );
+        }
+    }
+}
+
+/// The exit edge of a self-loop into code that is **not compiled**: the word has
+/// nowhere lazy to go, so the edge must pack it.
+///
+/// `dec eax` · `jne` self · `stc` · `pushfq` · `pop rdx` · `ud2`. `stc` is not
+/// JIT-lowered (it forces the interpreter fallback), so the loop's exit edge
+/// hands its word to the dispatcher and iced executes `stc` on it — the one exit
+/// path where a lazy carrier must materialise. `stc` changes only CF, so every
+/// other bit in RDX is the word the loop's last `dec` produced; a stale or
+/// missing pack shows up there instead of in CF.
+#[test]
+fn self_loop_exit_into_the_interpreter_packs_the_word() {
+    let code = [
+        0xFF, 0xC8, // dec eax
+        0x75, 0xFC, // jne back to it
+        0xF9, // stc            (interpreter fallback)
+        0x9C, // pushfq
+        0x5A, // pop rdx
+        0x0F, 0x0B, // ud2
+    ];
+    let stop = super::SIMD_BASE + 7;
+    for eax in [1_u64, 3, 5] {
+        for rflags in LOOP_FLAGS {
+            let (iced, jit) =
+                chain_dual(&code, stop, setup_loop_with_flags(eax, 0, rflags), |_| {});
+            assert_same_regs(
+                &iced,
+                &jit,
+                &format!("loop exit into the interpreter, eax={eax:#x}, rflags={rflags:#x}"),
+            );
+        }
     }
 }

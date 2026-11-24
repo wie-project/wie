@@ -232,6 +232,33 @@ pub(super) fn block_needs_flags(insns: &[DecodedInsn], term: Option<BlockTerm>) 
     insns.iter().any(|d| opclass::needs_flags(&d.instr))
 }
 
+/// Whether the block can read the incoming FLAGS **before** it writes them.
+///
+/// This is the question a self-loop's carried flag word actually depends on: the
+/// loop header parameter exists so a consumer at the top of the body can read
+/// the flags the previous iteration left. If the body's first flag-touching
+/// instruction is a writer (the normal shape — a `sub`/`add` near the top, its
+/// consumer at the bottom), the incoming word is dead and passing it costs a
+/// full pack per iteration for nothing.
+///
+/// Conservative on the two edges that matter: a block with **no** flag-touching
+/// instruction answers `true` (its terminator, a `jcc`, reads the incoming
+/// flags), and a `ReadWrite` use answers `true`.
+pub(super) fn flags_live_in(insns: &[DecodedInsn]) -> bool {
+    for d in insns {
+        // `iced` carries the read/write split per instruction; `rflags_modified`
+        // alone answers "writer", so no second name list can drift from it.
+        let reads = d.instr.rflags_read() != 0;
+        let writes = d.instr.rflags_modified() != 0;
+        if reads || writes {
+            return reads;
+        }
+    }
+    // No flag-touching instruction in the body: whatever the terminator reads is
+    // the incoming word.
+    true
+}
+
 pub(super) fn block_has_mem(insns: &[DecodedInsn]) -> bool {
     insns.iter().any(|d| {
         let m = d.instr.mnemonic();

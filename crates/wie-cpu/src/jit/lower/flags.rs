@@ -517,7 +517,7 @@ impl FlagState {
 
     /// Pack the SSA flags into the packed rflags carrier, keeping the previous
     /// rflags value for bits we do not track (DF, IF, reserved).
-    fn pack(&self, bcx: &mut FunctionBuilder<'_>) -> Value {
+    pub(super) fn pack(&self, bcx: &mut FunctionBuilder<'_>) -> Value {
         let mut f = clear_flags(
             bcx,
             self.old,
@@ -535,6 +535,50 @@ impl FlagState {
         f = bcx.ins().bor(f, of);
         let af = select_flag(bcx, self.af, Rflags::AF);
         bcx.ins().bor(f, af)
+    }
+}
+
+/// The packed word for an edge that needs it, computed *where it is used*.
+///
+/// `FlagState` is the authority; the packed word is an observation. An edge that
+/// leads out of the compiled block (a chain hop, the exit block, a fault) is
+/// entered far less often than the block body, so the pack belongs there rather
+/// than in front of a branch the body takes every iteration. `None` means the
+/// block runs without the SSA state and `rflags` is already a packed word.
+pub(super) fn packed_word(
+    bcx: &mut FunctionBuilder<'_>,
+    fs: Option<&FlagState>,
+    rflags: Value,
+) -> Value {
+    match fs {
+        Some(fs) => fs.pack(bcx),
+        None => rflags,
+    }
+}
+
+/// [`packed_word`], memoised per block.
+///
+/// A block can observe its flags at more than one exit site (`lower_term`
+/// builds the argument list, then `emit_chain_or_exit` writes it back), and
+/// those sites share one architectural state. `packed_word` is a pure function
+/// of that state, so the second site reuses the first site's value instead of
+/// emitting a second 14-instruction rebuild.
+pub(super) fn pack_once(
+    bcx: &mut FunctionBuilder<'_>,
+    cache: &mut Option<Value>,
+    fs: Option<&FlagState>,
+    rflags: Value,
+) -> Value {
+    match fs {
+        Some(fs) => {
+            if let Some(v) = *cache {
+                return v;
+            }
+            let v = fs.pack(bcx);
+            *cache = Some(v);
+            v
+        }
+        None => rflags,
     }
 }
 

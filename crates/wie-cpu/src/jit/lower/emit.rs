@@ -2,9 +2,9 @@
 //! terminator helpers (chaining, self-loops, fast UCRT inline ops).
 
 use super::analysis::{ensure_gprs_loaded, ensure_xmm_loaded};
-use super::flags::{FlagState, decompose_packed, iconst_u64, resync_state};
+use super::flags::{FlagState, decompose_packed, iconst_u64, pack_once, packed_word, resync_state};
 use super::gpr::mark_dirty;
-use super::insn::{PendingFlags, flush_pending, lower_insn};
+use super::insn::{PendingFlags, flush_pending, flush_pending_deferred, lower_insn};
 use super::mem::call_load;
 use super::string::lower_string;
 use super::{
@@ -577,6 +577,10 @@ pub(super) fn lower_self_loop_term(
                 // (regs + RIP = start_rip) and return to the dispatcher; the
                 // next dispatch re-decodes the loop body from current bytes.
                 let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, &trip, |bcx| {
+                    // Cold boundary: the dispatcher re-dispatches from
+                    // `ctx.rflags`, so this is one of the places the word must
+                    // exist. The backedge itself does not build it.
+                    let rflags = packed_word(bcx, flag_state, rflags);
                     writeback_gprs(
                         bcx,
                         ctx_ptr,
@@ -619,6 +623,8 @@ pub(super) fn lower_self_loop_term(
                         // Same guarded backedge for jcc edges that re-enter
                         // this block.
                         let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, &trip, |bcx| {
+                            // Same cold boundary as the plain backedge above.
+                            let rflags = packed_word(bcx, flag_state, rflags);
                             writeback_gprs(
                                 bcx,
                                 ctx_ptr,
@@ -637,6 +643,8 @@ pub(super) fn lower_self_loop_term(
                     }
                     bcx.ins().jump(loop_header, &args);
                 } else {
+                    // Loop-exit edge: the flags leave the compiled code here.
+                    let rflags = packed_word(bcx, flag_state, rflags);
                     let rv = iconst_u64(bcx, va);
                     emit_chain_or_exit(
                         bcx,
@@ -698,6 +706,10 @@ pub(super) fn lower_jcc_chain(
     for (blk, va, href) in [(taken_blk, taken, t_ref), (not_blk, not_taken, n_ref)] {
         bcx.switch_to_block(blk);
         bcx.seal_block(blk);
+        // The word is built *on* the edge, not in front of the branch: an edge
+        // out of the block is where the flags leave the compiled code, so it is
+        // also the only place the carrier has to exist.
+        let rflags = packed_word(bcx, flag_state, rflags);
         let rv = iconst_u64(bcx, va);
         emit_chain_or_exit(
             bcx,
@@ -1007,7 +1019,13 @@ pub(super) fn emit_body_and_term(
     let mut pending = PendingFlags::None;
     let mut string_exit_rip: Option<Value> = None;
     let ssa_flags = super::super::config::JitConfig::get().ssa_flags_enabled();
-    let mut flag_state: Option<FlagState> = if ssa_flags && pass_flags {
+    // The SSA state is what the body's consumers read, so it is gated on the
+    // block touching flags at all — not on whether the incoming *word* is
+    // carried (`pass_flags`). A self-loop that writes flags before it reads them
+    // carries no word across the backedge; its state starts from the word loaded
+    // once in the entry block, which is what keeps the bits `FlagState` does not
+    // track (DF, IF, reserved) intact when an exit edge packs.
+    let mut flag_state: Option<FlagState> = if ssa_flags && needs_flags {
         Some(decompose_packed(bcx, *rflags_val))
     } else {
         None
@@ -1061,9 +1079,22 @@ pub(super) fn emit_body_and_term(
         // values the state already held. It is conditional on `fs` being
         // `Some`, and `WIE_JIT_SSA_FLAGS=0` makes it a no-op anyway, so
         // deleting the call cannot change behaviour on either path.
-        flush_pending(bcx, rflags_val, &mut pending, &mut flag_state);
+        // Deferred when `FlagState` is the authority: the body's consumers are
+        // done, so nothing below reads the *word* except the edges that leave
+        // the block — and each of those packs it where it is used
+        // (`packed_word`). A block whose flags are consumed only by its own
+        // terminator therefore never builds one.
+        if flag_state.is_some() {
+            flush_pending_deferred(bcx, rflags_val, &mut pending, &mut flag_state);
+        } else {
+            flush_pending(bcx, rflags_val, &mut pending, &mut flag_state);
+        }
     }
 
+    // One pack per block, built at the first exit edge that needs the word and
+    // reused by any later one: the edges below all observe the same architectural
+    // state, so a second rebuild would be the same 14 instructions twice.
+    let mut exit_word: Option<Value> = None;
     if let Some(t) = term {
         if let Some(ti) = term_insn {
             ensure_gprs_loaded(bcx, ctx_ptr, gpr_vals, gpr_loaded, &ti.instr, flags);
@@ -1095,7 +1126,10 @@ pub(super) fn emit_body_and_term(
                 gpr_vals[0] = bcx.ins().load(types::I64, flags, p, 0);
                 gpr_loaded[0] = true;
             }
-            lower_fast_ucrt(bcx, kind, gpr_vals, gpr_dirty, *rflags_val, mem_env)?;
+            // The helper call and the writeback behind it observe the same
+            // state, so they share one pack.
+            let rflags_word = pack_once(bcx, &mut exit_word, flag_state.as_ref(), *rflags_val);
+            lower_fast_ucrt(bcx, kind, gpr_vals, gpr_dirty, rflags_word, mem_env)?;
             let exit_rip = iconst_u64(bcx, return_ip);
             emit_chain_or_exit(
                 bcx,
@@ -1104,7 +1138,7 @@ pub(super) fn emit_body_and_term(
                 gpr_vals,
                 gpr_loaded,
                 Some(gpr_dirty),
-                *rflags_val,
+                rflags_word,
                 rflags_ptr,
                 true,
                 exit,
@@ -1179,12 +1213,14 @@ pub(super) fn emit_body_and_term(
                     )?;
                 }
                 BlockTerm::Jmp { target } | BlockTerm::Call { target, .. } => {
+                    let rflags_word =
+                        pack_once(bcx, &mut exit_word, flag_state.as_ref(), *rflags_val);
                     let exit_rip = lower_term(
                         bcx,
                         t,
                         gpr_vals,
                         gpr_dirty,
-                        *rflags_val,
+                        rflags_word,
                         mem_env,
                         term_ip,
                         term_insn.map(|ti| &ti.instr),
@@ -1196,7 +1232,7 @@ pub(super) fn emit_body_and_term(
                         gpr_vals,
                         gpr_loaded,
                         Some(gpr_dirty),
-                        *rflags_val,
+                        rflags_word,
                         rflags_ptr,
                         needs_flags,
                         exit,
@@ -1211,12 +1247,14 @@ pub(super) fn emit_body_and_term(
                 // `call r/m64`: the exit RIP is a runtime value, so there is
                 // no direct chain edge — exactly like `ret`.
                 BlockTerm::CallDyn { .. } | BlockTerm::Ret => {
+                    let rflags_word =
+                        pack_once(bcx, &mut exit_word, flag_state.as_ref(), *rflags_val);
                     let exit_rip = lower_term(
                         bcx,
                         t,
                         gpr_vals,
                         gpr_dirty,
-                        *rflags_val,
+                        rflags_word,
                         mem_env,
                         term_ip,
                         term_insn.map(|ti| &ti.instr),
@@ -1228,7 +1266,7 @@ pub(super) fn emit_body_and_term(
                         gpr_vals,
                         gpr_loaded,
                         Some(gpr_dirty),
-                        *rflags_val,
+                        rflags_word,
                         rflags_ptr,
                         needs_flags,
                         exit,
@@ -1243,6 +1281,7 @@ pub(super) fn emit_body_and_term(
             }
         }
     } else if let Some(sr) = string_exit_rip {
+        let rflags_word = pack_once(bcx, &mut exit_word, flag_state.as_ref(), *rflags_val);
         emit_chain_or_exit(
             bcx,
             ctx_ptr,
@@ -1250,7 +1289,7 @@ pub(super) fn emit_body_and_term(
             gpr_vals,
             gpr_loaded,
             Some(gpr_dirty),
-            *rflags_val,
+            rflags_word,
             rflags_ptr,
             needs_flags,
             exit,
@@ -1262,6 +1301,7 @@ pub(super) fn emit_body_and_term(
             &trip,
         );
     } else {
+        let rflags_word = pack_once(bcx, &mut exit_word, flag_state.as_ref(), *rflags_val);
         let exit_rip = iconst_u64(bcx, end_rip);
         emit_chain_or_exit(
             bcx,
@@ -1270,7 +1310,7 @@ pub(super) fn emit_body_and_term(
             gpr_vals,
             gpr_loaded,
             Some(gpr_dirty),
-            *rflags_val,
+            rflags_word,
             rflags_ptr,
             needs_flags,
             exit,

@@ -1024,18 +1024,18 @@ mod region_tests;
 
 use analysis::{
     analyze_def_xmm, analyze_live_gprs, analyze_live_xmm, block_has_fp, block_has_mem,
-    block_has_string, block_needs_flags, load_xmm_pair,
+    block_has_string, block_needs_flags, flags_live_in, load_xmm_pair,
 };
 use emit::{
     MemEnv, SuperStack, TripCounter, emit_block_wide_stack_guard, emit_body_and_term,
     term_chain_targets,
 };
-use flags::{FlagState, flag_bit, iconst_u64, mask_width, select_flag};
+use flags::{FlagState, flag_bit, iconst_u64, mask_width, packed_word, select_flag};
 use gpr::{
     bool_to_i64, effective_addr, flag_set, indirect_branch_target, mark_dirty, op_width_bits,
     read_op_mem, reg_index, sext_to_i64, write_gpr, write_op_mem,
 };
-use insn::{PendingFlags, ShiftKind, flush_pending};
+use insn::{PendingFlags, ShiftKind, flush_pending_deferred};
 use mem::{call_load, call_store, hoist_pin_slot, hoist_refill};
 
 pub(super) use gpr::wie_div64;
@@ -1426,8 +1426,15 @@ pub(super) fn compile_block(
         // on chain/exit (reg-mapping: avoid storing read-only live-ins).
         let mut gpr_dirty = [false; 16];
         let rflags_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RFLAGS));
-        // Carry flags across self-loop iterations via a block param when needed.
-        let pass_flags = needs_flags || self_loop;
+        // Carry flags across self-loop iterations via a block param when the
+        // body can *read* them before it writes them. `needs_flags` answers "does
+        // this block touch flags at all", which a body whose first flag
+        // instruction is a writer (the normal shape: `sub` near the top, its
+        // `jcc` at the bottom) answers `true` for while the incoming word is
+        // dead. Carrying it anyway is a packed-word rebuild per iteration (14
+        // host instructions, measured) for a value nothing reads.
+        let flags_in = flags_live_in(insns);
+        let pass_flags = needs_flags && (flags_in || !self_loop);
 
         // Hoist pin descriptors on the **entry** block (once per run_compiled).
         // Slot 0 = stack. Slots 1.. = size-ranked data (heap + VirtualAlloc).
@@ -1482,7 +1489,13 @@ pub(super) fn compile_block(
                 entry_loaded[i] = true;
             }
         }
-        let entry_rflags = if pass_flags {
+        // Loaded whenever the block uses flags at all, not only when the word is
+        // loop-carried. `FlagState` keeps the bits it does not track (DF, IF,
+        // reserved) from this value, so an exit edge that packs has to start
+        // from the real word even when no loop parameter carries one. The load
+        // sits in the entry block, ahead of the loop header, so it is one load
+        // per entry rather than one per iteration.
+        let entry_rflags = if needs_flags {
             bcx.ins().load(types::I64, flags, rflags_ptr, 0)
         } else {
             bcx.ins().iconst(types::I64, 0)
@@ -2259,14 +2272,37 @@ pub(super) fn lower_shift_lazy(
     mem: &mut MemEnv,
     kind: ShiftKind,
 ) -> Result<(), LowerError> {
-    // Prior ALU flags must be in `rflags` before we record a Shift pending
-    // (shift flags are applied relative to current rflags for OF when count!=1).
-    flush_pending(bcx, rflags, pending, flag_state);
+    // Prior ALU flags go into the SSA state, **not** into the carrier: the shift
+    // reads the flags it preserves (`fs.cf` for Rcl/Rcr, `fs.of` when
+    // `count_mod != 1`) as `i1`s from `FlagState`, and the only other consumer of
+    // `*rflags` here is the fault edge of a *memory* operand read below, which
+    // hands out whatever word was last materialised — the same fidelity every
+    // other mid-block fault edge already has.
+    //
+    // This was the eager `flush_pending`, and it is the 39-instruction pack
+    // measured at `0x17bb480fc-0x17bb48194` in SDL2's scaled-blit block: the
+    // `add` before a `shr` was packed into the word, and the only reader of that
+    // word was the next writer's clear-flag mask, which clears exactly the bits
+    // it had just inserted. Removing it moves the pack to the block's exit edge
+    // (`emit_body_and_term`), where it belongs.
+    flush_pending_deferred(bcx, rflags, pending, flag_state);
 
+    // A **memory** operand read below has a fault edge, and that edge hands the
+    // guest its architectural flags — so it is the one place in this instruction
+    // that needs the word. It pays for it only when the shape can fault there:
+    // a register-operand shift (the hot shape, and every shift in the blit
+    // block) leaves `*rflags` as the last materialised word and builds nothing.
+    let fault_word = if matches!(instr.op_kind(0), OpKind::Memory)
+        || matches!(instr.op_kind(1), OpKind::Memory)
+    {
+        packed_word(bcx, flag_state.as_ref(), *rflags)
+    } else {
+        *rflags
+    };
     let bits = op_width_bits(instr, 0)?;
-    let dst_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
+    let dst_raw = read_op_mem(bcx, instr, 0, gpr, fault_word, mem)?;
     let dst = mask_width(bcx, dst_raw, bits);
-    let count_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
+    let count_raw = read_op_mem(bcx, instr, 1, gpr, fault_word, mem)?;
     let mask63 = iconst_u64(bcx, 0x3f);
     let count_masked = bcx.ins().band(count_raw, mask63);
     let bits_v = iconst_u64(bcx, u64::from(bits));

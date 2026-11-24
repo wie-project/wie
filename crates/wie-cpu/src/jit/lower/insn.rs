@@ -88,18 +88,48 @@ pub(super) enum PendingFlags {
     },
 }
 
+/// Apply the deferred flags to the SSA state **without** building the packed
+/// word.
+///
+/// The word is an observation, not the authority: a block whose flags are only
+/// read by its own consumers (a `jcc`, a `setcc`) never needs it, and the edges
+/// that do need it (a chain hop, the exit block, a fault) are rare enough to pay
+/// for it there. Callers that use `*rflags` afterwards must go through
+/// [`packed_word`](super::flags::packed_word), which re-derives it from the
+/// state on demand.
+pub(super) fn flush_pending_deferred(
+    bcx: &mut FunctionBuilder<'_>,
+    rflags: &mut Value,
+    pending: &mut PendingFlags,
+    flag_state: &mut Option<FlagState>,
+) {
+    flush_pending_impl(bcx, rflags, pending, flag_state, false);
+}
+
 pub(super) fn flush_pending(
     bcx: &mut FunctionBuilder<'_>,
     rflags: &mut Value,
     pending: &mut PendingFlags,
     flag_state: &mut Option<FlagState>,
 ) {
+    flush_pending_impl(bcx, rflags, pending, flag_state, true);
+}
+
+fn flush_pending_impl(
+    bcx: &mut FunctionBuilder<'_>,
+    rflags: &mut Value,
+    pending: &mut PendingFlags,
+    flag_state: &mut Option<FlagState>,
+    materialize: bool,
+) {
     match *pending {
         PendingFlags::None => {}
         PendingFlags::Add { a, b, res, bits } => {
             if let Some(fs) = flag_state {
                 fs.assign_arith(bcx, a, b, res, bits, false, false);
-                *rflags = pack_state(bcx, fs);
+                if materialize {
+                    *rflags = pack_state(bcx, fs);
+                }
             } else {
                 *rflags = flags_add(bcx, *rflags, a, b, res, bits);
             }
@@ -107,7 +137,9 @@ pub(super) fn flush_pending(
         PendingFlags::Sub { a, b, res, bits } => {
             if let Some(fs) = flag_state {
                 fs.assign_arith(bcx, a, b, res, bits, true, false);
-                *rflags = pack_state(bcx, fs);
+                if materialize {
+                    *rflags = pack_state(bcx, fs);
+                }
             } else {
                 *rflags = flags_sub(bcx, *rflags, a, b, res, bits);
             }
@@ -115,7 +147,9 @@ pub(super) fn flush_pending(
         PendingFlags::Logic { res, bits } => {
             if let Some(fs) = flag_state {
                 fs.assign_logic(bcx, res, bits);
-                *rflags = pack_state(bcx, fs);
+                if materialize {
+                    *rflags = pack_state(bcx, fs);
+                }
             } else {
                 *rflags = flags_logic(bcx, *rflags, res, bits);
             }
@@ -125,7 +159,9 @@ pub(super) fn flush_pending(
                 let one = iconst_u64(bcx, 1);
                 // INC preserves CF: assign arith flags but keep the incoming fs.cf.
                 fs.assign_arith(bcx, a, one, res, bits, false, true);
-                *rflags = pack_state(bcx, fs);
+                if materialize {
+                    *rflags = pack_state(bcx, fs);
+                }
             } else {
                 let one = iconst_u64(bcx, 1);
                 // CF bit value (I64 0/1): live fs.cf (i1) widened, else packed read.
@@ -139,7 +175,9 @@ pub(super) fn flush_pending(
                 let one = iconst_u64(bcx, 1);
                 // DEC preserves CF: assign arith flags but keep the incoming fs.cf.
                 fs.assign_arith(bcx, a, one, res, bits, true, true);
-                *rflags = pack_state(bcx, fs);
+                if materialize {
+                    *rflags = pack_state(bcx, fs);
+                }
             } else {
                 let one = iconst_u64(bcx, 1);
                 // CF bit value (I64 0/1): live fs.cf (i1) widened, else packed read.
@@ -159,7 +197,9 @@ pub(super) fn flush_pending(
                 // Predicate-direct: shift flags from fs + operands (count_mod==0
                 // preserves all fields), pack only for the carrier.
                 fs.assign_shift(bcx, kind, dst, res, count_mod, bits);
-                *rflags = pack_state(bcx, fs);
+                if materialize {
+                    *rflags = pack_state(bcx, fs);
+                }
             } else {
                 *rflags = materialize_shift_flags(bcx, *rflags, kind, dst, res, count_mod, bits);
             }
