@@ -1127,7 +1127,10 @@ pub(super) fn compile_block(
         // `pin_resolve` all 8 slots (VA/heaps) so walks collapse — without the
         // IR cascade tax that measured 22–25 % on `7za h`/`x` (see
         // `JitMemMode`). Set `WIE_JIT_MEM=pin` to probe top-2 data pins too.
-        let (stack_pin, mut data_pins) = if JitConfig::get().mem_inline_enabled() {
+        // Gate on `has_mem`: a block with no memory operand and no call/ret has
+        // nothing to translate, and `opt_level = none` means nothing downstream
+        // removes the six pin/generation loads this would emit at its entry.
+        let (stack_pin, mut data_pins) = if has_mem && JitConfig::get().mem_inline_enabled() {
             let stack = Some(hoist_pin_slot(&mut bcx, ctx_ptr, flags, 0));
             // Default sticky: no data-pin IR (helpers cover VA via pin_resolve).
             // `WIE_JIT_MEM=pin`: top-2 size-ranked data pins after sticky.

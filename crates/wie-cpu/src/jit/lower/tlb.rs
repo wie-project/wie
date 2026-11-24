@@ -421,10 +421,10 @@ pub(super) unsafe fn tlb_page_ptr(
     // Miss: resolve via GuestMemory (committed + protect meta + host ptr).
     // SAFETY: `mem` set by `run_compiled` to the live guest map.
     let mem = unsafe { &*ctx.mem };
-    let Some(entry) = mem
-        .page_tlb_entry_walk(page_key)
-        .or_else(|| mem.page_tlb_entry(page_key))
-    else {
+    // `page_tlb_entry_walk` *is* `page_tlb_entry` (mem/rw.rs:275), so the
+    // `or_else` fallback here could never fire — it only cost a second walk,
+    // with its own `fast_tlb` read, on every miss.
+    let Some(entry) = mem.page_tlb_entry_walk(page_key) else {
         ctx.mem_path.slow = ctx.mem_path.slow.saturating_add(1);
         return None;
     };
