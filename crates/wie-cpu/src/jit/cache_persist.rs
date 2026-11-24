@@ -947,6 +947,21 @@ fn resolve_config(explicit: Option<String>, under_test: bool) -> Option<PathBuf>
         {
             None
         }
+        // `WIE_JIT_CACHE` doubles as a boolean switch *and* as a directory
+        // override, so it must accept the same "on" spellings as its sibling
+        // `WIE_JIT_CODE_CACHE`. Without this arm `WIE_JIT_CACHE=1` — the value
+        // every other knob in this table takes for "on", and the value a reader
+        // will reach for out of symmetry with `WIE_JIT_CODE_CACHE=1` — falls
+        // through to `Some(PathBuf::from(v))` and silently creates a directory
+        // literally named `1` in the cwd, then writes the ledger into it.
+        Some(v)
+            if v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("on")
+                || v.eq_ignore_ascii_case("yes") =>
+        {
+            (!under_test).then(default_cache_dir)
+        }
         Some(v) => Some(PathBuf::from(v)),
     }
 }
@@ -1464,5 +1479,42 @@ mod tests {
             );
             assert!(resolve_config(v, true).is_none(), "{off:?} must disable");
         }
+    }
+
+    #[test]
+    fn boolean_on_spellings_resolve_to_the_default_dir_not_a_relative_path() {
+        // Regression: `WIE_JIT_CACHE=1` used to fall through to
+        // `Some(PathBuf::from("1"))`, creating a directory named `1` in the cwd
+        // and writing the ledger into it. Every knob in this table spells "on"
+        // as `1`/`true`/`on`/`yes`, and `WIE_JIT_CODE_CACHE` already honours
+        // exactly those, so this knob must too.
+        for on in ["1", "true", "TRUE", "on", "On", "yes", "YES"] {
+            let v = Some(on.to_string());
+            assert_eq!(
+                resolve_config(v.clone(), false),
+                Some(default_cache_dir()),
+                "{on:?} must mean \"on\", not a directory called {on:?}"
+            );
+            // ... and in a test process it must not re-enable persistence, the
+            // same isolation guarantee `None` gets.
+            assert!(
+                resolve_config(v, true).is_none(),
+                "{on:?} must not defeat test isolation"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_directory_override_is_still_honoured() {
+        // The boolean arm must not swallow genuine paths.
+        let dir = Some("/tmp/wie-jit-cache-some-dir".to_string());
+        assert_eq!(
+            resolve_config(dir.clone(), false),
+            Some(PathBuf::from("/tmp/wie-jit-cache-some-dir"))
+        );
+        assert_eq!(
+            resolve_config(dir, true),
+            Some(PathBuf::from("/tmp/wie-jit-cache-some-dir"))
+        );
     }
 }
