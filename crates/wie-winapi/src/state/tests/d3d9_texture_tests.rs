@@ -110,8 +110,8 @@ fn test_d3d9_texture_lock_unlock_round_trip() {
     assert_eq!(record.width, 2);
     assert_eq!(record.height, 2);
     assert_eq!(
-        record.pixels,
-        texels.to_vec(),
+        record.pixels.as_slice(),
+        texels.as_slice(),
         "unlock must copy the texels back"
     );
     assert_eq!(record.locked_va, 0, "lock state cleared");

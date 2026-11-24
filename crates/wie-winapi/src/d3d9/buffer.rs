@@ -16,6 +16,8 @@
 //! GPU overlap uploads with reads, a race the host-side copy-back cannot
 //! have.
 
+use std::sync::Arc;
+
 use crate::gdi32::{ArgReg, read_arg};
 use anyhow::{Context, Result};
 
@@ -84,7 +86,16 @@ pub struct BufferRecord {
     /// `Pool` from Create (D3DPOOL_DEFAULT/MANAGED/SYSTEMMEM).
     pub pool: u32,
     /// Host-owned bytes (the authoritative copy after `Unlock`).
-    pub data: Vec<u8>,
+    ///
+    /// The storage is an `Arc` for the same sharing reason as
+    /// `RenderTargetRecord::pixels` (see `texture.rs`): a buffer-form draw
+    /// hands the capture stream — and, when the stream is off, the
+    /// rasterizer — an `Arc` clone of the whole buffer instead of copying the
+    /// vertex stream and index bytes at every draw. The single writer
+    /// (`Unlock`'s copy-back) takes the bytes exclusively with
+    /// `Arc::make_mut`, so a recorded draw keeps the exact bytes it drew and
+    /// the copy is free when no snapshot is live.
+    pub data: Arc<Vec<u8>>,
     /// Guest block VA handed out by the active `Lock` (0 = not locked).
     pub locked_va: u64,
     /// COM reference count (AddRef/Release; freed at 0).
@@ -335,7 +346,7 @@ fn buffer_unlock_common(
         && let Some(record) = state.d3d9().d3d9_buffers.get_mut(&this_pointer)
         && record.data.len() == bytes.len()
     {
-        record.data.copy_from_slice(&bytes);
+        Arc::make_mut(&mut record.data).copy_from_slice(&bytes);
     }
     let _ = state
         .heap_state
@@ -569,7 +580,7 @@ pub(crate) fn create_buffer_record(
             size: length,
             usage,
             pool,
-            data: vec![0_u8; size],
+            data: Arc::new(vec![0_u8; size]),
             locked_va: 0,
             ref_count: 1,
         },

@@ -1473,6 +1473,8 @@ pub(super) fn compile_block(
         bcx.finalize();
     }
 
+    dump_ir_if_requested(start_rip, insns.len(), &eng.ctx.func);
+
     eng.module
         .define_function(func_id, &mut eng.ctx)
         .map_err(|e| LowerError::verifier(e.to_string()))?;
@@ -1494,6 +1496,44 @@ pub(super) fn compile_block(
         guest_end,
         inv_gen: inv_gen_baked,
     })
+}
+
+/// How many blocks `WIE_JIT_DUMP_IR` writes before it stops.
+///
+/// A cap rather than a filter: two thousand blocks (~2 MB of text) include
+/// enough distinct shapes to count them — the first two hundred turned out to be
+/// start-up code with no 32-bit ALU form in it at all, which is exactly the kind
+/// of thing a capped sample should be big enough to expose.
+const IR_DUMP_BLOCKS: u32 = 2000;
+
+/// Append one block's CLIF to `WIE_JIT_DUMP_IR`, if that knob names a file.
+///
+/// Best effort by design: a dump that cannot be written must never fail a
+/// compile, so every error here is swallowed after being surfaced once through
+/// the counter. `opt_level = none` makes the emitter the optimiser, so CLIF is
+/// the only place a redundant-mask question can be answered directly.
+fn dump_ir_if_requested(start_rip: u64, insn_count: usize, func: &cranelift_codegen::ir::Function) {
+    static WRITTEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let Some(path) = crate::jit::config::JitConfig::get().ir_dump_path() else {
+        return;
+    };
+    let n = WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= IR_DUMP_BLOCKS {
+        return;
+    }
+    let header = format!("; block {n} rip={start_rip:#x} insns={insn_count}\n");
+    let body = func.display().to_string();
+    let mut text = String::with_capacity(header.len() + body.len() + 2);
+    text.push_str(&header);
+    text.push_str(&body);
+    text.push('\n');
+    // Append: concurrent compiles write the same file, and each record is a
+    // single `write` call, so interleaving cannot corrupt a line.
+    let _appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
 }
 
 #[derive(Clone, Copy)]

@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 
 use super::buffer::BufferKind;
+use super::capture::StreamBytes;
 use super::raster::{draw_vertex_stream, draw_vertex_stream_host, primitive_vertex_count};
 use super::{D3D_OK, D3DERR_INVALIDCALL, D3DFMT_INDEX32};
 use crate::WinApiState;
@@ -116,11 +117,14 @@ pub(super) fn draw_buffer_form_common(
         return Ok(D3DERR_INVALIDCALL);
     }
 
-    // Clone the vertex slice out of the record so the mutable `state` borrow
-    // below (the rasterizer) is uncontended (the handle_present pattern).
+    // Share the record's bytes instead of copying them so the mutable `state`
+    // borrow below (the rasterizer) is uncontended (the handle_present
+    // pattern): the stream is the record's `Arc` plus the base offset, and the
+    // rasterizer skips vertices past the buffer end (out-of-range → no pixels,
+    // like the UP path's bad-pointer skip).
     let stream_base =
         u64::from(stream_offset).saturating_add(start_vertex.saturating_mul(u64::from(stride_u32)));
-    let data = {
+    let stream = {
         let d3d = state.d3d9();
         let Some(record) = d3d.d3d9_buffers.get(&stream_va) else {
             return Ok(D3DERR_INVALIDCALL);
@@ -128,14 +132,10 @@ pub(super) fn draw_buffer_form_common(
         if !matches!(record.kind, BufferKind::Vertex { .. }) {
             return Ok(D3DERR_INVALIDCALL);
         }
-        // The stream slice is everything after the base; the rasterizer skips
-        // vertices past the buffer end (out-of-range → no pixels, like the UP
-        // path's bad-pointer skip).
-        record
-            .data
-            .get(usize::try_from(stream_base).unwrap_or(usize::MAX)..)
-            .unwrap_or(&[])
-            .to_vec()
+        StreamBytes::from_buffer(
+            &record.data,
+            usize::try_from(stream_base).unwrap_or(usize::MAX),
+        )
     };
     let vertex_count = primitive_vertex_count(primitive_type, primitive_count).unwrap_or(0);
 
@@ -155,7 +155,9 @@ pub(super) fn draw_buffer_form_common(
                 };
                 let index_size =
                     usize::try_from(if format == D3DFMT_INDEX32 { 4 } else { 2 }).unwrap_or(2);
-                (index_record.data.clone(), index_size)
+                // The whole index buffer, shared; `StartIndex` travels
+                // separately as `index_offset` (unchanged semantics).
+                (std::sync::Arc::clone(&index_record.data), index_size)
             };
             // BaseVertexIndex is a signed INT: bit 31 is the sign.
             let base_vertex = i64::try_from(base_vertex_index & u64::from(u32::MAX)).unwrap_or(0);
@@ -171,11 +173,11 @@ pub(super) fn draw_buffer_form_common(
     };
 
     if super::capture::capture_enabled(state) {
-        // Wave 2: move the cloned stream/index bytes into the op — the
+        // Wave 2: move the shared stream/index handles into the op — the
         // capture render thread rasterizes into its own targets.
         super::capture::record_draw_buffer(
             state,
-            data,
+            stream,
             layout,
             stride,
             primitive_type,
@@ -190,13 +192,15 @@ pub(super) fn draw_buffer_form_common(
 
     draw_vertex_stream_host(
         state,
-        &data,
+        stream.as_slice(),
         &layout,
         stride,
         vertex_count,
         primitive_type,
         primitive_count,
-        index_data.as_deref().map(|bytes| (bytes, index_size)),
+        index_data
+            .as_ref()
+            .map(|bytes| (bytes.as_slice(), index_size)),
         index_offset,
         vertex_base,
     )?;

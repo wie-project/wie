@@ -25,6 +25,9 @@ const D3DRTYPE_SURFACE: u32 = 3;
 
 /// One mip level's host texels (levels 1..; level 0 lives in
 /// [`TextureRecord::pixels`]).
+///
+/// The texels are an `Arc` for the same sharing as [`TextureRecord::pixels`]:
+/// a captured draw takes a refcount bump per level instead of a copy.
 #[derive(Debug, Clone)]
 pub struct MipLevel {
     /// Level width in texels (the CreateTexture chain halves per level).
@@ -32,7 +35,7 @@ pub struct MipLevel {
     /// Level height in texels.
     pub height: u32,
     /// Texels in `0xAARRGGBB` order, row-major.
-    pub pixels: Vec<u32>,
+    pub pixels: std::sync::Arc<Vec<u32>>,
 }
 
 /// An offscreen render target (L6: `CreateRenderTarget`).
@@ -72,6 +75,14 @@ pub struct RenderTargetRecord {
 /// samples them and masks to 0RGB when writing the backbuffer. Level 0 is the
 /// record's `width`/`height`/`pixels`; the halved chain lives in `mip_levels`
 /// (empty when `levels == 1` — no mips).
+///
+/// The texel storage is an `Arc` for the same reason as
+/// [`RenderTargetRecord::pixels`]: the capture stream hands the render thread
+/// `Arc` clones of the bound stages' texels at record time, so a draw costs a
+/// refcount bump per level instead of a copy of the whole mip chain. The
+/// writer (`UnlockRect`'s copy-back) takes the level exclusively with
+/// `Arc::make_mut`, so a recorded draw keeps the texels it drew and the copy
+/// is free when no snapshot is live.
 #[derive(Debug, Clone)]
 pub struct TextureRecord {
     /// The texture object's guest VA (also the `IDirect3DTexture9` pointer).
@@ -85,7 +96,7 @@ pub struct TextureRecord {
     /// `D3DFMT_*` format (only A8R8G8B8 / X8R8G8B8 are accepted).
     pub format: u32,
     /// Level-0 texels in `0xAARRGGBB` order.
-    pub pixels: Vec<u32>,
+    pub pixels: std::sync::Arc<Vec<u32>>,
     /// Levels 1.. (the halved mip chain; empty for a single-level texture).
     pub mip_levels: Vec<MipLevel>,
     /// Surface object VA per level, handed out by `GetSurfaceLevel` (created
@@ -287,7 +298,7 @@ pub fn handle_create_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
                     mip_levels.push(MipLevel {
                         width: level_w,
                         height: level_h,
-                        pixels: vec,
+                        pixels: std::sync::Arc::new(vec),
                     });
                 }
                 // Return any leftover Vecs to the pool (capacity retained) so
@@ -311,7 +322,7 @@ pub fn handle_create_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
                         MipLevel {
                             width: level_w,
                             height: level_h,
-                            pixels: vec![0; texel_count],
+                            pixels: std::sync::Arc::new(vec![0; texel_count]),
                         }
                     })
                     .collect();
@@ -327,7 +338,7 @@ pub fn handle_create_texture(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
                     height,
                     levels,
                     format,
-                    pixels,
+                    pixels: std::sync::Arc::new(pixels),
                     mip_levels,
                     surface_vas: vec![0; usize::try_from(levels).unwrap_or(0)],
                     locked_va: 0,
@@ -890,13 +901,14 @@ fn unlock_rect_common(
                     .saturating_add(col);
                 if locked_level == 0 {
                     if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va)
-                        && let Some(slot) = record.pixels.get_mut(index)
+                        && let Some(slot) =
+                            std::sync::Arc::make_mut(&mut record.pixels).get_mut(index)
                     {
                         *slot = texel;
                     }
                 } else if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va)
                     && let Some(mip) = record.mip_levels.get_mut(locked_level as usize - 1)
-                    && let Some(slot) = mip.pixels.get_mut(index)
+                    && let Some(slot) = std::sync::Arc::make_mut(&mut mip.pixels).get_mut(index)
                 {
                     *slot = texel;
                 }
@@ -1126,11 +1138,14 @@ pub fn handle_texture_release(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
             .unwrap_or_else(|e| e.into_inner())
             .free_coherent(engine, vtable);
         // Q9/C: per-device pool `HashMap<tex_id, Vec<Vec<u32>>>` — retain
-        // capacities by moving the chain Vecs into the pool.
+        // capacities by moving the chain Vecs into the pool. A level still
+        // shared with a recorded draw (`Arc` count > 1) is copied instead:
+        // the pool owns plain `Vec`s, and dropping the snapshot to avoid the
+        // copy would mutate what that draw draws.
         let mut chain: Vec<Vec<u32>> = Vec::with_capacity(record.levels as usize);
-        chain.push(record.pixels);
+        chain.push(std::sync::Arc::unwrap_or_clone(record.pixels));
         for mip in record.mip_levels {
-            chain.push(mip.pixels);
+            chain.push(std::sync::Arc::unwrap_or_clone(mip.pixels));
         }
         state.d3d9().d3d9_texture_pool.insert(this_pointer, chain);
         1

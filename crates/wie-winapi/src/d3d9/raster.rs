@@ -276,7 +276,7 @@ fn resolve_sampler_stage<'a>(
         *slot = Some(MipLevelView {
             width: record.width,
             height: record.height,
-            pixels: &record.pixels,
+            pixels: record.pixels.as_slice(),
         });
     }
     chain.count = record.levels;
@@ -285,12 +285,12 @@ fn resolve_sampler_stage<'a>(
             *slot = Some(MipLevelView {
                 width: mip.width,
                 height: mip.height,
-                pixels: &mip.pixels,
+                pixels: mip.pixels.as_slice(),
             });
         }
     }
     Some(TextureStage {
-        pixels: &record.pixels,
+        pixels: record.pixels.as_slice(),
         width: record.width,
         height: record.height,
         addr_u: stage.address_u,

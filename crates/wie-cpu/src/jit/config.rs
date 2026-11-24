@@ -108,6 +108,16 @@ pub(super) struct JitConfig {
     jit_workers: usize,
     verifier_enabled: bool,
     code_cache_enabled: bool,
+    /// `WIE_JIT_DUMP_IR=<path>` — append the CLIF of each compiled block to that
+    /// file (capped, see `IR_DUMP_BLOCKS`). Off by default.
+    ///
+    /// This exists because `opt_level = none` means **the emitter is the
+    /// optimiser**: every redundant `band`/`ireduce`/`uextend`/`insertlane` the
+    /// lowering writes becomes real machine code, and nothing downstream removes
+    /// it. Whether a given arithmetic shape emits 5 host ops or 2 is therefore a
+    /// question about CLIF, and this is how it gets answered — by counting ops
+    /// in the dump rather than reasoning about them.
+    ir_dump_path: Option<std::path::PathBuf>,
 }
 
 /// Bounds of the background worker-pool size (`WIE_JIT_WORKERS`).
@@ -317,6 +327,9 @@ impl JitConfig {
             code_cache_enabled: code_cache_enabled_from_env(
                 std::env::var("WIE_JIT_CODE_CACHE").ok(),
             ),
+            ir_dump_path: std::env::var_os("WIE_JIT_DUMP_IR")
+                .filter(|p| !p.is_empty())
+                .map(std::path::PathBuf::from),
         }
     }
 
@@ -350,6 +363,12 @@ impl JitConfig {
     ///
     /// 2 — the shadow return stack (`shadow_sp`, `shadow_ret`) was removed.
     pub(super) const FRAME_LAYOUT_VERSION: u64 = 2;
+
+    /// Where to append CLIF dumps, if `WIE_JIT_DUMP_IR` names a file.
+    #[must_use]
+    pub(super) fn ir_dump_path(&self) -> Option<&std::path::Path> {
+        self.ir_dump_path.as_deref()
+    }
 
     #[must_use]
     pub(super) fn emit_fingerprint(&self) -> u64 {

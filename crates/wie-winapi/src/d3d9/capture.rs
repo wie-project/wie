@@ -11,11 +11,14 @@
 //!
 //! # Design decisions (the three hard problems from the handoff, resolved)
 //!
-//! 1. **Textures/shaders are snapshotted at record time** (v1 copies — the
-//!    opt-in gate makes the cost acceptable during bring-up; wrapping the
-//!    record storage in `Arc` is the follow-up optimization). A draw op
-//!    carries clones of the bound stages' texels and the parsed shader
-//!    programs, so the render thread never touches `D3D9State`.
+//! 1. **Textures/shaders are snapshotted at record time.** A draw op carries
+//!    the bound stages' texels and the parsed shader programs, so the render
+//!    thread never touches `D3D9State`. The texel storage is shared, not
+//!    copied: `CapturedTexture` holds `Arc` clones of the texture record's
+//!    level-0 and mip texels, and the buffer form's vertex/index bytes are
+//!    `Arc` handles on the buffer records (`StreamBytes`), so a draw costs a
+//!    few refcount bumps instead of megabytes per stage. The parsed shader
+//!    programs are still copied per op.
 //! 2. **Render targets + depth buffers round-trip through the render
 //!    thread.** Their texel storage is an `Arc` (see `RenderTargetRecord`).
 //!    At each flush the emu thread sends an `Arc` clone of a target's current
@@ -113,7 +116,7 @@ pub(crate) struct CapturedClear {
     pub rects: Vec<IRect>,
 }
 
-/// One captured texture: a private clone of a bound texture record's texels.
+/// One captured texture: a shared handle on a bound texture record's texels.
 #[derive(Debug, Clone)]
 pub(crate) struct CapturedTexture {
     /// Level-0 width in texels.
@@ -123,10 +126,57 @@ pub(crate) struct CapturedTexture {
     /// The record's requested level count (drives `MipChain::count` — see
     /// `raster::resolve_sampler_stage`).
     pub levels: u32,
-    /// Level-0 texels (`0xAARRGGBB`).
-    pub pixels: Vec<u32>,
-    /// Levels 1.. (the halved mip chain): `(width, height, texels)`.
-    pub mips: Vec<(u32, u32, Vec<u32>)>,
+    /// Level-0 texels (`0xAARRGGBB`) — an `Arc` clone of the record's
+    /// storage, so N draws from one texture cost N refcount bumps, not N
+    /// copies of the texels.
+    pub pixels: Arc<Vec<u32>>,
+    /// Levels 1.. (the halved mip chain): `(width, height, texels)`, shared
+    /// the same way.
+    pub mips: Vec<(u32, u32, Arc<Vec<u32>>)>,
+}
+
+/// The vertex bytes one captured draw reads: a handle on the shared storage
+/// plus the byte offset of the draw's first vertex.
+///
+/// A buffer-form draw shares the buffer record's `Arc` (a refcount bump — the
+/// pre-`Arc` code copied the stream slice at every draw), so a run of draws
+/// from one buffer stays one allocation; `SetStreamSource`'s `OffsetInBytes`
+/// and the non-indexed form's `StartVertex` fold into `offset` instead of a
+/// copy. The `Draw*UP` form has no record behind it — its guest read is the
+/// sole owner of a fresh buffer, with `offset` 0.
+#[derive(Debug, Clone)]
+pub(crate) struct StreamBytes {
+    /// The shared backing bytes.
+    bytes: Arc<Vec<u8>>,
+    /// Byte offset of the draw's first vertex into `bytes`.
+    offset: usize,
+}
+
+impl StreamBytes {
+    /// Share a buffer record's bytes, drawing from `offset` onward.
+    pub(crate) fn from_buffer(bytes: &Arc<Vec<u8>>, offset: usize) -> Self {
+        Self {
+            bytes: Arc::clone(bytes),
+            offset,
+        }
+    }
+
+    /// Own a freshly read byte block (the `Draw*UP` guest read).
+    pub(crate) fn from_owned(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: Arc::new(bytes),
+            offset: 0,
+        }
+    }
+
+    /// The vertex bytes from the first vertex to the end of the buffer.
+    ///
+    /// An offset past the end is the empty stream (the caller's draw then
+    /// produces no pixels, exactly like the pre-`Arc` `get(..).unwrap_or(&[])`
+    /// slice).
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.bytes.get(self.offset..).unwrap_or(&[])
+    }
 }
 
 /// One captured draw op: the stream bytes plus a full snapshot of the device
@@ -140,8 +190,8 @@ pub(crate) struct CapturedDraw {
     /// The bound depth-stencil surface VA (0 = none).
     pub depth_stencil: u64,
     /// Vertex pool bytes (the UP form's guest read, or the buffer form's
-    /// stream slice — both read at record time).
-    pub data: Vec<u8>,
+    /// shared stream handle — see [`StreamBytes`]).
+    pub data: StreamBytes,
     /// FVF decode layout.
     pub layout: FvfLayout,
     /// Stream stride in bytes.
@@ -150,8 +200,9 @@ pub(crate) struct CapturedDraw {
     pub primitive_type: u64,
     /// Primitive count.
     pub primitive_count: u64,
-    /// Index buffer bytes (`None` = non-indexed draw).
-    pub indices: Option<Vec<u8>>,
+    /// Index buffer bytes (`None` = non-indexed draw) — the buffer form's
+    /// shared handle, `StartIndex` applied through `index_offset`.
+    pub indices: Option<Arc<Vec<u8>>>,
     /// Index size (2 or 4 bytes).
     pub index_size: usize,
     /// `StartIndex` offset into the index buffer.
@@ -244,6 +295,10 @@ pub(crate) fn capture_enabled(state: &mut WinApiState) -> bool {
 
 /// Snapshot the per-stage bound textures (only stages with a live, non-empty
 /// binding carry an entry — the same filter `resolve_sampler_stage` applies).
+///
+/// The texels are taken by `Arc` clone: a draw's snapshot costs one refcount
+/// bump per bound level instead of a full copy of the stage-0 texels plus the
+/// mip chain.
 fn capture_textures(state: &mut WinApiState) -> [Option<Box<CapturedTexture>>; 8] {
     let d3d = state.d3d9();
     std::array::from_fn(|stage| {
@@ -259,11 +314,11 @@ fn capture_textures(state: &mut WinApiState) -> [Option<Box<CapturedTexture>>; 8
                 width: record.width,
                 height: record.height,
                 levels: record.levels,
-                pixels: record.pixels.clone(),
+                pixels: Arc::clone(&record.pixels),
                 mips: record
                     .mip_levels
                     .iter()
-                    .map(|mip| (mip.width, mip.height, mip.pixels.clone()))
+                    .map(|mip| (mip.width, mip.height, Arc::clone(&mip.pixels)))
                     .collect(),
             }))
         })
@@ -355,12 +410,12 @@ fn capture_draw_state(
 #[allow(clippy::too_many_arguments)]
 fn build_captured_draw(
     state: &mut WinApiState,
-    data: Vec<u8>,
+    data: StreamBytes,
     layout: FvfLayout,
     stride: usize,
     primitive_type: u64,
     primitive_count: u64,
-    indices: Option<Vec<u8>>,
+    indices: Option<Arc<Vec<u8>>>,
     index_size: usize,
     index_offset: usize,
     vertex_base: i64,
@@ -457,12 +512,12 @@ pub(crate) fn record_draw_up(
         }
     });
     let (indices, index_size) = match indices {
-        Some((bytes, size)) => (Some(bytes), size),
+        Some((bytes, size)) => (Some(Arc::new(bytes)), size),
         None => (None, 0),
     };
     let draw = build_captured_draw(
         state,
-        data,
+        StreamBytes::from_owned(data),
         layout,
         stride,
         primitive_type,
@@ -479,17 +534,17 @@ pub(crate) fn record_draw_up(
 }
 
 /// Record a buffer-form draw (`DrawPrimitive`/`DrawIndexedPrimitive`): the
-/// caller already cloned the stream + index bytes out of the buffer records —
-/// this moves them into the op with the state snapshot.
+/// caller already took `Arc` handles on the stream + index bytes out of the
+/// buffer records — this moves them into the op with the state snapshot.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_draw_buffer(
     state: &mut WinApiState,
-    data: Vec<u8>,
+    data: StreamBytes,
     layout: FvfLayout,
     stride: usize,
     primitive_type: u64,
     primitive_count: u64,
-    indices: Option<Vec<u8>>,
+    indices: Option<Arc<Vec<u8>>>,
     index_size: usize,
     index_offset: usize,
     vertex_base: i64,
@@ -681,7 +736,7 @@ fn captured_sampler_stage<'a>(
         *slot = Some(MipLevelView {
             width: texture.width,
             height: texture.height,
-            pixels: &texture.pixels,
+            pixels: texture.pixels.as_slice(),
         });
     }
     chain.count = texture.levels;
@@ -690,12 +745,12 @@ fn captured_sampler_stage<'a>(
             *slot = Some(MipLevelView {
                 width: *width,
                 height: *height,
-                pixels,
+                pixels: pixels.as_slice(),
             });
         }
     }
     Some(TextureStage {
-        pixels: &texture.pixels,
+        pixels: texture.pixels.as_slice(),
         width: texture.width,
         height: texture.height,
         addr_u: stage.address_u,
@@ -869,7 +924,8 @@ impl ReplayTargets {
         let Ok(groups) = primitive_groups(draw.primitive_type, draw.primitive_count) else {
             return;
         };
-        if groups.is_empty() || draw.data.is_empty() || draw.stride == 0 {
+        let data = draw.data.as_slice();
+        if groups.is_empty() || data.is_empty() || draw.stride == 0 {
             return;
         }
         // Resolve the color output: the bound target's copy, or the implicit
@@ -926,8 +982,8 @@ impl ReplayTargets {
             );
         let indices = draw
             .indices
-            .as_deref()
-            .map(|bytes| (bytes, draw.index_size, draw.index_offset));
+            .as_ref()
+            .map(|bytes| (bytes.as_slice(), draw.index_size, draw.index_offset));
         let mut frame = RasterFrame {
             output: output.as_mut_slice(),
             width,
@@ -940,7 +996,7 @@ impl ReplayTargets {
             ps,
             vs,
             frag,
-            data: &draw.data,
+            data,
             layout: &draw.layout,
             stride: draw.stride,
             groups: &groups,
@@ -973,5 +1029,252 @@ impl ReplayTargets {
             .collect();
         self.touched_rts.clear();
         CaptureHandback { rts }
+    }
+}
+
+// ── tests: the snapshot sharing ──────────────────────────────────────────
+//
+// The point of the `Arc` storage on the buffer/texture records is invisible
+// in output bytes: a recorded draw must carry the resource's ALLOCATION, not
+// a copy of it. `Arc::ptr_eq` is the only way to assert that, so these tests
+// do exactly that on two consecutive draws from one buffer / one texture.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::d3d9::buffer::BufferRecord;
+    use crate::d3d9::texture::MipLevel;
+    use crate::d3d9::{BufferKind, D3D_OK, D3DFMT_A8R8G8B8, TextureRecord};
+    use crate::d3d9_render::{D3DFVF_XYZ, D3DPT_TRIANGLELIST};
+    use crate::state::SceneState;
+    use crate::state::tests::winapi_state_default_with_bump_heap;
+
+    /// The `D3DFVF_XYZ` stream stride (3 floats).
+    const XYZ_STRIDE: u32 = 12;
+    /// Bound vertex buffer VA.
+    const VERTEX_VA: u64 = 0x8000;
+    /// Bound index buffer VA.
+    const INDEX_VA: u64 = 0x8100;
+    /// Bound texture VA.
+    const TEXTURE_VA: u64 = 0x9000;
+
+    /// One triangle's worth of vertex bytes (`D3DFVF_XYZ`, 3 vertices).
+    fn vertex_bytes() -> Vec<u8> {
+        (0..u8::try_from(XYZ_STRIDE).unwrap_or(0) * 3).collect()
+    }
+
+    /// A state with the capture gate armed and one `D3DFVF_XYZ` triangle
+    /// configured. Arming the gate is all the recording path needs — no
+    /// render thread is spawned (nothing flushes here).
+    fn armed_state() -> WinApiState {
+        let mut state = winapi_state_default_with_bump_heap();
+        state.present().channel.set_capture_enabled(true);
+        assert!(capture_enabled(&mut state), "the armed gate is observable");
+        state.d3d9().d3d9_scene_active = SceneState::Active;
+        state.d3d9().d3d9_current_fvf = D3DFVF_XYZ;
+        state.d3d9().d3d9_stream_stride = XYZ_STRIDE;
+        state.d3d9().d3d9_stream_source_va = VERTEX_VA;
+        state.d3d9().d3d9_index_buffer_va = INDEX_VA;
+        state
+    }
+
+    /// A `D3DPT_TRIANGLELIST` buffer-form draw (`indexed` = `Some` for the
+    /// indexed form). `start_vertex` shifts the stream base.
+    fn draw(state: &mut WinApiState, indexed: bool, start_vertex: u64) {
+        let indexed = indexed.then_some((0_u64, 0_u64));
+        let result = crate::d3d9::draw::draw_buffer_form_common(
+            state,
+            u64::from(D3DPT_TRIANGLELIST),
+            1,
+            indexed,
+            start_vertex,
+        );
+        assert_eq!(result.expect("buffer-form draw runs"), D3D_OK);
+    }
+
+    /// Insert the vertex + index buffer records and return the `Arc`s the
+    /// records hold (the allocations a draw must share).
+    fn insert_buffers(state: &mut WinApiState) -> (Arc<Vec<u8>>, Arc<Vec<u8>>) {
+        let vertices = Arc::new(vertex_bytes());
+        let indices = Arc::new(vec![0_u8, 0, 1, 0, 2, 0]);
+        state.d3d9().d3d9_buffers.insert(
+            VERTEX_VA,
+            BufferRecord {
+                handle: VERTEX_VA,
+                kind: BufferKind::Vertex { fvf: D3DFVF_XYZ },
+                size: u32::try_from(vertices.len()).unwrap_or(0),
+                usage: 0,
+                pool: 0,
+                data: Arc::clone(&vertices),
+                locked_va: 0,
+                ref_count: 1,
+            },
+        );
+        state.d3d9().d3d9_buffers.insert(
+            INDEX_VA,
+            BufferRecord {
+                handle: INDEX_VA,
+                kind: BufferKind::Index { format: 101 }, // D3DFMT_INDEX16
+                size: u32::try_from(indices.len()).unwrap_or(0),
+                usage: 0,
+                pool: 0,
+                data: Arc::clone(&indices),
+                locked_va: 0,
+                ref_count: 1,
+            },
+        );
+        (vertices, indices)
+    }
+
+    /// The recorded `Draw` ops, in stream order.
+    fn recorded_draws(state: &mut WinApiState) -> Vec<CapturedDraw> {
+        state
+            .d3d9()
+            .d3d9_capture_stream
+            .iter()
+            .filter_map(|op| match op {
+                CaptureOp::Draw(draw) => Some((**draw).clone()),
+                CaptureOp::Clear(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn consecutive_buffer_form_draws_share_the_buffer_allocations() {
+        let mut state = armed_state();
+        let (vertices, indices) = insert_buffers(&mut state);
+
+        draw(&mut state, true, 0);
+        draw(&mut state, true, 0);
+
+        let draws = recorded_draws(&mut state);
+        assert_eq!(draws.len(), 2, "both draws recorded");
+        assert!(
+            Arc::ptr_eq(&draws[0].data.bytes, &draws[1].data.bytes),
+            "the second draw shares the first's vertex allocation (no copy)"
+        );
+        assert!(
+            Arc::ptr_eq(&draws[0].data.bytes, &vertices),
+            "the recorded stream is the buffer record's own allocation"
+        );
+        let first_indices = draws[0].indices.as_ref().expect("indexed draw");
+        let second_indices = draws[1].indices.as_ref().expect("indexed draw");
+        assert!(
+            Arc::ptr_eq(first_indices, second_indices),
+            "the second draw shares the first's index allocation (no copy)"
+        );
+        assert!(
+            Arc::ptr_eq(first_indices, &indices),
+            "the recorded indices are the index record's own allocation"
+        );
+        // Sharing must not change what is drawn: the same bytes reach the
+        // rasterizer, and the record is unmoved (a reader, not a mutator).
+        assert_eq!(draws[0].data.as_slice(), vertices.as_slice());
+        assert_eq!(
+            state
+                .d3d9()
+                .d3d9_buffers
+                .get(&VERTEX_VA)
+                .map(|record| record.data.as_slice()),
+            Some(vertices.as_slice()),
+            "recording a draw leaves the buffer record untouched"
+        );
+    }
+
+    #[test]
+    fn shared_stream_honours_the_base_offset_without_a_copy() {
+        let mut state = armed_state();
+        let (vertices, _) = insert_buffers(&mut state);
+
+        // `SetStreamSource(OffsetInBytes)` / `StartVertex` fold into the
+        // snapshot's offset; the pre-`Arc` code copied the tail instead.
+        draw(&mut state, false, 1);
+        let draws = recorded_draws(&mut state);
+        assert_eq!(
+            draws[0].data.offset,
+            usize::try_from(XYZ_STRIDE).unwrap_or(0),
+            "one vertex of offset"
+        );
+        assert!(
+            Arc::ptr_eq(&draws[0].data.bytes, &vertices),
+            "the offset stream still shares the record's allocation"
+        );
+        assert_eq!(
+            draws[0].data.as_slice(),
+            vertices
+                .get(usize::try_from(XYZ_STRIDE).unwrap_or(0)..)
+                .unwrap_or(&[]),
+            "the offset stream is the buffer's tail, not a re-read"
+        );
+
+        // A base past the end is the empty stream — the draw that produces no
+        // pixels, exactly as the pre-`Arc` `get(..).unwrap_or(&[])` slice did.
+        draw(&mut state, false, 0x1000);
+        let draws = recorded_draws(&mut state);
+        assert!(
+            draws[1].data.as_slice().is_empty(),
+            "an out-of-range base is an empty stream"
+        );
+        assert!(
+            Arc::ptr_eq(&draws[0].data.bytes, &draws[1].data.bytes),
+            "even the skipped draw shares the allocation"
+        );
+    }
+
+    #[test]
+    fn consecutive_draws_share_the_bound_texture_allocation() {
+        let mut state = armed_state();
+        insert_buffers(&mut state);
+        let pixels = Arc::new(vec![0xFF11_2233_u32; 4]);
+        let mip_pixels = Arc::new(vec![0xFF44_5566_u32]);
+        state.d3d9().d3d9_textures.insert(
+            TEXTURE_VA,
+            TextureRecord {
+                handle: TEXTURE_VA,
+                width: 2,
+                height: 2,
+                levels: 2,
+                format: D3DFMT_A8R8G8B8,
+                pixels: Arc::clone(&pixels),
+                mip_levels: vec![MipLevel {
+                    width: 1,
+                    height: 1,
+                    pixels: Arc::clone(&mip_pixels),
+                }],
+                surface_vas: vec![0; 2],
+                locked_va: 0,
+                locked_level: 0,
+                locked_rect: None,
+            },
+        );
+        state.d3d9().d3d9_texture_bindings[0] = TEXTURE_VA;
+
+        draw(&mut state, false, 0);
+        draw(&mut state, false, 0);
+
+        let draws = recorded_draws(&mut state);
+        assert_eq!(draws.len(), 2, "both draws recorded");
+        let first = draws[0].textures[0].as_ref().expect("stage 0 bound");
+        let second = draws[1].textures[0].as_ref().expect("stage 0 bound");
+        assert!(
+            Arc::ptr_eq(&first.pixels, &second.pixels),
+            "the second draw shares the first's stage-0 texel allocation"
+        );
+        assert!(
+            Arc::ptr_eq(&first.pixels, &pixels),
+            "the snapshot is the texture record's own texel allocation"
+        );
+        let (_, _, first_mip) = first.mips.first().expect("level 1 captured");
+        let (_, _, second_mip) = second.mips.first().expect("level 1 captured");
+        assert!(
+            Arc::ptr_eq(first_mip, second_mip),
+            "the mip level is shared too (no per-mip copy per draw)"
+        );
+        assert!(
+            Arc::ptr_eq(first_mip, &mip_pixels),
+            "the mip snapshot is the record's own allocation"
+        );
+        // Same texels reach the sampler.
+        assert_eq!(first.pixels.as_slice(), pixels.as_slice());
+        assert_eq!(first_mip.as_slice(), mip_pixels.as_slice());
     }
 }
