@@ -22,11 +22,11 @@ use wie_winapi::guest_heap::{HEAP_SIZE_CLASS_COUNT, LARGE_THRESHOLD, SIZE_CLASSE
 use wie_winapi::{WinApiId, encode_alias};
 
 /// Control block: bump (u64) + freelist heads (24 × u64).
-pub const HEAP_CTRL_SIZE: usize = 8 + HEAP_SIZE_CLASS_COUNT * 8;
+pub(crate) const HEAP_CTRL_SIZE: usize = 8 + HEAP_SIZE_CLASS_COUNT * 8;
 
 /// Layout of the in-guest heap control block and helper code region.
 #[derive(Debug, Clone)]
-pub struct GuestHeapAccelConfig {
+pub(crate) struct GuestHeapAccelConfig {
     /// Guest VA of the control block (bump cursor + freelist heads).
     pub ctrl_va: u64,
     /// First byte of the guest process-heap arena.
@@ -47,7 +47,7 @@ pub struct GuestHeapAccelConfig {
 
 impl GuestHeapAccelConfig {
     #[must_use]
-    pub fn from_layout(layout: &RuntimeMemoryLayout) -> Self {
+    pub(crate) fn from_layout(layout: &RuntimeMemoryLayout) -> Self {
         let code = layout.guest_heap_code.base;
         let heap_end = layout
             .process_heap
@@ -87,10 +87,7 @@ pub(crate) fn install_guest_heap_accel(
 
     // Default OFF for wall/CPU: host freelist is cheaper than dual guest path.
     // Opt in with WIE_GUEST_HEAP=1. Control block still planted for coherent host.
-    let rewire = matches!(
-        std::env::var("WIE_GUEST_HEAP").as_deref(),
-        Ok("1" | "true" | "on" | "yes")
-    );
+    let rewire = crate::knobs::guest_heap_rewire();
     if rewire {
         let mut api = crate::guest_rewire::FakeApiRewire {
             engine,

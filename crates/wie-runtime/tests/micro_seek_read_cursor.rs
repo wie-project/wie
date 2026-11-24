@@ -429,6 +429,6 @@ fn seek_read_cursor_tracking_regression() -> anyhow::Result<()> {
         "read at end of file",
     )?;
 
-    let _ = std::fs::remove_file(&tmp);
+    drop(std::fs::remove_file(&tmp));
     Ok(())
 }

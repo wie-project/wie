@@ -42,7 +42,7 @@ pub struct RuntimeFakeApiEntry {
 /// Init cost was O(n²) in import count (linear scan for every intern call);
 /// on large mingw / MSVC CRT bundles this was a measurable startup drag.
 #[derive(Debug, Default, Clone)]
-pub struct SoftApiTable {
+pub(crate) struct SoftApiTable {
     entries: Vec<RuntimeFakeApiEntry>,
     /// Lowercase `(library, name)` → index into `entries`.
     ///
@@ -55,17 +55,17 @@ pub struct SoftApiTable {
 impl SoftApiTable {
     /// Look up a soft entry by dense index (O(1) on the handler path).
     #[must_use]
-    pub fn get(&self, index: u16) -> Option<&RuntimeFakeApiEntry> {
+    pub(crate) fn get(&self, index: u16) -> Option<&RuntimeFakeApiEntry> {
         self.entries.get(index as usize)
     }
 
     #[must_use]
-    pub fn as_slice(&self) -> &[RuntimeFakeApiEntry] {
+    pub(crate) fn as_slice(&self) -> &[RuntimeFakeApiEntry] {
         &self.entries
     }
 
     /// Intern `(library, name)` → encoded VA (stable across duplicates).
-    pub fn intern(
+    pub(crate) fn intern(
         &mut self,
         library: &str,
         name: &str,
@@ -128,7 +128,7 @@ fn lowercase_ascii(s: &str) -> String {
 /// allocation on the hot path, no ref-counting.  The Unresolved/COM paths that
 /// need owned strings allocate only once, at resolution time.
 #[derive(Debug, Clone)]
-pub struct ResolvedFakeApi {
+pub(crate) struct ResolvedFakeApi {
     pub library: Cow<'static, str>,
     pub name: Cow<'static, str>,
     pub winapi_id: Option<WinApiId>,
@@ -176,7 +176,7 @@ pub(crate) fn make_entry(
 }
 
 /// Resolve import to dense fake VA; grows `soft` for non-WinApiId exports.
-pub fn resolve_import_fake_va(
+pub(crate) fn resolve_import_fake_va(
     library: &str,
     name: &str,
     iat_slot_va: u64,

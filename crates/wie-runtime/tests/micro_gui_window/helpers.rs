@@ -452,7 +452,7 @@ impl FrameWatcher {
         };
         self.stop.store(true, Ordering::Relaxed);
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            drop(join.join());
         }
         found.or_else(|| self.observed_rx.try_recv().ok())
     }
@@ -463,7 +463,7 @@ impl Drop for FrameWatcher {
         use std::sync::atomic::Ordering;
         self.stop.store(true, Ordering::Relaxed);
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            drop(join.join());
         }
     }
 }

@@ -284,7 +284,7 @@ impl SessionInit {
 
 impl super::RuntimeSession {
     fn from_init(init: SessionInit) -> Result<Self> {
-        let profile_enabled = std::env::var_os("WIE_RUNTIME_PROFILE").is_some();
+        let profile_enabled = crate::knobs::runtime_profile();
         if profile_enabled {
             wie_winapi::present::set_frame_timing_enabled(true);
         }
@@ -893,11 +893,11 @@ impl super::RuntimeSession {
         let bottle_root = options
             .bottle_root
             .clone()
-            .or_else(wie_winapi::bottle_root_from_env);
+            .or_else(crate::knobs::bottle_root_from_env);
         let drive_d_root = options
             .drive_d_root
             .clone()
-            .or_else(wie_winapi::drive_d_from_env);
+            .or_else(crate::knobs::drive_d_root_from_env);
         let volumes =
             wie_winapi::VolumeConfig::from_parts(bottle_root.clone(), drive_d_root.clone());
 
@@ -1028,16 +1028,18 @@ impl super::RuntimeSession {
         let effective_root = wie_winapi::effective_bottle_root(&volumes);
         winapi_state.file_io.volumes = volumes;
         winapi_state.file_io.bottle_root = bottle_root;
-        let _ = wie_winapi::seed_default_skeleton(&effective_root);
+        drop(wie_winapi::seed_default_skeleton(&effective_root));
         t_phase = phase("seed-skeleton", t_phase);
         // Register the primary thread kernel object so DuplicateHandle
         // can resolve GetCurrentThread/GetCurrentProcess pseudohandles.
         {
             let ctx = wie_cpu::ThreadContext::default();
-            let _ = winapi_state
-                .kernel
-                .sync
-                .register_thread(wie_winapi::PRIMARY_THREAD_ID, ctx);
+            drop(
+                winapi_state
+                    .kernel
+                    .sync
+                    .register_thread(wie_winapi::PRIMARY_THREAD_ID, ctx),
+            );
         }
 
         // Register .pdata function table for C++ exception handling.
@@ -1272,7 +1274,7 @@ mod tests {
     impl TempDir {
         fn new(tag: &str) -> Self {
             let path = std::env::temp_dir().join(format!("wie-init-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
+            drop(std::fs::remove_dir_all(&path));
             std::fs::create_dir_all(&path).expect("create temp dir");
             Self(path)
         }
@@ -1284,7 +1286,7 @@ mod tests {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            drop(std::fs::remove_dir_all(&self.0));
         }
     }
 
@@ -1392,7 +1394,7 @@ mod tests {
         }
         let bottle =
             std::env::temp_dir().join(format!("wie-identity-bottle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&bottle);
+        drop(std::fs::remove_dir_all(&bottle));
         let copy = bottle
             .join("drive_c")
             .join("Program Files")
@@ -1416,7 +1418,7 @@ mod tests {
             .process
             .with_winapi_ref(|s| s.process.main_module_path.clone());
         assert_eq!(module_path, r"C:\Program Files\crt_hello\crt_hello.exe");
-        let _ = std::fs::remove_dir_all(&bottle);
+        drop(std::fs::remove_dir_all(&bottle));
     }
 
     /// `SessionOptions::current_directory` (the CLI's staged-app folder)

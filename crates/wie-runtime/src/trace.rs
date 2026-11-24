@@ -178,7 +178,7 @@ pub struct MicroRunSummary {
 /// Uses [`MessageQueueIdlePolicy::ExitOnIdle`] so an accidental idle path fails
 /// closed instead of hanging.
 pub fn run_micro_exe(path: &std::path::Path, max_api: usize) -> Result<MicroRunSummary> {
-    run_micro_exe_with_root(path, max_api, wie_winapi::bottle_root_from_env())
+    run_micro_exe_with_root(path, max_api, crate::knobs::bottle_root_from_env())
 }
 
 /// Like [`run_micro_exe`], with an explicit bottle root (`None` = no bottle / env ignored).

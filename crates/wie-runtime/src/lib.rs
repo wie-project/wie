@@ -11,6 +11,7 @@ mod guest_rewire;
 mod guest_stubs;
 mod gui_loop;
 mod hooks;
+mod knobs;
 mod memory;
 mod mt_runtime;
 mod quantum;

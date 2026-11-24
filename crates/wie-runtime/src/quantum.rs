@@ -53,13 +53,13 @@ pub(crate) trait QuantumHooks {
     /// Called once per quantum, before activation, with no WinAPI lock held.
     /// Returns the API index for this quantum (the primary allocates and
     /// journals it; workers return 0).
-    fn prepare_quantum(&mut self, _core: &mut QuantumCore) -> Result<usize> {
+    fn prepare_quantum(&mut self, _core: &mut QuantumCore<'_>) -> Result<usize> {
         Ok(0)
     }
 
     /// Called once before the first quantum. The primary prepares the first
     /// static `DllMain(PROCESS_ATTACH)` call when static dependencies exist.
-    fn prepare_first_quantum(&mut self, _core: &mut QuantumCore) -> Result<()> {
+    fn prepare_first_quantum(&mut self, _core: &mut QuantumCore<'_>) -> Result<()> {
         Ok(())
     }
 
@@ -68,7 +68,7 @@ pub(crate) trait QuantumHooks {
     /// thread here; the primary returns `None`.
     fn on_activated(
         &mut self,
-        _core: &mut QuantumCore,
+        _core: &mut QuantumCore<'_>,
         _st: &mut WinApiState,
     ) -> Result<Option<Step>> {
         Ok(None)
@@ -77,7 +77,7 @@ pub(crate) trait QuantumHooks {
     /// RIP was 0 at quantum start. `Some(va)` resumes from `va` (the primary
     /// dispatches the PE entry point); `None` means the thread returned and
     /// exits with the low u32 of RAX (worker semantics).
-    fn zero_rip_begin(&mut self, _core: &mut QuantumCore) -> Result<Option<u64>> {
+    fn zero_rip_begin(&mut self, _core: &mut QuantumCore<'_>) -> Result<Option<u64>> {
         Ok(None)
     }
 
@@ -87,7 +87,7 @@ pub(crate) trait QuantumHooks {
     /// returns `None` so the shared SEH / diagnostic handling applies.
     fn on_run_fault(
         &mut self,
-        _core: &mut QuantumCore,
+        _core: &mut QuantumCore<'_>,
         _run: &RunUntilHook,
         _error: Option<&CpuError>,
     ) -> Result<Option<Step>> {
@@ -100,7 +100,7 @@ pub(crate) trait QuantumHooks {
     /// last journaled API for context.
     fn on_run_error(
         &mut self,
-        core: &mut QuantumCore,
+        core: &mut QuantumCore<'_>,
         error: &CpuError,
         api_index: usize,
     ) -> Result<Step> {
@@ -127,7 +127,7 @@ pub(crate) trait QuantumHooks {
 
     /// No fake-API hook this quantum. The worker yields and retries; the
     /// primary accounts no-hook slices and may stop the session.
-    fn on_no_hook(&mut self, _core: &mut QuantumCore, _begin: u64) -> Result<Step> {
+    fn on_no_hook(&mut self, _core: &mut QuantumCore<'_>, _begin: u64) -> Result<Step> {
         Ok(Step::PureCompute)
     }
 
@@ -137,7 +137,7 @@ pub(crate) trait QuantumHooks {
     /// dispatch path.
     fn claim_hook_locked(
         &mut self,
-        _core: &mut QuantumCore,
+        _core: &mut QuantumCore<'_>,
         _st: &mut WinApiState,
         _address: u64,
     ) -> Result<Option<Step>> {
@@ -150,7 +150,7 @@ pub(crate) trait QuantumHooks {
     /// run bridged callbacks).
     fn on_callback_return(
         &mut self,
-        _core: &mut QuantumCore,
+        _core: &mut QuantumCore<'_>,
         _guard: MutexGuard<'_, WinApiState>,
         _address: u64,
         _api_index: usize,
@@ -162,7 +162,7 @@ pub(crate) trait QuantumHooks {
     /// primary's journaling + API charging.
     fn on_seh_continue(
         &mut self,
-        _core: &mut QuantumCore,
+        _core: &mut QuantumCore<'_>,
         _api_index: usize,
         _address: u64,
         _return_value: u64,
@@ -175,7 +175,7 @@ pub(crate) trait QuantumHooks {
     /// re-lock through the core). The default is the worker policy.
     fn dispatch(
         &mut self,
-        core: &mut QuantumCore,
+        core: &mut QuantumCore<'_>,
         mut guard: MutexGuard<'_, WinApiState>,
         resolved: &ResolvedFakeApi,
         _hook_address: u64,
@@ -229,10 +229,10 @@ pub(crate) trait QuantumHooks {
     }
 
     /// One `run_until_stop` quantum elapsed (`emu_ns`).
-    fn on_emu_time(&mut self, _core: &mut QuantumCore, _ns: u128) {}
+    fn on_emu_time(&mut self, _core: &mut QuantumCore<'_>, _ns: u128) {}
 
     /// A fake-API hook resolved (`resolve_ns`).
-    fn on_resolved(&mut self, _core: &mut QuantumCore, _ns: u128) {}
+    fn on_resolved(&mut self, _core: &mut QuantumCore<'_>, _ns: u128) {}
 }
 
 /// The shared executor for one guest thread's quantum loop.
@@ -1177,19 +1177,19 @@ mod tests {
     }
 
     impl QuantumHooks for TestHooks {
-        fn prepare_quantum(&mut self, _core: &mut QuantumCore) -> Result<usize> {
+        fn prepare_quantum(&mut self, _core: &mut QuantumCore<'_>) -> Result<usize> {
             Ok(self.api_index)
         }
-        fn prepare_first_quantum(&mut self, _core: &mut QuantumCore) -> Result<()> {
+        fn prepare_first_quantum(&mut self, _core: &mut QuantumCore<'_>) -> Result<()> {
             self.prepare_first_calls = self.prepare_first_calls.saturating_add(1);
             Ok(())
         }
-        fn zero_rip_begin(&mut self, _core: &mut QuantumCore) -> Result<Option<u64>> {
+        fn zero_rip_begin(&mut self, _core: &mut QuantumCore<'_>) -> Result<Option<u64>> {
             Ok(self.zero_rip)
         }
         fn on_run_fault(
             &mut self,
-            _core: &mut QuantumCore,
+            _core: &mut QuantumCore<'_>,
             _run: &RunUntilHook,
             _error: Option<&CpuError>,
         ) -> Result<Option<Step>> {
@@ -1197,7 +1197,7 @@ mod tests {
         }
         fn claim_hook_locked(
             &mut self,
-            _core: &mut QuantumCore,
+            _core: &mut QuantumCore<'_>,
             _st: &mut WinApiState,
             address: u64,
         ) -> Result<Option<Step>> {
@@ -1206,7 +1206,7 @@ mod tests {
         }
         fn on_callback_return(
             &mut self,
-            _core: &mut QuantumCore,
+            _core: &mut QuantumCore<'_>,
             _guard: MutexGuard<'_, WinApiState>,
             _address: u64,
             _api_index: usize,
@@ -1216,7 +1216,7 @@ mod tests {
         }
         fn on_seh_continue(
             &mut self,
-            _core: &mut QuantumCore,
+            _core: &mut QuantumCore<'_>,
             _api_index: usize,
             _address: u64,
             _return_value: u64,
@@ -1226,7 +1226,7 @@ mod tests {
         }
         fn dispatch(
             &mut self,
-            _core: &mut QuantumCore,
+            _core: &mut QuantumCore<'_>,
             _guard: MutexGuard<'_, WinApiState>,
             resolved: &ResolvedFakeApi,
             _hook_address: u64,
@@ -1267,7 +1267,7 @@ mod tests {
 
         assert!(matches!(step, Step::Next));
         // Drop the core so the engine (borrowed by it) is inspectable again.
-        let _ = core;
+        drop(core);
         assert_eq!(engine.run_calls.len(), 1);
         assert_eq!(
             engine.run_calls[0].0, 0x1400_1000,
@@ -1357,7 +1357,7 @@ mod tests {
     impl QuantumHooks for TebReaffirmHooks {
         fn on_activated(
             &mut self,
-            core: &mut QuantumCore,
+            core: &mut QuantumCore<'_>,
             _st: &mut WinApiState,
         ) -> Result<Option<Step>> {
             self.activations = self.activations.saturating_add(1);
@@ -1425,7 +1425,7 @@ mod tests {
             core.step(&mut hooks).expect("step"),
             Step::PureCompute
         ));
-        let _ = core;
+        drop(core);
         assert_eq!(
             engine.gs_base,
             wie_cpu::GS_BASE,
@@ -1539,7 +1539,7 @@ mod tests {
 
         let step = core.step(&mut hooks).expect("step");
         assert!(matches!(step, Step::ExitThread(42)));
-        let _ = core;
+        drop(core);
         let st = lock(&winapi);
         assert!(st.kernel.sync.process_dying);
     }
@@ -1647,7 +1647,7 @@ mod tests {
             let mut core = core_for(&mut engine, &config, &winapi, &heap, &stats);
             core.with_locked(|_engine, _st| {});
         }
-        let _ = holder.join();
+        drop(holder.join());
         let snap = stats.snapshot();
         assert!(
             snap.guest_total_ns >= 5_000_000,

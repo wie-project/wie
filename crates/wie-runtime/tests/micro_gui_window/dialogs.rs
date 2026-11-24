@@ -78,7 +78,7 @@ fn notepad_file_open_builds_interactive_dialog() {
     {
         handle.post_message(dialog, WM_COMMAND, 2, 0); // IDCANCEL
         for _ in 0..50 {
-            let _ = session.run_until_stop(1_000_000).expect("run");
+            drop(session.run_until_stop(1_000_000).expect("run"));
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
@@ -87,7 +87,7 @@ fn notepad_file_open_builds_interactive_dialog() {
         "CMD_OPEN must build the interactive file dialog (a FileDialog window) — \
          the action does not complete if no dialog appears"
     );
-    let _ = EntryTraceTermination::WaitingForMessage;
+    drop(EntryTraceTermination::WaitingForMessage);
 }
 
 /// WM_COMMAND(CMD_SAVE_AS) with the interactive policy must build the dialog
@@ -119,7 +119,7 @@ fn notepad_file_save_as_builds_interactive_dialog() {
     {
         handle.post_message(dialog, WM_COMMAND, 2, 0); // IDCANCEL
         for _ in 0..50 {
-            let _ = session.run_until_stop(1_000_000).expect("run");
+            drop(session.run_until_stop(1_000_000).expect("run"));
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
@@ -496,7 +496,7 @@ fn notepad_file_dialog_paints_into_the_owner_surface() {
     if dialog_hwnd != 0 {
         handle.post_message(dialog_hwnd, WM_COMMAND, 2, 0); // IDCANCEL
         for _ in 0..50 {
-            let _ = session.run_until_stop(1_000_000).expect("run");
+            drop(session.run_until_stop(1_000_000).expect("run"));
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
@@ -542,7 +542,7 @@ fn notepad_file_save_builds_interactive_dialog() {
     {
         handle.post_message(dialog, WM_COMMAND, 2, 0); // IDCANCEL
         for _ in 0..50 {
-            let _ = session.run_until_stop(1_000_000).expect("run");
+            drop(session.run_until_stop(1_000_000).expect("run"));
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
@@ -913,12 +913,12 @@ fn notepad_file_save_native_bridge_accept_completes_save_flow() {
     // mounted guest path (`Z:\pick{N}\...`) — the exact seam in the trace.
     let bottle =
         std::env::temp_dir().join(format!("wie-ofn-bridge-save-bottle-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(bottle.join("drive_c"));
+    drop(std::fs::create_dir_all(bottle.join("drive_c")));
     let picked_host = std::env::temp_dir().join(format!(
         "wie-ofn-bridge-save-picked-{}.txt",
         std::process::id()
     ));
-    let _ = std::fs::remove_file(&picked_host);
+    drop(std::fs::remove_file(&picked_host));
 
     let mut session =
         wie_runtime::RuntimeSession::new(&path, wie_winapi::MessageQueueIdlePolicy::YieldOnIdle)
@@ -1020,8 +1020,8 @@ fn notepad_file_save_native_bridge_accept_completes_save_flow() {
         "the saved file must contain the typed text; got {:?}",
         String::from_utf8_lossy(&saved)
     );
-    let _ = std::fs::remove_file(&picked_host);
-    let _ = std::fs::remove_dir_all(&bottle);
+    drop(std::fs::remove_file(&picked_host));
+    drop(std::fs::remove_dir_all(&bottle));
 }
 
 /// REPRO: the native-bridge OPEN flow. RNotepad's File→Open with a scripted
@@ -1039,7 +1039,7 @@ fn notepad_file_open_native_bridge_accept_reads_picked_file() {
 
     let bottle =
         std::env::temp_dir().join(format!("wie-ofn-bridge-open-bottle-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(bottle.join("drive_c"));
+    drop(std::fs::create_dir_all(bottle.join("drive_c")));
     let picked_host = std::env::temp_dir().join(format!(
         "wie-ofn-bridge-open-picked-{}.txt",
         std::process::id()
@@ -1137,7 +1137,7 @@ fn notepad_file_open_native_bridge_accept_reads_picked_file() {
         }
         // Keep pumping so the guest's post-read SetWindowText/EM_SETHANDLE
         // dispatch lands on the host control.
-        let _ = session.run_until_stop(1_000_000).expect("run");
+        drop(session.run_until_stop(1_000_000).expect("run"));
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     assert_eq!(
@@ -1148,8 +1148,8 @@ fn notepad_file_open_native_bridge_accept_reads_picked_file() {
          api sequence:\n{}",
         api_sequence.join("\n")
     );
-    let _ = std::fs::remove_file(&picked_host);
-    let _ = std::fs::remove_dir_all(&bottle);
+    drop(std::fs::remove_file(&picked_host));
+    drop(std::fs::remove_dir_all(&bottle));
 }
 
 /// REPRO: a LARGE picked file (>4 KiB) must load in FULL into the EDIT.
@@ -1167,7 +1167,7 @@ fn notepad_file_open_large_picked_file_loads_in_full() {
 
     let bottle =
         std::env::temp_dir().join(format!("wie-ofn-large-open-bottle-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(bottle.join("drive_c"));
+    drop(std::fs::create_dir_all(bottle.join("drive_c")));
     let picked_host = std::env::temp_dir().join(format!(
         "wie-ofn-large-open-picked-{}.txt",
         std::process::id()
@@ -1251,7 +1251,7 @@ fn notepad_file_open_large_picked_file_loads_in_full() {
         if edit_text.len() >= expected.len() {
             break;
         }
-        let _ = session.run_until_stop(1_000_000).expect("run");
+        drop(session.run_until_stop(1_000_000).expect("run"));
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     assert_eq!(
@@ -1269,8 +1269,8 @@ fn notepad_file_open_large_picked_file_loads_in_full() {
         edit_text, expected,
         "the EDIT content must match the picked file, LF normalized to CRLF"
     );
-    let _ = std::fs::remove_file(&picked_host);
-    let _ = std::fs::remove_dir_all(&bottle);
+    drop(std::fs::remove_file(&picked_host));
+    drop(std::fs::remove_dir_all(&bottle));
 }
 /// (via the pick-mount) must re-open with the SAME content in the EDIT. This
 /// pins the full content path — the save's WriteFile, the re-open's
@@ -1289,12 +1289,12 @@ fn notepad_file_save_then_open_roundtrips_content() {
 
     let bottle =
         std::env::temp_dir().join(format!("wie-ofn-roundtrip-bottle-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(bottle.join("drive_c"));
+    drop(std::fs::create_dir_all(bottle.join("drive_c")));
     let picked_host = std::env::temp_dir().join(format!(
         "wie-ofn-roundtrip-picked-{}.txt",
         std::process::id()
     ));
-    let _ = std::fs::remove_file(&picked_host);
+    drop(std::fs::remove_file(&picked_host));
     let roundtrip_text = "roundtrip content 42";
 
     let mut session =
@@ -1396,8 +1396,8 @@ fn notepad_file_save_then_open_roundtrips_content() {
         edit_text
     );
 
-    let _ = std::fs::remove_file(&picked_host);
-    let _ = std::fs::remove_dir_all(&bottle);
+    drop(std::fs::remove_file(&picked_host));
+    drop(std::fs::remove_dir_all(&bottle));
 }
 /// post File→New (CMD_NEW=256), answer the save prompt with "Don't Save"
 /// (IDNO — the discard path), and assert the EDIT is CLEARED and the repaint
@@ -1547,7 +1547,7 @@ fn notepad_file_new_yes_save_prompt_routes_to_save_dialog() {
     {
         handle.post_message(dialog, WM_COMMAND, 2, 0); // IDCANCEL
         for _ in 0..50 {
-            let _ = session.run_until_stop(1_000_000).expect("run");
+            drop(session.run_until_stop(1_000_000).expect("run"));
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }

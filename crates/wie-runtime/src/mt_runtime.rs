@@ -141,14 +141,6 @@ pub(crate) fn lock_wait<'a, T>(m: &'a Mutex<T>, stats: &LockWaitStats) -> MutexG
     guard
 }
 
-/// Cached `WIE_MT_DEBUG` flag. Was `env::var_os` on every spawn / park /
-/// worker-exit path; now a single `getenv()` guarded by `OnceLock`.
-pub(crate) fn mt_debug() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("WIE_MT_DEBUG").is_some())
-}
-
 /// Process-wide registry of guest **worker** engine CPU-stat snapshots.
 ///
 /// A guest worker owns its `Box<dyn CpuEngine>` and drops it on exit, so the
@@ -456,7 +448,7 @@ impl ProcessResources {
         if spawns.is_empty() {
             return Ok(());
         }
-        if mt_debug() {
+        if crate::knobs::mt_debug() {
             tracing::error!(
                 "[mt] drain_spawns count={} tids={:?}",
                 spawns.len(),
@@ -601,7 +593,7 @@ fn join_workers_impl(
         }
     }
     for j in joins.drain(..) {
-        let _ = j.join();
+        drop(j.join());
     }
 }
 
@@ -626,7 +618,7 @@ impl QuantumHooks for WorkerHooks {
     /// engine's segment base since the last quantum.
     fn on_activated(
         &mut self,
-        core: &mut QuantumCore,
+        core: &mut QuantumCore<'_>,
         _st: &mut WinApiState,
     ) -> Result<Option<Step>> {
         core.engine().set_gs_base(self.teb_va);
@@ -635,7 +627,7 @@ impl QuantumHooks for WorkerHooks {
 
     fn on_run_fault(
         &mut self,
-        core: &mut QuantumCore,
+        core: &mut QuantumCore<'_>,
         run: &RunUntilHook,
         error: Option<&wie_cpu::CpuError>,
     ) -> Result<Option<Step>> {
@@ -652,7 +644,7 @@ impl QuantumHooks for WorkerHooks {
             && run.invalid_memory.address == wie_winapi::pthread_return_trampoline_va()
         {
             let return_value = core.engine().read_rax().unwrap_or(0);
-            if mt_debug() {
+            if crate::knobs::mt_debug() {
                 tracing::error!(
                     "[mt] worker tid={:#x} pthread return value={return_value:#x}",
                     self.tid
@@ -678,7 +670,7 @@ impl QuantumHooks for WorkerHooks {
         if rip_now == 0 || (run.invalid_memory.hit && run.invalid_memory.address == 0) {
             let code = u32::try_from(core.engine().read_rax().unwrap_or(0) & u64::from(u32::MAX))
                 .unwrap_or(0);
-            if mt_debug() {
+            if crate::knobs::mt_debug() {
                 tracing::error!(
                     "[mt] worker_main exit tid={:#x} code={code} (ret-to-0)",
                     self.tid
@@ -732,7 +724,7 @@ fn worker_main(
     // Engine is dead: its TEB page cannot be accessed anymore. Return the
     // page to the pool for the next worker (re-init zero-fills it).
     drop(engine);
-    if mt_debug() {
+    if crate::knobs::mt_debug() {
         tracing::error!(
             "[mt] worker_main release teb tid={tid:#x} teb={:#x}",
             teb.va()
@@ -756,7 +748,7 @@ fn run_worker(
     teb: wie_cpu::PerThreadTeb,
     cpu_stats: WorkerCpuStats,
 ) -> Box<dyn CpuEngine> {
-    if mt_debug() {
+    if crate::knobs::mt_debug() {
         tracing::error!("[mt] worker_main start tid={tid:#x} teb={:#x}", teb.va());
     }
     let layout = &config.layout;
@@ -768,7 +760,7 @@ fn run_worker(
         config.stop_bitmap.clone(),
     ) {
         tracing::error!(tid, error = %e, "failed to install runtime hooks for worker");
-        if mt_debug() {
+        if crate::knobs::mt_debug() {
             tracing::error!("[mt] worker_main hooks failed tid={tid:#x}: {e}");
         }
         // Always mark finished so joiners do not hang forever.
@@ -817,7 +809,7 @@ fn run_worker(
         let step = match core.step(&mut hooks) {
             Ok(step) => step,
             Err(e) => {
-                if mt_debug() {
+                if crate::knobs::mt_debug() {
                     tracing::error!("[mt] worker_main step error tid={tid:#x}: {e}");
                 }
                 let st = lock_wait(&shared_winapi, &lock_wait_stats);
@@ -857,7 +849,7 @@ fn run_worker(
                 }
             }
             Step::ExitThread(code) => {
-                if mt_debug() {
+                if crate::knobs::mt_debug() {
                     tracing::error!("[mt] worker_main exit tid={tid:#x} code={code}");
                 }
                 let st = lock_wait(&shared_winapi, &lock_wait_stats);
@@ -1164,7 +1156,7 @@ mod tests {
         let guard = lock_wait(&state, &stats);
         assert_eq!(*guard, 42);
         drop(guard);
-        let _ = holder.join();
+        drop(holder.join());
 
         let snap = stats.snapshot();
         assert!(
@@ -1312,7 +1304,7 @@ mod tests {
         if path.is_file() {
             return Some(path);
         }
-        if std::env::var_os("WIE_ALLOW_MISSING_GUESTS").is_some() {
+        if crate::knobs::allow_missing_guests() {
             eprintln!(
                 "SKIPPED: missing guest fixture {} (allowed by WIE_ALLOW_MISSING_GUESTS)",
                 path.display()

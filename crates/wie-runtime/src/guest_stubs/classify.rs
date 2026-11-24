@@ -12,7 +12,7 @@ use wie_cpu::guest_layout::{
 };
 
 /// Guest FLS table slot count (index 0..N-1 accelerated).
-pub const GUEST_FLS_SLOT_COUNT: u32 = 256;
+pub(super) const GUEST_FLS_SLOT_COUNT: u32 = 256;
 
 /// Marker library for the UCRT group in [`CLASSIFY_TABLE`].
 ///

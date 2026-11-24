@@ -959,7 +959,7 @@ fn take_frame_times_presenter_wait_when_enabled() {
         elapsed < std::time::Duration::from_millis(10),
         "take_frame must not wait out the guest-held big lock (took {elapsed:?})"
     );
-    let _ = holder.join();
+    drop(holder.join());
     let snap = stats.snapshot();
     assert_eq!(
         snap.presenter_total_ns, 0,
@@ -980,8 +980,8 @@ fn take_frame_times_presenter_wait_when_enabled() {
 fn take_frame_disabled_records_nothing() {
     let (handle, stats) = handle_with_stats();
     assert!(!stats.enabled(), "stats start disabled");
-    let _ = handle.take_frame(0x100);
-    let _ = handle.z_snapshot();
+    drop(handle.take_frame(0x100));
+    drop(handle.z_snapshot());
     let snap = stats.snapshot();
     assert_eq!(snap.presenter_total_ns, 0);
     assert_eq!(snap.presenter_max_ns, 0);
@@ -1075,7 +1075,7 @@ fn probe_without_big_lock<R: Send + 'static>(
     };
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(probe(&handle));
+        drop(tx.send(probe(&handle)));
     });
     rx.recv_timeout(std::time::Duration::from_secs(2))
         .unwrap_or_else(|_| panic!("{what} blocked on the big WinApiState lock"))
