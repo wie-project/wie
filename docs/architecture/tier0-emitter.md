@@ -180,7 +180,15 @@ places (GPRs, the RFLAGS word, memory effects, the exit rip):
    and "wins on both", and it is not a decision the emitter can make for itself.
 3. **Where does the code live?** A separate buffer per §11.5's mutex argument, which
    means the code-memory path in `code-memory-on-darwin.md` applies to it (page-aligned
-   starts, `MAP_JIT`, the aliasing defect) — not a detail to discover late.
+   starts, the aliasing defect) — not a detail to discover late. **Answered for the
+   allocation**: `jit::tier0::CodeBuffer` is a plain anonymous `RW` mapping filled and
+   then `mprotect`ed to `RX`, which is what `cranelift-jit` itself does. The obvious
+   alternative — `MAP_JIT` with `PROT_READ|WRITE|EXEC` plus
+   `pthread_jit_write_protect_np` — **does not fail at allocation in this process; it
+   succeeds and SIGBUSes on the first call**, so it is recorded in the module docs as a
+   landmine rather than rediscovered. The smoke tests execute emitted bytes (`movz w0,
+   #42; ret` at offset 0 and again at a second offset), because an encoder tested against
+   its own output is the failure mode this campaign has already hit once.
 4. **`Push`/`Pop` and the stack-pin contract.** They are 4 % of the arm and the only
    blockers that *write* the guest stack; whatever the emitter does there must agree
    with `mem.rs`'s pin/refill contract, or the region path and the block path will
