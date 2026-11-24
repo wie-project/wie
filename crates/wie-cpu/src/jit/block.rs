@@ -270,17 +270,31 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Cmp
         | Mnemonic::Test
         | Mnemonic::Bt => alu_is_lowerable(instr),
-        // BTS/BTR/BTC are read-modify-write against memory, so `LOCK` needs a
-        // native atomic lowering (see `lock_rmw_mem_is_lowerable`).
+        // BTS/BTR/BTC are read-modify-write against memory. They are NOT
+        // implicitly locked, so only an explicit `LOCK` needs an atomic lowering
+        // — see `mem_rmw_is_lowerable`, which is the one place that decides.
         Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
-            alu_is_lowerable(instr) && lock_rmw_mem_is_lowerable(instr)
+            alu_is_lowerable(instr) && mem_rmw_is_lowerable(instr)
         }
         Mnemonic::Inc | Mnemonic::Dec | Mnemonic::Not | Mnemonic::Neg => unary_is_lowerable(instr),
         Mnemonic::Imul => imul_is_lowerable(instr),
         // Integer div/idiv: 32-bit register or simple-mem divisor (v1).
         // 64-bit stays iced (128-bit RDX:RAX dividend needs i128 helpers).
+        //
+        // These are two-operand encodings (`div ecx`) whose *dividend* is the
+        // implicit EDX:EAX pair — neither register appears in the decode, so the
+        // live-in analysis has to mark RAX and RDX itself (see the `Div`/`Idiv`
+        // case in `analysis::mark_insn_gprs`, which is where that knowledge
+        // belongs). `lower_div` reads both through `read_gpr`, so if that
+        // analysis entry is ever lost the block silently divides an `iconst 0`
+        // dividend — EAX and EDX come back 0,0 with no error. This pairing of
+        // "admitted here" with "made live there" is the same implicit-operand
+        // shape as `CmpXchg`'s accumulator, and is why the analysis list is
+        // worth auditing whenever a new implicit-operand mnemonic is admitted.
         Mnemonic::Div | Mnemonic::Idiv => div_is_lowerable(instr),
-        Mnemonic::Xchg => xchg_is_lowerable(instr),
+        // `XCHG` reg,reg only. The memory form is implicitly locked on x86-64, so
+        // `mem_rmw_is_lowerable` refuses it for either operand order.
+        Mnemonic::Xchg => mem_rmw_is_lowerable(instr),
         Mnemonic::Shl
         | Mnemonic::Sal
         | Mnemonic::Shr
@@ -289,12 +303,15 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Ror
         | Mnemonic::Rcl
         | Mnemonic::Rcr => shift_is_lowerable(instr),
-        // Xadd/Cmpxchg: same operand forms (dst reg/mem, src register), except
-        // that a `LOCK` memory destination needs a native atomic lowering.
+        // Xadd/Cmpxchg: same operand forms (dst reg/mem, src register). The two
+        // differ in atomicity and only in that: `CMPXCHG`'s memory form is
+        // implicitly locked on x86-64, `XADD`'s is not. Both decisions come from
+        // `mem_rmw_is_lowerable` so the implicit-lock rule cannot be applied to one
+        // and forgotten for the other.
         Mnemonic::Xadd | Mnemonic::Cmpxchg => match (instr.op0_kind(), instr.op1_kind()) {
             (OpKind::Register, OpKind::Register) => true,
             (OpKind::Memory, OpKind::Register) => {
-                mem_ea_ok(instr) && mem_size_ok(instr) && lock_rmw_mem_is_lowerable(instr)
+                mem_ea_ok(instr) && mem_size_ok(instr) && mem_rmw_is_lowerable(instr)
             }
             _ => false,
         },
@@ -825,28 +842,68 @@ fn div_is_lowerable(instr: &Instruction) -> bool {
     }
 }
 
-/// `xchg` reg,reg only.
+/// Whether *any* operand of `instr` is a memory reference.
 ///
-/// The memory form is **implicitly locked** on x86-64 even without a `LOCK`
-/// prefix, so it must be a single atomic read-modify-write. Cranelift
-/// `atomic_rmw` is not emitted for it here, so those blocks fall back to the
-/// interpreter, whose [`crate::exec`] `XCHG` is a real host atomic. Do not
-/// re-admit the memory form here without a native atomic lowering — the old
-/// `call_load` + `call_store` pair silently compiled a guest spinlock down to
-/// an unsynchronised load/store pair.
-fn xchg_is_lowerable(instr: &Instruction) -> bool {
-    matches!(
-        (instr.op0_kind(), instr.op1_kind()),
-        (OpKind::Register, OpKind::Register)
-    )
+/// Operand-agnostic on purpose. `XCHG` is symmetric, so the memory operand lands
+/// in either ModRM field across the two encodings of the same instruction; iced
+/// canonicalises both to op0, but relying on that is relying on a decoder
+/// presentation detail rather than on the encoding. Scanning every operand also
+/// means an instruction with a memory operand in a slot this code does not
+/// enumerate (`LEA`'s op1, a three-operand form) is still classified correctly
+/// rather than silently treated as register-only.
+fn has_memory_operand(instr: &Instruction) -> bool {
+    (0..instr.op_count()).any(|i| instr.op_kind(i) == OpKind::Memory)
 }
 
-/// `LOCK` on a memory RMW requires an atomic lowering, which the JIT does not
-/// emit: `LOCK XADD` / `LOCK CMPXCHG` / `LOCK BTX` against memory would be
-/// compiled as a plain load plus a store. Only the non-`LOCK` forms (and the
-/// register-only forms, which need no memory ordering) stay compiled.
-fn lock_rmw_mem_is_lowerable(instr: &Instruction) -> bool {
-    !(instr.has_lock_prefix() && instr.op0_kind() == OpKind::Memory)
+/// Is this instruction's memory-operand form an **implicitly locked**
+/// read-modify-write on x86-64?
+///
+/// This is the single source of truth for that architectural fact, and it is
+/// deliberately *not* written in terms of `Instruction::has_lock_prefix()`.
+///
+/// ## Why the prefix byte cannot answer this
+///
+/// On x86-64 the memory forms of `XCHG` and `CMPXCHG` are implicitly locked by
+/// the architecture whether or not a `F0` prefix byte is present, and compilers
+/// emit them **without** one as the norm (`cmpxchg [rbx], rcx` is `0F B1 /r`).
+/// iced, like every x86 decoder, reports only the *prefix byte*, so
+/// `has_lock_prefix()` is `false` for the standard encoding of the two
+/// instructions whose memory form most needs to be atomic. Keying the lowerability
+/// decision on it compiled a guest's 64-bit CAS — every `std::atomic` CAS and
+/// every `InterlockedCompareExchange64` — into a plain load plus store while the
+/// interpreter performed a real atomic CAS, i.e. no mutual exclusion at all on the
+/// default backend.
+///
+/// `XCHG` and `CMPXCHG` are the *only* two instructions in the ISA with an
+/// implicitly locked memory form. Notably **`INC`/`DEC`/`NOT`/`NEG` on memory are
+/// not**: an unlocked `inc [rbx]` is a plain read-modify-write in hardware too, so
+/// admitting them is architecturally correct and rejecting them would cost
+/// coverage for nothing. Anything added to this list changes guest-visible atomic
+/// behaviour, so it belongs here and nowhere else.
+fn mem_rmw_is_implicitly_locked(instr: &Instruction) -> bool {
+    has_memory_operand(instr) && matches!(instr.mnemonic(), Mnemonic::Xchg | Mnemonic::Cmpxchg)
+}
+
+/// Can this memory-operand read-modify-write be lowered as a plain load plus
+/// store?
+///
+/// Every decision that depends on memory-RMW atomicity routes through here, so
+/// the rule lives in exactly one place: a form is refused when the architecture
+/// guarantees atomicity (see [`mem_rmw_is_implicitly_locked`]) **or** when the
+/// encoding carries an explicit `LOCK`. The JIT emits no `atomic_rmw`, so both
+/// cases fall back to the interpreter, whose [`crate::exec`] `XCHG` / `CMPXCHG` /
+/// locked `XADD` / locked `BTX` are real host atomics.
+///
+/// Do not re-admit a refused form without a native atomic lowering: the old
+/// `call_load` + `call_store` pair silently compiled a guest spinlock down to an
+/// unsynchronised load/store pair.
+fn mem_rmw_is_lowerable(instr: &Instruction) -> bool {
+    if !has_memory_operand(instr) {
+        return true; // register-only: no memory ordering to provide
+    }
+    // Explicit LOCK: iced *does* report this prefix byte faithfully, so it is the
+    // right test for the mnemonics that are not implicitly locked.
+    !(instr.has_lock_prefix() || mem_rmw_is_implicitly_locked(instr))
 }
 
 /// `push` r64 / imm / simple mem (64-bit stack ops only; 16-bit override → iced).

@@ -6,6 +6,7 @@ mod bg_pool_tests;
 mod btx_tests;
 mod chain_tests;
 mod cmpxchg_tests;
+mod implicit_lock_tests;
 mod inv_gen_tests;
 mod pause_tests;
 mod strlen_repro;

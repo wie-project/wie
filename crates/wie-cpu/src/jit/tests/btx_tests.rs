@@ -1,7 +1,7 @@
 // `LOCK BTS`/`BTR`/`BTC` against memory must be a real read-modify-write.
 //
 // `e09e22c` made `XCHG` and `CMPXCHG` on memory atomic, and the JIT's
-// `lock_rmw_mem_is_lowerable` deliberately *rejects* locked memory `BTX` so those
+// `mem_rmw_is_lowerable` deliberately *rejects* locked memory `BTX` so those
 // blocks fall back to the interpreter. That left the interpreter as the only path
 // for a locked memory `BTX` — and `exec_bit` ignored the `LOCK` prefix, doing a
 // plain `mem.read` followed by `write_mem_value`. So the one remaining atomicity
@@ -33,8 +33,9 @@ use super::atomic_tests::{
     BACKENDS, DATA_BASE, Engine, LOCK_WORD, UNALIGNED_WORD, ctx, open, open_worker, plant,
     read_word, write_word,
 };
-use super::*;
+use crate::ThreadContext;
 use crate::exec::{AccessType, StepResult as StepResultAlias};
+use crate::mem::{MEM_COMMIT, MEM_RESERVE, protect};
 use crate::regs::Rflags;
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
 use std::sync::Barrier;
@@ -493,7 +494,7 @@ fn btx_mem_updates_the_bit_and_reports_cf_on_both_backends() {
 ///
 /// Unlocked memory `BTX` is `alu_is_lowerable`, so it compiles and this really
 /// exercises the JIT's BTX lowering. Locked memory `BTX` is rejected by
-/// `lock_rmw_mem_is_lowerable`, so the JIT arm must fall back to iced. Asserting
+/// `mem_rmw_is_lowerable`, so the JIT arm must fall back to iced. Asserting
 /// that split here is what stops the locked cases from silently "passing" on a
 /// block some future change might admit *without* a native atomic lowering — the
 /// exact regression `e09e22c` was written to prevent.
@@ -893,4 +894,204 @@ fn locked_btx_mem_stays_inside_its_word() {
             let _ = read_byte(&mut cpu, LOCK_WORD);
         }
     }
+}
+
+/// `BT`/`BTS`/`BTR`/`BTC` on a **register** destination mask the bit index to the
+/// operand width: `index mod operand size in bits` — a 3-bit mask for a byte, 4 for
+/// a word, 5 for a dword, 6 for a qword.
+///
+/// The JIT hardcoded `31` for every width narrower than 64, which is correct only at
+/// 32 bits. At 16 bits the shift stayed at the unmasked index, so `bt dx, 20`
+/// addressed bit 4 of the word on the interpreter but bit 20 of the 64-bit slot on
+/// the JIT: CF was read from a zero-extended bit (always 0) and `bts`/`btr`/`btc`
+/// wrote the wrong bit of the slot. The interpreter masked with `% bits` all along,
+/// so the two engines disagreed on the same bytes.
+///
+/// ## How the expectations are derived
+///
+/// `expected_btx` below computes the answer from the ISA rule — mask the index to
+/// the width, read CF from the old value, apply the update, then merge back at the
+/// operand width. Every case in the table supplies only `(width, op, rdx, index)`
+/// and the expectation is *derived*, never transcribed. An earlier hand-written
+/// version of this table asserted CF=true for a 64-bit case whose seed had bit 24
+/// set while the case was about bit 40; the derived form makes that class of slip
+/// impossible, because the seed and the index can no longer disagree about which
+/// bit they mean.
+///
+/// The differential assertion is kept but is **not** the primary defence: both
+/// engines could agree on the same wrong answer. Each case pins the architectural
+/// value, and `expected_btx` is itself checked against the width-mask arithmetic
+/// below it.
+#[test]
+fn btx_reg_masks_the_index_to_the_operand_width_on_both_backends() {
+    // `bt`/`bts`/`btr`/`btc` r/m, r — opcodes 0F A3 / 0F AB / 0F B3 / 0F BB, with
+    // ModRM 0xCA: mod=11, reg=DX(010), rm=CX(001). The register form always takes
+    // its index from **CL** (gpr[1]) and its operand is DX (gpr[2]).
+    //
+    // (0F A8 is `push fs`, not `bt`: the BT group's /4..7 extension is the imm8
+    // form, `0F BA /4`, while the r/m,r form is 0F A3.)
+    const BT: [u8; 3] = [0x0F, 0xA3, 0xCA];
+    const BTS: [u8; 3] = [0x0F, 0xAB, 0xCA];
+    const BTR: [u8; 3] = [0x0F, 0xB3, 0xCA];
+    const BTC: [u8; 3] = [0x0F, 0xBB, 0xCA];
+    // 16-bit: the 0x66 override.
+    const BT16: [u8; 4] = [0x66, 0x0F, 0xA3, 0xCA];
+    const BTS16: [u8; 4] = [0x66, 0x0F, 0xAB, 0xCA];
+    const BTR16: [u8; 4] = [0x66, 0x0F, 0xB3, 0xCA];
+    const BTC16: [u8; 4] = [0x66, 0x0F, 0xBB, 0xCA];
+    // 64-bit: REX.W.
+    const BT64: [u8; 4] = [0x48, 0x0F, 0xA3, 0xCA];
+    const BTS64: [u8; 4] = [0x48, 0x0F, 0xAB, 0xCA];
+
+    // One code page per distinct byte sequence: the interpreter's decode cache is
+    // process-wide and keyed by (rip, mem_generation), so sharing a VA between two
+    // encodings makes the second case replay the first case's instruction.
+    const ID_BT: u64 = 20;
+    const ID_BTS: u64 = 21;
+    const ID_BTR: u64 = 22;
+    const ID_BTC: u64 = 23;
+    const ID_BT16: u64 = 24;
+    const ID_BTS16: u64 = 25;
+    const ID_BTR16: u64 = 26;
+    const ID_BTC16: u64 = 27;
+    const ID_BT64: u64 = 28;
+    const ID_BTS64: u64 = 29;
+
+    // (label, op, id, width, operand seed, index)
+    for (label, op, id, width, seed, index) in [
+        // 16-bit, 4-bit mask. Index 20 wraps to 4 — the case the old `31` got
+        // wrong, since 20 & 31 = 20 and the shift ran off the top of the word.
+        (
+            "bt16-idx20-set",
+            &BT16[..],
+            ID_BT16,
+            16_u32,
+            1_u64 << 4,
+            20_u64,
+        ),
+        ("bt16-idx20-clear", &BT16[..], ID_BT16, 16, 0, 20),
+        ("bt16-idx15-top", &BT16[..], ID_BT16, 16, 1 << 15, 15),
+        ("bts16-idx20", &BTS16[..], ID_BTS16, 16, 0, 20),
+        ("bts16-idx20-already", &BTS16[..], ID_BTS16, 16, 1 << 4, 20),
+        ("btr16-idx20", &BTR16[..], ID_BTR16, 16, 1 << 4, 20),
+        ("btc16-idx20-on", &BTC16[..], ID_BTC16, 16, 1 << 4, 20),
+        ("btc16-idx20-off", &BTC16[..], ID_BTC16, 16, 0, 20),
+        // Bits above the word must survive a 16-bit write-back.
+        (
+            "bts16-high-bits",
+            &BTS16[..],
+            ID_BTS16,
+            16,
+            0xaaaa_0000_0000_0000,
+            20,
+        ),
+        // 32-bit, 5-bit mask: index 40 wraps to 8. This width was already right.
+        ("bt32-idx40", &BT[..], ID_BT, 32, 1 << 8, 40),
+        ("bts32-idx40", &BTS[..], ID_BTS, 32, 0, 40),
+        ("btr32-idx31-top", &BTR[..], ID_BTR, 32, 1 << 31, 31),
+        ("btc32-idx0", &BTC[..], ID_BTC, 32, 0, 0),
+        // 64-bit, 6-bit mask: index 40 is *not* wrapped, it addresses bit 40.
+        // This is the case whose hand-written expectation was wrong: it seeded a
+        // dword's worth of bits and asked about bit 40.
+        ("bt64-idx40-set", &BT64[..], ID_BT64, 64, 1 << 40, 40),
+        ("bt64-idx40-clear", &BT64[..], ID_BT64, 64, 0, 40),
+        ("bt64-idx63-top", &BT64[..], ID_BT64, 64, 1 << 63, 63),
+        // 64 + 40 = 104, and 104 & 63 = 40, so the index wraps within the width.
+        ("bt64-idx104-wraps", &BT64[..], ID_BT64, 64, 1 << 40, 104),
+        ("bts64-idx40", &BTS64[..], ID_BTS64, 64, 0, 40),
+        ("bts64-idx40-already", &BTS64[..], ID_BTS64, 64, 1 << 40, 40),
+    ] {
+        let (want_dx, want_cf) = expected_btx(op, width, seed, index);
+        let code_base = code_va(id);
+        let mut results = Vec::with_capacity(2);
+        let mut jit_compiled = false;
+        for backend in BACKENDS {
+            let mut cpu = open(backend);
+            let mut gpr = [0_u64; 16];
+            gpr[1] = index; // CL — the bit index for the register form
+            gpr[2] = seed; // DX — the operand
+            cpu.cpu()
+                .virtual_alloc(
+                    code_base,
+                    0x1000,
+                    MEM_RESERVE | MEM_COMMIT,
+                    protect::PAGE_EXECUTE_READWRITE,
+                )
+                .expect("code alloc");
+            let mut code = op.to_vec();
+            code.extend_from_slice(&[0x90, 0x0F, 0x0B]);
+            cpu.cpu().mem_write(code_base, &code).expect("code");
+            cpu.set_state(&ThreadContext {
+                rip: code_base,
+                gpr,
+                ..ThreadContext::default()
+            });
+            assert!(
+                matches!(cpu.run_rmw(), StepResultAlias::Continue),
+                "{backend:?} {label}: must retire"
+            );
+            let out = cpu.cpu().snapshot_thread_context();
+            // The architectural answer, asserted on each backend independently of
+            // the other: this is what makes the case a real test of the ISA rather
+            // than a test of "the two engines happen to agree".
+            assert_eq!(out.gpr[2], want_dx, "{backend:?} {label}: DX");
+            assert_eq!(
+                (u64::from(out.rflags) & u64::from(Rflags::CF) != 0),
+                want_cf,
+                "{backend:?} {label}: CF (expected {} for index {index} of a \
+                 {width}-bit operand seeded {seed:#x})",
+                want_cf
+            );
+            results.push((out.gpr, u64::from(out.rflags)));
+            if let Engine::Jit(ref j) = cpu {
+                jit_compiled = j.has_ready_at(code_base);
+                assert_eq!(
+                    j.stats().exec.iced_insns,
+                    0,
+                    "{label}: the register form must compile, not fall back to iced"
+                );
+            }
+        }
+        assert!(jit_compiled, "{label}: block must compile");
+        assert_eq!(
+            results[0], results[1],
+            "{label}: engines disagree on (gpr, rflags)"
+        );
+    }
+}
+
+/// The architectural result of a register-form `BT`/`BTS`/`BTR`/`BTC`.
+///
+/// `index` is masked to the operand width, CF comes from the *old* value, and the
+/// update is merged back at the operand width (a 16-bit result leaves bits above
+/// the word alone; a 32-bit result zero-extends). The mnemonic is taken from the
+/// encoding so the caller cannot pass a seed and an opcode that disagree.
+fn expected_btx(op: &[u8], width: u32, seed: u64, index: u64) -> (u64, bool) {
+    let mnemonic = {
+        let mut dec = Decoder::with_ip(64, op, CODE_DECODE, DecoderOptions::NONE);
+        dec.decode().mnemonic()
+    };
+    let idx = index & (u64::from(width) - 1);
+    let bit = 1_u64 << idx;
+    let cf = seed & bit != 0;
+    // Mask the seed to the operand, exactly as a narrow register read does.
+    let masked = match width {
+        16 => seed & 0xffff,
+        32 => seed & 0xffff_ffff,
+        _ => seed,
+    };
+    let updated = match mnemonic {
+        Mnemonic::Bts => masked | bit,
+        Mnemonic::Btr => masked & !bit,
+        Mnemonic::Btc => masked ^ bit,
+        _ => masked, // Bt: read-only
+    };
+    let merged = match width {
+        // A 16-bit write preserves everything above the word.
+        16 => (seed & !0xffff) | (updated & 0xffff),
+        // A 32-bit write zero-extends into the upper half.
+        32 => updated & 0xffff_ffff,
+        _ => updated,
+    };
+    (merged, cf)
 }
