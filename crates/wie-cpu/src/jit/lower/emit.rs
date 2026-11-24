@@ -1,8 +1,8 @@
 //! Block emission: `emit_body_and_term`, the block-wide stack guard, and the
 //! terminator helpers (chaining, self-loops, fast UCRT inline ops).
 
-use super::analysis::{ensure_gprs_loaded, ensure_xmm_loaded, entry_decode_needed};
-use super::flags::{FlagState, decompose_packed, iconst_u64, pack_once, packed_word, resync_state};
+use super::analysis::{ensure_gprs_loaded, ensure_xmm_loaded, entry_decode_mask};
+use super::flags::{FlagState, decompose_bits, iconst_u64, pack_once, packed_word, resync_state};
 use super::gpr::mark_dirty;
 use super::insn::{
     PendingFlags, flush_pending, flush_pending_deferred, flush_pending_impl, lower_insn,
@@ -1105,11 +1105,12 @@ pub(super) fn emit_body_and_term(
         // (`FlagState::carried`). The predicate is conservative — see
         // `analysis::entry_decode_needed` for the shapes that keep the decode and
         // why iced's own read/modify masks are not sufficient on their own.
-        if entry_decode_needed(body, term) {
-            Some(decompose_packed(bcx, *rflags_val))
-        } else {
-            Some(FlagState::carried(bcx, *rflags_val))
-        }
+        // The mask is what the block can *observe* before it writes: `0` carries
+        // the word and packs nothing, a single-bit mask decodes one bit, and only
+        // a block whose writers are not all "defines six" keeps the full cone.
+        // See `analysis::entry_decode_mask`.
+        let mask = entry_decode_mask(body, term, term_insn);
+        Some(decompose_bits(bcx, *rflags_val, mask))
     } else {
         None
     };

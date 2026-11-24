@@ -9,6 +9,7 @@ use super::gpr::reg_index;
 use super::super::block::{BlockTerm, DecodedInsn};
 use super::err::LowerError;
 use super::opclass;
+use crate::regs::Rflags;
 
 use cranelift::prelude::*;
 use cranelift_codegen::ir::MemFlagsData;
@@ -305,19 +306,91 @@ pub(super) fn flags_live_in(insns: &[DecodedInsn]) -> bool {
 /// decode. A missed optimisation costs twenty instructions per block visit; a
 /// wrongly skipped decode hands a fault, or a successor, a word with cleared flag
 /// bits.
-pub(super) fn entry_decode_needed(insns: &[DecodedInsn], term: Option<BlockTerm>) -> bool {
-    if matches!(term, Some(BlockTerm::Jcc { .. })) {
-        return true;
-    }
+/// The flag **bits** the entry decode has to produce, as a mask of
+/// [`Rflags`](crate::regs::Rflags) bit values (`0` = carry the word instead).
+///
+/// Two passes' worth of thinking collapsed into one forward scan, because the
+/// question is "which bits can be *observed* before this block writes them":
+///
+/// * a bit read while it is still unwritten is an entry bit — the body's writer
+///   has not produced it yet, so it must come from the incoming word;
+/// * a bit written first and read later is **not** an entry bit (the writer
+///   produced it), which is what makes a compare-and-branch loop mask `0` rather
+///   than six;
+/// * a writer that does not define all six in this lowering can carry an entry
+///   bit forward into a later pack, and narrowing would then pack a placeholder
+///   over it — so such a block keeps the whole mask. That is every `and`/`or`/
+///   `xor`/`test` (AF is preserved), every `inc`/`dec` (CF), every `imul`/`mul`
+///   (ZF/SF/AF/PF), and every shift — **including** a shift whose count is a
+///   multiple of the width: `assign_shift` reads the incoming CF/OF/ZF/SF/PF for
+///   the `count % bits == 0` preservation and derives OF from the old value
+///   otherwise, so a shift forces all six regardless of what its own `setcc`/
+///   `jcc` consumers read.
+///
+/// `term_insn` is the terminator's own instruction when there is one: a `jcc`
+/// reads the bits its condition names, after the body, so only the ones the body
+/// did not write are entry bits.
+pub(super) fn entry_decode_mask(
+    insns: &[DecodedInsn],
+    _term: Option<BlockTerm>,
+    term_insn: Option<&DecodedInsn>,
+) -> u32 {
+    let mut written: u32 = 0;
+    let mut mask: u32 = 0;
     for d in insns {
-        if d.instr.rflags_read() != 0 {
-            return true;
+        let writes = d.instr.rflags_modified();
+        if writes != 0 && !defines_all_six(d.instr.mnemonic()) {
+            // Cannot narrow: this writer may leave some field at its entry value
+            // and a later pack would emit that placeholder instead of the bit.
+            return flag_bits_all();
         }
-        if d.instr.rflags_modified() != 0 && !defines_all_six(d.instr.mnemonic()) {
-            return true;
+        mask |= iced_to_rflags(d.instr.rflags_read()) & !written;
+        written |= iced_to_rflags(writes);
+    }
+    if let Some(ti) = term_insn {
+        mask |= iced_to_rflags(ti.instr.rflags_read()) & !written;
+    }
+    mask
+}
+
+/// Translate an `iced` RFLAGS mask into [`Rflags`] bit values.
+///
+/// `iced`'s masks are a **compact layout, not architectural bit positions** —
+/// measured from the decoder: `setb` reads `0x10` (CF), `sete` `0x4` (ZF),
+/// `sets` `0x2` (SF), `setp` `0x20` (PF), `seto` `0x1` (OF), `lahf` `0x3e`
+/// (SF|ZF|AF|PF|CF), `pushfq` `0x1ff`. Using them as if they were
+/// `Rflags::CF = 1 / ZF = 0x40 / ...` would decode the wrong bits and, worse,
+/// decode *fewer* than the block reads — the unsound direction.
+fn iced_to_rflags(m: u32) -> u32 {
+    let mut out = 0_u32;
+    for (iced_bit, our) in [
+        (0x10_u32, Rflags::CF),
+        (0x20, Rflags::PF),
+        (0x08, Rflags::AF),
+        (0x04, Rflags::ZF),
+        (0x02, Rflags::SF),
+        (0x01, Rflags::OF),
+    ] {
+        if m & iced_bit != 0 {
+            out |= u64::from(our) as u32;
         }
     }
-    false
+    out
+}
+
+/// CF | PF | AF | ZF | SF | OF — every architectural bit the SSA state tracks.
+fn flag_bits_all() -> u32 {
+    [
+        Rflags::CF,
+        Rflags::PF,
+        Rflags::AF,
+        Rflags::ZF,
+        Rflags::SF,
+        Rflags::OF,
+    ]
+    .into_iter()
+    .map(|b| u64::from(b) as u32)
+    .fold(0, |a, b| a | b)
 }
 
 /// Mnemonics whose lowering assigns **all six** architectural flag fields from
@@ -326,7 +399,7 @@ pub(super) fn entry_decode_needed(insns: &[DecodedInsn], term: Option<BlockTerm>
 ///
 /// `assign_arith` covers `Add`/`Sub`/`Cmp`/`Neg` (neg is `0 - a` as a `Sub`) and
 /// `assign_adc`/`assign_sbb` cover the carry forms — but `adc`/`sbb` also *read*
-/// CF, so [`entry_decode_needed`] rejects them one clause earlier and they only
+/// CF, so [`entry_decode_mask`] narrows to it and they only
 /// appear here so the "which writer defines everything" question has one answer.
 fn defines_all_six(m: Mnemonic) -> bool {
     matches!(
@@ -532,7 +605,7 @@ mod flag_gate_tests {
 // row below is one shape whose answer has to stay on the conservative side.
 #[cfg(test)]
 mod entry_decode_tests {
-    use super::entry_decode_needed;
+    use super::{entry_decode_mask, flag_bits_all};
     use crate::jit::block::{BlockTerm, DecodedInsn};
     use iced_x86::{Decoder, DecoderOptions};
 
@@ -548,6 +621,20 @@ mod entry_decode_tests {
             out.push(DecodedInsn { instr });
         }
         out
+    }
+
+    /// The mask for a block, with the terminator supplied the way `emit.rs`
+    /// supplies it: as a decoded instruction, not just a mnemonic.
+    fn mask_of(bytes: &[u8], with_jcc: bool) -> u32 {
+        let insns = block(bytes);
+        assert!(!insns.is_empty(), "fixture did not decode");
+        match with_jcc {
+            false => entry_decode_mask(&insns, None, None),
+            true => {
+                let term = block(&[0x75, 0x00]); // jne +0
+                entry_decode_mask(&insns, jcc(), term.first())
+            }
+        }
     }
 
     fn jcc() -> Option<BlockTerm> {
@@ -577,9 +664,23 @@ mod entry_decode_tests {
             false,
         ),
         ("add then store", &[0x01, 0xD8, 0x89, 0x07], false, false),
-        // --- kept: a hot reader ---
-        ("add + jcc terminator", &[0x01, 0xD8], true, true),
-        ("mov + jcc terminator", &[0x89, 0xD8], true, true),
+        // --- the terminator's own read of a bit the body already wrote is NOT an
+        // entry read: `add` assigns all six, so the `jne` reads the add's ZF and
+        // nothing has to be decoded. This row used to expect the decode: the
+        // pre-narrowing gate answered "is the terminator a jcc" without asking
+        // whether the body had written the bits the condition names.
+        (
+            "add + jcc terminator (the add wrote ZF)",
+            &[0x01, 0xD8],
+            true,
+            false,
+        ),
+        (
+            "mov + jcc terminator (nothing wrote ZF)",
+            &[0x89, 0xD8],
+            true,
+            true,
+        ),
         ("adc reads CF", &[0x11, 0xD8], false, true),
         ("sbb reads CF", &[0x19, 0xD8], false, true),
         ("pushfq reads the word", &[0x9C], false, true),
@@ -596,7 +697,12 @@ mod entry_decode_tests {
         ("test keeps AF in this lowering", &[0x85, 0xD8], false, true),
         ("shl reads the old CF/OF/ZS", &[0xD1, 0xE0], false, true),
         ("imul keeps ZF/SF/AF/PF", &[0x0F, 0xAF, 0xC3], false, true),
-        ("stosd (string op)", &[0xAB], false, true),
+        // `stosd` touches no flag bit; the string helper round-trips the word and
+        // `resync`s the state from it, so nothing has to be decoded at entry.
+        ("stosd (string op, no flag access)", &[0xAB], false, false),
+        // `scasd` writes all six from the scan — a non-`assign_arith` writer, so
+        // the mask stays whole.
+        ("scasd (string compare)", &[0xAF], false, true),
         // --- kept: not recognised as a writer of all six, and the safe
         // direction is to decode ---
         (
@@ -610,16 +716,90 @@ mod entry_decode_tests {
         ("rdtsc touches no flag", &[0x0F, 0x31], false, false),
     ];
 
+    /// `(name, bytes, terminator?, expected mask)`.
+    ///
+    /// The `0` rows carry the word (nothing reads an entry bit); the single-bit
+    /// rows are the narrowing this slice is for; the `ALL` rows are the shapes
+    /// where narrowing would be unsound because a writer can carry an entry bit
+    /// into a later pack.
+    ///
+    /// Two rows exist specifically to fail if the two traps come back:
+    /// `shl reads CF/OF/ZS even when its consumers read only ZF` (so the shift's
+    /// own read set, not its consumers', decides) and
+    /// `cmp then setb reads nothing at entry` (a bit written before it is read is
+    /// not an entry bit).
+    fn mask_rows() -> Vec<(&'static str, &'static [u8], bool, u32)> {
+        let all = flag_bits_all();
+        let zf = u64::from(crate::regs::Rflags::ZF) as u32;
+        let cf = u64::from(crate::regs::Rflags::CF) as u32;
+        vec![
+            // --- 0: nothing observers an entry bit ---
+            ("cmp then jne (writer first)", &[0x39, 0xD8], true, 0),
+            (
+                "cmp then setb (writer first)",
+                &[0x39, 0xD8, 0x0F, 0x92, 0xC1],
+                false,
+                0,
+            ),
+            ("add then jne", &[0x01, 0xD8], true, 0),
+            ("mov only", &[0x89, 0xD8], false, 0),
+            // --- one bit, read before any writer ---
+            ("jne only", &[0x89, 0xD8], true, zf),
+            ("setb only", &[0x0F, 0x92, 0xC1], false, cf),
+            ("cmovb only", &[0x0F, 0x42, 0xC1], false, cf),
+            // --- the whole mask: a writer that can carry a bit forward ---
+            (
+                "shl (assign_shift reads CF/OF/ZS)",
+                &[0xD1, 0xE0],
+                false,
+                all,
+            ),
+            (
+                "shl then jne (consumers read only ZF)",
+                &[0xD1, 0xE0],
+                true,
+                all,
+            ),
+            ("inc (preserves CF)", &[0xFF, 0xC0], false, all),
+            ("and (keeps AF)", &[0x21, 0xD8], false, all),
+            ("imul (keeps ZF/SF/AF/PF)", &[0x0F, 0xAF, 0xC3], false, all),
+            // `adc` reads CF but *writes* all six, so the only entry bit is CF.
+            ("adc (reads CF, writes all six)", &[0x11, 0xD8], false, cf),
+            ("pushfq (reads the word)", &[0x9C], false, all),
+        ]
+    }
+
+    #[test]
+    fn the_entry_mask_names_only_the_bits_read_before_a_writer() {
+        for (name, bytes, term, expected) in mask_rows() {
+            assert_eq!(
+                mask_of(bytes, term),
+                expected,
+                "{name}: entry_decode_mask should be {expected:#x}"
+            );
+        }
+    }
+
+    /// The same rows through the *boolean* the emitter used before this slice:
+    /// mask `0` means "carry the word", anything else means "decode".
+    #[test]
+    fn a_zero_mask_is_exactly_the_old_skip_predicate() {
+        for (name, bytes, term, expected) in mask_rows() {
+            assert_eq!(
+                mask_of(bytes, term) != 0,
+                expected != 0,
+                "{name}: decode/skip must not change with narrowing"
+            );
+        }
+    }
+
     #[test]
     fn the_gate_keeps_the_decode_except_for_the_pure_writer_shapes() {
         for (name, bytes, term, expected) in ROWS {
-            let insns = block(bytes);
-            assert!(!insns.is_empty(), "{name}: fixture did not decode");
-            let term = if *term { jcc() } else { None };
             assert_eq!(
-                entry_decode_needed(&insns, term),
+                mask_of(bytes, *term) != 0,
                 *expected,
-                "{name}: entry_decode_needed(term={term:?}) should be {expected}"
+                "{name}: decode/skip should be {expected}"
             );
         }
     }

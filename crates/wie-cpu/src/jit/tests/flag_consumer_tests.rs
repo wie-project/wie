@@ -866,6 +866,40 @@ fn adc_links_carry_into_each_other_with_no_consumer_between() {
     }
 }
 
+/// A consumer that reads an **inherited** flag bit before this block writes flags.
+///
+/// This is the shape the entry-decode mask narrows: nothing here writes a flag
+/// before `cmovb`/`cmovae` reads CF, so the entry state has to carry CF — and
+/// *only* CF — from the incoming word. `add` after it writes all six, so the mask
+/// stays narrow rather than becoming the whole cone.
+///
+/// The rows differ in the incoming CF, so a lowering that decoded the wrong bit
+/// (or decoded nothing and left the field false) changes ECX instead of passing
+/// silently. This is the fixture that makes the mask's *bit selection* observable
+/// in a register: the analysis table can only check the mask itself.
+#[test]
+fn cmovcc_reads_an_inherited_carry_before_any_writer() {
+    for (flags_name, flags) in [("cf clear", LOOP_FLAGS[0]), ("cf set", LOOP_FLAGS[1])] {
+        for (cc, name) in [(2_u8, "cmovb"), (3, "cmovae")] {
+            // cmovcc ecx, edx · add eax, 1 · nop · ud2
+            let mut code = Vec::from(cmov_ecx_edx(cc));
+            code.extend_from_slice(&[0x83, 0xC0, 0x01]);
+            let setup = move |r: &mut RegFile| {
+                setup(0, 0)(r);
+                r.set_gpr_public(1, 0xaaaa); // ECX: the destination
+                r.set_gpr_public(2, 0x5555); // EDX: the source
+                r.rflags = Rflags::from(flags);
+            };
+            let (iced, jit) = simd_dual(&code, &[], setup);
+            assert_same_regs(
+                &iced,
+                &jit,
+                &format!("{name} on the inherited {flags_name}, before any writer"),
+            );
+        }
+    }
+}
+
 /// A pending **logic** writer clears CF, whatever the block inherited.
 ///
 /// AND/OR/XOR/TEST set CF = 0 unconditionally, and the incoming word here has

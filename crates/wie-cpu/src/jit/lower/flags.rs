@@ -220,6 +220,59 @@ pub(super) struct FlagState {
     pub packed: Option<Value>,
 }
 
+/// Decode only the flag bits in `mask`, leaving the rest as `false`
+/// placeholders.
+///
+/// `mask` comes from
+/// [`entry_decode_mask`](super::analysis::entry_decode_mask), which proves no
+/// hot consumer can observe an unmasked, unwritten bit before a writer that
+/// defines all six runs — so the placeholder is never read, and every pack
+/// reached before such a writer is the identity on the carried word because
+/// `packed` is set to it. A narrower mask is the difference between an
+/// 18-instruction entry cone and a 3-instruction one on a block whose only
+/// entry-flag consumer reads ZF.
+pub(super) fn decompose_bits(bcx: &mut FunctionBuilder<'_>, rflags: Value, mask: u32) -> FlagState {
+    if mask == 0 {
+        return FlagState::carried(bcx, rflags);
+    }
+    let f = bcx.ins().iconst(types::I8, 0);
+    let want = |bit: Rflags| mask & (u64::from(bit) as u32) != 0;
+    FlagState {
+        zf: if want(Rflags::ZF) {
+            flag_set(bcx, rflags, Rflags::ZF)
+        } else {
+            f
+        },
+        sf: if want(Rflags::SF) {
+            flag_set(bcx, rflags, Rflags::SF)
+        } else {
+            f
+        },
+        cf: if want(Rflags::CF) {
+            flag_set(bcx, rflags, Rflags::CF)
+        } else {
+            f
+        },
+        of: if want(Rflags::OF) {
+            flag_set(bcx, rflags, Rflags::OF)
+        } else {
+            f
+        },
+        pf: if want(Rflags::PF) {
+            flag_set(bcx, rflags, Rflags::PF)
+        } else {
+            f
+        },
+        af: if want(Rflags::AF) {
+            flag_set(bcx, rflags, Rflags::AF)
+        } else {
+            f
+        },
+        old: rflags,
+        packed: Some(rflags),
+    }
+}
+
 pub(super) fn decompose_packed(bcx: &mut FunctionBuilder<'_>, rflags: Value) -> FlagState {
     FlagState {
         zf: flag_set(bcx, rflags, Rflags::ZF),
