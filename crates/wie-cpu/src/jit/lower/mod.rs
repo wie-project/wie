@@ -6,7 +6,7 @@
 use super::block::{BlockTerm, DecodedInsn, analyze_block_stack_pin};
 use super::config::JitConfig;
 use super::engine::IsaEngine;
-use super::fast_api::FastApiKind;
+use super::fast_api::{FastApiKind, LargeFreeList};
 use super::gen_tlb::GenTlb;
 use super::tier::OptTier;
 use crate::mem::GuestMemory;
@@ -381,6 +381,33 @@ pub(super) struct JitCtx {
     /// Chaining accumulates (never overwrites), so one dispatcher entry
     /// accounts for the whole native chain.
     pub insn_acc: u64,
+    /// Guest heap control-block VA for the session running this block
+    /// (`0` disables the UCRT `malloc`/`free` fast path entirely).
+    ///
+    /// Host-helper-side only — no `OFF_*` constant, because emitted IR never
+    /// reads it. It lives HERE, not in a `static`, because the consumer is a
+    /// per-guest-thread Cranelift import symbol: a process-global would make
+    /// two `RuntimeSession`s in one process share one guest heap, and any
+    /// reconfigure after execution starts would silently repoint every
+    /// engine's allocator. `JitShared` holds the authoritative copy
+    /// (`configure_fast_path` writes it, `run_compiled` publishes it into this
+    /// field under its exclusive ownership of the context for the frame).
+    pub heap_ctrl_va: u64,
+    /// First byte of the session's guest heap region (`JitHeapLayout::base`).
+    pub heap_base: u64,
+    /// One past the last byte of the session's guest heap region
+    /// (`JitHeapLayout::end`).
+    pub heap_end: u64,
+    /// Pointer to this engine's [`LargeFreeList`] in
+    /// [`PerThreadJitState`](super::PerThreadJitState), live for the whole
+    /// `run_compiled` frame.
+    ///
+    /// A raw pointer rather than a by-value `Vec` for two reasons: the list
+    /// must OUTLIVE a single frame (a value would be dropped at every block
+    /// boundary, so large blocks would never be reused), and a pointer keeps
+    /// the helper's access to one `&mut` with no `Drop` glue in the
+    /// `#[repr(C)]` C-ABI context. Same idiom as [`Self::chain_slots`].
+    pub large_free: *mut LargeFreeList,
 }
 
 /// Per-`run_compiled` mem helper resolution counters (appended after IR-stable layout).

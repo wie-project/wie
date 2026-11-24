@@ -16,7 +16,7 @@ use super::block::{self, BlockKind, decode_pure_gpr_block, pure_is_self_loop};
 use super::config::{
     BG_QUEUE_CAP, COOLDOWN_THRESHOLD_CAP, JitConfig, WORK_THRESHOLD_CEILING, WORK_THRESHOLD_FLOOR,
 };
-use super::fast_api::{FastApiKind, JitFastPathConfig, install_heap_layout};
+use super::fast_api::{FastApiKind, JitFastPathConfig};
 use super::gen_tlb::GenTlb;
 use super::lower::{
     self, CompiledBlock, JitCtx, MemPathSlice, MemPin, PIN_SLOTS, STICKY_WAYS, TLB_EMPTY, XmmSlot,
@@ -155,8 +155,22 @@ impl JitCpu {
     }
 
     /// Install UCRT/heap fast-path config (called once after fake-API table build).
+    ///
+    /// The heap layout is published on the SHARED state, not a process global:
+    /// two `RuntimeSession`s in one process (or any reconfigure after execution
+    /// starts) would otherwise leave every engine's `malloc`/`free` reading the
+    /// last-installed layout, so session A would allocate from session B's heap.
+    /// `run_compiled` copies these into the `JitCtx` it owns, which is what the
+    /// UCRT helpers actually read.
     pub fn configure_fast_path(&mut self, cfg: JitFastPathConfig) {
-        install_heap_layout(cfg.heap);
+        self.shared.heap[0].store(cfg.heap.ctrl_va, Ordering::Release);
+        self.shared.heap[1].store(cfg.heap.base, Ordering::Release);
+        self.shared.heap[2].store(cfg.heap.end, Ordering::Release);
+        // New session → discard this ENGINE's stale large freelist entries
+        // (VAs are heap-region relative). Scoped to `self.thread`, so it cannot
+        // reach another engine's live blocks; the list did not exist at all
+        // before, and a fresh engine starts empty.
+        self.thread.large_free.clear();
         let pairs = cfg.pairs.clone();
         self.fast_api = cfg.pairs;
         // Mirror the pairs so the background worker lowers UCRT calls exactly
@@ -1251,6 +1265,14 @@ impl JitCpu {
             // Blocks (and chained successors / micro-stubs) fold their dynamic
             // instruction count in here; read back below.
             insn_acc: 0,
+            // UCRT malloc/free fast path: this session's heap layout, published
+            // from the shared config at init. Plain copies — this frame owns the
+            // context exclusively, so no atomicity is needed on the read side
+            // (the Acquire on the publish is what orders the init writes).
+            heap_ctrl_va: self.shared.heap[0].load(Ordering::Acquire),
+            heap_base: self.shared.heap[1].load(Ordering::Acquire),
+            heap_end: self.shared.heap[2].load(Ordering::Acquire),
+            large_free: &raw mut self.thread.large_free,
         };
         drop(mem_guard); // GuestMemory read lock already released; compiled block runs on TLB/pins.
         // SAFETY: func is a finalized Cranelift block; TLB/pins resolve to stable mmap pointers.
