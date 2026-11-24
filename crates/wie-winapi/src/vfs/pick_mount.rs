@@ -63,6 +63,17 @@ static PICK_MOUNTS: Mutex<Vec<PickMount>> = Mutex::new(Vec::new());
 /// Monotonic pick id — the per-pick unique component of the guest path.
 static NEXT_PICK_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Monotonic generation of the pick-mount registry.
+///
+/// A pick mount binds an exact guest path to a consented host file, and
+/// `guest_path_to_host` consults the registry before the volume roots — so
+/// anything derived from a guest→host mapping goes stale when a mount is
+/// registered. This counter is the cheap invalidation key for such caches.
+#[must_use]
+pub fn generation() -> u64 {
+    NEXT_PICK_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Resolve a mounted guest path to its host file (`None` when unregistered).
 #[must_use]
 pub(crate) fn resolve_pick_mount(guest_path: &str) -> Option<PathBuf> {

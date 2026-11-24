@@ -336,6 +336,7 @@ pub mod clock;
 pub mod environment;
 pub mod file_io;
 pub mod heap;
+pub mod load_stages;
 pub mod memory;
 pub mod misc;
 pub mod module;

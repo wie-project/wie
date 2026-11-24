@@ -110,39 +110,54 @@ pub(crate) fn resolve_or_load_dll(
     }
 
     // 1. Check if it's the main module.
-    if is_main_module_name(state, name) {
+    if crate::kernel32::load_stages::timed_main(|| is_main_module_name(state, name)) {
         return environment.image_base;
     }
 
     // 2. Check fake/well-known modules.
-    let fake_handle = resolve_loaded_module_handle(name, environment.image_base, state);
+    let fake_handle = crate::kernel32::load_stages::timed_fake(|| {
+        resolve_loaded_module_handle(name, environment.image_base, state)
+    });
     if fake_handle != 0 {
         return fake_handle;
     }
 
     // 3. Check already-loaded real modules. Bump refcount per LoadLibrary contract.
     let norm = normalize_module_name(name);
-    if let Some(module) = state.module_state.loaded_modules.get_mut(&norm) {
-        module.ref_count = module.ref_count.saturating_add(1);
-        return module.handle;
+    let loaded = crate::kernel32::load_stages::timed_loaded(|| {
+        state
+            .module_state
+            .loaded_modules
+            .get_mut(&norm)
+            .map(|module| {
+                module.ref_count = module.ref_count.saturating_add(1);
+                module.handle
+            })
+    });
+    if let Some(handle) = loaded {
+        return handle;
     }
 
     // 4. Try to load from disk (requires import_resolver).
     let mut resolver_opt = state.module_state.import_resolver.take();
     let Some(ref mut resolver) = resolver_opt else {
+        crate::kernel32::load_stages::note_missing();
         state.process.last_error = ERROR_MOD_NOT_FOUND;
         return 0;
     };
 
     // Resolve DLL path via search order.
-    let host_path = crate::dll_loader::resolve_dll_path(
-        name,
-        &state.process.main_module_path,
-        &state.file_io.volumes,
-        state.process.main_module_host_dir.as_deref(),
-    );
+    let host_path = crate::kernel32::load_stages::timed_search(|| {
+        crate::dll_loader::resolve_dll_path(
+            name,
+            &state.process.main_module_path,
+            &state.file_io.volumes,
+            state.process.main_module_host_dir.as_deref(),
+        )
+    });
     let Some(ref host) = host_path else {
         state.module_state.import_resolver = resolver_opt;
+        crate::kernel32::load_stages::note_missing();
         state.process.last_error = ERROR_MOD_NOT_FOUND;
         return 0;
     };
@@ -152,20 +167,25 @@ pub(crate) fn resolve_or_load_dll(
     let guest_cwd = state.file_io.cwd_utf8();
     let guest_path = resolve_windows_dll_path(name, &state.process.main_module_path, &guest_cwd);
 
-    match crate::dll_loader::load_dll(engine, state, host, &guest_path, &mut |lib, name, slot| {
-        resolver.resolve(lib, name, slot)
-    }) {
-        Ok(result) => {
+    let loaded = crate::kernel32::load_stages::timed_map(|| {
+        crate::dll_loader::load_dll(engine, state, host, &guest_path, &mut |lib, name, slot| {
+            resolver.resolve(lib, name, slot)
+        })
+        .map(|result| (result.module.handle, result.dependencies))
+    });
+    match loaded {
+        Ok((handle, dependencies)) => {
             state.module_state.import_resolver = resolver_opt;
             // Recursively load dependencies. If any dependency fails to
             // load, the parent load also fails (Windows LoadLibrary contract).
-            for dep in &result.dependencies {
+            for dep in &dependencies {
                 if resolve_or_load_dll(dep, engine, environment, state) == 0 {
+                    crate::kernel32::load_stages::note_missing();
                     state.process.last_error = ERROR_MOD_NOT_FOUND;
                     return 0;
                 }
             }
-            result.module.handle
+            handle
         }
         Err(e) => {
             state.module_state.import_resolver = resolver_opt;

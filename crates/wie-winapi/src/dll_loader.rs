@@ -10,6 +10,8 @@
 use ahash::HashMap;
 use ahash::HashMapExt;
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use wie_cpu::CpuEngine;
@@ -321,6 +323,20 @@ pub(crate) fn normalize_dll_name(name: &str) -> String {
 /// 4. Current directory
 ///
 /// Each guest directory is resolved to a host path via the volume config.
+/// The directory part of a **guest** path.
+///
+/// `std::path::Path::parent` looks tempting and is wrong here: these are Windows
+/// paths, and on the host a backslash is an ordinary character, so
+/// `Path::new("C:\\App\\game.exe").parent()` is the empty path and the
+/// application directory silently drops out of the search order. That is what a
+/// failing test showed — the list held only `System32` and `Windows`, and DLLs
+/// beside the executable were found only by the last-resort host fallback.
+fn guest_parent_dir(path: &str) -> Option<&str> {
+    let clean = path.trim().trim_matches('"');
+    let cut = clean.rfind(['\\', '/'])?;
+    Some(&clean[..cut])
+}
+
 fn search_directories(
     main_module_path: &str,
     volumes: &crate::vfs::VolumeConfig,
@@ -336,8 +352,8 @@ fn search_directories(
     };
 
     // 1. Application directory.
-    if let Some(parent) = std::path::Path::new(main_module_path).parent()
-        && let Some(map) = guest_path_to_host(volumes, &parent.to_string_lossy())
+    if let Some(parent) = guest_parent_dir(main_module_path)
+        && let Some(map) = guest_path_to_host(volumes, parent)
     {
         push_if_new(map.host);
     }
@@ -353,12 +369,71 @@ fn search_directories(
     }
 
     // 4. Current directory (same as app dir, may already be added).
-    if let Some(parent) = std::path::Path::new(main_module_path).parent()
-        && let Some(map) = guest_path_to_host(volumes, &parent.to_string_lossy())
+    if let Some(parent) = guest_parent_dir(main_module_path)
+        && let Some(map) = guest_path_to_host(volumes, parent)
     {
         push_if_new(map.host);
     }
 
+    dirs
+}
+
+/// What [`search_directories_cached`]'s answer depends on.
+///
+/// Every input `search_directories` reads: the executable's guest path, both
+/// volume roots (the `C:` root falls back to the global app-data bottle, which
+/// is process-constant), and the pick-mount generation, because
+/// `guest_path_to_host` consults that registry before the volume roots.
+type SearchDirsKey = (String, Option<PathBuf>, Option<PathBuf>, u64);
+
+/// The last computed search-directory list and the key it was computed for.
+///
+/// # What this does and does not cache
+///
+/// It caches **the question, never the answer**: which directories the search
+/// order visits for a given bottle and executable, never whether a given DLL
+/// exists in them. Every `resolve_dll_path` call still stats every candidate, so
+/// a file the guest creates is found by its very next `LoadLibrary` — the
+/// guest's entitlement to change what the search order finds is untouched. That
+/// distinction is what makes caching here safe when caching a *handle* would
+/// not be.
+///
+/// It is worth doing because the cost was surprising: attribution put 93 % of
+/// `LoadLibraryW`'s 69 µs on rebuilding this four-element list (64 µs a call,
+/// 15 618 calls in 90 s), against 1.4 µs for each candidate `is_file()`.
+static SEARCH_DIRS_CACHE: Mutex<Option<(SearchDirsKey, Arc<Vec<PathBuf>>)>> = Mutex::new(None);
+
+/// [`search_directories`], memoised on its full input.
+fn search_directories_cached(
+    main_module_path: &str,
+    volumes: &crate::vfs::VolumeConfig,
+) -> Arc<Vec<PathBuf>> {
+    let Ok(mut cache) = SEARCH_DIRS_CACHE.lock() else {
+        // A poisoned cache must not fail the call: recompute and move on.
+        return Arc::new(search_directories(main_module_path, volumes));
+    };
+    // Compare against the stored key without building a new one: allocating the
+    // key here would put back three allocations per call, and allocations are
+    // most of what this stage is. A new key is only built on a miss.
+    let generation = crate::vfs::pick_mount::generation();
+    if let Some((cached_key, dirs)) = cache.as_ref()
+        && cached_key.0 == main_module_path
+        && cached_key.1 == volumes.bottle_root
+        && cached_key.2 == volumes.drive_d_root
+        && cached_key.3 == generation
+    {
+        return Arc::clone(dirs);
+    }
+    let dirs = Arc::new(search_directories(main_module_path, volumes));
+    *cache = Some((
+        (
+            main_module_path.to_owned(),
+            volumes.bottle_root.clone(),
+            volumes.drive_d_root.clone(),
+            generation,
+        ),
+        Arc::clone(&dirs),
+    ));
     dirs
 }
 
@@ -405,10 +480,12 @@ pub fn resolve_dll_path(
     }
 
     // Search standard locations.
-    let dirs = search_directories(main_module_path, volumes);
-    for dir in &dirs {
+    let dirs = crate::kernel32::load_stages::timed_search_dirs(|| {
+        search_directories_cached(main_module_path, volumes)
+    });
+    for dir in dirs.iter() {
         let candidate = dir.join(&search_name);
-        if candidate.is_file() {
+        if crate::kernel32::load_stages::timed_probe(|| candidate.is_file()) {
             return Some(candidate);
         }
     }
@@ -417,7 +494,7 @@ pub fn resolve_dll_path(
     // This handles micro-exes and other scenarios without a bottle root.
     if let Some(host_dir) = main_module_host_dir {
         let candidate = host_dir.join(&search_name);
-        if candidate.is_file() {
+        if crate::kernel32::load_stages::timed_probe(|| candidate.is_file()) {
             return Some(candidate);
         }
     }
@@ -1162,4 +1239,102 @@ pub fn prepare_dll_main_call(
         .context("failed to write RIP for DllMain")?;
 
     Ok(())
+}
+
+#[cfg(all(test, debug_assertions))]
+mod cache_tests {
+    //! The memoised search-directory list, and the guest-visible property it
+    //! must not break: a DLL that appears between two lookups is found.
+
+    use super::{resolve_dll_path, search_directories, search_directories_cached};
+    use crate::vfs::VolumeConfig;
+    use std::path::PathBuf;
+
+    /// A bottle whose `drive_c/App` directory exists, unique per test thread.
+    fn temp_bottle(tag: &str) -> (PathBuf, VolumeConfig) {
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_owned();
+        let bottle = std::env::temp_dir().join(format!(
+            "wie-dllcache-{tag}-{}-{thread}",
+            std::process::id()
+        ));
+        let app = bottle.join("drive_c/App");
+        std::fs::create_dir_all(&app).expect("mkdir bottle App");
+        let volumes = VolumeConfig {
+            bottle_root: Some(bottle.clone()),
+            drive_d_root: None,
+        };
+        (app, volumes)
+    }
+
+    /// The cache returns exactly what recomputing would.
+    #[test]
+    fn the_cached_directory_list_matches_a_fresh_computation() {
+        let (_app, volumes) = temp_bottle("same");
+        let fresh = search_directories("C:\\App\\game.exe", &volumes);
+        let first = search_directories_cached("C:\\App\\game.exe", &volumes);
+        let second = search_directories_cached("C:\\App\\game.exe", &volumes);
+        assert_eq!(*first, fresh, "the cached list must equal a fresh one");
+        assert_eq!(*second, fresh, "and stay equal across calls");
+    }
+
+    /// A different executable means a different app directory, so the key must
+    /// not hand back the previous answer.
+    #[test]
+    fn a_different_executable_path_gets_its_own_list() {
+        let (_app, volumes) = temp_bottle("keyed");
+        let first = search_directories_cached("C:\\App\\game.exe", &volumes);
+        let other = search_directories_cached("C:\\Games\\other.exe", &volumes);
+        assert_ne!(
+            *first, *other,
+            "the app directory is part of the key, not a constant"
+        );
+        assert_eq!(
+            *other,
+            search_directories("C:\\Games\\other.exe", &volumes),
+            "and a key change recomputes rather than reusing"
+        );
+    }
+
+    /// Windows searches the application directory before the system directories,
+    /// and two DLLs of the same name resolve by that order. It was silently
+    /// broken (the app directory was absent from the list entirely), so the
+    /// order is pinned here rather than assumed.
+    #[test]
+    fn the_application_directory_wins_over_the_system_directory() {
+        let (app, volumes) = temp_bottle("order");
+        let system = app.parent().expect("drive_c").join("Windows/System32");
+        std::fs::create_dir_all(&system).expect("mkdir System32");
+        std::fs::write(app.join("plugin.dll"), b"MZ-app").expect("app dll");
+        std::fs::write(system.join("plugin.dll"), b"MZ-system").expect("system dll");
+        assert_eq!(
+            resolve_dll_path("plugin.dll", "C:\\App\\game.exe", &volumes, None),
+            Some(app.join("plugin.dll")),
+            "the application directory is searched before System32"
+        );
+    }
+
+    /// **The guest-visible property.** The cache memoises *which directories are
+    /// searched*, never *whether the DLL is there*: a file created between two
+    /// lookups must be found by the second. A handle cache that skipped the
+    /// lookup would fail this, which is exactly why this one does not cache
+    /// results.
+    #[test]
+    fn a_dll_created_between_two_lookups_is_found_by_the_second() {
+        let (app, volumes) = temp_bottle("created");
+        let main = "C:\\App\\game.exe";
+        assert_eq!(
+            resolve_dll_path("plugin.dll", main, &volumes, None),
+            None,
+            "nothing there yet"
+        );
+        std::fs::write(app.join("plugin.dll"), b"MZ").expect("create the dll");
+        assert_eq!(
+            resolve_dll_path("plugin.dll", main, &volumes, None),
+            Some(app.join("plugin.dll")),
+            "a DLL created between two lookups must be found by the second"
+        );
+    }
 }

@@ -36,6 +36,7 @@ pub mod dinput;
 pub mod dll_loader;
 pub mod dynamic_apis;
 pub mod pthread;
+mod stage_timer;
 pub use dynamic_apis::{DYNAMIC_FAKE_APIS, PREPLANTED_SOFT_APIS, resolve_get_proc_address};
 pub mod exception;
 pub mod fake_va;

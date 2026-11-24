@@ -576,6 +576,10 @@ impl RuntimeProfile {
             // interception fire" is otherwise indistinguishable from "the guest
             // was slow", which is exactly the question a frame count gets wrong.
             lines.extend(wie_winapi::port::sdl2_host_export_report_lines());
+            // Per-stage `LoadLibrary*` accounting: one export-level total says
+            // nothing about which stage owns it, which is how 84 us per call
+            // survived unexamined.
+            lines.extend(wie_winapi::port::handler_stage_report_lines());
         }
         if self.present_enqueued() > 0
             || self.frames_published() > 0

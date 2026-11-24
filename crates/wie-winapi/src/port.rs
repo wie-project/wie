@@ -123,6 +123,18 @@ pub use crate::fake_va::{
 };
 pub use crate::sdl2::report_lines as sdl2_host_export_report_lines;
 
+/// Per-stage `LoadLibrary*` accounting for the runtime profile.
+pub use crate::kernel32::load_stages::report_lines as load_library_report_lines;
+
+/// Every per-stage handler breakdown, as report lines.
+///
+/// One entry point so the runtime profile needs a single line for all of them:
+/// each new attribution adds a stage set, not another edit in `profile.rs`.
+#[must_use]
+pub fn handler_stage_report_lines() -> Vec<String> {
+    crate::kernel32::load_stages::report_lines()
+}
+
 // ── §2 The session boundary ────────────────────────────────────────────────
 //
 // What a `wie-runtime` session must name to drive one WinAPI dispatch: the
