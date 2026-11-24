@@ -14,7 +14,10 @@
 
 - **Task 1 — DONE** (`9930935`): cache key now `jit_cache_key(pe_hash, opt_level)`, `FORMAT_VERSION` 1 → 2 so v1 ledgers are deleted not orphaned, `load_file` refuses a key/opt mismatch. 3 tests.
 - **Task 2 — DONE** (`e2c7d5c`): `OPT_LEVEL_DEFAULT = "none"`, parsing extracted to a pure `opt_level_from_env(Option<String>) -> &'static str`. 4 tests.
-- **Task 3 — NOT started.** It needs a **per-record** opt level on `LedgerRec` before it is safe: with per-block tier-up one process compiles the same guest VA at both `none` and `speed`, so the per-*file* key from Task 1 is insufficient and a `none` run would happily load a record that only ever succeeded at `speed`. Do the `compiled_at_opt` field first.
+- **Task 3 Part A — DONE** (`2c70770`): the ledger is record-level opt-aware. `LedgerRec.compiled_at_opt: OptTier` (new `jit/tier.rs`; unknown codes rejected, never guessed), `FORMAT_VERSION` 2 → 3, record-level rejection in `load_file`, and two-ledger routing — tier records go to a second key-derived file the writing run never reads back, and an all-empty tier ledger is not written at all, which preserves Task 1's "a `none` run leaves the `speed` namespace alone" invariant. 9 new tests; free on `long_loop` (the 1.36x ratio reproduced).
+- **Task 3 Part B — unblocked, not yet implemented.** The blocker was **Cranelift, not policy**, and is now closed. `cranelift_jit::JITModule` binds one `TargetIsa` (hence one `opt_level`) in a private field with no setter, and the in-module lever `TargetIsa::flags()` was unreachable because `isa::Triple` and `CompiledCodeStencil` are not publicly re-exported. A direct `target-lexicon = "0.13"` dependency (already in the lock at 0.13.5 as a Cranelift transitive) closes it.
+  **Do NOT take the "second `JITModule` per tier" route** — it is a correctness hazard, not a workaround. `JitShared::chain_ids` is a flat `VA → FuncId` table, and `Module::declare_func_in_func` returns `ir::FuncRef`, not `Option<FuncRef>`, indexing that module's own `compiled_functions[func_id]`. A cross-module id either panics or silently names a different function and emits a call to the wrong address.
+  **This plan's earn signal was wrong and is corrected here.** The hotness counter cannot be it. Measured `long_loop` is `block_entries=1`, `cache_hits=1`, `hot=0`, with 1.1e9 instructions retired inside a *single* dispatcher entry, so there is no post-compile observation before it has retired everything it ever will. And `Hot { visits, thr }` is destroyed at promotion (the entry becomes `Ready`) while promotion fires on the first visit with `visits >= thr` — so `visits` can never exceed `thr` by a margin, and the "exceed the threshold by a clear margin" guardrail is **not expressible on that counter at all**. Tiering must therefore be decided **pre-compile, from block shape** (`is_loop`): a block whose terminator jumps to its own entry multiplies emitted-code quality by its iteration count, while every other shape amortises it over at most one pass plus dispatch overhead. Supporting datum: 7-Zip's `hot` set contains no self-loops (`WIE_JIT_LOOP_HOTNESS=8` vs `=1000000` gives identical `hot=15`), and its `insn_per_entry=215` is one-shot-ish.
 - **The plan's original causal claim was WRONG and is corrected below.** The first measurement compared a *cold-ledger* `speed` run against a *warm-ledger* `none` run.
 
 ## Corrected measured evidence (2026-09-27, release, interleaved A/B, medians)
@@ -149,8 +152,28 @@ git commit -m "jit: default to opt_level=none - compile cost dominates real tool
 
 ### Task 3: Tier hot blocks up to `speed` (recovers the compute-bound case)
 
+> **PREREQUISITE — do this first, it is a correctness fix, not an optimization.**
+> Task 1 keyed the cache on the **run-level** opt level, which is correct for
+> Tasks 1–2 because one run compiles everything at one level. Per-block tier-up
+> breaks that assumption: one process will compile the same guest VA at **both**
+> `none` and `speed`. A per-file key is then wrong, and a `none` run will happily
+> load a `LedgerRec` for a block that only ever succeeded at `speed`. Add a
+> per-record `compiled_at_opt` field to `LedgerRec`, bump `FORMAT_VERSION` to 3,
+> and have the load path reject a record whose `compiled_at_opt` does not match
+> the level the block is being compiled at now. Only then implement tier-up.
+
+**Anti-thrash guardrails (a tier-up policy that oscillates is worse than none):**
+- **Tier up only, never down.** Once a block is compiled at `speed` it stays there
+  for the rest of the run. A block that oscillates across the threshold would
+  otherwise recompile forever, and recompiling is exactly the cost Task 2 removed.
+- **At most one tier-up per block per run.** Assert it.
+- **Bound the total**: cap tier-ups per run (or per guest) so a pathological
+  workload cannot spend the compile budget re-establishing `speed` everywhere.
+- **A block must earn it**: require the existing hotness counter to exceed
+  `hotness_threshold()` by a clear margin, not merely touch it.
+
 **Files:**
-- Modify: `crates/wie-cpu/src/jit/pipeline.rs` (promotion path — where `hot` compiles are already triggered), `crates/wie-cpu/src/jit/engine.rs` (per-compilation `settings::Flags`), `crates/wie-cpu/src/jit/config.rs` (threshold knob)
+- Modify: `crates/wie-cpu/src/jit/cache_persist.rs` (the `compiled_at_opt` prerequisite), `crates/wie-cpu/src/jit/pipeline.rs` (the promotion path that already produces `hot=209` compiles), `crates/wie-cpu/src/jit/engine.rs` (per-compilation `settings::Flags` instead of one shared set), `crates/wie-cpu/src/jit/config.rs` (threshold/knob)
 - Test: `crates/wie-cpu/src/jit/tests/`
 
 **Interfaces:**

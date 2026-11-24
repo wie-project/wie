@@ -3092,6 +3092,7 @@ dependencies = [
  "iced-x86",
  "libc",
  "papaya",
+ "target-lexicon",
  "thiserror 2.0.18",
  "tracing",
 ]
