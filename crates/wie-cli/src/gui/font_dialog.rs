@@ -13,10 +13,10 @@
 //! edit control.
 //!
 //! This module is the GUI integration point: it registers the interactive
-//! policy on the runtime session so [`super::app::run_gui_windowed`] enables
-//! the dialog exactly when a real window is on screen. Headless runs and
-//! `trace` keep the default [`FontDialogPolicy::Cancel`] policy and never open
-//! a dialog.
+//! policy on the runtime session so `gui::app::run_gui_windowed` (macOS-only)
+//! enables the dialog exactly when a real window is on screen. Headless runs
+//! and `trace` keep the default [`FontDialogPolicy::Cancel`] policy and never
+//! open a dialog.
 
 use wie_runtime::RuntimeSession;
 use wie_winapi::FontDialogPolicy;

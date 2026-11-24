@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 /// Prints basic PE64 metadata.
-pub(crate) fn inspect(path: &Path) -> Result<()> {
+pub fn inspect(path: &Path) -> Result<()> {
     let summary = wie_pe::inspect_pe_file(path)?;
 
     println!("file: {}", summary.path);
@@ -39,7 +39,7 @@ fn format_machine(machine: wie_pe::Machine) -> String {
 }
 
 /// Prints PE section layout.
-pub(crate) fn sections(path: &Path) -> Result<()> {
+pub fn sections(path: &Path) -> Result<()> {
     let sections = wie_pe::inspect_pe_sections(path)?;
 
     for section in sections {
@@ -58,7 +58,7 @@ pub(crate) fn sections(path: &Path) -> Result<()> {
 }
 
 /// Prints the import address table, optionally filtered.
-pub(crate) fn imports(path: &Path, find: Option<&str>) -> Result<()> {
+pub fn imports(path: &Path, find: Option<&str>) -> Result<()> {
     let imports = wie_pe::inspect_pe_imports(path)?;
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -101,7 +101,7 @@ fn format_import_name(name: &str, ordinal: u16) -> String {
 /// The loader's memory buffer itself is never materialized here — every
 /// printed field is a header-derived identity field (`size_of_image` →
 /// `image_size`, `size_of_headers` → `header_size`).
-pub(crate) fn image(path: &Path) -> Result<()> {
+pub fn image(path: &Path) -> Result<()> {
     let identity = wie_pe::pe_identity_from_file(path)?;
 
     println!("image_base: {:#018x}", identity.image_base);
@@ -115,7 +115,7 @@ pub(crate) fn image(path: &Path) -> Result<()> {
 }
 
 /// Writes a text map of imported WinAPI functions and handler coverage.
-pub(crate) fn winapi_map(path: &Path, out: Option<&Path>) -> Result<()> {
+pub fn winapi_map(path: &Path, out: Option<&Path>) -> Result<()> {
     let imports = wie_pe::inspect_pe_imports(path)?;
 
     let mut by_library: BTreeMap<String, Vec<String>> = BTreeMap::new();

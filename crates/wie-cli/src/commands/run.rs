@@ -24,7 +24,7 @@ fn is_interactive_stdin(path: &Path) -> bool {
 /// A run source after bottle staging: the host path to load plus the guest
 /// current directory the process should start in.
 #[derive(Debug)]
-pub(crate) struct StagedRunSource {
+pub struct StagedRunSource {
     /// Host path of the run source (the in-bottle copy when staged).
     pub run_path: PathBuf,
     /// Guest current directory for the launched process. `None` when no
@@ -41,7 +41,7 @@ pub(crate) struct StagedRunSource {
 /// `--app-dir <HOST_DIR>` names a complete folder explicitly
 /// ([`StageMode::AppDir`]).
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum StageMode<'a> {
+pub enum StageMode<'a> {
     /// Copy only the executable file into the bottle.
     ExeOnly,
     /// Copy the executable's parent directory (the pre-`--app-dir` default,
@@ -56,7 +56,7 @@ impl<'a> StageMode<'a> {
     /// The staging mode for a micro / GUI / screenshot run entry: an explicit
     /// `--app-dir`, else the exe-only default.
     #[must_use]
-    pub(crate) fn from_run_entry(app_dir: Option<&'a Path>) -> Self {
+    pub fn from_run_entry(app_dir: Option<&'a Path>) -> Self {
         match app_dir {
             Some(dir) => Self::AppDir(dir),
             None => Self::ExeOnly,
@@ -93,7 +93,7 @@ impl<'a> StageMode<'a> {
 /// directory could point outside it (copying foreign files into the bottle)
 /// or loop back on an ancestor, and a link planted at a destination path
 /// could redirect the copy outside the bottle.
-pub(crate) fn stage_run_source(
+pub fn stage_run_source(
     host_path: &Path,
     volumes: &VolumeConfig,
     stage: StageMode<'_>,
@@ -200,7 +200,7 @@ pub(crate) fn stage_run_source(
 /// over `WIE_ROOT` / `WIE_DRIVE_D`. `None` for both leaves the environment as
 /// the only source (the console / persistent / headless / windowed entries'
 /// behavior).
-pub(crate) fn resolve_volume_config(
+pub fn resolve_volume_config(
     bottle_root: Option<&Path>,
     drive_d_root: Option<&Path>,
 ) -> VolumeConfig {
@@ -212,6 +212,78 @@ pub(crate) fn resolve_volume_config(
             .map(std::path::Path::to_path_buf)
             .or_else(wie_winapi::drive_d_from_env),
     )
+}
+
+/// Everything a run entry tells [`prepare_run`] before the session starts.
+///
+/// A struct rather than positional arguments because three of the fields are
+/// `Option<&Path>` with the same type: the staging contract (which root is
+/// which) is then readable at the call site.
+#[derive(Debug, Clone, Copy)]
+pub struct RunSetup<'a> {
+    /// Effective bottle root (`--root` or the resolved `--bottle`); `None`
+    /// keeps the `WIE_ROOT` fallback.
+    pub bottle_root: Option<&'a Path>,
+    /// Host root for the guest `D:\…` bridge (`--drive-d`); `None` keeps the
+    /// `WIE_DRIVE_D` fallback.
+    pub drive_d_root: Option<&'a Path>,
+    /// What to stage into the bottle for an out-of-bottle run source.
+    pub stage: StageMode<'a>,
+    /// Guest argv after the module name.
+    pub guest_args: &'a [String],
+}
+
+/// The resolved inputs of a run: what to load, under which volumes, and with
+/// which session bootstrap.
+#[derive(Debug)]
+pub struct PreparedRun {
+    /// The staged run source (host path plus the staged folder's guest cwd).
+    pub staged: StagedRunSource,
+    /// Session bootstrap options carrying the resolved roots, the staged guest
+    /// current directory and the guest argv. The console/persistent entries
+    /// pass no guest argv (the flag is rejected before dispatch), so for them
+    /// this differs from [`SessionOptions::default`] only in the roots and the
+    /// staged cwd.
+    pub session_options: wie_runtime::SessionOptions,
+    /// The volume config the staging used and the session is handed, so both
+    /// agree on what `C:\…` / `D:\…` mean.
+    pub volumes: VolumeConfig,
+}
+
+/// Resolve the volumes, stage the run source and build the session options
+/// for one run entry — the shared setup every entry (micro, persistent,
+/// console, headless screenshot, windowed GUI) needs before its session starts.
+///
+/// One implementation so the entries cannot drift: the FS policy (stage the
+/// source into the bottle under `C:\Program Files\{name}\`), the effective
+/// volumes, and the fact that the staged root must reach the session — without
+/// it the session would fall back to `WIE_ROOT` / the global bottle and map
+/// `C:\…` differently than the staging above — are decided once here.
+///
+/// The per-entry differences are parameters, never hidden unification: the
+/// staging contract is [`RunSetup::stage`] (console/persistent keep the legacy
+/// whole-parent-folder default; the `--app-dir`-taking entries stage exe-only
+/// unless `--app-dir` names a folder). Both resolved roots are forwarded to the
+/// session: staging and guest access must agree on what `C:\…` and `D:\…` mean,
+/// so a `--drive-d` bridge is mounted, not merely read during staging.
+///
+/// [`SessionOptions::default`]: wie_runtime::SessionOptions::default
+pub fn prepare_run(path: &Path, setup: RunSetup<'_>) -> Result<PreparedRun> {
+    let volumes = resolve_volume_config(setup.bottle_root, setup.drive_d_root);
+    let staged = stage_run_source(path, &volumes, setup.stage)?;
+    let bottle_root = volumes.bottle_root.clone();
+    let drive_d_root = volumes.drive_d_root.clone();
+    Ok(PreparedRun {
+        session_options: wie_runtime::SessionOptions {
+            guest_args: setup.guest_args.to_vec(),
+            bottle_root,
+            drive_d_root,
+            current_directory: staged.guest_current_directory.clone(),
+            ..wie_runtime::SessionOptions::default()
+        },
+        staged,
+        volumes,
+    })
 }
 
 /// Recursively copy the source tree into `dst`, preserving relative paths.
@@ -295,7 +367,7 @@ fn is_under(path: &Path, dir: &Path) -> bool {
 /// bootstrap inputs (argv, stdin). Grouped so [`run_micro`] keeps a short
 /// signature; `path` stays a separate argument because callers (bottle run)
 /// resolve it independently.
-pub(crate) struct MicroRunOptions<'a> {
+pub struct MicroRunOptions<'a> {
     /// Cap host API stops (the CLI applies the mode default before building).
     pub max_api: usize,
     /// Expected ExitProcess code (default 0).
@@ -308,26 +380,36 @@ pub(crate) struct MicroRunOptions<'a> {
 }
 
 /// Runs a freestanding / micro PE until `ExitProcess` and checks the exit code.
-pub(crate) fn run_micro(path: &Path, options: MicroRunOptions<'_>) -> Result<()> {
-    let volumes = resolve_volume_config(options.bottle_root, options.drive_d);
-    let root = volumes.bottle_root.clone();
-    let drive_d_root = volumes.drive_d_root.clone();
-    match root.as_ref() {
+pub fn run_micro(path: &Path, options: MicroRunOptions<'_>) -> Result<()> {
+    // FS policy: an exe outside the bottle runs from a drive_c copy. Only the
+    // exe itself is staged by default; `--app-dir` names a complete folder so
+    // the guest identity's `C:\Program Files\{name}\{name}.exe` label maps
+    // back to a real bottle file and relative resource paths resolve from the
+    // staged folder.
+    let prepared = prepare_run(
+        path,
+        RunSetup {
+            bottle_root: options.bottle_root,
+            drive_d_root: options.drive_d,
+            stage: StageMode::from_run_entry(options.app_dir),
+            guest_args: options.guest_args,
+        },
+    )?;
+    let PreparedRun {
+        staged,
+        session_options,
+        volumes,
+    } = prepared;
+    match volumes.bottle_root.as_ref() {
         Some(r) => tracing::debug!("bottle_root: {} (override)", r.display()),
         None => tracing::debug!(
             "bottle_root: {} (global default)",
             wie_winapi::global_bottle_root().display()
         ),
     }
-    if let Some(ref d) = drive_d_root {
+    if let Some(ref d) = volumes.drive_d_root {
         tracing::debug!("drive_d: {}", d.display());
     }
-    // FS policy: an exe outside the bottle runs from a drive_c copy. Only the
-    // exe itself is staged by default; `--app-dir` names a complete folder so
-    // the guest identity's `C:\Program Files\{name}\{name}.exe` label maps
-    // back to a real bottle file and relative resource paths resolve from the
-    // staged folder.
-    let staged = stage_run_source(path, &volumes, StageMode::from_run_entry(options.app_dir))?;
     let stdin_bytes = match options.stdin_path {
         Some(p) if is_interactive_stdin(p) => {
             // Interactive stdin: let the emulator read line-by-line from the host
@@ -349,11 +431,11 @@ pub(crate) fn run_micro(path: &Path, options: MicroRunOptions<'_>) -> Result<()>
         &staged.run_path,
         options.max_api,
         wie_runtime::MicroRunOptions {
-            bottle_root: root,
-            drive_d_root,
-            guest_args: options.guest_args.to_vec(),
+            bottle_root: session_options.bottle_root,
+            drive_d_root: session_options.drive_d_root,
+            guest_args: session_options.guest_args,
             stdin_bytes,
-            current_directory: staged.guest_current_directory,
+            current_directory: session_options.current_directory,
         },
     )?;
 
@@ -449,17 +531,20 @@ pub(crate) fn run_micro(path: &Path, options: MicroRunOptions<'_>) -> Result<()>
 }
 
 /// Runs a PE until the persistent runtime yields (or exits).
-pub(crate) fn run_until_yield(
-    path: &Path,
-    max_api: usize,
-    bottle_root: Option<&Path>,
-) -> Result<()> {
+pub fn run_until_yield(path: &Path, max_api: usize, bottle_root: Option<&Path>) -> Result<()> {
     // FS policy: an exe outside the bottle runs from a drive_c copy of its
     // whole application folder first (the session options carry the staged
     // folder's guest cwd). Unchanged for `--persistent`: the entry never
     // takes `--app-dir`, so it keeps the legacy parent-folder default.
-    let volumes = resolve_volume_config(bottle_root, None);
-    let staged = stage_run_source(path, &volumes, StageMode::ParentFolder)?;
+    let prepared = prepare_run(
+        path,
+        RunSetup {
+            bottle_root,
+            drive_d_root: None,
+            stage: StageMode::ParentFolder,
+            guest_args: &[],
+        },
+    )?;
     // Ensure Sleep(n>0) actually sleeps and the idle loop parks the host
     // thread when waiting for messages. Otherwise every Sleep is a no-op
     // and interactive programs render all frames instantly.
@@ -472,16 +557,9 @@ pub(crate) fn run_until_yield(
         std::env::set_var("WIE_IDLE", "park");
     }
     let summary = wie_runtime::run_persistent_until_yield_with_options(
-        &staged.run_path,
+        &prepared.staged.run_path,
         max_api,
-        wie_runtime::SessionOptions {
-            current_directory: staged.guest_current_directory,
-            // The staged root must reach the session: without it the session
-            // would fall back to `WIE_ROOT` / the global bottle and map
-            // `C:\…` differently than the staging above.
-            bottle_root: bottle_root.map(std::path::Path::to_path_buf),
-            ..wie_runtime::SessionOptions::default()
-        },
+        prepared.session_options,
     )?;
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -538,7 +616,7 @@ const QUANTUM_MAX_API_DEFAULT: usize = 1_000_000;
 /// loop is the frame clock (Windows-identical). With `VMIN`/`VTIME = 0` the
 /// read returns instantly with whatever the pump buffered, so every keystroke
 /// arrives immediately — no Enter, no host tick source.
-pub(crate) fn run_console_interactive(
+pub fn run_console_interactive(
     path: &Path,
     max_api: Option<usize>,
     bottle_root: Option<&Path>,
@@ -547,8 +625,15 @@ pub(crate) fn run_console_interactive(
     // whole application folder first; the session options carry the staged
     // folder's guest current directory. Unchanged for `--console`: the entry
     // never takes `--app-dir`, so it keeps the legacy parent-folder default.
-    let volumes = resolve_volume_config(bottle_root, None);
-    let staged = stage_run_source(path, &volumes, StageMode::ParentFolder)?;
+    let prepared = prepare_run(
+        path,
+        RunSetup {
+            bottle_root,
+            drive_d_root: None,
+            stage: StageMode::ParentFolder,
+            guest_args: &[],
+        },
+    )?;
     let _raw = TerminalRawGuard::enter();
 
     // The guest's frame loop is Sleep + input poll, so Sleep(n>0) must park
@@ -560,19 +645,15 @@ pub(crate) fn run_console_interactive(
     }
 
     let mut session = wie_runtime::RuntimeSession::new_with_options(
-        &staged.run_path,
+        &prepared.staged.run_path,
         wie_winapi::MessageQueueIdlePolicy::YieldOnIdle,
         wie_runtime::DEFAULT_LAYOUT.with_env_overrides(),
         // Defaults: no guest argv and empty stdin bytes → LiveHost mode, so
         // ReadFile(STD_INPUT_HANDLE) and ReadConsoleInputW read from the host
         // terminal. The staging above used the env roots (or the `--bottle`
         // root), so the session resolves the same root — threaded explicitly
-        // when a bottle was named, env → global bottle otherwise.
-        wie_runtime::SessionOptions {
-            current_directory: staged.guest_current_directory,
-            bottle_root: bottle_root.map(std::path::Path::to_path_buf),
-            ..wie_runtime::SessionOptions::default()
-        },
+        // by `prepare_run` (env → global bottle otherwise).
+        prepared.session_options,
     )?;
 
     // One quantum's worth of API stops; the loop re-enters, so this bounds a

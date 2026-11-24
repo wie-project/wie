@@ -42,9 +42,8 @@ use native_dialog::{map_alert_result, map_message_box_buttons, order_window_fron
 
 /// Custom events from the guest thread to the host event loop.
 ///
-/// `pub(crate)` so the [`menu_bar`] module can name it in its event-loop
-/// proxy.
-pub(crate) enum WieEvent {
+/// Named by the [`menu_bar`] module in its event-loop proxy.
+pub enum WieEvent {
     /// A frame was published and the wake callback fired. `published_at` is
     /// the wake timestamp — the event loop measures wake→redraw latency.
     Frame { published_at: Instant },
@@ -870,40 +869,39 @@ pub fn run_gui_windowed(
     app_dir: Option<&std::path::Path>,
     guest_args: &[String],
 ) -> Result<()> {
-    // The winapi volume config and the run-source resolution read the bottle
-    // from WIE_ROOT/WIE_DRIVE_D. Propagate the GUI-entry flags into the
-    // environment so `--root`/`--drive-d` work in GUI mode too (the console
-    // entries consume the flags directly; this mirrors their env-channel).
-    let volumes = crate::commands::resolve_volume_config(bottle_root, drive_d_root);
-    if let Some(root) = volumes.bottle_root.as_deref() {
-        // SAFETY: set before the guest thread or any session reads it.
-        unsafe { std::env::set_var("WIE_ROOT", root) };
-    }
-    if let Some(d) = volumes.drive_d_root.as_deref() {
-        // SAFETY: set before the guest thread or any session reads it.
-        unsafe { std::env::set_var("WIE_DRIVE_D", d) };
-    }
     // FS policy: an exe outside the bottle runs from a drive_c copy so the
     // guest identity's `C:\Program Files\{name}\{name}.exe` label maps back
     // to a real bottle file (the non-GUI run entries wire `stage_run_source`
     // at the same point, before the session build). Only the exe is staged
-    // by default; `--app-dir` names a complete folder instead.
-    let staged = crate::commands::stage_run_source(
+    // by default; `--app-dir` names a complete folder instead. The resolved
+    // roots reach the session through `SessionOptions` (typed, `Send`), not
+    // through `WIE_ROOT` / `WIE_DRIVE_D`: the session is constructed on the
+    // spawned guest thread, and mutating the process environment there would
+    // be a data race with every other reader of it.
+    let prepared = crate::commands::prepare_run(
         path,
-        &volumes,
-        crate::commands::StageMode::from_run_entry(app_dir),
+        crate::commands::RunSetup {
+            bottle_root,
+            drive_d_root,
+            stage: crate::commands::StageMode::from_run_entry(app_dir),
+            guest_args,
+        },
     )?;
+    let staged = prepared.staged;
 
     // Explicit guest argv entries that name absolute `C:`/`D:` files must
     // exist in the mapped volumes BEFORE the guest thread starts — a missing
     // one is a launch error, not a runtime open failure. The volumes here are
-    // the exact roots the session will derive from the propagated env, so the
-    // preflight and the guest agree on what `C:\…` / `D:\…` mean. Deliberately
-    // does not touch FileDialogPolicy: GetOpenFileName stays interactive.
+    // the exact roots handed to the session, so the preflight and the guest
+    // agree on what `C:\…` / `D:\…` mean. Deliberately does not touch
+    // FileDialogPolicy: GetOpenFileName stays interactive.
     let mut session_options =
-        crate::gui::arg_preflight::preflight_guest_args(guest_args, &volumes)?;
-    // A staged app starts in its own folder (Windows launch semantics): the
-    // guest resolves relative resource paths from the staged exe's directory.
+        crate::gui::arg_preflight::preflight_guest_args(guest_args, &prepared.volumes)?;
+    // The staged roots and the staged app folder (Windows launch semantics:
+    // the guest resolves relative resource paths from the staged exe's
+    // directory) come from the same prepared run.
+    session_options.bottle_root = prepared.session_options.bottle_root;
+    session_options.drive_d_root = prepared.session_options.drive_d_root;
     session_options.current_directory = staged.guest_current_directory;
     let script_steps = match &input_script {
         Some(script_path) => Some(crate::gui::input_script::read_script(script_path)?),
@@ -991,9 +989,9 @@ pub fn run_gui_windowed(
                             let capture_pending = pending_frame_guest.clone();
                             handle.enable_capture_stream(Box::new(move || {
                                 capture_pending.store(true, std::sync::atomic::Ordering::SeqCst);
-                                let _ = capture_proxy.send_event(WieEvent::Frame {
+                                drop(capture_proxy.send_event(WieEvent::Frame {
                                     published_at: Instant::now(),
-                                });
+                                }));
                             }))
                         };
 
@@ -1005,9 +1003,9 @@ pub fn run_gui_windowed(
                                 // Mark the pending frame BEFORE sending so
                                 // the first Frame event always does the work.
                                 pending.store(true, std::sync::atomic::Ordering::SeqCst);
-                                let _ = proxy.send_event(WieEvent::Frame {
+                                drop(proxy.send_event(WieEvent::Frame {
                                     published_at: Instant::now(),
-                                });
+                                }));
                             }));
                         }
 
@@ -1119,7 +1117,7 @@ pub fn run_gui_windowed(
                             }
                         }));
 
-                        let _ = tx.send(handle);
+                        drop(tx.send(handle));
 
                         // Run the guest.
                         let run_t0 = std::time::Instant::now();
@@ -1143,9 +1141,9 @@ pub fn run_gui_windowed(
                         }
                         let code = control.exit_code.load(std::sync::atomic::Ordering::SeqCst);
                         if interrupted {
-                            let _ = proxy.send_event(WieEvent::HostInterrupt);
+                            drop(proxy.send_event(WieEvent::HostInterrupt));
                         } else {
-                            let _ = proxy.send_event(WieEvent::GuestExited { code });
+                            drop(proxy.send_event(WieEvent::GuestExited { code }));
                         }
                     }
                     Err(e) => tracing::error!("session: {e}"),

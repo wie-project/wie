@@ -228,7 +228,7 @@ impl MacMenuBar {
     /// handler is set, muda routes all events to it.
     pub fn new(proxy: EventLoopProxy<WieEvent>) -> Self {
         MenuEvent::set_event_handler(Some(move |event| {
-            let _ = proxy.send_event(WieEvent::MenuEvent(event));
+            drop(proxy.send_event(WieEvent::MenuEvent(event)));
         }));
         Self {
             menu: None,
