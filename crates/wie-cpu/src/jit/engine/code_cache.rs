@@ -68,14 +68,13 @@ use super::super::config::JitConfig;
 use super::super::tier::OptTier;
 use super::IsaEngine;
 use crate::mem::GuestMemory;
-use ahash::HashMapExt as _;
 use cranelift_codegen::binemit::Reloc;
 use cranelift_module::{ModuleReloc, ModuleRelocTarget};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -161,8 +160,18 @@ const MAX_DISK_BLOBS: usize = 4_000_000;
 /// value reaches the JIT memory allocator.
 const MAX_ALIGN: u64 = 4096;
 
-/// Buffered blobs flushed when the buffer exceeds this many records.
+/// Minimum buffered blobs before a rewrite, and how fast the bar is allowed to
+/// grow with the table.
+///
+/// A flush is a **whole-file** rewrite (temp file + rename — the only shape that
+/// survives a crash mid-write), so flushing on a fixed record count is quadratic
+/// in the number of blobs: 10k blobs means ~80 rewrites of a growing file. That
+/// is not a theoretical cost — it turned a 6 s 7-Zip boot into hours. Letting
+/// the bar grow by a quarter of the table per flush makes the number of
+/// rewrites logarithmic, i.e. total rewrite work O(n).
 const APPEND_FLUSH_CAP: usize = 128;
+const APPEND_FLUSH_GROWTH_NUM: usize = 4;
+const APPEND_FLUSH_GROWTH_DEN: usize = 5;
 
 /// Minimum interval between flushes (code blobs are much bigger than metadata,
 /// so this is lazier and the cap above does the real work).
@@ -423,6 +432,13 @@ pub(crate) struct CodeCacheCounters {
     /// Blobs successfully replayed (one per `restored`; kept separate so the
     /// summary can be diffed against a suspected over-count).
     pub blocks_replayed: AtomicU64,
+    /// Total machine-code bytes handed to `define_function_bytes`.
+    ///
+    /// The load-independent cost signal for lazy restore: it is exactly the
+    /// memcpy + relocation-application work the restore path performed, with no
+    /// timing in it. Compare against `compiled` to see how much emitted code a
+    /// warm boot avoided producing; divide by `restored` for mean block size.
+    pub bytes_replayed: AtomicU64,
     pub probe_absent: AtomicU64,
     pub refused_bytes_changed: AtomicU64,
     pub refused_generation_moved: AtomicU64,
@@ -433,6 +449,20 @@ pub(crate) struct CodeCacheCounters {
     /// persist (today: a direct chain call), so they were recorded as metadata
     /// only. Non-zero is expected and healthy.
     pub skipped_unpersistable: AtomicU64,
+    /// Successful whole-file rewrites performed. Equals 1 per session with the
+    /// session-teardown flush, and proves the flush is no longer dependent on
+    /// the last `Arc` dropping.
+    pub flushes_written: AtomicU64,
+    /// Blobs found and validated but NOT replayed, because another thread held
+    /// the JIT engine lock at that instant. Non-zero is normal and cheap: the
+    /// block compiles normally this visit and restores on a later one. A large
+    /// number means the restore path is losing the lock race constantly, which
+    /// is the signature of a guest thread being starved behind compiles.
+    pub restore_deferred: AtomicU64,
+    /// Times the exit summary was actually emitted. Exactly 1 for the life of
+    /// the process even when both the explicit session flush and `Drop` run —
+    /// a counter rather than a log assertion, so a test can pin it.
+    pub summaries_reported: AtomicU64,
 }
 
 impl CodeCacheCounters {
@@ -444,6 +474,7 @@ impl CodeCacheCounters {
             restored: g(&self.restored),
             compiled: g(&self.compiled),
             blocks_replayed: g(&self.blocks_replayed),
+            bytes_replayed: g(&self.bytes_replayed),
             missing: g(&self.probe_absent),
             refused_bytes_changed: g(&self.refused_bytes_changed),
             refused_generation_moved: g(&self.refused_generation_moved),
@@ -451,6 +482,9 @@ impl CodeCacheCounters {
             refused_unrelocatable: g(&self.refused_unrelocatable),
             refused_malformed: g(&self.refused_malformed),
             skipped_unpersistable: g(&self.skipped_unpersistable),
+            flushes_written: g(&self.flushes_written),
+            restore_deferred: g(&self.restore_deferred),
+            summaries_reported: g(&self.summaries_reported),
         }
     }
 
@@ -477,6 +511,7 @@ pub(crate) struct CodeCacheCounts {
     pub restored: u64,
     pub compiled: u64,
     pub blocks_replayed: u64,
+    pub bytes_replayed: u64,
     pub missing: u64,
     pub refused_bytes_changed: u64,
     pub refused_generation_moved: u64,
@@ -484,6 +519,9 @@ pub(crate) struct CodeCacheCounts {
     pub refused_unrelocatable: u64,
     pub refused_malformed: u64,
     pub skipped_unpersistable: u64,
+    pub flushes_written: u64,
+    pub restore_deferred: u64,
+    pub summaries_reported: u64,
 }
 
 impl CodeCacheCounts {
@@ -511,6 +549,9 @@ impl CodeCacheCounts {
 }
 
 struct FlushState {
+    /// Records appended since the last successful write. Only a safety net for
+    /// the window between the table snapshot in [`CodeCache::flush`] and the
+    /// table swap; the table itself is always authoritative.
     pending: Vec<PersistedCode>,
     last_flush: Instant,
     warned_err: bool,
@@ -525,11 +566,26 @@ pub(crate) struct CodeCache {
     enabled: bool,
     base_dir: PathBuf,
     /// Per-(PE, opt level) tables of blobs, keyed like the ledger.
-    tables: RwLock<ahash::HashMap<u64, Arc<ahash::HashMap<u64, PersistedCode>>>>,
+    ///
+    /// `papaya` for **O(1) insert**, which is not an optimisation here but a
+    /// correctness-of-scale requirement: a guest like 7-Zip records >10k blobs
+    /// in one run, so a copy-on-write map (clone the table per record) is
+    /// quadratic *in bytes copied* and turns a 6 s boot into hours. Same choice
+    /// as the metadata ledger for the same reason.
+    tables: RwLock<ahash::HashMap<u64, Arc<papaya::HashMap<u64, PersistedCode>>>>,
     /// The attached file's identity, checked on every probe.
     identity: RwLock<Option<FileIdentity>>,
     flush: Mutex<FlushState>,
     counters: CodeCacheCounters,
+    /// Set by any mutation that changes what a flush would write, and cleared
+    /// only by a **successful** write. This is what makes [`CodeCache::flush`]
+    /// idempotent in the cheap direction: a second flush with nothing recorded
+    /// since is a no-op rather than a second identical rewrite.
+    dirty: AtomicU64,
+    /// One-shot guard for the exit summary. `flush` may legitimately run twice
+    /// (explicit teardown, then `Drop` as a backstop) and the counters must be
+    /// reported exactly once.
+    summary_reported: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,6 +618,8 @@ impl CodeCache {
                 warned_err: false,
             }),
             counters: CodeCacheCounters::default(),
+            dirty: AtomicU64::new(0),
+            summary_reported: AtomicBool::new(false),
         }
     }
 
@@ -580,6 +638,8 @@ impl CodeCache {
                 warned_err: false,
             }),
             counters: CodeCacheCounters::default(),
+            dirty: AtomicU64::new(0),
+            summary_reported: AtomicBool::new(false),
         };
         me.identity = RwLock::new(Some(FileIdentity {
             key: 0,
@@ -606,7 +666,6 @@ impl CodeCache {
                 .is_some_and(|i| i.matched)
     }
 
-    #[cfg(test)]
     pub(crate) fn counters(&self) -> &CodeCacheCounters {
         &self.counters
     }
@@ -644,10 +703,10 @@ impl CodeCache {
         self.base_dir.join(format!("{key:016x}.code"))
     }
 
-    fn load_file(&self, identity: &FileIdentity) -> ahash::HashMap<u64, PersistedCode> {
+    fn load_file(&self, identity: &FileIdentity) -> papaya::HashMap<u64, PersistedCode> {
         let path = self.file_path(identity.key);
         let Ok(raw) = fs::read(&path) else {
-            return ahash::HashMap::new(); // cold boot, stay quiet
+            return papaya::HashMap::new(); // cold boot, stay quiet
         };
         let decoded = (|| {
             if raw.len() < MAGIC.len() || raw[..MAGIC.len()] != MAGIC {
@@ -679,21 +738,24 @@ impl CodeCache {
                     "jit code cache identity mismatch — reset"
                 );
             }
-            return ahash::HashMap::new();
+            return papaya::HashMap::new();
         };
 
-        let mut map = ahash::HashMap::with_capacity(body.blobs.len());
+        let map = papaya::HashMap::with_capacity(body.blobs.len());
         let mut rejected = 0_u64;
-        for b in body.blobs {
-            let Some(p) = from_disk(b) else {
-                rejected = rejected.saturating_add(1);
-                continue;
-            };
-            if !p.structurally_sound() || !p.all_targets_are_imports() {
-                rejected = rejected.saturating_add(1);
-                continue;
+        {
+            let pin = map.pin();
+            for b in body.blobs {
+                let Some(p) = from_disk(b) else {
+                    rejected = rejected.saturating_add(1);
+                    continue;
+                };
+                if !p.structurally_sound() || !p.all_targets_are_imports() {
+                    rejected = rejected.saturating_add(1);
+                    continue;
+                }
+                pin.insert(p.va, p);
             }
-            map.insert(p.va, p);
         }
         if rejected > 0 {
             tracing::info!(
@@ -705,7 +767,7 @@ impl CodeCache {
         map
     }
 
-    fn table(&self) -> Option<Arc<ahash::HashMap<u64, PersistedCode>>> {
+    fn table(&self) -> Option<Arc<papaya::HashMap<u64, PersistedCode>>> {
         let identity = (*self.identity.read().unwrap_or_else(|e| e.into_inner()))?;
         let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
         tables.get(&identity.key).cloned()
@@ -736,22 +798,17 @@ impl CodeCache {
         {
             return;
         }
-        // The table is an immutable `Arc<HashMap>` so probes stay lock-free, so
-        // a write copies it. Blobs are small and this is once per compiled
-        // block — the same order of cost as the ledger's own record write.
-        let mut next = match self.table() {
-            Some(p) => (*p).clone(),
-            None => return,
+        // In-place insert: `papaya` gives lock-free reads for the probe path and
+        // an O(1) write here, with no whole-table copy.
+        let Some(table) = self.table() else {
+            return;
         };
-        next.insert(va, code.clone());
-        self.tables
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(identity.key, Arc::new(next));
+        table.pin().insert(va, code.clone());
         {
             let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
             st.pending.push(code);
         }
+        self.dirty.store(1, Ordering::Release);
         self.flush_tick();
     }
 
@@ -765,7 +822,7 @@ impl CodeCache {
         va: u64,
         live_inv_gen: u64,
     ) -> Option<PersistedCode> {
-        let p = self.table()?.get(&va)?.clone();
+        let p = self.table()?.pin().get(&va).cloned()?;
         if p.inv_gen != live_inv_gen {
             return None;
         }
@@ -789,7 +846,8 @@ impl CodeCache {
         let Some(table) = self.table() else {
             return CodeRestoreOutcome::Absent;
         };
-        let Some(p) = table.get(&va) else {
+        let p = table.pin().get(&va).cloned();
+        let Some(p) = p else {
             return CodeRestoreOutcome::Absent;
         };
         if p.inv_gen != live_inv_gen {
@@ -802,6 +860,22 @@ impl CodeCache {
     }
 
     /// Count one restore attempt's outcome.
+    /// Record a blob that was found but not replayed because the JIT engine
+    /// lock was held by another thread.
+    pub(crate) fn note_restore_deferred(&self) {
+        self.counters
+            .restore_deferred
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a successful replay of `code_bytes` of machine code.
+    pub(crate) fn note_restored(&self, code_bytes: usize) {
+        self.counters
+            .bytes_replayed
+            .fetch_add(code_bytes as u64, Ordering::Relaxed);
+        self.note(CodeRestoreOutcome::Restored);
+    }
+
     pub(crate) fn note(&self, outcome: CodeRestoreOutcome) {
         self.counters.record(outcome);
         if outcome.is_restored() {
@@ -811,18 +885,71 @@ impl CodeCache {
         }
     }
 
+    /// Records buffered before the next whole-file rewrite is due: the fixed
+    /// floor, plus a quarter of the current table so the rewrite count stays
+    /// logarithmic in the number of blobs.
+    fn flush_threshold(&self, table_len: usize) -> usize {
+        APPEND_FLUSH_CAP
+            .saturating_add(table_len / APPEND_FLUSH_GROWTH_DEN * APPEND_FLUSH_GROWTH_NUM)
+    }
+
     fn flush_tick(&self) {
+        let table_len = self.table().map_or(0, |t| t.pin().len());
         let due = {
             let st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
-            st.pending.len() >= APPEND_FLUSH_CAP || st.last_flush.elapsed() >= FLUSH_MIN_INTERVAL
+            st.pending.len() >= self.flush_threshold(table_len)
+                || st.last_flush.elapsed() >= FLUSH_MIN_INTERVAL
         };
         if due {
-            self.flush_now();
+            self.flush();
         }
     }
 
     /// Rewrite the attached file through a temp-file rename.
-    pub(crate) fn flush_now(&self) {
+    /// Rewrite the attached file if anything changed since the last successful
+    /// write. Idempotent: a call with no intervening mutation does nothing.
+    ///
+    /// Public because teardown order is easy to get wrong twice; safe to call
+    /// any number of times from any number of places.
+    pub(crate) fn flush(&self) {
+        if !self.enabled {
+            return;
+        }
+        // Claim the write: `swap` returns the previous value, so 0 means
+        // nothing has been recorded since the last successful write and the
+        // whole rewrite can be skipped. Claiming it up front also serialises
+        // two concurrent flushes — the loser's `pending` is still in the table
+        // snapshot the winner takes.
+        if self.dirty.swap(0, Ordering::AcqRel) == 0 {
+            return;
+        }
+        self.write_file_now();
+    }
+
+    /// Flush, then report the counters **exactly once**.
+    ///
+    /// This is the deterministic end-of-session entry point: it does not depend
+    /// on the last `Arc<CodeCache>` happening to drop, which is *not* something
+    /// a guest can be relied on to do (see [`super::shared`]'s
+    /// `RuntimeSession` teardown note). [`Drop`] calls it as a backstop, and the
+    /// `summary_reported` swap makes the double call harmless.
+    pub(crate) fn finish(&self) {
+        if !self.enabled {
+            return;
+        }
+        self.flush();
+        if self.summary_reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.counters
+            .summaries_reported
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::info!("jit code cache: {}", self.summary().unwrap_or_default());
+    }
+
+    /// The actual temp-file + rename write. Only reached when [`Self::flush`]
+    /// saw pending mutations, so [`Self::dirty`] stays authoritative.
+    fn write_file_now(&self) {
         let Some(table) = self.table() else {
             return;
         };
@@ -833,8 +960,9 @@ impl CodeCache {
             let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut st.pending)
         };
-        let mut blobs = Vec::with_capacity(table.len() + pending.len());
-        for p in table.values() {
+        let mut blobs = Vec::with_capacity(table.pin().len() + pending.len());
+        let pin = table.pin();
+        for p in pin.values() {
             if let Some(b) = disk_blob(p) {
                 blobs.push(b);
             }
@@ -862,17 +990,26 @@ impl CodeCache {
         let written = write_file(&path, &body);
         match written {
             Ok(()) => {
+                self.counters
+                    .flushes_written
+                    .fetch_add(1, Ordering::Relaxed);
                 let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
                 st.last_flush = Instant::now();
             }
             Err(e) => {
+                // Re-arm `dirty` so a later `flush()` (the session hook, or the
+                // `Drop` backstop) retries instead of silently dropping the
+                // only on-disk copy of these blobs. We warn once either way:
+                // a cache that cannot be written must not look like a cache
+                // that has nothing to save.
+                self.dirty.store(1, Ordering::Release);
                 let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
                 if !st.warned_err {
                     st.warned_err = true;
                     tracing::warn!(
                         error = %e,
                         path = %path.display(),
-                        "jit code cache write failed — code persistence off for this run"
+                        "jit code cache write failed — code persistence degraded for this run"
                     );
                 }
             }
@@ -884,29 +1021,26 @@ impl CodeCache {
         if !self.enabled || end <= addr {
             return;
         }
-        let Some(identity) = *self.identity.read().unwrap_or_else(|e| e.into_inner()) else {
+        let Some(table) = self.table() else {
             return;
         };
-        let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
-        let Some(previous) = tables.remove(&identity.key) else {
-            return;
+        let doomed: Vec<u64> = {
+            let pin = table.pin();
+            pin.iter()
+                .filter(|(_, p)| p.va < end && addr < p.guest_end.max(p.va))
+                .map(|(&va, _)| va)
+                .collect()
         };
-        let mut next = (*previous).clone();
-        let doomed: Vec<u64> = next
-            .iter()
-            .filter(|(_, p)| p.va < end && addr < p.guest_end.max(p.va))
-            .map(|(va, _)| *va)
-            .collect();
         if doomed.is_empty() {
-            tables.insert(identity.key, previous);
             return;
         }
+        let pin = table.pin();
         for va in doomed {
-            next.remove(&va);
+            pin.remove(&va);
         }
-        tables.insert(identity.key, Arc::new(next));
-        drop(tables);
-        self.flush_now();
+        drop(pin);
+        self.dirty.store(1, Ordering::Release);
+        self.flush();
     }
 
     /// One-line hit-rate summary, or `None` when the cache was never enabled.
@@ -936,6 +1070,15 @@ impl CodeCache {
             g(&c.blocks_replayed),
         ))
         .map(|line| {
+            let c = &self.counters;
+            format!(
+                "{line} replayed_bytes={} flushes={} deferred={}",
+                c.bytes_replayed.load(Ordering::Relaxed),
+                c.flushes_written.load(Ordering::Relaxed),
+                c.restore_deferred.load(Ordering::Relaxed)
+            )
+        })
+        .map(|line| {
             let counts = self.counters.snapshot();
             format!("{line} hit_rate={}%", counts.hit_rate_pct())
         })
@@ -944,7 +1087,7 @@ impl CodeCache {
     /// Captured blob for `va`, for tests that assert on what was emitted.
     #[cfg(test)]
     pub(crate) fn test_blob(&self, va: u64) -> Option<PersistedCode> {
-        self.table()?.get(&va).cloned()
+        self.table()?.pin().get(&va).cloned()
     }
 
     /// Guest VAs currently held in the table (test failure output).
@@ -952,7 +1095,7 @@ impl CodeCache {
     pub(crate) fn test_vas(&self) -> Vec<u64> {
         let mut v: Vec<u64> = self
             .table()
-            .map(|t| t.keys().copied().collect())
+            .map(|t| t.pin().keys().copied().collect())
             .unwrap_or_default();
         v.sort_unstable();
         v
@@ -966,19 +1109,19 @@ impl CodeCache {
 
     #[cfg(test)]
     pub(crate) fn test_len(&self) -> usize {
-        self.table().map_or(0, |t| t.len())
+        self.table().map_or(0, |t| t.pin().len())
     }
 }
 
+/// Backstop only.
+///
+/// The deterministic flush is [`CodeCache::finish`], called from guest-session
+/// teardown; this exists for the paths that skip teardown entirely (an aborted
+/// CLI run, a panic unwinding past the session). It is a no-op when the session
+/// already finished, and vice versa.
 impl Drop for CodeCache {
     fn drop(&mut self) {
-        if self.enabled {
-            CodeCache::flush_now(self);
-            // The hit rate is the feature's whole justification, and there is no
-            // other place in this crate that owns the numbers, so they are
-            // emitted here. `RUST_LOG=wie=info` is how you read them.
-            tracing::info!("jit code cache: {}", self.summary().unwrap_or_default());
-        }
+        CodeCache::finish(self);
     }
 }
 

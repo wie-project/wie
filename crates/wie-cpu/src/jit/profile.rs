@@ -113,22 +113,29 @@ pub struct JitProfile {
     pub warm_ledger_hits: u64,
     /// Blocks whose machine code was **replayed** from the on-disk code cache
     /// (`WIE_JIT_CODE_CACHE`) instead of compiled. This is the whole point of
-    /// that knob and the only number that says whether it worked; the
-    /// denominator is `compile.compiles` for the same run.
+    /// that knob and the only number that says whether it worked.
     ///
     /// Shared-derived: folded from the one [`super::JitShared`] that owns the
     /// cache, because the restore happens there and not on a guest thread's
-    /// dispatch path.
+    /// dispatch path. Reported by [`super::diag`]'s `jit_code_cache:` profile
+    /// line as a percentage of `restored + code_cache_refused` (what the cache
+    /// had to offer), which is *not* `compile.compiles` — read
+    /// `restored / compiles` off the same report for the share of block
+    /// compiles avoided.
     pub code_cache_restored: u64,
     /// Blobs the code cache refused to replay, by reason:
     /// `bytes-changed` + `generation-moved` + `file-mismatch` +
-    /// `unrelocatable-target` + `malformed`.
+    /// `unrelocatable-target` + `malformed`, summed.
+    ///
+    /// Shared-derived (see [`SHARED_DERIVED_STATS`](super::SHARED_DERIVED_STATS)).
     pub code_cache_refused: u64,
     /// Blobs the code cache could not *write* — emitted code carrying a
     /// relocation the format refuses to persist (today: a direct chain call), or
     /// a capture that was already drained. Expected to be a large fraction of
     /// all compiles on a warm-then-cold run and is **not** an error: chained
     /// blocks are recompiled by design.
+    ///
+    /// Shared-derived (see [`SHARED_DERIVED_STATS`](super::SHARED_DERIVED_STATS)).
     pub code_cache_unpersistable: u64,
     /// Blocks compiled at the tier-up opt level (self-loops that earned it).
     /// Shared-derived (folded from the one [`JitShared`], see

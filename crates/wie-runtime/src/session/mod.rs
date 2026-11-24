@@ -533,6 +533,13 @@ impl Drop for RuntimeSession {
         if !self.process.worker_joins.is_empty() {
             self.process.join_workers();
         }
+        // Durable JIT code cache (`WIE_JIT_CODE_CACHE`). After the join, so no
+        // worker can record a blob after the file was written; the `Arc` held
+        // here is dropped with `self.process` a moment later, and the cache's
+        // own `Drop` is a no-op backstop by then.
+        if let Some(shared_jit) = self.process.shared_jit.as_ref() {
+            shared_jit.finish_jit_caches();
+        }
     }
 }
 

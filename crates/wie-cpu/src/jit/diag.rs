@@ -62,10 +62,12 @@ fn bg_ledger_line(s: &JitStats) -> Option<String> {
 }
 
 /// Report lines for the `=== WIE_RUNTIME_PROFILE ===` block: the promotion
-/// ledger and the sampled iced-residue opcode histogram
-/// (`WIE_JIT_OPCODE_HISTO=1`). Rendered into the report itself so they print
-/// on every profile path — SIGINT included — without depending on a tracing
-/// subscriber being installed (tracing is silent under a default RUST_LOG).
+/// ledger, direct-chaining health, the opt-level tier ledger, the persistent
+/// machine-code cache (`WIE_JIT_CODE_CACHE`) and the sampled iced-residue
+/// opcode histogram (`WIE_JIT_OPCODE_HISTO=1`). Rendered into the report itself
+/// so they print on every profile path — SIGINT included — without depending on
+/// a tracing subscriber being installed (tracing is silent under a default
+/// RUST_LOG).
 #[must_use]
 pub fn jit_profile_report_lines(s: &JitStats) -> Vec<String> {
     let mut out = Vec::new();
@@ -78,6 +80,13 @@ pub fn jit_profile_report_lines(s: &JitStats) -> Vec<String> {
     if let Some(line) = tier_line(s) {
         out.push(line);
     }
+    // Unconditional, unlike its neighbours: the code cache is the one feature
+    // whose *absence of data* is the interesting result. The exit-time summary
+    // in `CodeCache::summary` is silent when `WIE_JIT_CODE_CACHE` is off, and
+    // it does not run at all for every guest, so a gated line here would leave
+    // a reader unable to tell "the cache did nothing" from "this build does not
+    // measure it".
+    out.push(code_cache_line(s));
     if JitConfig::get().opcode_hist_enabled() {
         out.extend(opcode_histogram_lines());
     }
@@ -130,6 +139,36 @@ fn tier_line(s: &JitStats) -> Option<String> {
         "[wie] jit_tier: tier_compiles={} tier_rejects={} budget_left={}",
         s.profile.tier_compiles, s.profile.tier_rejects, s.profile.tier_budget_left
     ))
+}
+
+/// Persistent machine-code cache (`WIE_JIT_CODE_CACHE`) as one report line.
+///
+/// `restored` blocks replayed from disk instead of compiled is the whole point
+/// of the knob; `refused` (summed over every reason — bytes, generation,
+/// file, target, malformed) and `unpersistable` (emitted code carrying a
+/// relocation the format refuses to persist, expected and *not* an error) are
+/// what explain a low or a zero `restored`.
+///
+/// Printed unconditionally, zeros included: see [`jit_profile_report_lines`].
+/// With the knob off every counter is genuinely 0, so the line reads as
+/// "measured, nothing happened" rather than being absent.
+fn code_cache_line(s: &JitStats) -> String {
+    let restored = s.profile.code_cache_restored;
+    let refused = s.profile.code_cache_refused;
+    // Same derived-ratio shape as `stores_per_hop`: an integer percent, 0 when
+    // the denominator is 0. Denominator is restored + every refusal — what the
+    // cache actually had to offer — not `compile.compiles`, so this measures
+    // restore correctness rather than guest coverage. Identical to
+    // `CodeCacheCounts::hit_rate_pct`, recomputed here because only the folded
+    // totals survive the cross-thread merge.
+    let hit_rate = restored
+        .saturating_mul(100)
+        .checked_div(restored.saturating_add(refused))
+        .unwrap_or(0);
+    format!(
+        "[wie] jit_code_cache: restored={restored} refused={refused} unpersistable={} hit_rate={hit_rate}%",
+        s.profile.code_cache_unpersistable
+    )
 }
 
 fn dump_mem_path_histogram(s: &JitStats) {
@@ -222,4 +261,61 @@ fn opcode_histogram_lines() -> Vec<String> {
             pipeline::OPCODE_SAMPLE_EVERY
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The cache-off case is the one that must not go missing: a run with
+    /// `WIE_JIT_CODE_CACHE` unset has to report measured zeros, not silence —
+    /// silence is indistinguishable from a build that lost the counters.
+    #[test]
+    fn code_cache_line_reports_zeros_without_the_knob() {
+        assert_eq!(
+            code_cache_line(&JitStats::default()),
+            "[wie] jit_code_cache: restored=0 refused=0 unpersistable=0 hit_rate=0%"
+        );
+    }
+
+    /// `hit_rate` is `restored / (restored + refused)`, matching
+    /// `CodeCacheCounts::hit_rate_pct`: a block with no blob at all is an absent
+    /// cache, not a failed restore, so it must stay out of the denominator.
+    #[test]
+    fn code_cache_line_hit_rate_uses_refusals_as_denominator() {
+        let mut s = JitStats::default();
+        s.profile.code_cache_restored = 23;
+        s.profile.code_cache_refused = 2;
+        s.profile.code_cache_unpersistable = 40;
+        assert_eq!(
+            code_cache_line(&s),
+            "[wie] jit_code_cache: restored=23 refused=2 unpersistable=40 hit_rate=92%"
+        );
+
+        // Every refusal, no restores: 0%.
+        s.profile.code_cache_restored = 0;
+        assert!(code_cache_line(&s).ends_with("hit_rate=0%"));
+
+        // Restores but no refusals: 100%, and not a divide-by-zero.
+        s.profile.code_cache_restored = 5;
+        s.profile.code_cache_refused = 0;
+        assert!(code_cache_line(&s).ends_with("hit_rate=100%"));
+    }
+
+    /// The line is unconditional, unlike the quiet-by-default ledger/tier lines.
+    #[test]
+    fn profile_report_always_carries_the_code_cache_line() {
+        let quiet = JitStats::default();
+        assert!(
+            !jit_profile_report_lines(&quiet)
+                .iter()
+                .any(|l| l.starts_with("[wie] jit_bg_ledger:")),
+            "ledger stays quiet when nothing was recorded"
+        );
+        let lines = jit_profile_report_lines(&quiet);
+        assert!(
+            lines.iter().any(|l| l.starts_with("[wie] jit_code_cache:")),
+            "code-cache line missing from {lines:?}"
+        );
+    }
 }

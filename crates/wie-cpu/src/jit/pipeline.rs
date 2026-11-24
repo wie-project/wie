@@ -151,6 +151,15 @@ impl JitCpu {
         s.profile.tier_compiles = tier.tier_ups;
         s.profile.tier_rejects = tier.tier_rejects;
         s.profile.tier_budget_left = u64::try_from(tier.budget_left).unwrap_or(u64::MAX);
+        // Code-cache counters live on the one `JitShared` that owns the on-disk
+        // cache — a restore happens there, not on a guest thread's dispatch path
+        // — so they are read (never summed) into every engine's snapshot, exactly
+        // like the tier ledger above. One snapshot of relaxed atomic loads per
+        // call, and `stats()` is only taken on the profile path.
+        let cc = self.shared.code_cache_counters();
+        s.profile.code_cache_restored = cc.restored;
+        s.profile.code_cache_refused = cc.refused();
+        s.profile.code_cache_unpersistable = cc.skipped_unpersistable;
         s
     }
 
