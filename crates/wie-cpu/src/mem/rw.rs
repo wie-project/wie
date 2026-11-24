@@ -111,6 +111,14 @@ impl super::GuestMemory {
     ///
     /// Used by REP MOVS/STOS after SPC. Never returns guest VAs.
     ///
+    /// `None` means **"no fast pointer", not "not writable"**: this is a
+    /// capability query, and the caller must fall back to [`Self::write`], which
+    /// is the permission authority. Two independent reasons produce `None`:
+    /// the protection denies the access (the write would fail anyway), or the
+    /// span is executable (a raw store would bypass the code-invalidation drain,
+    /// see `PageProtect::allows_soft_store`) — and in that second case
+    /// `Self::write` *succeeds*.
+    ///
     /// Returns `None` when:
     /// - `len == 0` or the range wraps,
     /// - SPC denies the access for the whole span,
@@ -283,9 +291,12 @@ impl super::GuestMemory {
         }
         let allow_r = run.protect.allows_read();
         let allow_x = run.protect.allows_execute();
-        // W-on-X: writes are denied on executable pages so stores cannot
-        // silently SMC under sticky/pin/TLB without `GuestMemory::write`.
-        let allow_w = run.protect.allow_write_for();
+        // W-on-X: writes are denied to *compiled* code on executable pages so
+        // stores cannot silently SMC under sticky/pin/TLB without going through
+        // `GuestMemory::write`. This is the fast-store capability, not the
+        // page's permission — `check_access` (i.e. `write`) still allows an
+        // RWX page. See `mem::protect` module docs.
+        let allow_w = run.protect.allows_soft_store();
         // NOACCESS / no usable rights → no TLB entry.
         // Keep RX pages installable for data reads (allow_r).
         if !allow_r && !allow_w && !allow_x {

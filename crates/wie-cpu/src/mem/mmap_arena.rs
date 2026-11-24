@@ -55,6 +55,13 @@ impl MmapArenaBackend {
         self.arenas.span_all_frames_default_rw(address, end)
     }
 
+    /// Last host protection applied to the frame starting at `frame_guest`;
+    /// `None` means the `mmap` default (RW). Pure lookup, no syscall.
+    #[must_use]
+    pub(super) fn frame_host_prot(&self, frame_guest: u64) -> Option<i32> {
+        self.arenas.frame_host_prot(frame_guest)
+    }
+
     /// MEM_RELEASE: munmap exact reservation arena.
     pub(super) fn unmap_range(&mut self, address: u64, size: usize) {
         self.arenas.unmap_exact(address, size);

@@ -255,6 +255,22 @@ impl ArenaSet {
         Ok(())
     }
 
+    /// Last host protection applied to the frame starting at `frame_guest`.
+    ///
+    /// `None` means "still at the `mmap` default (`PROT_READ | PROT_WRITE`)" —
+    /// an absent cache entry is only ever written for a frame that was never
+    /// tightened (see [`MmapArena::host_prot`]), so `None` is a positive answer,
+    /// not "unknown". Used by `sync_host_protect` to decide whether a failed
+    /// `mprotect` left a frame too tight for the guest (fatal) or merely lost
+    /// defense-in-depth (harmless).
+    ///
+    /// Not keyed by an arena: the frame must lie inside one, so the arena is
+    /// looked up from `frame_guest`.
+    pub(super) fn frame_host_prot(&self, frame_guest: u64) -> Option<i32> {
+        let arena = self.find_va(frame_guest)?;
+        arena.host_prot.get(&frame_guest).copied()
+    }
+
     /// True when every host frame in `[address, end)` is at the `mmap` default
     /// (RW): never touched (absent from the per-frame cache) or explicitly RW.
     ///

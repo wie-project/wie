@@ -289,7 +289,12 @@ pub(crate) struct PageTlbEntry {
     pub host: *mut u8,
     /// Software read permission at install time.
     pub allow_r: bool,
-    /// Software write permission at install time.
+    /// Fast-store **capability** at install time, not the page's permission.
+    ///
+    /// `false` on an executable page even when it is `PAGE_EXECUTE_READWRITE`:
+    /// a compiled store there must call the helper so code invalidation runs, and
+    /// the helper's slow path ([`GuestMemory::write`]) honours the protection and
+    /// succeeds. See `mem::protect` module docs.
     pub allow_w: bool,
     /// [`GuestMemory::generation`] at install time.
     pub generation: u64,

@@ -85,10 +85,11 @@ impl super::GuestMemory {
                 return None;
             }
             allow_r &= run.protect.allows_read();
-            // W-on-X (see `PageProtect::allow_write_for`): never soft-translate
+            // W-on-X (see `PageProtect::allows_soft_store`): never soft-translate
             // writes onto executable pages, so SMC always hits
-            // `GuestMemory::write` + code-invalidate drain.
-            allow_w &= run.protect.allow_write_for();
+            // `GuestMemory::write` + code-invalidate drain. A pin that loses
+            // `allow_w` this way is a fast-path miss, not a permission denial.
+            allow_w &= run.protect.allows_soft_store();
             saw = true;
             let next = run.end_page;
             if next <= page {
@@ -316,7 +317,10 @@ impl super::GuestMemory {
             self.regions.set_host_base_if_covers(address, hb);
         }
         // Optional host mprotect for uniform host frames (defense-in-depth).
-        self.sync_host_protect(address, size);
+        // Not undone on failure: a fresh arena's frames are at the `mmap` default
+        // RW, so this call can only ever *tighten*, which is never fatal — see
+        // `sync_host_protect`.
+        self.sync_host_protect(address, size)?;
         Ok(())
     }
 }

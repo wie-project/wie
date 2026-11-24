@@ -5,6 +5,27 @@
 //! under the guest-4K / host-16K clinch on Apple Silicon.
 //!
 //! Values match Microsoft Learn memory-protection constants.
+//!
+//! # Which layer answers which question
+//!
+//! Two questions are asked of a page and they have **different** answers, so
+//! they are separate functions and must never be substituted for each other:
+//!
+//! 1. *May this byte be accessed?* — [`PageProtect::allows`]. The protection the
+//!    guest last set is the **only** authority here. `PageMap::check_access`
+//!    (and therefore `GuestMemory::read` / `write` / `fetch_into`) is the sole
+//!    caller, so `VirtualProtect` takes effect for every access it grants.
+//! 2. *May a store land through a raw host pointer that bypasses
+//!    [`crate::mem::GuestMemory::write`]?* — [`PageProtect::allows_soft_store`].
+//!    Denied on executable pages, because such a store cannot run the code
+//!    invalidation drain that self-modifying code needs. A denial is a
+//!    **capability miss, not a permission denial**: every consumer falls back to
+//!    `write`, which succeeds.
+//!
+//! Keeping (2) inside (1) is the bug this split exists to prevent: it made
+//! `PAGE_EXECUTE_READWRITE` read as "not writable" to the TLB, the region pins
+//! and the bulk paths while `write` honoured it, so a guest that protected a
+//! page RWX then wrote it got a different answer from each layer.
 
 /// No access (committed or reserved placeholder).
 pub const PAGE_NOACCESS: u32 = 0x01;
@@ -135,18 +156,24 @@ impl PageProtect {
     }
 
     /// Whether a store may be **soft-translated** onto a page with this
-    /// protection — the single definition of the W-on-X rule.
+    /// protection — i.e. whether a raw host pointer handed to compiled guest
+    /// code (or to a bulk copy) may be stored through.
     ///
     /// Write is deliberately denied on executable pages: the TLB and the region
     /// pins hand compiled guest code a raw host pointer, and a store through
     /// one would silently self-modify code without passing the code-invalidation
-    /// drain in [`crate::mem::GuestMemory::write`]. Every caller that mints such
-    /// a fast pointer must use this, never [`Self::allows_write`].
+    /// drain in [`crate::mem::GuestMemory::write`].
+    ///
+    /// **This is a capability, not a permission** (see the module docs). Every
+    /// caller of this predicate must treat a `false` as "use the slow path" and
+    /// never as "the guest may not write here" — `GuestMemory::write` answers
+    /// that question from [`Self::allows_write`] alone, and it succeeds on an
+    /// executable-but-writable page.
     ///
     /// TLB fill and pin creation only — never on an executed access — so the
     /// second test is free at run time.
     #[must_use]
-    pub(crate) fn allow_write_for(self) -> bool {
+    pub(crate) fn allows_soft_store(self) -> bool {
         self.allows_write() && !self.allows_execute()
     }
 
@@ -312,16 +339,22 @@ mod tests {
         }
     }
 
-    /// The W-on-X rule: every executable protection denies the soft-translated
-    /// write path, every non-executable one defers to [`PageProtect::allows_write`].
+    /// The W-on-X capability rule: every executable protection refuses the
+    /// soft-translated store path, every non-executable one defers to
+    /// [`PageProtect::allows_write`].
     ///
     /// Pinned here because two fast-pointer paths depend on it — the per-page
     /// TLB (`mem::rw::page_protect_meta`) and whole-region pins
     /// (`mem::map::region_pin`). They are now one call to
-    /// [`PageProtect::allow_write_for`]; this test pins the semantics that both
-    /// inherit, so a future "just use `allows_write()`" edit fails here.
+    /// [`PageProtect::allows_soft_store`]; this test pins the semantics that
+    /// both inherit, so a future "just use `allows_write()`" edit fails here.
+    ///
+    /// The *last* two assertions are the part that must not drift: refusing the
+    /// fast pointer does **not** make the page read-only. `allows_write` stays
+    /// true on `PAGE_EXECUTE_READWRITE`, which is what `VirtualProtect` to RWX
+    /// promises the guest and what `GuestMemory::write` honours.
     #[test]
-    fn allow_write_for_denies_writes_on_executable_pages() {
+    fn allows_soft_store_denies_writes_on_executable_pages() {
         let all = [
             PageProtect::NoAccess,
             PageProtect::ReadOnly,
@@ -332,10 +365,10 @@ mod tests {
         ];
         for p in all {
             if p.allows_execute() {
-                assert!(!p.allow_write_for(), "{p:?} must deny W-on-X");
+                assert!(!p.allows_soft_store(), "{p:?} must deny W-on-X");
             } else {
                 assert_eq!(
-                    p.allow_write_for(),
+                    p.allows_soft_store(),
                     p.allows_write(),
                     "{p:?} non-execute must equal allows_write()"
                 );
@@ -343,8 +376,8 @@ mod tests {
         }
         // Spelled out, so the rule does not hide behind the loop above.
         assert!(PageProtect::ExecuteReadWrite.allows_write());
-        assert!(!PageProtect::ExecuteReadWrite.allow_write_for());
-        assert!(PageProtect::ReadWrite.allow_write_for());
+        assert!(!PageProtect::ExecuteReadWrite.allows_soft_store());
+        assert!(PageProtect::ReadWrite.allows_soft_store());
     }
 
     /// `rwx()` encodes each variant with the same bits as [`crate::perm`].

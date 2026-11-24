@@ -755,3 +755,479 @@ fn generation_guard_rejects_stale_gen() {
     let result = mem.write(0x2_0100, &[0x33]);
     assert!(result.is_ok(), "write onto fresh arena must succeed");
 }
+
+// ── Protection is the access authority; the host mapping follows it ────────
+//
+// `VirtualProtect` to a writable+executable protection used to be honoured by
+// `write` and refused by every other write path, because the W-on-X *fast-store
+// capability* was read as a permission. These tests pin the resulting order:
+// the page map decides what the guest may do, and the host mapping is only ever
+// a cache of it.
+
+/// `mov dword ptr [disp32], imm32` — a guest store to an absolute address, so
+/// no register needs setting up before the run.
+fn store_abs32(target: u64, value: u32) -> [u8; 11] {
+    let mut bytes = [0_u8; 11];
+    bytes[0] = 0xc7; // mov r/m32, imm32
+    bytes[1] = 0x04; // mod = 00, reg = eax, r/m = SIB
+    bytes[2] = 0x25; // SIB: no index, base = none → disp32
+    bytes[3..7].copy_from_slice(
+        &u32::try_from(target)
+            .expect("guest fixture address fits u32")
+            .to_le_bytes(),
+    );
+    bytes[7..11].copy_from_slice(&value.to_le_bytes());
+    bytes
+}
+
+fn read_u32(engine: &mut dyn crate::CpuEngine, address: u64) -> u32 {
+    let mut buf = [0_u8; 4];
+    engine.mem_read(address, &mut buf).expect("read u32");
+    u32::from_le_bytes(buf)
+}
+
+/// A guest store to a page whose protection changed *after* the block that
+/// contains the store was compiled.
+///
+/// This is the case that corrupts a guest if the invalidation is wrong: the
+/// compiled block cached a TLB entry (or a region pin) for `DATA` while it was
+/// writable, so unless `virtual_protect` bumps the generation and drops the
+/// translated state, the store keeps landing on a page the guest made read-only.
+fn guest_store_observes_the_current_protection(engine: &mut dyn crate::CpuEngine, label: &str) {
+    // Below 4 GiB: the fixture stores through the absolute-`disp32` encoding,
+    // which cannot name a higher address.
+    let code = 0x0500_0000_u64;
+    let data = 0x0500_1000_u64;
+    let stop = code + 0x40;
+    engine
+        .mem_map(code, 0x1000, crate::RwxPerms::ALL)
+        .expect("map code page");
+    engine
+        .mem_map(data, 0x1000, crate::RwxPerms::READ_WRITE)
+        .expect("map data page");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&store_abs32(data, 0x1111_1111));
+    // `jmp stop` — leaves the block instead of self-looping, so a bounded run
+    // cannot spin inside compiled code.
+    let rel = i32::try_from(stop)
+        .expect("stop fits i32")
+        .saturating_sub(i32::try_from(code + 16).expect("resume fits i32"));
+    bytes.push(0xe9);
+    bytes.extend_from_slice(&rel.to_le_bytes());
+    engine.mem_write(code, &bytes).expect("write code");
+    engine.mem_write(stop, &[0x0f, 0x0b]).expect("ud2 sentinel");
+
+    // 1. Runs while the data page is writable.
+    let hook = engine
+        .run_until_stop(code, stop, 0, 8, 0, 0)
+        .expect("run 1 dispatch");
+    assert!(!hook.invalid_memory.hit, "{label}: run 1 must not fault");
+    assert_eq!(read_u32(engine, data), 0x1111_1111, "{label}: run 1 stored");
+
+    // 2. Guest drops write permission: the same store must now fault, with a
+    //    write access violation at the faulting address, and store nothing.
+    engine
+        .virtual_protect(data, 0x1000, protect::PAGE_EXECUTE_READ)
+        .expect("protect data rx");
+    let hook = engine
+        .run_until_stop(code, stop, 0, 8, 0, 0)
+        .expect("run 2 dispatch");
+    assert!(
+        hook.invalid_memory.hit,
+        "{label}: a store to a read-only page must fault"
+    );
+    assert_eq!(
+        hook.invalid_memory.exception_code,
+        crate::exception_code::ACCESS_VIOLATION,
+        "{label}: access violation"
+    );
+    assert_eq!(
+        hook.invalid_memory.access_type, 1,
+        "{label}: the fault is a write"
+    );
+    assert_eq!(hook.invalid_memory.address, data, "{label}: fault address");
+    assert_eq!(
+        read_u32(engine, data),
+        0x1111_1111,
+        "{label}: a faulting store must not have written"
+    );
+
+    // 3. Guest restores write permission *and* changes the code, so the store
+    //    must both be permitted again and come from the new bytes.
+    engine
+        .virtual_protect(data, 0x1000, protect::PAGE_READWRITE)
+        .expect("protect data rw");
+    engine
+        .mem_write(code, &store_abs32(data, 0x2222_2222))
+        .expect("rewrite the store");
+    let hook = engine
+        .run_until_stop(code, stop, 0, 8, 0, 0)
+        .expect("run 3 dispatch");
+    assert!(!hook.invalid_memory.hit, "{label}: run 3 must not fault");
+    assert_eq!(
+        read_u32(engine, data),
+        0x2222_2222,
+        "{label}: the recompiled store must use the new bytes and land again"
+    );
+}
+
+#[test]
+fn guest_store_observes_protection_change_interpreter() {
+    let mut cpu = crate::IcedCpu::open_x86_64();
+    guest_store_observes_the_current_protection(&mut cpu, "interpreter");
+}
+
+#[test]
+fn guest_store_observes_protection_change_jit() {
+    use crate::CpuEngine;
+    let mut cpu = crate::jit::JitCpu::open_x86_64();
+    guest_store_observes_the_current_protection(&mut cpu, "jit");
+    // The claim is about a *compiled* block, so require that one ran: with a
+    // stale translation the run-2 store would have landed and not faulted.
+    let stats = cpu.cpu_stats().expect("jit exposes stats");
+    assert!(
+        stats.exec.cache_hits >= 1,
+        "the JIT must have executed a compiled block (cache_hits={})",
+        stats.exec.cache_hits
+    );
+}
+
+#[test]
+fn protected_writable_page_writes_but_offers_no_fast_pointer() {
+    let mut mem = GuestMemory::new();
+    let base = 0x1400_0000_u64;
+    let page = base + 0x1000;
+    mem.map(base, 0x1_0000, crate::RwxPerms::READ_WRITE)
+        .expect("map");
+
+    // RW → RWX. This is the protect the host-export lane issues for a
+    // trampoline in the image tail.
+    let old = mem
+        .virtual_protect(page, 0x1000, protect::PAGE_EXECUTE_READWRITE)
+        .expect("protect rwx");
+    assert_eq!(old, protect::PAGE_READWRITE);
+    assert_eq!(
+        mem.virtual_query(page).protect,
+        protect::PAGE_EXECUTE_READWRITE,
+        "VirtualQuery reports the new protection"
+    );
+
+    // Authority: the protection the guest just set, for the *whole* page.
+    mem.write(page, &[0xA5; 32]).expect("write on a RWX page");
+    let mut back = [0_u8; 32];
+    mem.read(page + 0x10, &mut back[..16]).expect("read back");
+    assert_eq!(back[..16], [0xA5; 16]);
+
+    // Capability: a raw store would bypass code invalidation, so it is refused —
+    // and that refusal is a *fallback*: `write` above is what carries the store.
+    let entry = mem.page_tlb_entry(page >> 12).expect("tlb entry");
+    assert!(entry.allow_r, "RWX pages stay readable through the TLB");
+    assert!(
+        !entry.allow_w,
+        "a compiled store on an executable page must use the helper"
+    );
+    assert!(mem.host_span(page, 32, true).is_none());
+    assert!(!mem.mem_fill(page, 0x5A, 32));
+    assert!(!mem.mem_copy(page + 0x100, page, 32));
+
+    // Drop execute and every write path agrees again — same page, same bytes.
+    let old = mem
+        .virtual_protect(page, 0x1000, protect::PAGE_READWRITE)
+        .expect("protect rw");
+    assert_eq!(old, protect::PAGE_EXECUTE_READWRITE);
+    assert!(mem.page_tlb_entry(page >> 12).expect("tlb").allow_w);
+    assert!(mem.mem_fill(page, 0x5A, 32));
+    assert_eq!(read_u32_bytes(&mem, page), 0x5A5A_5A5A);
+}
+
+fn read_u32_bytes(mem: &GuestMemory, address: u64) -> u32 {
+    let mut buf = [0_u8; 4];
+    mem.read(address, &mut buf).expect("read u32");
+    u32::from_le_bytes(buf)
+}
+
+#[test]
+fn protect_to_rx_denies_write_with_permission_error_and_keeps_fetch() {
+    let mut mem = GuestMemory::new();
+    let base = 0x1420_0000_u64;
+    mem.map(base, 0x1000, crate::RwxPerms::READ_WRITE)
+        .expect("map");
+    mem.write(base, &[0x90; 16]).expect("seed");
+
+    let old = mem
+        .virtual_protect(base, 0x1000, protect::PAGE_EXECUTE_READ)
+        .expect("protect rx");
+    assert_eq!(old, protect::PAGE_READWRITE);
+
+    let err = mem
+        .write(base, &[0xCC])
+        .expect_err("a store on an RX page must fail");
+    assert!(
+        err.to_string().contains("permission denied"),
+        "the refusal must name the permission, got: {err}"
+    );
+    // Reads and fetches still work — that is why the guest-visible symptom was
+    // "mem_read works, mem_write does not".
+    let mut buf = [0_u8; 4];
+    mem.read(base, &mut buf).expect("read on RX");
+    let mut fetched = [0_u8; 4];
+    mem.fetch_into(base, &mut fetched).expect("fetch on RX");
+    assert_eq!(fetched, [0x90; 4]);
+    assert!(
+        mem.host_span(base, 4, true).is_none(),
+        "no fast store on RX"
+    );
+}
+
+#[test]
+fn protect_from_rx_to_rw_makes_the_write_succeed() {
+    let mut mem = GuestMemory::new();
+    let base = 0x1430_0000_u64;
+    mem.map(base, 0x1000, crate::RwxPerms::new(true, false, true))
+        .expect("map RX");
+    assert!(mem.write(base, &[1, 2, 3, 4]).is_err(), "RX denies write");
+
+    let old = mem
+        .virtual_protect(base, 0x1000, protect::PAGE_READWRITE)
+        .expect("protect rw");
+    assert_eq!(old, protect::PAGE_EXECUTE_READ);
+
+    mem.write(base, &[1, 2, 3, 4]).expect("write after RX → RW");
+    let mut buf = [0_u8; 4];
+    mem.read(base, &mut buf).expect("read back");
+    assert_eq!(buf, [1, 2, 3, 4]);
+    // And the fast paths come back with the permission.
+    assert!(mem.page_tlb_entry(base >> 12).expect("tlb").allow_w);
+    assert!(mem.host_span(base, 4, true).is_some());
+}
+
+#[test]
+fn protect_partial_page_rounds_to_the_whole_page() {
+    let mut mem = GuestMemory::new();
+    let base = 0x1440_0000_u64;
+    let middle = base + 0x1000;
+    mem.map(base, 0x3000, crate::RwxPerms::READ_WRITE)
+        .expect("map");
+
+    // 32 bytes at +0x20 of the middle page: the protect is page-granular, so the
+    // whole page must become read-only, not the 32-byte span.
+    let old = mem
+        .virtual_protect(middle + 0x20, 32, protect::PAGE_READONLY)
+        .expect("protect 32 bytes");
+    assert_eq!(old, protect::PAGE_READWRITE);
+    assert!(mem.write(middle, &[1]).is_err(), "page start is read-only");
+    assert!(
+        mem.write(middle + 0xFF0, &[1]).is_err(),
+        "page end is read-only"
+    );
+    // Neighbouring pages are untouched.
+    mem.write(base, &[1]).expect("page before");
+    mem.write(base + 0x2000, &[1]).expect("page after");
+    let query = mem.virtual_query(middle);
+    assert_eq!(query.protect, protect::PAGE_READONLY);
+    assert_eq!(query.region_size, 0x1000, "one homogeneous page");
+}
+
+#[test]
+fn protect_unmapped_range_reports_invalid_address() {
+    let mut mem = GuestMemory::new();
+    let reserved = mem
+        .virtual_alloc(0, 0x1_0000, MEM_RESERVE, protect::PAGE_READWRITE)
+        .expect("reserve");
+
+    // Reserved but not committed: no protection to change.
+    let err = mem
+        .virtual_protect(reserved, 0x1000, protect::PAGE_READONLY)
+        .expect_err("reserved page");
+    assert_eq!(win32_from_cpu_error(&err), Some(ERROR_INVALID_ADDRESS));
+
+    // Nothing is mapped at all.
+    let err = mem
+        .virtual_protect(0x4000_0000, 0x1000, protect::PAGE_READONLY)
+        .expect_err("free VA");
+    assert_eq!(win32_from_cpu_error(&err), Some(ERROR_INVALID_ADDRESS));
+
+    // A range that runs off the end of its own allocation.
+    let committed = mem
+        .virtual_alloc(
+            0,
+            0x1_0000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_READWRITE,
+        )
+        .expect("commit");
+    let err = mem
+        .virtual_protect(committed + 0xf000, 0x2000, protect::PAGE_READONLY)
+        .expect_err("crosses the allocation");
+    assert_eq!(win32_from_cpu_error(&err), Some(ERROR_INVALID_ADDRESS));
+
+    // The refused calls changed nothing.
+    assert_eq!(
+        mem.virtual_query(committed + 0xf000).protect,
+        protect::PAGE_READWRITE
+    );
+    mem.write(committed + 0xf000, &[1]).expect("still writable");
+}
+
+/// The host mapping must never be tighter than the protection table.
+///
+/// `MEM_DECOMMIT` zeros the guest bytes by storing through the *host* mapping,
+/// so a page whose frame a previous `VirtualProtect(PAGE_READONLY)` tightened had
+/// to be relaxed first — the reverse order killed the process with SIGBUS
+/// (measured on macOS 26.5 / arm64, 16 KiB host pages, before this fix).
+#[test]
+fn decommit_inside_a_readonly_host_frame_does_not_fault() {
+    let mut mem = GuestMemory::new();
+    let base = mem
+        .virtual_alloc(
+            0,
+            0x1_0000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_READWRITE,
+        )
+        .expect("alloc");
+    mem.write(base, &[0xAB; 4]).expect("seed");
+    // A whole host frame's worth of guest pages at READONLY: with WIE_MPROTECT on
+    // (default) that is what drives the host frame to PROT_READ.
+    mem.virtual_protect(base, 0x4000, protect::PAGE_READONLY)
+        .expect("protect 16 KiB read-only");
+
+    mem.virtual_free(base + 0x1000, 0x1000, MEM_DECOMMIT)
+        .expect("decommit inside a read-only frame");
+
+    let mut byte = [0_u8; 1];
+    assert!(mem.read(base + 0x1000, &mut byte).is_err(), "decommitted");
+
+    // Recommit grants the write back; the host frame must be writable by then.
+    mem.virtual_alloc(base + 0x1000, 0x1000, MEM_COMMIT, protect::PAGE_READWRITE)
+        .expect("recommit");
+    mem.read(base + 0x1000, &mut byte)
+        .expect("read after recommit");
+    assert_eq!(byte[0], 0, "decommit zeroes the guest bytes");
+    mem.write(base + 0x1000, &[0x11; 8])
+        .expect("write after recommit");
+    let mut got = [0_u8; 8];
+    mem.read(base + 0x1000, &mut got).expect("read back");
+    assert_eq!(got, [0x11; 8]);
+    // The neighbour kept both its protection and its data.
+    assert!(mem.write(base, &[1]).is_err());
+    mem.read(base, &mut byte).expect("neighbour still readable");
+    assert_eq!(byte[0], 0xAB, "the neighbour kept its data");
+}
+
+/// `WIE_MPROTECT=0` must keep meaning "do not touch host protections at all" —
+/// the switch is a bisect aid, so its off-values are pinned rather than probed
+/// through the process environment (which parallel tests share).
+#[test]
+fn host_mprotect_switch_is_off_only_for_explicit_off_values() {
+    assert!(
+        super::alloc::host_mprotect_enabled_from(None),
+        "unset keeps host mprotect on"
+    );
+    assert!(super::alloc::host_mprotect_enabled_from(Some("1")));
+    assert!(
+        super::alloc::host_mprotect_enabled_from(Some("yes")),
+        "only the listed values turn it off"
+    );
+    for off in ["0", "false", "FALSE", "Off", "off"] {
+        assert!(
+            !super::alloc::host_mprotect_enabled_from(Some(off)),
+            "WIE_MPROTECT={off} must disable host mprotect"
+        );
+    }
+}
+
+// ── Every protection change bumps the memory generation ────────────────────
+//
+// The JIT's probe folds `page_key ^ mem_gen` into its slot tag and a compiled
+// block bakes the generation at compile time, so a protection change that did
+// not bump this counter is a stale tag — a memory-safety bug, not a slow path.
+// These two tests are the invariant, stated once, for every mutation entry point
+// (`jit/cpu_engine.rs` mirrors the value into `JitShared::mem_gen` and calls
+// `invalidate_tlb` for the same four calls; the store test above exercises the
+// consequence).
+
+fn assert_bumped(mem: &GuestMemory, previous: u64, what: &str) -> u64 {
+    let now = mem.generation();
+    assert!(
+        now > previous,
+        "{what} must bump the generation (was {previous}, now {now})"
+    );
+    now
+}
+
+#[test]
+fn every_protection_change_bumps_the_generation() {
+    let mut mem = GuestMemory::new();
+    let mut before = mem.generation();
+
+    mem.map(0x1460_0000, 0x2000, crate::RwxPerms::READ_WRITE)
+        .expect("map");
+    before = assert_bumped(&mem, before, "mem_map");
+
+    mem.virtual_protect(0x1460_0000, 0x1000, protect::PAGE_READONLY)
+        .expect("protect ro");
+    before = assert_bumped(&mem, before, "VirtualProtect to RO");
+
+    // Even a protect that sets the protection already in force must invalidate:
+    // the JIT cannot know the guest skipped a real change.
+    mem.virtual_protect(0x1460_0000, 0x1000, protect::PAGE_READONLY)
+        .expect("protect ro again");
+    before = assert_bumped(&mem, before, "VirtualProtect idempotent");
+
+    mem.virtual_protect(0x1460_0000, 0x1000, protect::PAGE_EXECUTE_READWRITE)
+        .expect("protect rwx");
+    before = assert_bumped(&mem, before, "VirtualProtect to RWX");
+
+    let base = mem
+        .virtual_alloc(0, 0x1_0000, MEM_RESERVE, protect::PAGE_READWRITE)
+        .expect("reserve");
+    before = assert_bumped(&mem, before, "VirtualAlloc RESERVE");
+
+    mem.virtual_alloc(base, 0x1000, MEM_COMMIT, protect::PAGE_READWRITE)
+        .expect("commit");
+    before = assert_bumped(&mem, before, "VirtualAlloc COMMIT");
+
+    mem.virtual_free(base, 0x1000, MEM_DECOMMIT)
+        .expect("decommit");
+    before = assert_bumped(&mem, before, "VirtualFree DECOMMIT");
+
+    mem.virtual_free(base, 0, MEM_RELEASE).expect("release");
+    before = assert_bumped(&mem, before, "VirtualFree RELEASE");
+
+    mem.map_image(0x1470_0000, 0x1000, crate::RwxPerms::ALL)
+        .expect("map image");
+    let _ = assert_bumped(&mem, before, "mem_map_image");
+}
+
+/// The engine-facing generation (`CpuEngine::mem_generation`, i.e.
+/// `JitShared::mem_gen`) must move with the memory it describes — a probe tag
+/// that still matches after a `VirtualProtect` would translate through stale
+/// permissions.
+#[test]
+fn engine_memory_generation_follows_protection_changes() {
+    use crate::{CpuEngine, RwxPerms};
+    let mut cpu = crate::jit::JitCpu::open_x86_64();
+    let base = 0x1480_0000_u64;
+    cpu.mem_map(base, 0x2000, RwxPerms::READ_WRITE)
+        .expect("map");
+
+    let before = cpu.mem_generation();
+    cpu.virtual_protect(base, 0x1000, protect::PAGE_READONLY)
+        .expect("protect rx loss");
+    let after = cpu.mem_generation();
+    assert!(
+        after > before,
+        "a VirtualProtect must move the engine's mem_gen (was {before}, now {after})"
+    );
+
+    cpu.virtual_protect(base, 0x1000, protect::PAGE_READWRITE)
+        .expect("protect rw");
+    let after_rw = cpu.mem_generation();
+    assert!(
+        after_rw > after,
+        "the RW restore must move it again (was {after}, now {after_rw})"
+    );
+    cpu.mem_write(base, &[1, 2, 3, 4])
+        .expect("write after RW restore");
+}

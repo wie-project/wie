@@ -12,9 +12,15 @@ use super::{
 
 /// Whether optional host mprotect dual-protection is enabled (`WIE_MPROTECT`, default on).
 fn host_mprotect_enabled() -> bool {
+    host_mprotect_enabled_from(std::env::var("WIE_MPROTECT").ok().as_deref())
+}
+
+/// Pure gate behind [`host_mprotect_enabled`], so the switch is testable
+/// without mutating the process environment under the parallel test runner.
+pub(super) fn host_mprotect_enabled_from(value: Option<&str>) -> bool {
     !matches!(
-        std::env::var("WIE_MPROTECT"),
-        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+        value,
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
     )
 }
 
@@ -86,6 +92,7 @@ impl super::GuestMemory {
         let last = page_end >> 12;
         let mut old_protect = protect::PageProtect::NoAccess;
         let mut first = true;
+        let mut previous: Vec<(u64, u64, protect::PageProtect)> = Vec::new();
         while page < last {
             match self.pages.lookup(page) {
                 Some(run) if run.state == PageState::Committed => {
@@ -100,6 +107,7 @@ impl super::GuestMemory {
                             "VirtualProtect corrupt pagemap",
                         ));
                     }
+                    previous.push((page, next, run.protect));
                     page = next;
                 }
                 Some(_) => {
@@ -120,8 +128,37 @@ impl super::GuestMemory {
         self.pages
             .set_range(page_base, size_usize, PageState::Committed, new_protect)?;
         self.bump_generation();
-        self.sync_host_protect(page_base, size_usize);
+        // The host mapping is a cache of the protection table, and it must never
+        // be *tighter* than the table: `write` stores through it, so a frame the
+        // protect failed to widen would fault the process instead of the guest.
+        // There is no partial answer here, so undo the table and report the
+        // failure — a protect that errors is recoverable; a protect that lies is
+        // not.
+        if let Err(error) = self.sync_host_protect(page_base, size_usize) {
+            self.restore_protect_runs(&previous)?;
+            self.bump_generation();
+            return Err(error);
+        }
         Ok(old_protect.to_win32())
+    }
+
+    /// Put committed runs `[(start_page, end_page, protect)]` back into the page
+    /// map — the undo half of a protection change the host mapping refused.
+    fn restore_protect_runs(
+        &mut self,
+        runs: &[(u64, u64, protect::PageProtect)],
+    ) -> Result<(), crate::CpuError> {
+        for &(start_page, end_page, page_protect) in runs {
+            let start_va = start_page.saturating_mul(PAGE_SIZE);
+            let size = end_page
+                .saturating_sub(start_page)
+                .saturating_mul(PAGE_SIZE);
+            let size_usize = usize::try_from(size)
+                .map_err(|_| va_error(ERROR_NOT_ENOUGH_MEMORY, "protect undo size"))?;
+            self.pages
+                .set_range(start_va, size_usize, PageState::Committed, page_protect)?;
+        }
+        Ok(())
     }
 
     /// `VirtualQuery` — build a real `MEMORY_BASIC_INFORMATION` for `addr`.
@@ -243,23 +280,49 @@ impl super::GuestMemory {
         }
     }
 
-    /// Optional dual protection: tighten host `mprotect` only for host-aligned
-    /// frames where every guest 4 KiB page is committed with the same R/W needs.
+    /// Make the **host mapping follow the protection table** for
+    /// `[address, address + size)`.
+    ///
+    /// Optional dual protection: tighten/widen host `mprotect` only for
+    /// host-aligned frames where every guest 4 KiB page in the frame is
+    /// committed, and derive the required host prot from those pages.
     ///
     /// Frames are relative to each arena's guest base so host pointers stay
     /// host-page aligned (soft translate: `host + (va - guest_base)`).
-    /// Correctness remains SPC; failures of `mprotect` are ignored.
-    /// Disabled with `WIE_MPROTECT=0`.
-    pub(super) fn sync_host_protect(&mut self, address: u64, size: usize) {
+    /// Correctness remains SPC; this is the layer that stops the *OS* from
+    /// refusing a store the guest was just granted. Disabled with
+    /// `WIE_MPROTECT=0`, in which case the host mapping stays at the `mmap`
+    /// default (RW) for the arena's whole life.
+    ///
+    /// # Errors
+    ///
+    /// Only one direction is fatal: a frame that **must be writable** and is
+    /// not, when the `mprotect` that would have widened it failed. `write`
+    /// stores through the host mapping, so such a frame turns a guest store into
+    /// a SIGBUS — the guest was told "writable" and the OS disagrees, which is
+    /// exactly the failure this function exists to prevent, so the protection
+    /// change it belongs to is refused instead.
+    ///
+    /// A failed **tighten** is not an error: SPC still denies the guest, and a
+    /// frame left at RW only loses defense-in-depth. Frames the arena cannot
+    /// express at host granularity (a 4 KiB-only arena, or a span that is not
+    /// host-page aligned) are likewise not an error — those frames are *never*
+    /// tightened either, because both directions pass identical alignment tests,
+    /// so they are still at the `mmap` default RW and a store is safe.
+    pub(super) fn sync_host_protect(
+        &mut self,
+        address: u64,
+        size: usize,
+    ) -> Result<(), crate::CpuError> {
         if !host_mprotect_enabled() {
-            return;
+            return Ok(());
         }
         if size == 0 {
-            return;
+            return Ok(());
         }
         let host_ps = host_page_size();
         if host_ps == 0 {
-            return;
+            return Ok(());
         }
         let host_ps_u64 = u64::try_from(host_ps).unwrap_or(PAGE_SIZE);
         let end = address.saturating_add(u64::try_from(size).unwrap_or(0));
@@ -274,12 +337,12 @@ impl super::GuestMemory {
         if self.span_all_committed_writable(address, end)
             && self.backend.span_all_frames_default_rw(address, end)
         {
-            return;
+            return Ok(());
         }
         let mut va = address;
         while va < end {
             let Some(arena_base) = self.backend.arena_guest_base_for_va(va) else {
-                // No arena covering this VA: skip host mprotect.
+                // No arena covering this VA: no host mapping to follow.
                 va = va.saturating_add(PAGE_SIZE);
                 continue;
             };
@@ -287,9 +350,25 @@ impl super::GuestMemory {
             let frame_off = align_down(off, host_ps_u64);
             let frame_guest = arena_base.saturating_add(frame_off);
             let prot = self.host_prot_for_frame(frame_guest, host_ps_u64);
-            let _ = self
+            // What the OS is believed to have for this frame right now. `None` is
+            // the `mmap` default (RW), which is the only thing an absent cache
+            // entry can mean (see `MmapArena::host_prot`).
+            let already_writable = self
                 .backend
-                .mprotect_guest_range(frame_guest, host_ps, prot);
+                .frame_host_prot(frame_guest)
+                .is_none_or(|current| current & HOST_PROT_WRITE != 0);
+            if self
+                .backend
+                .mprotect_guest_range(frame_guest, host_ps, prot)
+                .is_err()
+                && prot & HOST_PROT_WRITE != 0
+                && !already_writable
+            {
+                return Err(va_error(
+                    ERROR_INVALID_ADDRESS,
+                    "host mprotect cannot make a writable guest page writable",
+                ));
+            }
             let next = frame_guest.saturating_add(host_ps_u64);
             if next <= va {
                 va = va.saturating_add(PAGE_SIZE);
@@ -297,6 +376,7 @@ impl super::GuestMemory {
                 va = next;
             }
         }
+        Ok(())
     }
 
     /// True when every guest page in `[address, end)` is committed and writable.
@@ -486,6 +566,7 @@ impl super::GuestMemory {
             owns_host: true,
         })?;
         self.bump_generation();
+        self.sync_host_protect(base, size_usize)?;
         Ok(base)
     }
 
@@ -512,6 +593,7 @@ impl super::GuestMemory {
             owns_host: true,
         })?;
         self.bump_generation();
+        self.sync_host_protect(base, size_usize)?;
         Ok(base)
     }
 
@@ -586,6 +668,20 @@ impl super::GuestMemory {
         self.pages
             .set_range(page_base, size_usize, PageState::Committed, protect)?;
         self.bump_generation();
+        // A commit *grants* access where the page map previously denied it, so
+        // the host mapping has to be brought up to the same rights before the
+        // guest can store there (a frame a previous protect tightened to R would
+        // otherwise fault the store). Same undo-or-report rule as a protect.
+        if let Err(error) = self.sync_host_protect(page_base, size_usize) {
+            self.pages.set_range(
+                page_base,
+                size_usize,
+                PageState::Reserved,
+                protect::PageProtect::NoAccess,
+            )?;
+            self.bump_generation();
+            return Err(error);
+        }
         Ok(page_base)
     }
 
@@ -622,6 +718,7 @@ impl super::GuestMemory {
         // and be Reserved or Committed (free is invalid).
         let mut page = page_base >> 12;
         let last = page_end >> 12;
+        let mut previous: Vec<(u64, u64, protect::PageProtect)> = Vec::new();
         while page < last {
             match self.pages.lookup(page) {
                 Some(run)
@@ -630,6 +727,9 @@ impl super::GuestMemory {
                     let next = run.end_page.min(last);
                     if next <= page {
                         return Err(va_error(ERROR_INVALID_ADDRESS, "DECOMMIT corrupt pagemap"));
+                    }
+                    if run.state == PageState::Committed {
+                        previous.push((page, next, run.protect));
                     }
                     page = next;
                 }
@@ -642,13 +742,24 @@ impl super::GuestMemory {
             }
         }
 
-        self.backend.discard_range(page_base, size_usize)?;
+        // Order matters, and it is the opposite of the obvious one. `discard_range`
+        // zeros the guest bytes by storing through the *host* mapping, so the host
+        // frames must be writable before it runs. Marking the span Reserved first
+        // then syncing does that: `host_prot_for_frame` answers RW for a reserved
+        // page. Zeroing first and syncing afterwards is a process kill (measured:
+        // SIGBUS) whenever a previous `VirtualProtect(PAGE_READONLY)` tightened the
+        // frame — the decommit would store into PROT_READ host pages.
         self.pages.set_range(
             page_base,
             size_usize,
             PageState::Reserved,
             protect::PageProtect::NoAccess,
         )?;
+        if let Err(error) = self.sync_host_protect(page_base, size_usize) {
+            self.restore_protect_runs(&previous)?;
+            return Err(error);
+        }
+        self.backend.discard_range(page_base, size_usize)?;
         self.bump_generation();
         Ok(())
     }
