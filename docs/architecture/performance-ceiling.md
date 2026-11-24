@@ -1560,6 +1560,10 @@ numbers were real; the doc's row was wrong three times over.
 
 ### 11.6a The memory-lowering default was the losing arm (measured, fixed)
 
+> The wider audit this came out of — every copy and per-element lock found on
+> the present, handler, lowering and SIMD paths, with what landed and what is
+> still open — is `docs/architecture/copy-and-lock-audit.md`.
+
 `WIE_JIT_MEM` shipped with **pin** as its default, justified in
 `config.rs` by a DOOM Retro startup counter: data-pin IR cut host load-helper
 calls 89 % there (21 M → 2.4 M). Helper *count* is not helper *time*, and the

@@ -13,7 +13,7 @@ The "JIT vs rendering" limitation is not a JIT problem and not a rendering probl
 
 On top of that sit three independent ceilings:
 
-1. **The JIT is ~6× off target and its accepted fix was never built.** ADR-0002 (direct block-to-block register hand-off, SSA rflags) is marked *Accepted, default on* — in code the `WIE_JIT_DIRECT_REGS` gate is parsed, defaults on, and **has zero call sites**; no x19–x28 mapping exists in `jit/lower/*`; every block boundary and every chain hop still pays the full 16-GPR + 16-XMM `JitCtx` round trip (`pipeline.rs:1181–1328`, `emit.rs:206–237`). Same story for ADR-0001's zero-copy pitch (`WIE_SURFACE_PAD` and the 64-px pad: zero hits in the workspace; `upload_source` allocates a fresh pack buffer per frame, `present_wgpu.rs:669`).
+1. **The JIT is ~6× off target and its accepted fix was never built.** ADR-0002 (direct block-to-block register hand-off, SSA rflags) is marked *Accepted, default on* — in code the `WIE_JIT_DIRECT_REGS` gate is parsed, defaults on, and **has zero call sites**; no x19–x28 mapping exists in `jit/lower/*`; every block boundary and every chain hop still pays the full 16-GPR + 16-XMM `JitCtx` round trip (`pipeline.rs:1181–1328`, `emit.rs:206–237`). ADR-0001's zero-copy pitch is **resolved, in the opposite direction**: the 64-px pad was never needed (`Queue::write_texture` requires no `bytes_per_row` alignment), so it is retired rather than implemented, `WIE_SURFACE_PAD` is deleted, and `upload_source` now borrows the frame for a region as well as a full frame instead of packing (`present_wgpu.rs`).
 2. **The ISA coverage cliff is fatal, not degrading.** One unimplemented mnemonic (SDL2 or a game's hand-coded SSE3/SSSE3/SSE4/AVX, or x87 in a legacy CRT) kills the session (`exec/mod.rs:654–657`). There is no x87 at all.
 3. **The game-subsystem surface is total absence, not gaps:** no audio backend anywhere (dsound/xaudio2 are not even name-recognized → load failure), no D3D11/DXGI, no XInput/DirectInput/RawInput, D3D9 at 51/119 device methods on a host-CPU software rasterizer, OpenGL fragment shading via a per-pixel tree-walking interpreter.
 
@@ -41,7 +41,7 @@ Two accepted ADRs and the status doc describe mitigations that are **not in the 
 |---|---|---|
 | ADR-0002 direct register ABI, "default on" | `config.rs:275-278, 408-413` | gate parsed, `direct_regs_enabled()` dead code (no call sites), no x19–x28 mapping in `jit/lower/*` |
 | ADR-0002 SSA rflags | `lower/insn.rs:89-…`, `lower/flags.rs:152-258` | flags are lazy but packed-u64; every consume re-unpacks bits |
-| ADR-0001 64-px padded width → always zero-copy upload | `present/mod.rs:292, 352-362` | unpadded; `WIE_SURFACE_PAD` does not exist (0 grep hits) |
+| ADR-0001 64-px padded width → always zero-copy upload | `present/mod.rs:surface_stride`, `present_wgpu.rs:upload_source` | **retired 2026-11** — the premise (a 256-byte `bytes_per_row` requirement) is false on the queue path, so surfaces are pitched at the logical width and both full frames and regions upload as a borrow. Padded pitch in fact *defeated* wgpu's single-memcpy fast path |
 | ADR-0001 reused `WgpuPresenter` upload scratch | `present_wgpu.rs:669` | fresh `vec![0_u8; h*padded]` per region/unaligned upload |
 | status.md "steady-state GDI/D3D9 frames are zero-alloc/zero-copy" | — | true only for widths ≡ 0 mod 64 and when the spare-buffer round trip doesn't miss |
 
