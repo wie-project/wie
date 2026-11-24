@@ -2,6 +2,18 @@
 //!
 //! CPU backends: see [`wie_cpu`] and `docs/WIE.md` (Cranelift JIT default; iced interpreter).
 
+// Machine-checked gate for this crate's *production* code (CLAUDE.md "Lint
+// policy", plan T1.2): no `unwrap`/`expect`/`panic`. This is the run loop: a
+// panic here ends the guest session with no HRESULT and no unwind. Test builds
+// are exempt on purpose. `indexing_slicing`/`as_conversions` are NOT gated — the
+// 14 and 72 measured production sites are fixed-offset writes into guest-stub
+// templates and bit-width arithmetic, where the checked spelling is longer
+// without being safer.
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 mod asm_utils;
 mod guest_callback;
 mod guest_heap_accel;

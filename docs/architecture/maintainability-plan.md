@@ -39,7 +39,7 @@ Item-by-item, with the check that shows it:
 | T0.1–T0.7 | **DONE** | `CLAUDE.md` lint + unsafe + dense-API sections rewritten; `CONTRIBUTING.md` rule 5 states cap 2000/target 1000; `DATA_TABLES` is empty; RUNBOOK table is now test-enforced (T1.3); `notepad-support-plan.md` carries a superseded banner |
 | T0.2 unsafe table | **DONE, re-drifted, re-fixed** | the table was corrected to 46/17 in the first pass; at `a4ba020` the count is 145 `wie-cpu` / 43 `wie-cli` / 17 `wie-winapi`. Corrected in `CLAUDE.md` again on 2026-11-23 |
 | T1.1 | **DONE** | `[lints] workspace = true` in all five crates (`grep -c '\[lints\]' crates/*/Cargo.toml`) |
-| T1.2 | **DECIDED — option A** | no `[workspace.lints.clippy]` anywhere; clippy runs without `-D warnings` in both `check.sh:554` and `ci.yml:97`. The workspace is nevertheless 0-warning, so option B is now a *scope* decision, not a cleanup |
+| T1.2 | **DONE — curated `[workspace.lints.clippy]` + four crate-root denies** | `todo`/`unimplemented`/`dbg_macro`/`print_stdout` deny workspace-wide; `unwrap_used`/`expect_used`/`panic` deny in `wie-pe`/`wie-winapi`/`wie-runtime`/`wie-cli`; `indexing_slicing` in `wie-pe`/`wie-cli`; `as_conversions` in `wie-pe`. Remainder: `wie-cpu`'s 63 panic-family sites under `src/jit/**`, `indexing_slicing` (198+242 production sites) and `as` casts outside `wie-pe`. Measured, not grepped |
 | T1.3 | **DONE** | `crates/wie-runtime/tests/runbook_knobs.rs` asserts bidirectional equality (`live ⊆ documented`, `documented ⊆ live ∪ {RUST_LOG}`) |
 | T1.4 | **DONE** | `check_deps()` in `scripts/check.sh` compares `cargo metadata`'s internal edges against `EXPECTED_EDGES` (7 normal, 0 dev — 8 until ADR-0006 decision 3 removed `wie-cli -> wie-winapi`) |
 | T2.1–T2.8, T2.10 | **DONE** | see each item |
@@ -169,9 +169,11 @@ Highest value per byte in this document. Each of these was verified against the 
 checks from what is convention, and names the one table that binds
 (`[workspace.lints.rust]`, opted into by all five crates).
 
-`unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `as_conversions`, `clippy::pedantic`. There is no `[workspace.lints.clippy]` section at all. **0 of 6 are enforced.** The paragraph reads as "this is what you must write to"; it is unbacked.
+`unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `as_conversions`, `clippy::pedantic`. At the time there was no `[workspace.lints.clippy]` section at all, and **0 of 6 were enforced**. The paragraph read as "this is what you must write to"; it was unbacked.
 
-The per-site `#[allow(clippy::expect_used)]` markers scattered through test code suppress lints that were never enabled.
+The per-site `#[allow(clippy::expect_used)]` markers scattered through test code suppressed lints that were never enabled.
+
+Two of the six are still unenforced and the section now says so per crate; the other four are denied **as of T1.2** (`unwrap_used`/`expect_used`/`panic` in four crates, `indexing_slicing` in two, `as_conversions` in one) — see that item for the measured counts.
 
 **Change.** Rewrite the paragraph to describe only what is enforced, and move the aspirational list into CONTRIBUTING.md under an explicit "aspirational, not enforced" heading.
 **Trade-off.** none. Documentation only.
@@ -306,29 +308,88 @@ The existing 11 `#[expect(unsafe_code)]` attributes in `wie-cli` become *fulfill
 
 ### T1.2 — Decide whether to add `[workspace.lints.clippy]`
 
-**Status: DECIDED — option A, and the gap it left is now smaller.** No
-`[lints.clippy]` table exists in any manifest, `scripts/check.sh:554` and
-`.github/workflows/ci.yml:97` both run clippy without `-D warnings`, and clippy
-is therefore still advisory. Two things changed since: the workspace is
-**clippy-clean with zero warnings** (so option B would no longer start with
-thousands of lines of churn), and `wie-cpu` grew the lock convention T4.6 asked
-for — `crates/wie-cpu/src/lock.rs` — which makes `clippy::unwrap_used` affordable
-*there* first. Option B scoped to `wie-cpu` is now the cheap experiment; it was
-not before.
+**Status: DONE — a curated table, measured per crate, with one stated remainder.**
+The table is in `[workspace.lints.clippy]` plus four per-crate
+`#![cfg_attr(not(test), deny(…))]` crate roots; CLAUDE.md's "Lint policy" section
+is the operator's view of it. Both `cargo clippy --workspace --all-targets` and
+`cargo clippy … -- -D warnings` are silent, and the denies are enforced by the
+compiler, not by a `-D warnings` someone remembers to pass.
 
-This is the one item in this document that is a genuine policy choice, not a mechanical fix. CLAUDE.md and CONTRIBUTING rule 4 currently say clippy is advisory and that natural Rust beats lint-silencing — a defensible position.
+**The numbers below were re-measured, because the ones this section carried were
+grep counts and were wrong by an order of magnitude.** The old text said option B
+would light up "547 `unwrap`/`expect`/`panic` sites in `wie-cpu`, 508 in
+`wie-runtime`, 2,487 in `wie-winapi`". Reproduction:
 
-**Options.**
+| reading | `wie-pe` | `wie-cpu` | `wie-winapi` | `wie-runtime` | `wie-cli` |
+| --- | --- | --- | --- | --- | --- |
+| `grep -rc 'unwrap'` (`*.rs`, HEAD) | 10 | 317 | 2,246 | 261 | 131 |
+| `grep -c '\.unwrap()'` | 0 | 17 | 94 | 17 | 60 |
+| `clippy::unwrap_used`, `--all-targets` | 0 | 16 | 63 | 17 | **0** |
 
-| Option | Gain | Cost |
-| --- | --- | --- |
-| **A. Keep clippy advisory; delete the aspirational lint list from CLAUDE.md** (recommended) | docs match reality; zero churn | no new enforcement |
-| B. Add a small curated table — `unwrap_used`, `indexing_slicing`, `as_conversions` — as `[lints.clippy]` table entries | three real hazards become machine-checked | lights up across 3 previously-unlinted crates: 547 `unwrap`/`expect`/`panic` sites in `wie-cpu`, 508 in `wie-runtime`, 2,487 in `wie-winapi`. One-off diff of thousands of lines |
-| C. Full table per CLAUDE.md + `-D warnings` | matches the documented intent | not achievable in one change; ~3,700 sites |
+The 2,487 was the first row: mostly `unwrap_or_else(|e| e.into_inner())` — the
+poison-tolerant idiom T4.6 asked for, i.e. the *fix* was being counted as the
+problem. The `wie-cli` gap between rows 2 and 3 is the second thing a grep cannot
+see: its test modules already carried `#[allow(clippy::unwrap_used)]`, so 60
+`.unwrap()` calls yielded 0 lint hits.
 
-**Recommend A now, B as a follow-up scoped to `wie-pe` and `wie-runtime` first** (the two smallest). Option B on `wie-winapi` alone is a multi-week project and would stall every other item here.
+**Measured fallout, per lint and crate** (`cargo clippy --workspace --all-targets
+--message-format=json -- -W clippy::<lint>`; production-only in parentheses,
+measured by dropping `--all-targets`):
 
-Note that `unwrap` counts are *not* automatically violations: `crates/wie-cpu` shows 547 sites of which the large majority are `RwLock::read().unwrap()` where a poison-tolerant idiom (`unwrap_or_else(|e| e.into_inner())`, `shared.rs:928`) is the local convention. B needs a per-crate decision about lock-poisoning first — see T4.6.
+| lint | `wie-pe` | `wie-cpu` | `wie-winapi` | `wie-runtime` | `wie-cli` | classification |
+| --- | --- | --- | --- | --- | --- | --- |
+| `unwrap_used` | 0 (0) | 16 (1) | 63 (0) | 17 (0) | 0 (0) | (c) test-only everywhere but `wie-cpu`; its 16 are 15 `#[cfg(test)]` + 1 in `jit/pipeline.rs` |
+| `expect_used` | 0 (0) | 27 (0) | 279 (4) | 323 (0) | 22 (2) | (c) except 4 `wie-winapi` and 2 `wie-cli` sites — (a) invariants |
+| `panic` | 0 (0) | 20 (0) | 65 (2) | 106 (0) | 1 (0) | (c) except `lock_order.rs`'s 2 — (a) deliberate detectors |
+| `indexing_slicing` | 69 (1) | 463 (198) | 1021 (242) | 42 (14) | 10 (0) | (b)+(d): guest-buffer reads after a bounds check; `wie-runtime`'s 14 are `copy_from_slice` into fixed templates |
+| `as_conversions` | 1 (0) | 935 (441) | 689 (323) | 220 (72) | 92 (46) | (d): bit-width arithmetic (`product as u64 & 0xffff`) |
+| `todo` / `unimplemented` / `dbg_macro` | 0 | 0 | 0 | 0 | 0 | free |
+| `print_stdout` | 0 | 0 | 0 | 0 | 46 (23) | (c)+(a): the CLI's product |
+| `pedantic` (group) | 61 | 1,276 | 5,510 | 1,047 | 469 | (d): 8,363 workspace-wide; `doc_markdown` 2,934 + `missing_errors_doc` 1,844 are the bulk |
+
+T4.6's ceiling holds exactly: the bare lock
+`.{lock,read,write}().{unwrap,expect}()` count is still **14**, every one under
+`jit/tests/**`, and 7 of those are also `unwrap_used` hits (the other 7 use
+`expect`). No *production* lock `unwrap` survives anywhere in the workspace.
+
+**Decision — B, maximal where the diff stays reviewable.** Enforced by the
+compiler: `todo`, `unimplemented`, `dbg_macro` and `print_stdout` workspace-wide
+(`deny`), plus `unwrap_used`/`expect_used`/`panic` in `wie-pe`, `wie-winapi`,
+`wie-runtime` and `wie-cli`, `indexing_slicing` in `wie-pe` and `wie-cli`, and
+`as_conversions` in `wie-pe`. Declined, with the counts above as the reason:
+`pedantic` (never — style, ~8,000 sites), `indexing_slicing` in `wie-cpu`/
+`wie-winapi` (198 + 242 production sites), `as_conversions` outside `wie-pe` (882
+production sites).
+
+**Why per-crate entries live in source, not in manifests.** This section assumed
+per-crate `[lints.clippy]` tables were the staged-rollout lever. They are not:
+
+```
+$ # crates/wie-pe/Cargo.toml, with [lints] workspace = true plus [lints.clippy]
+error: failed to parse manifest
+  cannot override `workspace.lints` in `lints`, either remove the overrides or
+  `lints.workspace = true` and manually specify the lints
+```
+
+Cargo makes inheritance and override mutually exclusive, so a manifest-level
+per-crate table would have to restate the 11-line `[workspace.lints.rust]` block —
+the duplication T1.1 exists to prevent. The two working shapes are therefore
+"workspace table, all five crates" (all-or-nothing) and "crate root, in source".
+The panic family takes the second because `wie-cpu` cannot pass it yet.
+
+**Stated remainder.** `wie-cpu` denies none of the panic family: 16 + 27 + 20 =
+63 sites, split **39 under `src/jit/**`** (the subtree a concurrent change was
+rewriting, so it was out of scope by construction) and **24 in
+`benches/jit_hot_paths.rs`** (23 `expect` + 1 `panic`; editable, but pointless to
+clean while the crate cannot pass the lint anyway). 36 of the 39 are
+`#[cfg(test)]`; the three that matter are all in `jit/pipeline.rs` (1 `unwrap`,
+2 `expect`), so the fix is smaller than the count suggests. That is an afternoon's
+work once the subtree settles — and then all three lints move into the workspace
+table, where the other four crates' crate-root deny lines disappear.
+
+**Reversibility.** one Cargo.toml block and four crate-root attribute blocks; the
+three `#[expect]`s it made necessary (six sites, all labelled with a `reason`)
+disappear with the code they exempt.
 
 ### T1.3 — Make the RUNBOOK knob table self-checking
 
@@ -848,7 +909,8 @@ release build, micro-suite) and `Non-macOS compile check`
 the `winapi-port` policy step (it runs only through `./scripts/check.sh`) and the
 `long_loop` budget, which the section below argues should stay local.
 
-Running on push and PR: fmt, file-sizes, clippy (advisory), `make micro-exes`, `fetch.sh notepad`, nextest, release build, **4 micro-suite categories** (~14 of ~70 exes).
+Running on push and PR: fmt, file-sizes, clippy (partly a gate since T1.2 — the
+deny-level entries fail the step), `make micro-exes`, `fetch.sh notepad`, nextest, release build, **4 micro-suite categories** (~14 of ~70 exes).
 
 Local-only (`./scripts/check.sh` runs the full sweep): `--matrix` (`WIE_JIT_MEM=slow/pin`, `WIE_CPU=iced`) and the `long_loop` timing budget. Not in CI: `scripts/notepad-scenario.sh` (the only paint-path check), `bench.yml` (`workflow_dispatch` only). Note the script layer was consolidated 2026-10-01 from 15 scripts to 6 — `check-file-sizes.sh` and `check-deps.sh` are now functions inside `scripts/check.sh` (run one with `--only file-sizes` / `--only dep-direction`), and the 40 s GUI/bench harnesses were removed, so there is now **no automated perf-regression threshold** (recorded in `docs/RUNBOOK.md`).
 

@@ -133,6 +133,13 @@ pub struct Scope;
 /// In debug builds, when `lock` outranks a lock already held (an inversion) or
 /// is already held by this thread (a double lock).
 #[cfg(debug_assertions)]
+// The panic *is* the mechanism: `enter` is the violation detector T4.4 installed
+// to convert a deadlock into a diagnostic, and debug-only assertions are exactly
+// what `clippy::panic` should not police.
+#[expect(
+    clippy::panic,
+    reason = "debug-only lock-order violation detector; panicking is the diagnostic"
+)]
 #[must_use = "dropping the scope immediately records nothing; keep it alive as long as the lock is held"]
 pub fn enter(lock: Lock) -> Scope {
     let held = HELD.with(Cell::get);

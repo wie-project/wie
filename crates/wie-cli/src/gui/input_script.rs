@@ -249,16 +249,28 @@ fn execute_real_steps(handle: &GuestHandle, hwnd: u64, steps: &[ScriptStep]) {
                     tracing::warn!(target: "wiegui", "snapshot: no frame");
                     continue;
                 };
-                let file = std::fs::File::create(path).expect("snapshot file");
+                // A failed snapshot is a scripting miss, not a reason to take
+                // the guest window down: warn and keep driving the script, the
+                // same way the two arms above do. (`clippy::expect_used` is
+                // denied in this crate's production code.)
+                let file = match std::fs::File::create(path) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        tracing::warn!(target: "wiegui", "snapshot {path}: {error}");
+                        continue;
+                    }
+                };
                 let mut writer = std::io::BufWriter::new(file);
-                crate::bmp::write_bmp(
+                if let Err(error) = crate::bmp::write_bmp(
                     &mut writer,
                     frame.width,
                     frame.height,
                     frame.stride,
                     &frame.pixels,
-                )
-                .expect("snapshot bmp");
+                ) {
+                    tracing::warn!(target: "wiegui", "snapshot bmp {path}: {error}");
+                    continue;
+                }
                 tracing::info!(target: "wiegui", "snapshot written to {path}");
             }
         }

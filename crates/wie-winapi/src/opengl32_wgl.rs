@@ -170,6 +170,10 @@ pub(crate) fn handle_wgl_get_pixel_format(
 /// (`crate::gdi32::resolve_dest_info`); an unresolvable DC falls back to the
 /// topmost top-level window. With no window at all the swap is a silent
 /// no-op — still TRUE, so the guest's present loop keeps running.
+#[expect(
+    clippy::expect_used,
+    reason = "`ensure_surface` on the line below creates this hwnd's surface, and `surface`/`surface_mut` cannot drop it; the three lookups are the same invariant stated once"
+)]
 pub(crate) fn handle_wgl_swap_buffers(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;

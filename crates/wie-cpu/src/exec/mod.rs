@@ -124,11 +124,28 @@ static DEGRADE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
 
 /// Total fallback-executed instructions (the Wave 4 coverage metric).
 static DEGRADED_INSNS: AtomicU64 = AtomicU64::new(0);
-/// Mnemonic debug names already traced (first occurrence per mnemonic).
-static DEGRADED_SEEN: LazyLock<Mutex<ahash::HashSet<u32>>> = LazyLock::new(|| {
-    use ahash::HashSetExt;
-    Mutex::new(ahash::HashSet::new())
-});
+
+/// One bit per `Mnemonic`, set when that mnemonic's first degrade has been
+/// traced.
+///
+/// This is a **per-instruction** path: every degraded instruction goes through
+/// [`degrade_fallback`], so the "trace once per mnemonic" latch must not be a
+/// global mutex. It used to be one (`Mutex<ahash::HashSet<u32>>`), which meant
+/// a guest full of a mnemonic nobody implements serialised every thread on one
+/// lock to re-discover a bit it had already set — the lock was taken ~20× per
+/// microsecond on `degrade_test.exe` (a loop of `fsin`, which neither the JIT
+/// nor the interpreter implements).
+///
+/// The bitset keeps the exactly-once property that the `HashSet::insert`
+/// boolean provided: `fetch_or` returns the previous word, so exactly one
+/// caller per mnemonic observes its bit clear and emits the warning. iced 1.21
+/// has 1894 `Mnemonic` variants (`INVALID = 0` … 1893), so 32 words cover the
+/// whole enum with headroom; a variant beyond that range falls back to
+/// "always log" rather than being silently suppressed.
+static DEGRADED_SEEN: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+
+/// Bits in [`DEGRADED_SEEN`].
+const DEGRADED_SEEN_BITS: u32 = 64 * 32;
 
 /// Total degrade-fallback executions, for the runtime profile report.
 #[must_use]
@@ -136,10 +153,22 @@ pub fn degraded_insn_count() -> u64 {
     DEGRADED_INSNS.load(Ordering::Relaxed)
 }
 
-type DegradedSeen = ahash::HashSet<u32>;
-
-fn degrade_locked_seen() -> MutexGuard<'static, DegradedSeen> {
-    crate::lock::lock_unpoisoned(&DEGRADED_SEEN)
+/// Record `mnemonic` as traced, returning `true` only for the caller that set
+/// its bit (i.e. the one that must emit the warning).
+pub(crate) fn degrade_first_sighting(mnemonic: Mnemonic) -> bool {
+    let idx = mnemonic as u32;
+    if idx >= DEGRADED_SEEN_BITS {
+        // Unreachable with iced's current enum; logging again is the safe
+        // failure direction (a duplicate line, never a missing one).
+        return true;
+    }
+    let word = usize::try_from(idx / 64).unwrap_or(0);
+    let bit = 1_u64 << (idx % 64);
+    // Relaxed: this latch is a diagnostic. Exactly-once comes from `fetch_or`
+    // returning the previous word, not from any ordering against other state.
+    DEGRADED_SEEN
+        .get(word)
+        .is_some_and(|w| w.fetch_or(bit, Ordering::Relaxed) & bit == 0)
 }
 
 pub(crate) fn step(
@@ -760,8 +789,7 @@ fn execute_one(
 fn degrade_fallback(instr: &Instruction, other: Mnemonic) -> Result<(), StepExecError> {
     if *DEGRADE_ENABLED {
         DEGRADED_INSNS.fetch_add(1, Ordering::Relaxed);
-        let mut seen = degrade_locked_seen();
-        if seen.insert(other as u32) {
+        if degrade_first_sighting(other) {
             tracing::warn!(
                 target: "wiecpu",
                 ip = format_args!("{:#x}", instr.ip()),

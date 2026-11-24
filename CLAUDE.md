@@ -21,6 +21,8 @@ cargo build -p wie-cli --release
 cargo fmt --all
 cargo clippy --workspace --all-targets            # what the gate runs
 cargo clippy --workspace --all-targets -- -D warnings   # stricter; worth running before a PR
+# `deny`-level entries in [workspace.lints.clippy] and the crate-root lints fail
+# both forms regardless of -D warnings; see "Lint policy" below.
 cargo nextest run --workspace
 cargo nextest run -p wie-cpu <test_name>    # single test
 
@@ -56,38 +58,85 @@ crates opt in**, so `unsafe_code = "deny"`, `unused_imports`,
 `unreachable_pub`, `elided_lifetimes_in_paths`, `explicit_outlives_requirements`
 warn. Doc comments on `unsafe` sites are a review rule; these denies are not.
 
-*Clippy.* Still **advisory**. There is no `[workspace.lints.clippy]` section in
-any manifest, and both `scripts/check.sh` (step 5 of 9) and
-`.github/workflows/ci.yml` run `cargo clippy --workspace --all-targets` without
-`-D warnings`. `unwrap_used`, `expect_used`, `panic`, `indexing_slicing`,
-`as_conversions` and `pedantic` are therefore not declared and not denied, and
-the `#[allow(clippy::…)]` / `#[expect(clippy::…)]` markers under `tests/` are
-inert — they document intent and enforce nothing.
+*Clippy.* Now **partly enforced, and the split is by crate** — so measure
+before quoting any of it as a gate. Two mechanisms, because cargo forbids mixing
+them: a manifest may not both inherit `[lints] workspace = true` and declare its
+own `[lints.clippy]` (`error: cannot override workspace.lints in lints`), so
+`[workspace.lints.clippy]` is all-or-nothing across all five crates.
+
+*Workspace table — all five crates, every target.* `todo`, `unimplemented`,
+`dbg_macro` and `print_stdout`, all `deny`. The first three measure 0 flagged
+sites in every crate, test code included; `print_stdout` measures 0 in the four
+library crates, so the whole table costs the diff of one manifest block. Its one
+exception is `wie-cli`, stated as
+`#![expect(clippy::print_stdout, reason = …)]` at its crate root because writing
+the report to stdout is that crate's product.
+
+*Per-crate, in source.* `#![cfg_attr(not(test), deny(…))]` at the top of each
+`lib.rs`, which is where the panic family lives — `wie-cpu` still measures 63
+sites (39 under `src/jit/**`, 24 in `benches/jit_hot_paths.rs`) and so cannot be
+carried by a workspace entry:
+
+| lint | `wie-pe` | `wie-cpu` | `wie-winapi` | `wie-runtime` | `wie-cli` |
+| --- | --- | --- | --- | --- | --- |
+| `unwrap_used` / `expect_used` / `panic` | deny | — | deny | deny | deny |
+| `indexing_slicing` | deny | — | — | — | deny |
+| `as_conversions` | deny | — | — | — | — |
+
+(The four workspace-table lints deny in all five crates, which is why they are
+not repeated in the columns.)
+
+`not(test)` because an assertion in a test is *supposed* to panic. That is also
+why the 69 `#[allow(…)]` mentions of the panic family that sit on `mod tests`
+(59 `expect_used`, 8 `unwrap_used`, 2 `panic`) are now redundant rather than
+load-bearing: they neither need to be added nor removed. A legitimate production exception is
+`#[expect(clippy::…, reason = "…")]`, never `#[allow]` — `expect` fails the build
+when the site stops firing, so the annotation cannot rot. There are six, in
+three places: two `panic!`s in `lock_order.rs` (the debug-only violation
+detector), three `.expect("surface ensured")` in `opengl32_wgl.rs`, one
+`.expect("device presence checked above")` in `dinput/device.rs`.
+
+**What is still convention, and the number that decides it.** Flagged sites,
+counted by running the lint (`cargo clippy --workspace --all-targets -- -W
+clippy::<lint>`) — `--all-targets` total outside parentheses, production-only
+inside. A grep count and a lint count are different numbers here, often by 4×:
+
+| lint | `wie-pe` | `wie-cpu` | `wie-winapi` | `wie-runtime` | `wie-cli` | status |
+| --- | --- | --- | --- | --- | --- | --- |
+| `unwrap_used` | 0 (0) | 16 (1) | 63 (0) | 17 (0) | 0 (0) | gated except `wie-cpu` |
+| `expect_used` | 0 (0) | 27 (0) | 279 (4) | 323 (0) | 22 (2) | gated except `wie-cpu` |
+| `panic` | 0 (0) | 20 (0) | 65 (2) | 106 (0) | 1 (0) | gated except `wie-cpu` |
+| `indexing_slicing` | 69 (1) | 463 (198) | 1021 (242) | 42 (14) | 10 (0) | `wie-cpu`, `wie-winapi`, `wie-runtime` convention |
+| `as_conversions` | 1 (0) | 935 (441) | 689 (323) | 220 (72) | 92 (46) | all but `wie-pe` convention |
+| `pedantic` (group) | 61 | 1,276 | 5,510 | 1,047 | 469 | **never** — 8,363 workspace-wide; `doc_markdown` 2,934 and `missing_errors_doc` 1,844 are the bulk, and they are style |
+
+The remainders are stated, not silent: `wie-cpu`'s 16/27/20 panic-family sites are
+39 under `src/jit/**` (the JIT rewrite in flight — re-check when it lands) and 24
+in its `benches/jit_hot_paths.rs`, which no workspace table could exempt;
+`indexing_slicing` is 1,021 + 198 production sites in `wie-winapi`/`wie-cpu`,
+overwhelmingly guest-buffer reads after an explicit bounds check, and gating them
+would mean more `#[expect]`s than lines of code. `.expect()` in tests remains
+legal everywhere.
 
 **The whole machine-checked set, in one place:** `cargo fmt --check`, the
 2000-line file cap, the crate-dependency-direction check, the `winapi-port`
-boundary check, the `long_loop` timing budget, the RUNBOOK-knob equality test —
-and the rustc lints above. Everything else in this file is convention.
+boundary check, the whole-state binding budget, the `long_loop` timing budget,
+the RUNBOOK-knob equality test, the rustc lints above, and the clippy entries in
+this section. Everything else in this file is convention.
 
-**Clippy is nevertheless clean, and that is new.** `cargo clippy --workspace
---all-targets` reports **zero warnings** at `a4ba020`, on a full rebuild of a pristine
-extraction (the commit that did that work records 3 before it). Two consequences: a new warning is now a signal rather than noise, and a
-curated `[workspace.lints.clippy]` table would no longer start with a
-thousands-of-lines diff. `wie-cpu` also grew the lock convention that made
-`unwrap_used` unimplementable before — `crates/wie-cpu/src/lock.rs` has
-`lock_unpoisoned` / `read_unpoisoned` / `write_unpoisoned`, used at 75 sites, with
-14 bare lock `unwrap`/`expect` sites left and all of them under `jit/tests/**`.
-Adding the gate crate-by-crate, starting with `wie-cpu`, is now a cheap
-experiment instead of an unbounded one.
+**Clippy is also clean, which is what makes the above affordable.** `cargo
+clippy --workspace --all-targets` reports **zero warnings** at `a4ba020`, on a
+full rebuild of a pristine extraction (the commit that did that work records 3
+before it). A new warning is therefore a signal rather than noise, and the table
+above is red-line enforcement: `deny` fails the build even though `check.sh` and
+CI invoke clippy without `-D warnings`.
 
-**What the project intends (convention, reviewer-enforced):** no
-`unwrap`/`expect`/`panic`/`unreachable`/`todo`/`unimplemented`; no
-`indexing_slicing`; no `as_conversions`; no cast lints; no `clippy::pedantic`;
-`unsafe` confined to `wie-cpu`, `wie-cli`'s AppKit FFI and `wie-winapi`'s two
-annotated modules. Write to that standard — use `?`/`ok_or_else`, `.get()`, and
-`u64::from(x)`/`try_from`, and keep `#[allow(...)]` escapes rare
-(CONTRIBUTING.md) — but do **not** assume a build failure will catch a violation,
-and do not describe it in review as if CI enforces it.
+**Still convention (reviewer-enforced only):** no `unreachable!()`; no cast
+lints beyond the two crates above; no `clippy::pedantic`; `unsafe` confined to
+`wie-cpu`, `wie-cli`'s AppKit FFI and `wie-winapi`'s two annotated modules. Write
+to that standard — `?`/`ok_or_else`, `.get()`, `u64::from(x)`/`try_from`, and
+`#[allow(...)]` escapes kept rare (CONTRIBUTING.md) — and for the rows marked
+convention above, do **not** claim a build failure will catch a violation.
 
 **Actual `unsafe` inventory.** Counted as **code sites only** — every line
 matching `\bunsafe\b` under `crates/<crate>/src`, minus lines whose first

@@ -82,8 +82,9 @@ test compiles guest code and you want a cold JIT every run.
 
 Runs, in order: the two policy checks (`check_file_sizes()` then
 `check_deps()` — both functions in this script, which is their only home),
-`cargo fmt --all --check`, `cargo clippy --workspace --all-targets` (advisory —
-clippy lints are not denied), `make -C micro-exes`, the FULL
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets` (advisory except the `deny`-level
+entries in `[workspace.lints.clippy]` and each crate root — see CLAUDE.md's lint
+policy), `make -C micro-exes`, the FULL
 `cargo nextest run --workspace` (default profile, slow groups included), then
 `scripts/run-micro-suite.sh`.
 

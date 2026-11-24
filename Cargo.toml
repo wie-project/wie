@@ -53,9 +53,47 @@ explicit_outlives_requirements = "warn"
 rust_2018_idioms = { level = "deny", priority = -1 }
 rust_2021_prelude_collisions = "deny"
 
-# No clippy lints are denied here: clippy runs at its defaults and is advisory
-# in CI (`scripts/check.sh` invokes it without `-D warnings`). `#[allow]` /
-# `#[expect]` leniency belongs in test code only.
+# ── Clippy: the curated table (maintainability plan T1.2) ────────────────────
+#
+# `deny`, not `warn`. `scripts/check.sh` and `ci.yml` run clippy WITHOUT
+# `-D warnings`, so a `warn` entry here would leave the step green and the rule
+# advisory — the confusion this table exists to end. `deny` is enforced by the
+# compiler, so it fails the gate regardless of how clippy is invoked.
+#
+# Only lints that hold for every crate and every target belong in this table.
+# `[workspace.lints.*]` binds a crate only through `[lints] workspace = true`
+# (all five crates opt in), and cargo REJECTS a manifest that also declares its
+# own `[lints.clippy]`:
+#     cannot override `workspace.lints` in `lints`, either remove the overrides
+#     or `lints.workspace = true` and manually specify the lints
+# A workspace entry is therefore all-or-nothing: one crate that cannot pass it
+# takes the table down for all five. Per-crate `[lints.clippy]` tables are not
+# a staged-rollout lever here — a crate that overrides stops inheriting, and the
+# 11-line `[workspace.lints.rust]` block above would have to be copied into it.
+#
+# The panic-family lints (`unwrap_used`, `expect_used`, `panic`) do not fit that
+# constraint yet: `wie-cpu` measures 16/27/20 sites (39 under `src/jit/**`, 24 in
+# `benches/jit_hot_paths.rs`), and `--all-targets` compiles the bench too. They
+# are therefore denied per crate, in source, where each crate can own its
+# exception — `#![cfg_attr(not(test), deny(...))]` at the top of `wie-pe`,
+# `wie-winapi`, `wie-runtime` and `wie-cli`'s `lib.rs`.
+# `indexing_slicing` is denied the same way in `wie-pe` and `wie-cli`,
+# `as_conversions` in `wie-pe` only. CLAUDE.md's lint-policy section carries the
+# measured site counts per crate and names what is still convention.
+[workspace.lints.clippy]
+# A `todo!()`/`unimplemented!()` that ships is a guest-reachable panic, and a
+# `dbg!()` left behind is an unrequested stderr write on the hot path.
+# Measured: 0 sites in all five crates, test code included — the entry is here
+# to keep it that way, not to fix anything.
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+# Guest output goes through the emulator's console/VFS, never the host's stdout;
+# a stray `println!` in a library crate corrupts `wie run`'s own output. Measured
+# 0 sites in `wie-pe`/`wie-cpu`/`wie-winapi`/`wie-runtime`. `wie-cli` is the one
+# crate whose product *is* host stdout (23 production sites, all in
+# `inspect`/`run`/`cli`), and it states that exception once, at its crate root.
+print_stdout = "deny"
 
 # ---------------------------------------------------------------------------
 # Dev/test profile: dependencies optimized, our own crates instrumented.

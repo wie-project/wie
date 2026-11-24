@@ -108,9 +108,11 @@ jobs:
       - name: Whole-state binding budget
         run: ./scripts/check.sh --only state-bindings
 
-      # No -D warnings: scripts/check.sh (the authoritative local gate) runs
-      # clippy advisory, and the workspace lint table denies no clippy lints
-      # (Cargo.toml [workspace.lints]). Keep the two invocations identical.
+      # No -D warnings, and that is deliberate: scripts/check.sh (the
+      # authoritative local gate) runs the same bare command. It is still a
+      # gate - [workspace.lints.clippy] and the per-crate crate-root denies
+      # (Cargo.toml, crates/*/src/lib.rs) are `deny`, so the lints they name
+      # fail this step without any flag. Keep the two invocations identical.
       - name: Clippy
         run: cargo clippy --workspace --all-targets
 

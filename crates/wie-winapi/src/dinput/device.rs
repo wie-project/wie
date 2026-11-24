@@ -407,6 +407,14 @@ fn get_device_state(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult>
         }
     };
 
+    // The presence of `this` was read from the same state above (`class`), and
+    // nothing between then and here removes a device record, so the second
+    // lookup cannot miss. Restructuring it as `?` would mean threading a
+    // `DIERR_NOTFOUND` return through `record`'s borrow of `state`.
+    #[expect(
+        clippy::expect_used,
+        reason = "device presence read from the same state earlier in this call"
+    )]
     let record = state
         .dinput8()
         .device_mut(this)

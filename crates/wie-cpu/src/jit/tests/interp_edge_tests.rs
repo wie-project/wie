@@ -1,5 +1,7 @@
 use super::*;
 use crate::IcedCpu;
+use crate::exec::degrade_first_sighting;
+use iced_x86::Mnemonic;
 
 /// Wave 4 degrade-not-die: an unimplemented mnemonic (x87 `f2xm1`) must NOT
 /// stop the interpreter — the fallback advances RIP past the instruction,
@@ -119,5 +121,60 @@ fn x87_scalar_load_store_arith_and_compare() {
         ax & u64::from(X87_C0),
         0,
         "fcomp(4.0, 6.0) must set C0 (st0 < other)"
+    );
+}
+
+/// The "trace once per mnemonic" latch must let exactly ONE caller through per
+/// mnemonic, whatever the interleaving.
+///
+/// This is the property `degrade_fallback`'s log depends on, and it used to
+/// come from `HashSet::insert`'s boolean under a mutex. It now comes from
+/// `AtomicU64::fetch_or` returning the previous word — same guarantee, no lock
+/// on a per-instruction path. `fdecstp`/`fincstp` are used by nothing else in
+/// the tree, so the process-global bits these assertions consume cannot be
+/// consumed by a parallel test.
+#[test]
+fn degrade_trace_latch_admits_exactly_once_per_mnemonic() {
+    assert!(
+        degrade_first_sighting(Mnemonic::Fdecstp),
+        "first sighting must win the latch"
+    );
+    assert!(
+        !degrade_first_sighting(Mnemonic::Fdecstp),
+        "second sighting of the same mnemonic must not log again"
+    );
+    assert!(
+        !degrade_first_sighting(Mnemonic::Fdecstp),
+        "the latch stays closed"
+    );
+}
+
+/// Same latch, raced: eight threads call it for one fresh mnemonic and exactly
+/// one of them may observe the bit clear. `fetch_or` is what makes that hold —
+/// a load-then-store would admit several winners.
+#[test]
+fn degrade_trace_latch_has_one_winner_under_contention() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    let winners = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(8));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let winners = Arc::clone(&winners);
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            if degrade_first_sighting(Mnemonic::Fincstp) {
+                winners.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+    for h in handles {
+        drop(h.join());
+    }
+    assert_eq!(
+        winners.load(Ordering::Relaxed),
+        1,
+        "exactly one thread may emit the warn line for a mnemonic"
     );
 }

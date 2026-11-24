@@ -645,7 +645,7 @@ step_header() {
     winapi-port)   echo "=== wie-winapi port boundary (ADR-0006) ===" ;;
     state-bindings) echo "=== whole-state binding budget (ADR-0005) ===" ;;
     fmt)           echo "=== cargo fmt ===" ;;
-    clippy)        echo "=== cargo clippy (advisory; no -D warnings — clippy lints are not denied) ===" ;;
+    clippy)        echo "=== cargo clippy (no -D warnings, but the deny-level entries in [workspace.lints.clippy] + each crate root DO fail this step) ===" ;;
     micro-exes)    echo "=== micro-exes (fixtures for the integration tests) ===" ;;
     nextest)       echo "=== cargo nextest ===" ;;
     micro-suite)   echo "=== micro-suite ===" ;;

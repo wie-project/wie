@@ -1,5 +1,16 @@
 //! WinAPI dispatcher model for WIE (generic PE64 userspace).
 
+// Machine-checked gate for this crate's *production* code (CLAUDE.md "Lint
+// policy", plan T1.2): no `unwrap`/`expect`/`panic`. A handler that panics kills
+// the whole guest session, so "return an HRESULT" is the rule and this is what
+// makes it a build failure rather than a review note. Test builds are exempt on
+// purpose. `indexing_slicing`/`as_conversions` are NOT gated here — 1,021 and
+// 689 measured sites, mostly guest-buffer reads after an explicit bounds check.
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 pub mod advapi32;
 pub mod bottle;
 // ADR-0005: the named capabilities a handler may ask for, and the narrowed

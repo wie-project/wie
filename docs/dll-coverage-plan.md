@@ -119,4 +119,6 @@ AddFontResource).
 3. Qt-class smoke: a minimal Qt app links and reaches its message loop.
 4. Full gate green: `./scripts/check.sh` (all nine steps — `--list` prints them),
    and clippy with `-D warnings` as an extra check, which is stricter than the
-   gate runs (clippy is advisory there).
+   gate: the `deny`-level entries in `[workspace.lints.clippy]` and the
+   per-crate crate-root lints (maintainability plan T1.2) fail either form, but
+   the rest of clippy stays advisory there).

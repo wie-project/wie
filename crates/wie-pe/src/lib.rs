@@ -1,5 +1,22 @@
 //! PE64 inspection and loading helpers for WIE (generic PE64 userspace).
 
+// Machine-checked gates for this crate's *production* code (CLAUDE.md "Lint
+// policy", plan T1.2): no `unwrap`/`expect`/`panic`, no unchecked slice index,
+// no `as` cast. This crate parses untrusted guest bytes, which is exactly where
+// a panic or a silent truncation turns one malformed file into a host crash, so
+// it carries the widest set of the five crates. `test` builds are exempt on
+// purpose — a failing assertion in a test is supposed to panic.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::as_conversions
+    )
+)]
+
 use anyhow::{Context, Result, bail};
 pub use goblin::pe::PE;
 use serde::Serialize;
@@ -945,13 +962,14 @@ where
     let header_size =
         usize::try_from(identity.size_of_headers).context("size_of_headers does not fit usize")?;
 
-    if header_size > bytes.len() {
-        bail!("size_of_headers is larger than file size");
-    }
-
-    // Write headers directly to guest memory.
-    mem_write(image_base, &bytes[..header_size])
-        .context("failed to write PE headers to guest memory")?;
+    // Write headers directly to guest memory. `get` rather than the `&bytes[..n]`
+    // slice this used to be: `header_size` comes from the guest's own COFF
+    // header, and `clippy::indexing_slicing` is denied in this crate. The error
+    // replaces the `bail!` that used to sit above, so the message is unchanged.
+    let headers = bytes
+        .get(..header_size)
+        .context("size_of_headers is larger than file size")?;
+    mem_write(image_base, headers).context("failed to write PE headers to guest memory")?;
 
     // Write sections directly to guest memory.
     for section in &pe.sections {

@@ -12,7 +12,7 @@ contract, and where each tier runs.
 | Tier | Command | What it covers | Where it runs |
 | --- | --- | --- | --- |
 | **Fast lane** | `cargo nextest run --profile fast` | whole workspace suite minus the two slow groups (`gui`, `guest` — the `micro_*`, `clock_stub` and `idle_park_wake` test binaries) | inner dev loop, every save |
-| **Full gate** | `./scripts/check.sh` | nine steps in order: file-size cap, crate-dependency direction, the `winapi-port` boundary, `cargo fmt --all --check`, advisory clippy, `make -C micro-exes`, the FULL `cargo nextest run --workspace` (slow groups included), `scripts/run-micro-suite.sh`, the `long_loop` perf budget | **authoritative pre-PR gate** — locally in full; CI runs the same functions split across named steps |
+| **Full gate** | `./scripts/check.sh` | nine steps in order: file-size cap, crate-dependency direction, the `winapi-port` boundary, `cargo fmt --all --check`, clippy (advisory except the `deny`-level entries, maintainability plan T1.2), `make -C micro-exes`, the FULL `cargo nextest run --workspace` (slow groups included), `scripts/run-micro-suite.sh`, the `long_loop` perf budget | **authoritative pre-PR gate** — locally in full; CI runs the same functions split across named steps |
 | **Nightly axes** | `./scripts/run-micro-suite.sh all --matrix` (plus the slow groups by hand) | the same guests re-run under `WIE_JIT_MEM=slow`, `WIE_JIT_MEM=pin` and `WIE_CPU=iced`; the full ~70-exe data-driven sweep; the 40 s fixed-window GUI harnesses | not on the push path — run before touching memory lowering, JIT chaining or CPU dispatch, and the target for a future scheduled job |
 
 `scripts/check.sh` is the gate: nothing in the fast lane short-circuits any of
@@ -184,7 +184,7 @@ mechanism and the table.
 `.github/workflows/ci.yml` has two jobs. `Checks` (on `macos-latest`), in
 order: checkout → Rust → cargo cache → nextest → mingw-w64 (+ `--version`
 probes) → `cargo fmt --all --check` → `./scripts/check.sh --only file-sizes` →
-`./scripts/check.sh --only dep-direction` → advisory clippy →
+`./scripts/check.sh --only dep-direction` → clippy (`deny`-level lints fail it) →
 `make -C micro-exes` → `cargo nextest run --workspace` →
 `cargo build -p wie-cli --release` → `scripts/run-micro-suite.sh` for
 `console_tests`, `pthread_tests`, `cpp_exes`, `dll_tests`. `Non-macOS compile
@@ -208,11 +208,17 @@ timeout or profile flag that only one of the two passes. The one intentional
 difference is the last step: `check.sh` runs the full data-driven micro-suite,
 CI runs four categories.
 
-Clippy in CI is advisory, exactly as in `scripts/check.sh` — no `-D warnings`.
-The workspace lint table (`Cargo.toml` `[workspace.lints]`) denies rustc lints
-only; clippy runs at its defaults in both places, and the two invocations are
-kept identical on purpose. A newer clippy therefore cannot turn CI red on its
-own.
+Clippy in CI runs the same bare command as `scripts/check.sh` — no `-D warnings`
+in either — and the two invocations are kept identical on purpose. That is not
+the same as "advisory": since maintainability plan T1.2 the `deny`-level entries
+in `[workspace.lints.clippy]` (`todo`, `unimplemented`, `dbg_macro`,
+`print_stdout`) and the per-crate `#![cfg_attr(not(test), deny(…))]` crate roots
+(`unwrap_used`, `expect_used`, `panic`, plus `indexing_slicing` in `wie-pe`/
+`wie-cli` and `as_conversions` in `wie-pe`) fail the step with no flag at all.
+Everything else clippy knows runs at its default level, so a newer clippy can
+only add warnings, not red — a warning is a signal, and the workspace is at
+zero. See CLAUDE.md's lint-policy table for which lint is which, and note the
+stated remainder: `wie-cpu` does not yet deny the panic family.
 
 That posture used to hide real noise: this section recorded "the 14
 `chunks_exact_to_as_chunks` warnings the 1.98 toolchain adds". There are none

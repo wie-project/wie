@@ -5,6 +5,13 @@
 //! the library (`wie_cli::cli`), so they are reachable from `tests/` — the
 //! tests below drive them through that public surface.
 
+// Same gate as `crates/wie-cli/src/lib.rs`: the binary target is its own crate
+// root, so it has to state the rule itself (plan T1.2).
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use anyhow::{Result, bail};
 use clap::Parser;
 use wie_cli::{Cli, run_command};
