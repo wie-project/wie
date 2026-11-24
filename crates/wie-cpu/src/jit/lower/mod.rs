@@ -1487,6 +1487,7 @@ pub(super) fn compile_block(
         .map_err(|e| LowerError::verifier(e.to_string()))?;
 
     let code = eng.module.get_finalized_function(func_id);
+    dump_map_if_requested(code as usize, start_rip, insns.len(), tier);
     let func = unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut JitCtx)>(code) };
 
     let guest_end = start_rip.saturating_add(u64::from(bytes_len));
@@ -1511,7 +1512,51 @@ const IR_DUMP_BLOCKS: u32 = 2000;
 /// from them while their steady-state loops are a different population
 /// entirely. Sampling across the whole run is what makes the dump represent the
 /// program instead of its prologue.
+///
+/// `WIE_JIT_DUMP_IR_STRIDE=1` overrides it to dump every block — the only way
+/// to reach a *specific* block once a guest has thousands of them, since the
+/// compiled index of a hot loop is not predictable in advance.
 const IR_DUMP_STRIDE: u32 = 50;
+
+/// The effective dump stride: `WIE_JIT_DUMP_IR_STRIDE` or [`IR_DUMP_STRIDE`].
+fn ir_dump_stride() -> u32 {
+    static STRIDE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *STRIDE.get_or_init(|| {
+        std::env::var("WIE_JIT_DUMP_IR_STRIDE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(IR_DUMP_STRIDE)
+    })
+}
+
+/// `WIE_JIT_DUMP_IR_RIP=<hex>[-<hex>]` — dump only blocks starting in this
+/// guest range, at every compile.
+///
+/// The stride and the block cap exist so a *sample* of a whole run fits in a
+/// file, but a hot loop's compiled index depends on how much startup code the
+/// guest compiles first, which is not predictable: DOOM Retro's palette scan
+/// was compiled past the 2,000-block cap on every attempt. Naming the guest
+/// address is exact and cheap when you already know which block you are chasing
+/// (an OS sampler attributes the time; this dumps that block).
+fn ir_dump_rip_filter() -> Option<(u64, u64)> {
+    static RANGE: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let raw = std::env::var("WIE_JIT_DUMP_IR_RIP").ok()?;
+        let parse = |s: &str| {
+            let s = s.trim();
+            let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+            u64::from_str_radix(s, 16).ok()
+        };
+        match raw.split_once('-') {
+            Some((lo, hi)) => Some((parse(lo)?, parse(hi)?)),
+            None => {
+                let at = parse(&raw)?;
+                Some((at, at))
+            }
+        }
+    })
+}
 
 /// Append one block's CLIF to `WIE_JIT_DUMP_IR`, if that knob names a file.
 ///
@@ -1525,14 +1570,30 @@ fn dump_ir_if_requested(start_rip: u64, insn_count: usize, func: &cranelift_code
     let Some(path) = crate::jit::config::JitConfig::get().ir_dump_path() else {
         return;
     };
-    let seen = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if !seen.is_multiple_of(IR_DUMP_STRIDE) {
-        return;
-    }
-    let n = WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n >= IR_DUMP_BLOCKS {
-        return;
-    }
+    // A named range bypasses both the stride and the cap: you asked for one
+    // block, so sampling it away or dropping it at the cap is never right.
+    let unnamed_sample = match ir_dump_rip_filter() {
+        Some((lo, hi)) => {
+            if start_rip < lo || start_rip > hi {
+                return;
+            }
+            false
+        }
+        None => true,
+    };
+    let n = if unnamed_sample {
+        let seen = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !seen.is_multiple_of(ir_dump_stride()) {
+            return;
+        }
+        let n = WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n >= IR_DUMP_BLOCKS {
+            return;
+        }
+        n
+    } else {
+        WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    };
     let header = format!("; block {n} rip={start_rip:#x} insns={insn_count}\n");
     let body = func.display().to_string();
     let mut text = String::with_capacity(header.len() + body.len() + 2);
@@ -1546,6 +1607,25 @@ fn dump_ir_if_requested(start_rip: u64, insn_count: usize, func: &cranelift_code
         .append(true)
         .open(path)
         .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
+}
+
+/// Append one block's host address to `WIE_JIT_MAP`, if that knob names a file.
+///
+/// Format: `<host_addr> <guest_start> <insns> <tier>`. Sort by `host_addr` and
+/// each block owns `[addr, next_addr)` — enough to attribute an `sample(1)`
+/// hit to a guest block and therefore to guest code. Best effort like
+/// [`dump_ir_if_requested`]: a map that cannot be written must never fail a
+/// compile.
+fn dump_map_if_requested(host_addr: usize, guest_start: u64, insns: usize, tier: OptTier) {
+    let Some(path) = crate::jit::config::JitConfig::get().jit_map_path() else {
+        return;
+    };
+    let line = format!("{host_addr:#x} {guest_start:#x} {insns} {tier:?}\n");
+    let _appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
 }
 
 #[derive(Clone, Copy)]

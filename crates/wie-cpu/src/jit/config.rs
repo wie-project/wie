@@ -118,6 +118,18 @@ pub(super) struct JitConfig {
     /// question about CLIF, and this is how it gets answered — by counting ops
     /// in the dump rather than reasoning about them.
     ir_dump_path: Option<std::path::PathBuf>,
+    /// `WIE_JIT_MAP=<path>` — append `host_addr guest_start insns` for every
+    /// compiled block, so an OS-level sample of this process can be attributed
+    /// to guest code. Off by default.
+    ///
+    /// The JIT's code is anonymous to the host toolchain: `sample(1)` reports
+    /// those frames as `<unknown binary>`, and cranelift's symbol registry is
+    /// invisible to it. That leaves "where do the retired instructions go?"
+    /// answerable only from inside the emulator (a counter in emitted code,
+    /// which perturbs the thing being measured) or from this map, which is
+    /// written once per compile and costs nothing at run time. Sort by address
+    /// and each block's range is `[addr, next_addr)`.
+    jit_map_path: Option<std::path::PathBuf>,
 }
 
 /// Bounds of the background worker-pool size (`WIE_JIT_WORKERS`).
@@ -330,6 +342,9 @@ impl JitConfig {
             ir_dump_path: std::env::var_os("WIE_JIT_DUMP_IR")
                 .filter(|p| !p.is_empty())
                 .map(std::path::PathBuf::from),
+            jit_map_path: std::env::var_os("WIE_JIT_MAP")
+                .filter(|p| !p.is_empty())
+                .map(std::path::PathBuf::from),
         }
     }
 
@@ -368,6 +383,13 @@ impl JitConfig {
     #[must_use]
     pub(super) fn ir_dump_path(&self) -> Option<&std::path::Path> {
         self.ir_dump_path.as_deref()
+    }
+
+    /// Where to append the host-address → guest-block map, if `WIE_JIT_MAP`
+    /// names a file.
+    #[must_use]
+    pub(super) fn jit_map_path(&self) -> Option<&std::path::Path> {
+        self.jit_map_path.as_deref()
     }
 
     #[must_use]
