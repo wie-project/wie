@@ -87,6 +87,7 @@ pub(super) struct JitConfig {
     tlb_neon_enabled: bool,
     string_inline_enabled: bool,
     jit_workers: usize,
+    verifier_enabled: bool,
 }
 
 /// Bounds of the background worker-pool size (`WIE_JIT_WORKERS`).
@@ -277,6 +278,8 @@ impl JitConfig {
             ),
             // Background worker-pool size (`WIE_JIT_WORKERS`).
             jit_workers: jit_workers_from_env(),
+            // Cranelift IR verifier (`WIE_JIT_VERIFIER`, default on).
+            verifier_enabled: verifier_enabled_from_env(std::env::var("WIE_JIT_VERIFIER").ok()),
         }
     }
 
@@ -430,6 +433,18 @@ impl JitConfig {
     pub(super) fn jit_workers(&self) -> usize {
         self.jit_workers
     }
+
+    /// Whether Cranelift runs its per-function IR verifier
+    /// (`WIE_JIT_VERIFIER`, default on).
+    ///
+    /// Default on: the verifier is the only thing that turns a lowering bug
+    /// into a diagnosable error instead of miscompiled host code. The knob
+    /// exists so the cost is *measurable* in one build (interleaved A/B), not
+    /// because the default is in doubt.
+    #[must_use]
+    pub(crate) fn verifier_enabled(&self) -> bool {
+        self.verifier_enabled
+    }
 }
 
 /// Upper bound on the fixed hotness threshold (`WIE_JIT_HOTNESS_THRESHOLD`).
@@ -558,11 +573,23 @@ fn tier_budget_from_env(raw: Option<String>) -> usize {
         .min(TIER_BUDGET_MAX)
 }
 
+/// Parse the Cranelift IR-verifier switch from a `WIE_JIT_VERIFIER` value.
+///
+/// Default **on**: the verifier runs per compiled function and is the only
+/// check that a bad lowering fails loudly instead of emitting wrong host code.
+/// Same shape as [`tier_enabled_from_env`] — only the explicit off-spellings
+/// (`0` / `false` / `off` / `no`) disable it, so a typo cannot silently drop
+/// the safety net that defaults are supposed to keep.
+fn verifier_enabled_from_env(raw: Option<String>) -> bool {
+    !matches!(raw, Some(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("no"))
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
         OPT_LEVEL_DEFAULT, opt_level_from_env, tier_budget_from_env, tier_enabled_from_env,
+        verifier_enabled_from_env,
     };
 
     #[test]
@@ -654,5 +681,27 @@ mod tests {
             tier_budget_from_env(Some("999999999".into())),
             super::TIER_BUDGET_MAX
         );
+    }
+
+    /// The verifier default is the load-bearing policy of this knob: turning
+    /// Cranelift's per-function IR check off is a safety decision, so it must
+    /// be taken explicitly, by every off-spelling a bisect might use.
+    #[test]
+    fn verifier_switch_defaults_on_and_only_explicit_off_disables() {
+        assert!(verifier_enabled_from_env(None), "default is on");
+        assert!(verifier_enabled_from_env(Some(String::new())));
+        assert!(verifier_enabled_from_env(Some("1".into())));
+        assert!(verifier_enabled_from_env(Some("true".into())));
+        assert!(verifier_enabled_from_env(Some("on".into())));
+        assert!(
+            verifier_enabled_from_env(Some("turbo".into())),
+            "junk must not disable the verifier"
+        );
+        for off in ["0", "false", "FALSE", "off", "OFF", "no", "No"] {
+            assert!(
+                !verifier_enabled_from_env(Some(off.into())),
+                "WIE_JIT_VERIFIER={off}"
+            );
+        }
     }
 }

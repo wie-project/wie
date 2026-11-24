@@ -151,11 +151,20 @@ impl IsaEngine {
         flag_builder
             .set("opt_level", opt_level)
             .map_err(|e| e.to_string())?;
-        // Verifier stays ON unconditionally (see comment above). WIE_JIT_VERIFY
-        // is no longer a gate; the per-compile verifier cost on small blocks
-        // is negligible next to the crash-safety it provides.
+        // Cranelift IR verifier (`WIE_JIT_VERIFIER`, default on). It runs per
+        // compiled function and is the only thing that turns a bad lowering
+        // into a diagnosable error instead of miscompiled host code, so the
+        // knob exists to make that cost *measurable* in one build (interleaved
+        // A/B), not to invite a change of default.
         flag_builder
-            .set("enable_verifier", "true")
+            .set(
+                "enable_verifier",
+                if JitConfig::get().verifier_enabled() {
+                    "true"
+                } else {
+                    "false"
+                },
+            )
             .map_err(|e| e.to_string())?;
         flag_builder
             .set("is_pic", "false")
