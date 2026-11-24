@@ -32,6 +32,14 @@
 //! - `SDL_UpperBlit` (what `SDL_BlitSurface` is defined as) / `SDL_LowerBlit` —
 //!   `SDL_BlitCopy` and the palette-expanding `Blit1toN[Key]` cases.
 //!
+//! The palette-expanding case needs one thing SDL would have done first: a
+//! `SDL_LowerBlit` whose source palette was recoloured is a *stale mapping*, and
+//! SDL rebuilds it with `SDL_MapSurface` → `Map1toN` before blitting. A guest
+//! that animates its palette therefore rebuilds that 256-entry table on every
+//! frame. [`palette`] reproduces `Map1toN` in place instead, which is what turns
+//! "the blit is stale every frame, so every frame is guest code" into "every
+//! frame is host code" — see that module for the exactness argument.
+//!
 //! Not served, on purpose: `SDL_UpdateTexture` / `SDL_LockTexture` /
 //! `SDL_UpdateWindowSurface` and anything else that reaches into
 //! `SDL_Renderer` / `SDL_Texture` internals. Those structures are renderer
@@ -41,6 +49,7 @@
 
 pub(crate) mod blit;
 pub(crate) mod fill;
+pub(crate) mod palette;
 pub(crate) mod surface;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -148,8 +157,16 @@ pub(super) enum Decline {
     MapMissing = 0,
     /// `map->dst` is not this destination — SDL is about to rebuild the map.
     MapStale,
-    /// A palette was recoloured since the map was built (`SDL_SetPaletteColors`).
+    /// A source palette was recoloured since the map was built
+    /// (`SDL_SetPaletteColors`) and the rebuild it needs is not one this module
+    /// reproduces (a palettized destination, or a map with no table yet).
     PaletteStale,
+    /// The *destination* palette was recoloured, so SDL would run `Map1to1`
+    /// (nearest colour in the destination palette) — a search, not arithmetic.
+    DstPaletteStale,
+    /// A format's masks disagree with its losses/shifts, so a table built from
+    /// them would be wrong (`Format::channels_are_consistent`).
+    FormatInconsistent,
     /// The map's format/pitch mirrors disagree with the surfaces.
     MapMirror,
     /// A pixel format or flag combination outside the reproduced set.
@@ -171,7 +188,7 @@ pub(super) enum Decline {
 
 impl Decline {
     /// Number of variants — the counter array length.
-    pub(super) const COUNT: usize = 11;
+    pub(super) const COUNT: usize = 13;
 
     /// Stable report label.
     #[must_use]
@@ -180,6 +197,8 @@ impl Decline {
             Self::MapMissing => "map_missing",
             Self::MapStale => "map_stale",
             Self::PaletteStale => "palette_stale",
+            Self::DstPaletteStale => "dst_palette_stale",
+            Self::FormatInconsistent => "format_inconsistent",
             Self::MapMirror => "map_mirror",
             Self::UnsupportedKind => "unsupported_kind",
             Self::NotDirect => "not_direct",
@@ -190,6 +209,16 @@ impl Decline {
             Self::Scaled => "scaled",
         }
     }
+}
+
+/// Palette tables rebuilt in place — the count that says the in-place path ran,
+/// as opposed to "the call was served and the guest's table happened to be
+/// fresh already". Reported only when nonzero.
+static TABLE_REBUILDS: AtomicU64 = AtomicU64::new(0);
+
+/// Tally one in-place palette table rebuild.
+pub(super) fn note_table_rebuilt() {
+    ExportStats::bump(&TABLE_REBUILDS);
 }
 
 /// One tally per [`Decline`] variant.
@@ -232,6 +261,12 @@ pub(crate) fn stats() -> Vec<(&'static str, u64, u64)> {
 /// not get an SDL2 section in its profile.
 #[must_use]
 pub fn report_lines() -> Vec<String> {
+    if !crate::host_exports::enabled() {
+        return vec![
+            "sdl2_host_export: disabled (WIE_HOST_EXPORTS=0); SDL2 ran entirely as guest code"
+                .to_owned(),
+        ];
+    }
     let stats = stats();
     if stats.iter().all(|(_, calls, _)| *calls == 0) {
         return Vec::new();
@@ -251,6 +286,8 @@ pub fn report_lines() -> Vec<String> {
         Decline::MapMissing,
         Decline::MapStale,
         Decline::PaletteStale,
+        Decline::DstPaletteStale,
+        Decline::FormatInconsistent,
         Decline::MapMirror,
         Decline::UnsupportedKind,
         Decline::NotDirect,
@@ -268,6 +305,13 @@ pub fn report_lines() -> Vec<String> {
         lines.push(format!(
             "sdl2_blit_declines: {} (the gate each refused blit failed)",
             reasons.join(" ")
+        ));
+    }
+    let rebuilt = TABLE_REBUILDS.load(Ordering::Relaxed);
+    if rebuilt > 0 {
+        lines.push(format!(
+            "sdl2_palette_tables: {rebuilt} rebuilt in place \
+             (Map1toN reimplemented host-side; SDL's own rebuild skipped)"
         ));
     }
     lines

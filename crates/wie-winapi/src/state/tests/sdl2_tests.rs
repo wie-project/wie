@@ -30,14 +30,60 @@ const RECT: u64 = 0x5000;
 const PIXELFORMAT_INDEX8: u32 = 0x1300_0000;
 /// `SDL_PIXELFORMAT_ARGB8888`.
 const PIXELFORMAT_ARGB8888: u32 = 0x1636_2004;
+/// `SDL_PIXELFORMAT_RGBA4444`.
+const PIXELFORMAT_RGBA4444: u32 = 0x1144_4010;
+/// `SDL_PIXELFORMAT_RGB565`.
+const PIXELFORMAT_RGB565: u32 = 0x1515_1022;
+/// `SDL_PIXELFORMAT_RGB24`.
+const PIXELFORMAT_RGB24: u32 = 0x1710_1806;
+/// `SDL_PIXELFORMAT_BGR24`.
+const PIXELFORMAT_BGR24: u32 = 0x1710_1803;
+/// A second palette object, for the palette-to-palette (8bpp destination) case.
+/// It sits between the 1 KiB table at [`LUT`] and the colour array.
+const DST_FORMAT_PALETTE: u64 = 0x2B00;
+
+/// The channel masks `SDL_AllocFormat` fills in for a given pixel format.
+///
+/// The handler checks that a format's masks and its losses/shifts agree with
+/// each other before it builds a palette table from them, so a fixture that
+/// leaves the masks zeroed would be rejected as inconsistent rather than
+/// exercised. These are the real values; `RGBA4444` and `RGB565` are the
+/// asymmetric-mask cases (different widths, and a two- or three-bit loss).
+fn masks_for(format: u32) -> [u32; 4] {
+    match format {
+        // Indexed: no channels at all, so SDL leaves `loss = 8, shift = 0`.
+        PIXELFORMAT_INDEX8 => [0; 4],
+        PIXELFORMAT_ARGB8888 => [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0xff00_0000],
+        PIXELFORMAT_RGBA4444 => [0xf000, 0x0f00, 0x00f0, 0x000f],
+        PIXELFORMAT_RGB565 => [0xf800, 0x07e0, 0x001f, 0],
+        // 24-bit: three one-byte channels, in the two orders SDL names.
+        PIXELFORMAT_RGB24 => [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0],
+        PIXELFORMAT_BGR24 => [0x0000_00ff, 0x0000_ff00, 0x00ff_0000, 0],
+        other => panic!("no channel-mask fixture for pixel format {other:#010x}"),
+    }
+}
 
 /// Write a guest `SDL_PixelFormat`.
 fn write_format(engine: &mut IcedCpu, va: u64, format: u32, palette: u64, bpp: u8, bytes_pp: u8) {
+    let masks = masks_for(format);
+    let fmt = crate::sdl2::surface::Format::from_masks(format, palette, bpp, bytes_pp, masks);
     let mut bytes = [0_u8; crate::sdl2::surface::FORMAT_SIZE];
-    bytes[0..4].copy_from_slice(&format.to_le_bytes());
-    bytes[8..16].copy_from_slice(&palette.to_le_bytes());
-    bytes[16] = bpp;
-    bytes[17] = bytes_pp;
+    bytes[0..4].copy_from_slice(&fmt.format.to_le_bytes());
+    bytes[8..16].copy_from_slice(&fmt.palette.to_le_bytes());
+    bytes[16] = fmt.bits_per_pixel;
+    bytes[17] = fmt.bytes_per_pixel;
+    bytes[20..24].copy_from_slice(&fmt.rmask.to_le_bytes());
+    bytes[24..28].copy_from_slice(&fmt.gmask.to_le_bytes());
+    bytes[28..32].copy_from_slice(&fmt.bmask.to_le_bytes());
+    bytes[32..36].copy_from_slice(&fmt.amask.to_le_bytes());
+    bytes[36] = fmt.rloss;
+    bytes[37] = fmt.gloss;
+    bytes[38] = fmt.bloss;
+    bytes[39] = fmt.aloss;
+    bytes[40] = fmt.rshift;
+    bytes[41] = fmt.gshift;
+    bytes[42] = fmt.bshift;
+    bytes[43] = fmt.ashift;
     engine.mem_write(va, &bytes).expect("write pixel format");
 }
 
@@ -766,4 +812,530 @@ fn a_rewritten_dispatch_slot_is_re_armed_and_falls_through_to_the_new_body() {
         vec![0xEE_u8; 48],
         "a declined blit must not have written a pixel"
     );
+}
+
+// ── The in-place palette rebuild ──────────────────────────────────────────
+//
+// A palette-era guest recolours its 8bpp palette every frame, so SDL's
+// `SDL_LowerBlit` sees a stale `src_palette_version` on *every* call and runs
+// `SDL_MapSurface` → `Map1toN` before blitting. The host rebuilds those 256
+// entries in place instead, which is only safe if the bytes are identical to
+// SDL's, so the tests below compare against an independent transcription of the
+// SDL code rather than against the implementation they are checking.
+
+/// Where [`write_palette`] puts the colour array (clear of the 1 KiB table at
+/// [`LUT`]).
+const PALETTE_COLORS: u64 = 0x2C00;
+
+/// A 256-colour palette that exercises every channel independently: a ramp, an
+/// inverted ramp, a wrapping product, and an alpha that alternates between
+/// opaque and transparent.
+fn palette_colors() -> Vec<[u8; 4]> {
+    (0..=255_u8)
+        .map(|i| {
+            [
+                i,
+                255 - i,
+                i.wrapping_mul(3),
+                if i % 2 == 0 { 255 } else { 0 },
+            ]
+        })
+        .collect()
+}
+
+/// Write a guest `SDL_Palette` with its colours.
+fn write_palette(engine: &mut IcedCpu, va: u64, version: u32, colors: &[[u8; 4]]) {
+    let mut header = [0_u8; crate::sdl2::surface::PALETTE_SIZE];
+    header[0..4].copy_from_slice(
+        &i32::try_from(colors.len())
+            .expect("palette fits an int")
+            .to_le_bytes(),
+    );
+    header[8..16].copy_from_slice(&PALETTE_COLORS.to_le_bytes());
+    header[16..20].copy_from_slice(&version.to_le_bytes());
+    engine.mem_write(va, &header).expect("write palette");
+    let flat: Vec<u8> = colors.iter().flat_map(|color| *color).collect();
+    engine
+        .mem_write(PALETTE_COLORS, &flat)
+        .expect("write palette colours");
+}
+
+/// Write the modulation the mapping was built with (`map->info.{r,g,b,a}`).
+fn write_map_mods(engine: &mut IcedCpu, va: u64, mods: [u8; 4]) {
+    // `info` starts 32 bytes into the map; `r` is 80 bytes into `info`.
+    engine.mem_write(va + 32 + 80, &mods).expect("write mods");
+}
+
+/// An independent transcription of `Map1toN` (`SDL_pixels.c`) and
+/// `ASSEMBLE_RGBA` (`SDL_blit.h`).
+///
+/// Written from SDL's sources, not from `crate::sdl2::palette`: comparing an
+/// implementation against itself proves nothing, and the failure this guards
+/// against (a mask/shift read from the wrong field) is silent — the frame just
+/// comes out the wrong colour.
+fn reference_map_1_to_n(
+    dst: &crate::sdl2::surface::Format,
+    palette: &[[u8; 4]],
+    mods: [u8; 4],
+) -> Vec<u8> {
+    // `bpp = (dst->BytesPerPixel == 3) ? 4 : dst->BytesPerPixel`, so a 24-bit
+    // destination still gets a four-byte lane, of which three are written.
+    let lane = if dst.bytes_per_pixel == 3 {
+        4
+    } else {
+        usize::from(dst.bytes_per_pixel)
+    };
+    let mut table = vec![0_u8; 256 * lane];
+    let scaled = |channel: u8, modulation: u8| -> u8 {
+        u8::try_from((u32::from(channel) * u32::from(modulation)) / 255).unwrap_or(0)
+    };
+    let shifts = [dst.rshift, dst.gshift, dst.bshift, dst.ashift];
+    let losses = [dst.rloss, dst.gloss, dst.bloss, dst.aloss];
+    for (index, color) in palette.iter().enumerate() {
+        let channels = [
+            scaled(color[0], mods[0]),
+            scaled(color[1], mods[1]),
+            scaled(color[2], mods[2]),
+            scaled(color[3], mods[3]),
+        ];
+        let mut entry = [0_u8; 4];
+        if dst.bytes_per_pixel == 3 {
+            // The 24-bit case bypasses the packing entirely: raw bytes at
+            // `shift / 8`, and alpha is never written.
+            for channel in 0..3 {
+                entry[usize::from(shifts[channel] / 8)] = channels[channel];
+            }
+        } else {
+            let mut pixel = 0_u32;
+            for channel in 0..4 {
+                pixel |=
+                    (u32::from(channels[channel]) >> losses[channel]) << u32::from(shifts[channel]);
+            }
+            for (byte, slot) in entry.iter_mut().enumerate() {
+                *slot = u8::try_from((pixel >> (8 * byte)) & 0xFF).unwrap_or(0);
+            }
+        }
+        table[index * lane..(index + 1) * lane].copy_from_slice(&entry[..lane]);
+    }
+    table
+}
+
+/// Every format these tests build a table for, as `(format, bits, bytes)`.
+const TABLE_FORMATS: [(u32, u8, u8); 5] = [
+    (PIXELFORMAT_ARGB8888, 32, 4),
+    (PIXELFORMAT_RGBA4444, 16, 2),
+    (PIXELFORMAT_RGB565, 16, 2),
+    (PIXELFORMAT_RGB24, 24, 3),
+    (PIXELFORMAT_BGR24, 24, 3),
+];
+
+fn format_of(format: u32, bits: u8, bytes: u8) -> crate::sdl2::surface::Format {
+    crate::sdl2::surface::Format::from_masks(format, 0, bits, bytes, masks_for(format))
+}
+
+/// The rebuild must reproduce SDL's table word for word: all 256 entries, for
+/// every destination width, every modulation, and both 24-bit byte orders.
+#[test]
+fn the_rebuilt_table_matches_map_1_to_n_entry_for_entry() {
+    const MODULATIONS: [[u8; 4]; 4] = [
+        [255, 255, 255, 255],
+        [0, 0, 0, 0],
+        [255, 128, 64, 32],
+        [200, 150, 100, 255],
+    ];
+    let colors = palette_colors();
+    for (format, bits, bytes) in TABLE_FORMATS {
+        let dst = format_of(format, bits, bytes);
+        for mods in MODULATIONS {
+            let mut engine = test_engine();
+            write_format(&mut engine, SRC_FORMAT, PIXELFORMAT_INDEX8, PALETTE, 8, 1);
+            write_format(&mut engine, DST_FORMAT, format, 0, bits, bytes);
+            write_palette(&mut engine, PALETTE, 9, &colors);
+            write_blit_map(
+                &mut engine,
+                BLIT_MAP,
+                DST_SURFACE,
+                0,
+                SRC_FORMAT,
+                DST_FORMAT,
+                4,
+                16,
+                LUT,
+                0,
+                0,
+                (1, 1),
+            );
+            write_map_mods(&mut engine, BLIT_MAP, mods);
+            // Poison the table so a rebuild that skipped entries is visible.
+            engine.mem_write(LUT, &[0xCD_u8; 1024]).expect("poison");
+
+            let rebuilt = crate::sdl2::palette::rebuild_table_from_guest(
+                &mut engine,
+                BLIT_MAP,
+                SRC_FORMAT,
+                DST_FORMAT,
+            )
+            .expect("the rebuild must not fail");
+            assert!(rebuilt, "format {format:#010x} mods {mods:?} must rebuild");
+
+            let lane = if bytes == 3 { 4 } else { usize::from(bytes) };
+            let expected = reference_map_1_to_n(&dst, &colors, mods);
+            let got = read_bytes(&mut engine, LUT, 256 * lane);
+            assert_eq!(
+                got, expected,
+                "format {format:#010x} mods {mods:?}: the rebuilt table must be \
+                 SDL's, entry for entry"
+            );
+        }
+    }
+}
+
+/// `Map1toN` writes only `palette->ncolors` entries; the rest of the `calloc`ed
+/// table stays zero. A rebuild that ran past `ncolors` would corrupt them.
+#[test]
+fn a_rebuild_leaves_the_entries_past_ncolors_alone() {
+    let mut engine = test_engine();
+    write_format(&mut engine, SRC_FORMAT, PIXELFORMAT_INDEX8, PALETTE, 8, 1);
+    write_format(&mut engine, DST_FORMAT, PIXELFORMAT_ARGB8888, 0, 32, 4);
+    let colors: Vec<[u8; 4]> = palette_colors().into_iter().take(200).collect();
+    write_palette(&mut engine, PALETTE, 4, &colors);
+    write_blit_map(
+        &mut engine,
+        BLIT_MAP,
+        DST_SURFACE,
+        0,
+        SRC_FORMAT,
+        DST_FORMAT,
+        4,
+        16,
+        LUT,
+        0,
+        0,
+        (1, 1),
+    );
+    write_map_mods(&mut engine, BLIT_MAP, [255, 255, 255, 255]);
+    engine.mem_write(LUT, &[0xCD_u8; 1024]).expect("poison");
+
+    assert!(
+        crate::sdl2::palette::rebuild_table_from_guest(
+            &mut engine,
+            BLIT_MAP,
+            SRC_FORMAT,
+            DST_FORMAT
+        )
+        .expect("rebuild must not fail"),
+        "a partial palette is still rebuildable"
+    );
+
+    let expected = reference_map_1_to_n(
+        &format_of(PIXELFORMAT_ARGB8888, 32, 4),
+        &colors,
+        [255, 255, 255, 255],
+    );
+    let got = read_bytes(&mut engine, LUT, 1024);
+    assert_eq!(
+        &got[..200 * 4],
+        &expected[..200 * 4],
+        "the first 200 entries"
+    );
+    assert_eq!(
+        &got[200 * 4..],
+        &[0xCD_u8; 56 * 4],
+        "entries at and past ncolors must not be touched"
+    );
+}
+
+/// The end-to-end shape DOOM Retro takes: a stale source palette version, a
+/// table that already exists, and a blit that must come out natively — with the
+/// guest's table rewritten and the version stamped so the next frame is free.
+#[test]
+fn a_stale_source_palette_is_rebuilt_in_place_and_the_blit_runs_natively() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    setup_expanding_blit(&mut engine);
+    let colors = palette_colors();
+    // The guest recoloured its palette: version 2, while the mapping was built
+    // for version 1 (`setup_expanding_blit`), so `SDL_LowerBlit` sees it stale.
+    write_palette(&mut engine, PALETTE, 2, &colors);
+    write_map_mods(&mut engine, BLIT_MAP, [255, 255, 255, 255]);
+
+    write_guest_rect(&mut engine, RECT, 0, 0, 4, 3);
+    let dst_rect = 0x5070_u64;
+    write_guest_rect(&mut engine, dst_rect, 0, 0, 4, 3);
+    write_regs(&mut engine, SRC_SURFACE, RECT, DST_SURFACE, dst_rect, 0);
+    assert_return_value!(
+        crate::sdl2::blit::handle_lower_blit(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        0
+    );
+
+    let colors_for_reference = colors.clone();
+    let expected = reference_map_1_to_n(
+        &format_of(PIXELFORMAT_ARGB8888, 32, 4),
+        &colors_for_reference,
+        [255; 4],
+    );
+    // The guest's own table now holds SDL's entries ...
+    assert_eq!(
+        read_bytes(&mut engine, LUT, 1024),
+        expected,
+        "the rebuild must happen in the guest's table, not in a copy"
+    );
+    // ... the blit read that table ...
+    let out = read_bytes(&mut engine, DST_PIXELS, 48);
+    for row in 0..3_usize {
+        for column in 0..4_usize {
+            let index = row * 4 + column;
+            let at = row * 16 + column * 4;
+            assert_eq!(
+                &out[at..at + 4],
+                &expected[index * 4..index * 4 + 4],
+                "row {row} column {column}: source index {index}"
+            );
+        }
+    }
+    // ... and the mapping was stamped, so SDL thinks it is current.
+    let stamped = read_bytes(&mut engine, BLIT_MAP + 124, 4);
+    assert_eq!(
+        u32::from_le_bytes(stamped[..4].try_into().expect("word")),
+        2,
+        "map->src_palette_version must be stamped with the palette's version"
+    );
+
+    // Next frame: the version matches, so nothing is rebuilt and the table is
+    // used as-is. Poisoning it is how that is made visible: the blit must read
+    // the poison rather than regenerate the table.
+    engine.mem_write(LUT, &[0x5A_u8; 1024]).expect("poison");
+    write_regs(&mut engine, SRC_SURFACE, RECT, DST_SURFACE, dst_rect, 0);
+    assert_return_value!(
+        crate::sdl2::blit::handle_lower_blit(&mut HandlerContext::new(
+            &mut engine,
+            test_environment(),
+            &mut state
+        )),
+        0
+    );
+    assert_eq!(
+        read_bytes(&mut engine, LUT, 1024),
+        vec![0x5A_u8; 1024],
+        "a fresh mapping must not be rebuilt again"
+    );
+    assert_eq!(
+        read_bytes(&mut engine, DST_PIXELS, 48),
+        vec![0x5A_u8; 48],
+        "the second blit must use the table as it found it"
+    );
+}
+
+/// Frame one: `map->info.table` is NULL, so SDL has to allocate it. There is
+/// nothing to rebuild in place, and the handler must stay out of the way.
+#[test]
+fn a_stale_palette_with_no_table_stays_with_the_guest() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    setup_expanding_blit(&mut engine);
+    let colors = palette_colors();
+    write_palette(&mut engine, PALETTE, 2, &colors);
+    // No table yet — the mapping the guest is about to build.
+    write_blit_map(
+        &mut engine,
+        BLIT_MAP,
+        DST_SURFACE,
+        0,
+        SRC_FORMAT,
+        DST_FORMAT,
+        4,
+        16,
+        0,
+        0,
+        0,
+        (1, 1),
+    );
+    let guest_body = record_export_site(&mut engine, &mut state);
+
+    write_guest_rect(&mut engine, RECT, 0, 0, 4, 3);
+    let dst_rect = 0x5080_u64;
+    write_guest_rect(&mut engine, dst_rect, 0, 0, 4, 3);
+    write_regs(&mut engine, SRC_SURFACE, RECT, DST_SURFACE, dst_rect, 0);
+    let result = crate::sdl2::blit::handle_lower_blit(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("fall-through must succeed");
+
+    assert_eq!(
+        result.return_address, guest_body,
+        "a NULL table means SDL must allocate it: the call goes back to the guest"
+    );
+    assert_eq!(
+        read_bytes(&mut engine, DST_PIXELS, 48),
+        vec![0xEE_u8; 48],
+        "a declined blit must not have written a pixel"
+    );
+    let stamped = read_bytes(&mut engine, BLIT_MAP + 124, 4);
+    assert_eq!(
+        u32::from_le_bytes(stamped[..4].try_into().expect("word")),
+        1,
+        "a declined call must not stamp the mapping"
+    );
+}
+
+/// A stale *destination* palette needs `Map1to1` — a nearest-colour search over
+/// the destination palette — which is guest work.
+#[test]
+fn a_stale_destination_palette_stays_with_the_guest() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    write_format(&mut engine, SRC_FORMAT, PIXELFORMAT_INDEX8, PALETTE, 8, 1);
+    // Both sides 8bpp: a palette-to-palette blit.
+    write_format(
+        &mut engine,
+        DST_FORMAT,
+        PIXELFORMAT_INDEX8,
+        DST_FORMAT_PALETTE,
+        8,
+        1,
+    );
+    write_palette(&mut engine, PALETTE, 5, &palette_colors());
+    write_palette(&mut engine, DST_FORMAT_PALETTE, 7, &palette_colors());
+    // The mapping was built when the destination palette was at version 3.
+    write_blit_map(
+        &mut engine,
+        BLIT_MAP,
+        DST_SURFACE,
+        0,
+        SRC_FORMAT,
+        DST_FORMAT,
+        4,
+        4,
+        LUT,
+        0,
+        0,
+        (3, 5),
+    );
+    write_surface(
+        &mut engine,
+        SRC_SURFACE,
+        0,
+        SRC_FORMAT,
+        4,
+        1,
+        4,
+        SRC_PIXELS,
+        0,
+        (0, 0, 4, 1),
+        BLIT_MAP,
+    );
+    write_surface(
+        &mut engine,
+        DST_SURFACE,
+        0,
+        DST_FORMAT,
+        4,
+        1,
+        4,
+        DST_PIXELS,
+        0,
+        (0, 0, 4, 1),
+        0,
+    );
+    engine.mem_write(SRC_PIXELS, &[0, 1, 2, 3]).expect("src");
+    engine.mem_write(DST_PIXELS, &[0xEE_u8; 4]).expect("dst");
+    let guest_body = record_export_site(&mut engine, &mut state);
+
+    write_guest_rect(&mut engine, RECT, 0, 0, 4, 1);
+    let dst_rect = 0x5090_u64;
+    write_guest_rect(&mut engine, dst_rect, 0, 0, 4, 1);
+    write_regs(&mut engine, SRC_SURFACE, RECT, DST_SURFACE, dst_rect, 0);
+    let result = crate::sdl2::blit::handle_lower_blit(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("fall-through must succeed");
+
+    assert_eq!(
+        result.return_address, guest_body,
+        "a stale destination palette needs Map1to1, which is guest work"
+    );
+    assert_eq!(read_bytes(&mut engine, DST_PIXELS, 4), vec![0xEE_u8; 4]);
+}
+
+/// A format whose masks and shifts disagree means one of the two struct reads
+/// is off by a field; every colour built from it would be wrong silently.
+#[test]
+fn a_format_with_inconsistent_channels_is_never_used() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    setup_expanding_blit(&mut engine);
+    // A destination whose `Gshift` was read from `Bshift`: the masks no longer
+    // reconstruct, which is exactly the failure the gate exists for.
+    let masks = masks_for(PIXELFORMAT_ARGB8888);
+    let mut torn = [0_u8; crate::sdl2::surface::FORMAT_SIZE];
+    torn[0..4].copy_from_slice(&PIXELFORMAT_ARGB8888.to_le_bytes());
+    torn[16] = 32;
+    torn[17] = 4;
+    torn[20..24].copy_from_slice(&masks[0].to_le_bytes());
+    torn[24..28].copy_from_slice(&masks[1].to_le_bytes());
+    torn[28..32].copy_from_slice(&masks[2].to_le_bytes());
+    torn[32..36].copy_from_slice(&masks[3].to_le_bytes());
+    torn[36] = 0;
+    torn[37] = 0;
+    torn[38] = 0;
+    torn[39] = 0;
+    torn[40] = 16;
+    torn[41] = 0; // must be 8: `Gshift` read from the wrong slot.
+    torn[42] = 0;
+    torn[43] = 24;
+    engine.mem_write(DST_FORMAT, &torn).expect("write format");
+    let guest_body = record_export_site(&mut engine, &mut state);
+
+    write_guest_rect(&mut engine, RECT, 0, 0, 4, 3);
+    let dst_rect = 0x50A0_u64;
+    write_guest_rect(&mut engine, dst_rect, 0, 0, 4, 3);
+    write_regs(&mut engine, SRC_SURFACE, RECT, DST_SURFACE, dst_rect, 0);
+    let result = crate::sdl2::blit::handle_lower_blit(&mut HandlerContext::new(
+        &mut engine,
+        test_environment(),
+        &mut state,
+    ))
+    .expect("fall-through must succeed");
+
+    assert_eq!(
+        result.return_address, guest_body,
+        "an inconsistent format must never be used to build a table"
+    );
+    assert_eq!(read_bytes(&mut engine, DST_PIXELS, 48), vec![0xEE_u8; 48]);
+}
+
+/// Record an `SDL_LowerBlit` export site so a decline can be observed as the
+/// actual tail jump the emulator performs, rather than inferred from counters
+/// that other tests are incrementing at the same time.
+fn record_export_site(engine: &mut IcedCpu, state: &mut WinApiState) -> u64 {
+    let export_va = 0x6000_u64;
+    let stub = [0x48_u8, 0xff, 0x25, 0x00, 0x00, 0x00, 0x00];
+    engine
+        .mem_write(export_va, &stub)
+        .expect("write export stub");
+    // Inside the recorded image (`base + size`), which is what makes `arm`
+    // treat the slot as a live implementation pointer and fall through to it.
+    let guest_body = 0x0000_0000_1400_1000_u64;
+    engine
+        .mem_write(export_va + 7, &guest_body.to_le_bytes())
+        .expect("write slot");
+    crate::host_exports::record_for_test(
+        engine,
+        state,
+        "SDL2.dll",
+        "SDL_LowerBlit",
+        0x0000_0000_6a00_5678,
+        export_va,
+        0x0000_0000_1400_0000,
+        0x2000,
+    );
+    guest_body
 }

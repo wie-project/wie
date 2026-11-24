@@ -452,14 +452,45 @@ fn lower_blit(
     }
     let src_fmt = read_format(engine, src.format_va)?;
     let dst_fmt = read_format(engine, dst.format_va)?;
-    for (palette, version) in [
-        (dst_fmt.palette, map.dst_palette_version),
-        (src_fmt.palette, map.src_palette_version),
-    ] {
-        if palette != 0 && palette_version(engine, palette)? != Some(version) {
+    // `SDL_LowerBlit`'s remaining validity tests are palette-version mismatches:
+    // the guest recoloured a palette after the map was built, so SDL would call
+    // `SDL_MapSurface` — which invalidates the map, rebuilds `info.table` and
+    // re-derives the blitter — before blitting.
+    //
+    // A stale *destination* palette means `Map1to1` (a nearest-colour search
+    // over the destination palette): guest work, declined. A stale *source*
+    // palette expanding into a bitfield destination means `Map1toN`, which is
+    // 256 entries of pure arithmetic — reproduced in place by
+    // [`rebuild_table`](crate::sdl2::palette::rebuild_table), so the table the
+    // blit below reads is the one SDL would have built.
+    if dst_fmt.palette != 0
+        && palette_version(engine, dst_fmt.palette)? != Some(map.dst_palette_version)
+    {
+        note_decline(Decline::DstPaletteStale);
+        return Ok(None);
+    }
+    if src_fmt.palette != 0
+        && palette_version(engine, src_fmt.palette)? != Some(map.src_palette_version)
+    {
+        // Two cases keep SDL's own rebuild: a destination that is itself
+        // palettized, and the very first mapping, whose table SDL has not
+        // allocated yet (`map->info.table == NULL`, so there is nothing to
+        // rebuild in place).
+        if !(src_fmt.is_indexed() && dst_fmt.palette == 0) || map.table == 0 {
             note_decline(Decline::PaletteStale);
             return Ok(None);
         }
+        if !super::palette::rebuild_table(engine, &map, &src_fmt, &dst_fmt)? {
+            note_decline(Decline::PaletteStale);
+            return Ok(None);
+        }
+        super::note_table_rebuilt();
+    }
+    // The channel fields must agree with each other before anything is built
+    // from them; see `Format::channels_are_consistent`.
+    if !dst_fmt.channels_are_consistent() || !src_fmt.channels_are_consistent() {
+        note_decline(Decline::FormatInconsistent);
+        return Ok(None);
     }
     // Layout cross-check: `SDL_CalculateBlit` mirrors both surface formats and
     // pitches into the map. If those agree, the offsets this module reads are

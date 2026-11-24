@@ -98,9 +98,46 @@ impl HostExportSite {
 /// The registry is [`crate::sdl2`]'s export list today. Adding another guest
 /// module means adding another arm here — the mechanism itself (recording a
 /// site, planting the dispatch slot, falling through) is library-agnostic.
+///
+/// `WIE_HOST_EXPORTS=0` (or the older `WIE_SDL2_NATIVE=0`) turns every host
+/// export off, which is the A/B switch: the same scene, twice, once with the
+/// handlers and once with none. It has to be a knob rather than a build flag
+/// because the comparison is a *rendered frame*, and the only way to know the
+/// handlers agree with SDL is to diff two frames the guest produced.
 #[must_use]
 pub(crate) fn is_host_export(library: &str, name: &str) -> bool {
+    if !enabled() {
+        return false;
+    }
     crate::sdl2::is_host_export(library, name)
+}
+
+/// Whether host exports are enabled at all (see [`is_host_export`]).
+///
+/// Read once: it decides how every import is resolved and cannot change
+/// mid-session.
+#[must_use]
+pub(crate) fn enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let value = std::env::var("WIE_HOST_EXPORTS")
+            .or_else(|_| std::env::var("WIE_SDL2_NATIVE"))
+            .ok();
+        knob_value(value.as_deref())
+    })
+}
+
+/// Whether a knob value means "enabled". Unset means enabled; only an explicit
+/// false spelling disables.
+#[must_use]
+fn knob_value(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        None => true,
+    }
 }
 
 /// Table key for one guest-module export (`"sdl2.dll!sdl_fillrect"`).
@@ -348,4 +385,23 @@ pub(crate) fn record_for_test(
         .module_state
         .host_exports
         .insert(key(library, name), site);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The A/B switch must be off only when asked in so many words: a typo in
+    /// the environment must not silently disable the whole acceleration lane
+    /// for a run that then looks mysteriously slow.
+    #[test]
+    fn only_an_explicit_false_spelling_disables_host_exports() {
+        for off in ["0", "off", "FALSE", " no ", "No"] {
+            assert!(!knob_value(Some(off)), "{off:?} must disable host exports");
+        }
+        for on in ["1", "on", "true", "yes", "", "sdl2"] {
+            assert!(knob_value(Some(on)), "{on:?} must not disable host exports");
+        }
+        assert!(knob_value(None), "unset must mean enabled");
+    }
 }

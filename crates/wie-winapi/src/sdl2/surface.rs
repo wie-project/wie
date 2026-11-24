@@ -21,9 +21,8 @@ use crate::guest_memory::read_u32;
 pub(crate) const SURFACE_SIZE: usize = 96;
 /// `SDL_PixelFormat` size.
 pub(crate) const FORMAT_SIZE: usize = 56;
-/// `SDL_Palette` size — asserted by the layout test and used by the fixtures
-/// that build a palette in guest memory, so it does not exist outside tests.
-#[cfg(test)]
+/// `SDL_Palette` size: asserted by the layout test, used by the palette reader
+/// below and by the fixtures that build a palette in guest memory.
 pub(crate) const PALETTE_SIZE: usize = 24;
 
 // ── SDL_Surface field offsets ───────────────────────────────────────────────
@@ -42,9 +41,25 @@ const FORMAT_FORMAT: u64 = 0;
 const FORMAT_PALETTE: u64 = 8;
 const FORMAT_BITS_PER_PIXEL: u64 = 16;
 const FORMAT_BYTES_PER_PIXEL: u64 = 17;
+const FORMAT_RMASK: u64 = 20;
+const FORMAT_GMASK: u64 = 24;
+const FORMAT_BMASK: u64 = 28;
+const FORMAT_AMASK: u64 = 32;
+const FORMAT_RLOSS: u64 = 36;
+const FORMAT_GLOSS: u64 = 37;
+const FORMAT_BLOSS: u64 = 38;
+const FORMAT_ALOSS: u64 = 39;
+const FORMAT_RSHIFT: u64 = 40;
+const FORMAT_GSHIFT: u64 = 41;
+const FORMAT_BSHIFT: u64 = 42;
+const FORMAT_ASHIFT: u64 = 43;
 
 // ── SDL_Palette field offsets ───────────────────────────────────────────────
+const PALETTE_NCOLORS: u64 = 0;
+const PALETTE_COLORS: u64 = 8;
 const PALETTE_VERSION: u64 = 16;
+/// `SDL_Palette` never holds more than 256 entries; SDL clamps `ncolors` to it.
+pub(super) const MAX_PALETTE_COLORS: usize = 256;
 
 // ── SDL_BlitMap / SDL_BlitInfo field offsets ────────────────────────────────
 // The map starts with `dst`, `identity`, `blit`, `data`, then embeds `info`.
@@ -150,16 +165,59 @@ pub(super) fn write_rect(engine: &mut dyn CpuEngine, va: u64, rect: Rect) -> Res
 
 /// A guest `SDL_PixelFormat`, reduced to the fields a blit/fill needs.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Format {
+pub(crate) struct Format {
     /// `SDL_PixelFormat::format` (the `SDL_PIXELFORMAT_*` enum value).
     pub format: u32,
     /// Guest VA of the `SDL_Palette`, or `0` for a non-indexed format.
     pub palette: u64,
     pub bits_per_pixel: u8,
     pub bytes_per_pixel: u8,
+    /// Channel masks. Unused by a palette expansion table (it goes through the
+    /// losses and shifts instead) but they are what identifies a format, so the
+    /// fixtures set them and the readers check them.
+    pub rmask: u32,
+    pub gmask: u32,
+    pub bmask: u32,
+    pub amask: u32,
+    /// Channel losses and shifts: the only two things `ASSEMBLE_RGBA` uses to
+    /// pack a colour into a destination pixel, and therefore the only two a
+    /// wrong table read would get silently wrong.
+    pub rloss: u8,
+    pub gloss: u8,
+    pub bloss: u8,
+    pub aloss: u8,
+    pub rshift: u8,
+    pub gshift: u8,
+    pub bshift: u8,
+    pub ashift: u8,
 }
 
 impl Format {
+    /// The channel masks and the channel losses/shifts agree with each other.
+    ///
+    /// `SDL_InitFormat` derives `loss`/`shift` *from* `mask`
+    /// (`SDL_pixels.c`): `shift` counts the mask's low zero bits and `loss`
+    /// starts at 8 and drops by one per set bit, so
+    /// `mask == ((0xFF >> loss) << shift)` holds for every format SDL can
+    /// allocate — including an absent channel, where the mask is 0 and SDL
+    /// leaves `loss = 8, shift = 0`.
+    ///
+    /// A palette expansion is built from `loss`/`shift` alone, so a mask that
+    /// disagrees means one of the two reads is off by a field and every colour
+    /// the table would receive is wrong. Cheaper to decline than to prove.
+    #[must_use]
+    pub(super) fn channels_are_consistent(self) -> bool {
+        let consistent = |mask: u32, loss: u8, shift: u8| {
+            let width = u32::from(loss.min(31));
+            let rebuilt = (0xFF_u32 >> width) << u32::from(shift & 31);
+            mask == rebuilt
+        };
+        consistent(self.rmask, self.rloss, self.rshift)
+            && consistent(self.gmask, self.gloss, self.gshift)
+            && consistent(self.bmask, self.bloss, self.bshift)
+            && consistent(self.amask, self.aloss, self.ashift)
+    }
+
     /// SDL's `SDL_ISPIXELFORMAT_INDEXED`: not FOURCC, and pixel type INDEX1/4/8.
     ///
     /// `SDL_ISPIXELFORMAT_FOURCC` is `format && SDL_PIXELFLAG(format) != 1`,
@@ -195,6 +253,34 @@ pub(super) fn read_format(engine: &mut dyn CpuEngine, va: u64) -> Result<Format>
         ),
         bits_per_pixel: bytes[FORMAT_BITS_PER_PIXEL as usize],
         bytes_per_pixel: bytes[FORMAT_BYTES_PER_PIXEL as usize],
+        rmask: u32::from_le_bytes(
+            bytes[FORMAT_RMASK as usize..FORMAT_RMASK as usize + 4]
+                .try_into()
+                .unwrap_or([0; 4]),
+        ),
+        gmask: u32::from_le_bytes(
+            bytes[FORMAT_GMASK as usize..FORMAT_GMASK as usize + 4]
+                .try_into()
+                .unwrap_or([0; 4]),
+        ),
+        bmask: u32::from_le_bytes(
+            bytes[FORMAT_BMASK as usize..FORMAT_BMASK as usize + 4]
+                .try_into()
+                .unwrap_or([0; 4]),
+        ),
+        amask: u32::from_le_bytes(
+            bytes[FORMAT_AMASK as usize..FORMAT_AMASK as usize + 4]
+                .try_into()
+                .unwrap_or([0; 4]),
+        ),
+        rloss: bytes[FORMAT_RLOSS as usize],
+        gloss: bytes[FORMAT_GLOSS as usize],
+        bloss: bytes[FORMAT_BLOSS as usize],
+        aloss: bytes[FORMAT_ALOSS as usize],
+        rshift: bytes[FORMAT_RSHIFT as usize],
+        gshift: bytes[FORMAT_GSHIFT as usize],
+        bshift: bytes[FORMAT_BSHIFT as usize],
+        ashift: bytes[FORMAT_ASHIFT as usize],
     })
 }
 
@@ -312,6 +398,8 @@ pub(super) fn write_locked(engine: &mut dyn CpuEngine, surface_va: u64, locked: 
 /// field offsets are the ones the guest is using before it touches a pixel.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BlitMap {
+    /// Guest VA of the map itself, for the in-place `src_palette_version` stamp.
+    pub va: u64,
     /// `map->dst` — the destination the cached mapping was built for.
     pub dst: u64,
     /// `map->identity` — bit-identical formats, no conversion needed.
@@ -330,10 +418,27 @@ pub(super) struct BlitMap {
     pub flags: i32,
     /// `info.colorkey`.
     pub colorkey: u32,
+    /// `info.{r,g,b,a}` — the channel modulation `Map1toN` is called with, so a
+    /// rebuilt table must use these and not the palette's raw colours.
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
     /// `map->src_palette_version`.
     pub src_palette_version: u32,
     /// `map->dst_palette_version`.
     pub dst_palette_version: u32,
+}
+
+impl BlitMap {
+    /// Where the *source* palette version is stamped, as a guest VA.
+    ///
+    /// Spelled as a method so the offset lives beside the struct it belongs to
+    /// rather than as a literal at the call site.
+    #[must_use]
+    pub(super) fn src_palette_version_va(&self) -> u64 {
+        self.va.saturating_add(MAP_SRC_PALETTE_VERSION)
+    }
 }
 
 /// Read a guest `SDL_BlitMap`, or `None` when the surface has no map.
@@ -355,6 +460,7 @@ pub(super) fn read_blit_map(engine: &mut dyn CpuEngine, map_va: u64) -> Result<O
     };
     let info = MAP_INFO;
     Ok(Some(BlitMap {
+        va: map_va,
         dst: word(MAP_DST),
         identity: i32::from_le_bytes(dword(MAP_IDENTITY).to_le_bytes()),
         src_fmt: word(info + 48),
@@ -364,6 +470,10 @@ pub(super) fn read_blit_map(engine: &mut dyn CpuEngine, map_va: u64) -> Result<O
         table: word(info + 64),
         flags: i32::from_le_bytes(dword(info + 72).to_le_bytes()),
         colorkey: dword(info + 76),
+        r: bytes[usize::try_from(info + 80).unwrap_or(0)],
+        g: bytes[usize::try_from(info + 81).unwrap_or(0)],
+        b: bytes[usize::try_from(info + 82).unwrap_or(0)],
+        a: bytes[usize::try_from(info + 83).unwrap_or(0)],
         src_palette_version: dword(MAP_SRC_PALETTE_VERSION),
         dst_palette_version: dword(MAP_DST_PALETTE_VERSION),
     }))
@@ -379,6 +489,151 @@ pub(super) fn palette_version(engine: &mut dyn CpuEngine, palette_va: u64) -> Re
         engine,
         palette_va.saturating_add(PALETTE_VERSION),
     )?))
+}
+
+/// One guest `SDL_Color`: `Uint8 r, g, b, a`, in that order, four bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+/// A guest `SDL_Palette` with its colours copied out in one read.
+///
+/// The colours are copied rather than iterated in place because the palette is
+/// about to be read up to 256 times per rebuild and a guest write between two
+/// of those reads would tear the table SDL would have built atomically.
+pub(super) struct Palette {
+    /// `palette->ncolors`.
+    pub ncolors: usize,
+    /// `palette->version` — the counter `SDL_LowerBlit` compares.
+    pub version: u32,
+    colors: [u8; MAX_PALETTE_COLORS * 4],
+}
+
+impl Palette {
+    /// The colours, in palette-index order (exactly `ncolors` of them).
+    pub(super) fn iter(&self) -> impl Iterator<Item = Color> + '_ {
+        self.colors
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .take(self.ncolors)
+            .map(|c| Color {
+                r: c[0],
+                g: c[1],
+                b: c[2],
+                a: c[3],
+            })
+    }
+}
+
+/// Read a guest `SDL_Palette`, or `None` when it has no colours or does not
+/// fit SDL's own limit of 256 entries (either way, not a palette this module
+/// can reproduce).
+pub(super) fn read_palette_colors(
+    engine: &mut dyn CpuEngine,
+    palette_va: u64,
+) -> Result<Option<Palette>> {
+    if palette_va == 0 {
+        return Ok(None);
+    }
+    let mut header = [0_u8; PALETTE_SIZE];
+    engine
+        .mem_read(palette_va, &mut header)
+        .context("failed to read a guest SDL_Palette")?;
+    let ncolors = i32::from_le_bytes(
+        header[PALETTE_NCOLORS as usize..PALETTE_NCOLORS as usize + 4]
+            .try_into()
+            .unwrap_or([0; 4]),
+    );
+    let colors_va = u64::from_le_bytes(
+        header[PALETTE_COLORS as usize..PALETTE_COLORS as usize + 8]
+            .try_into()
+            .unwrap_or([0; 8]),
+    );
+    let version = u32::from_le_bytes(
+        header[PALETTE_VERSION as usize..PALETTE_VERSION as usize + 4]
+            .try_into()
+            .unwrap_or([0; 4]),
+    );
+    if ncolors <= 0 || colors_va == 0 {
+        return Ok(None);
+    }
+    let Ok(ncolors) = usize::try_from(ncolors) else {
+        return Ok(None);
+    };
+    if ncolors > MAX_PALETTE_COLORS {
+        return Ok(None);
+    }
+    let mut colors = [0_u8; MAX_PALETTE_COLORS * 4];
+    engine
+        .mem_read(colors_va, &mut colors[..ncolors * 4])
+        .context("failed to read a guest SDL_Palette's colours")?;
+    Ok(Some(Palette {
+        ncolors,
+        version,
+        colors,
+    }))
+}
+
+#[cfg(test)]
+impl Format {
+    /// A fixture format built from masks, with losses and shifts derived the
+    /// way `SDL_InitFormat` derives them.
+    ///
+    /// Deriving them rather than accepting them is what makes the fixture
+    /// trustworthy: [`Format::channels_are_consistent`] is a real gate in the
+    /// blit path, so a hand-written inconsistent fixture would decline for the
+    /// wrong reason and the test would pass while proving nothing.
+    pub(crate) fn from_masks(
+        format: u32,
+        palette: u64,
+        bits_per_pixel: u8,
+        bytes_per_pixel: u8,
+        masks: [u32; 4],
+    ) -> Self {
+        let channel = |mask: u32| -> (u8, u8) {
+            let mut shift = 0_u8;
+            let mut loss = 8_u8;
+            if mask != 0 {
+                let mut probe = mask;
+                while probe & 1 == 0 {
+                    shift += 1;
+                    probe >>= 1;
+                }
+                while probe & 1 == 1 {
+                    loss -= 1;
+                    probe >>= 1;
+                }
+            }
+            (loss, shift)
+        };
+        let (rloss, rshift) = channel(masks[0]);
+        let (gloss, gshift) = channel(masks[1]);
+        let (bloss, bshift) = channel(masks[2]);
+        let (aloss, ashift) = channel(masks[3]);
+        Self {
+            format,
+            palette,
+            bits_per_pixel,
+            bytes_per_pixel,
+            rmask: masks[0],
+            gmask: masks[1],
+            bmask: masks[2],
+            amask: masks[3],
+            rloss,
+            gloss,
+            bloss,
+            aloss,
+            rshift,
+            gshift,
+            bshift,
+            ashift,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -444,19 +699,46 @@ mod tests {
     #[test]
     fn indexed_formats_are_detected_like_sdl() {
         // SDL_PIXELFORMAT_INDEX8 = 0x1300_0000, ARGB8888 = 0x1636_2004.
-        let index8 = Format {
-            format: 0x1300_0000,
-            palette: 1,
-            bits_per_pixel: 8,
-            bytes_per_pixel: 1,
-        };
+        let index8 = Format::from_masks(0x1300_0000, 1, 8, 1, [0; 4]);
         assert!(index8.is_indexed());
-        let argb = Format {
-            format: 0x1636_2004,
-            palette: 0,
-            bits_per_pixel: 32,
-            bytes_per_pixel: 4,
-        };
+        let argb = Format::from_masks(
+            0x1636_2004,
+            0,
+            32,
+            4,
+            [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0xff00_0000],
+        );
         assert!(!argb.is_indexed());
+        assert!(argb.channels_are_consistent());
+    }
+
+    /// The consistency check must accept every format SDL can allocate and
+    /// reject one whose fields were read from the wrong place.
+    #[test]
+    fn channel_masks_must_agree_with_losses_and_shifts() {
+        let argb = Format::from_masks(
+            0x1636_2004,
+            0,
+            32,
+            4,
+            [0x00ff_0000, 0x0000_ff00, 0x0000_00ff, 0xff00_0000],
+        );
+        assert!(argb.channels_are_consistent());
+        // RGB565: a real 16-bit format with two-bit and three-bit losses.
+        let rgb565 = Format::from_masks(0x1515_1022, 0, 16, 2, [0xf800, 0x07e0, 0x001f, 0]);
+        assert!(rgb565.channels_are_consistent());
+        assert_eq!((rgb565.rloss, rgb565.rshift), (3, 11));
+        assert_eq!((rgb565.gloss, rgb565.gshift), (2, 5));
+        // An absent channel: SDL leaves `loss = 8, shift = 0`, which the check
+        // has to accept as consistent with a zero mask.
+        assert_eq!((rgb565.aloss, rgb565.ashift), (8, 0));
+        // One field off by one struct slot is exactly the failure mode this
+        // guard exists for.
+        let mut torn = argb;
+        torn.gmask = argb.bmask;
+        assert!(!torn.channels_are_consistent());
+        let mut torn = rgb565;
+        torn.bshift = 1;
+        assert!(!torn.channels_are_consistent());
     }
 }
