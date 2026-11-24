@@ -43,8 +43,10 @@ This document attributes **three** blocks, not one: §1–§7 are `0x1800d8fb0`
 (54.1 % of guest time, 174 host instructions per iteration, 8 guest instructions),
 §8 is `0x1800a1c60` (27.4 %, 115 per iteration, 6 guest instructions) and §9 is
 `0x1800cef0b` (14.6 %, 177 per iteration, 10 guest instructions) — together
-**96.1 % of leaf samples**. The per-iteration rule, the counting rules and the
-verdict vocabulary are the same in all three sections.
+**96.1 % of leaf samples**. §10 then answers the one question the three
+attributions raise but cannot settle: whether the region form of block #1 already
+delivers §7's probe hoist (it does not). The per-iteration rule, the counting rules
+and the verdict vocabulary are the same throughout.
 
 Date 2026-11-24, HEAD `bd9a5c7`, host macOS 26.5.2 / Apple Silicon, release
 build, `opt_level=none`, `WIE_JIT_REGION` off.
@@ -1065,6 +1067,187 @@ and it removes 20 instructions from every iteration: 11.3 %.
 
 ---
 
+## 10. Does the region form of block #1 deliver the hoist? **No** — and the hoist still needs an implementer
+
+The question: `0x1800d8fb0` is 54.1 % of guest time, the region path is supposed to
+hoist the probe descriptors once per region entry, and `form_self_loop_region` was
+landing to give this block a region at all. If the region form delivered the hoist,
+§7's spec would not need an implementer.
+
+**It does not.** Measured on one binary, both forms:
+
+| | block path | region path |
+| --- | --- | --- |
+| forms for `0x1800d8fb0`? | yes, 609-instruction function | **yes** — `; region 0 rip=0x1800d8fb0 insns=8` |
+| per iteration | **156** | **171** |
+| probe guard, per iteration | 32 (2 operands × 16) | **32 (2 operands × 16)** |
+| entry | 63 | 63 |
+| exit through the trip charge | 52 instructions, 19 `str` | 44 instructions, 19 `str` |
+| latch (reload + respill) | 28 | 35 |
+
+### 10.1 Build provenance — read this before quoting anything above
+
+`/tmp/wie-region-a54d8d2b` = `target/release/wie`, sha256 `a54d8d2b9c52830f…`,
+**built 20:42, from a dirty tree**, and this matters:
+
+* **HEAD (`cd1fae7`) does not contain `form_self_loop_region`.** `git show
+  HEAD:…/lower/region.rs | grep -c form_self_loop_region` returns 0. The function
+  exists only as uncommitted work in the working tree (`region.rs` 20:36,
+  `region_emit.rs` 20:31), which the 20:42 build picked up. So the region numbers
+  below describe the *in-flight* region lane, not the tree at `cd1fae7`.
+* The same binary predates later in-flight edits to `lower/flags.rs` (20:46),
+  `lower/gpr.rs` (20:45) and `lower/insn.rs` (20:46) — one minute after the build,
+  not nine seconds. Those are the flag and insn lanes, not the region emitter, so
+  the region *shape* here is the region lane's current shape.
+* **Both forms were measured on this one binary** (`WIE_JIT_REGION=1` and off), so
+  the block-versus-region comparison is internally consistent even though the tree
+  is dirty. What it is not is a statement about what `cd1fae7` ships.
+
+Two bounded runs (`timeout -k 5 -s INT 120`), one `lldb -p` attach each, no A/B
+timing: every number is an instruction count. Files `/tmp/r1*` (region),
+`/tmp/r2*` (block).
+
+### 10.2 Q1 — is it a region now?
+
+Yes. `WIE_JIT_DUMP_IR_RIP=0x1800d8fb0` under `WIE_JIT_REGION=1` starts with
+
+```text
+; region 0 rip=0x1800d8fb0 insns=8
+function u0:6717(i64) apple_aarch64 {
+```
+
+and `WIE_JIT_MAP` has exactly one line for the block (`0x155940000 0x1800d8fb0 8
+Base`) — no block-form fallback was compiled. The function is
+`0x155940000–0x155940a88` = **675 instructions** with an internal back edge
+`0x155940a00 b 0x1559400fc`: one region, one block, one latch.
+
+### 10.3 Q2 — per-iteration, region versus block, and the guard
+
+Region form, 15-phase partition, 674 of 675 covered (the 675th is a cold `b`):
+
+| phase | insns | hot? |
+| --- | --- | --- |
+| entry: `JitCtx` → `[sp]`, pin descriptor sources | 63 | per entry |
+| body 1: `add rdx,r10` + six-flag cone + `shr` + address (`madd`) | 43 | **yes** |
+| guard 1 (4 descriptor loads + 4 predicates + 4 cold legs) | 20 | 16 hot |
+| pin hit arm: base load, `ldr w0` | 3 | **yes** |
+| value merge + second address | 4 | **yes** |
+| guard 2 | 16 | **yes** |
+| pin hit arm: base load, `str` | 3 | **yes** |
+| body 2: `sub r8d,1` + masks + six-flag cone + **pack** + `jne` test | 51 | **yes** |
+| continue: 12 reloads + inv-gen | 18 | **yes** |
+| latch: 13 respills + trip + 2 moves + `b` | 17 | **yes** |
+| cold refill + fault cones, per operand | 95 + 96 | per fault |
+| exit writeback, through inv-gen: 13 reload + 16 GPR stores + RFLAGS | 39 | per exit |
+| exit trip check + charge | 5 | 5 |
+| exit trip, chain match ×5, lookup call, retabs | 172 | per exit (one arm) |
+| invalidated exit | 34 | per exit |
+
+**Per iteration: 43 + 16 + 3 + 4 + 16 + 3 + 51 + 18 + 17 = 171.** Same method on
+the block form of the same binary:
+
+| | block | region | Δ |
+| --- | --- | --- | --- |
+| body 1 (add + cone + shift + address) | 43 | 43 | 0 |
+| guard 1, hot | 16 | 16 | 0 |
+| hit arms + value merge | 3 + 3 | 3 + 4 | +1 |
+| guard 2, hot | 16 | 16 | 0 |
+| hit arm 2 | 11 | 3 | −8 |
+| body 2 (sub + masks + cone + **pack?** + test) | 36 | 51 | **+15** |
+| latch | 28 | 35 | +7 |
+| **per iteration** | **156** | **171** | **+15** |
+
+**The probe guard is 16 instructions per operand per iteration in both forms — the
+region hoists nothing it did not already hoist.** What sits in the region entry
+(`0x…0a8–0x…0f4`) is six loads of the *descriptor sources* from `JitCtx+0xb08…
+0xb28`; the block prologue does exactly the same six loads at `0x…008–0x…04c`. Per
+access, both forms reload the descriptor, the page low, the page high and the `live`
+bit, and run the same four predicates. `mem.rs` emits that at the access, and region
+formation does not touch `mem.rs`.
+
+So the §9.4 prediction holds on a fourth independent axis: the guard is a **per
+memory operand, per iteration** cost of 15–16 instructions, and neither the region
+fold nor the self-loop fold reduces it. Hoisting it is still an implementer's job.
+
+### 10.4 The +15 is the flag pack, not the region
+
+Decomposed from the table: +15 in body 2, −8 in the second hit arm, +7 at the latch,
++1 in the merge. The −8 and +7 are allocator choices (the block spills ten values
+into its store arm; the region reloads twelve at its latch), and they point in
+opposite directions, so region structure is worth roughly nothing here.
+
+The +15 is not noise. **The region path builds the second flag word inline on the
+per-iteration path; the block path defers it to the exit edge:**
+
+```text
+region 0x1559405ec  mov  x6,#-0x8d6 ; and x6,x24,x6      ┐
+       0x1559405f4…0x155940620  6 × (uxtb, orr)           ├ 14 instructions, every iteration
+       0x155940624  tst w2,#0xff ; b.eq <continue>        ┘
+block  0x15d0846d4  tst w20,#0xff ; b.eq <continue>      ← no pack here
+       0x15d0846dc  mov  x0,#-0x8d6 ; and x0,x7,x0 …     ← pack only on the exit edge
+```
+
+That is `a2c499f`'s change applied to `lower/emit.rs`'s flush point and **not** to
+the region emitter's branch flush. Word 1's pack *is* deferred in the region form
+(it sits in the fault path at `0x…2f4`), so only the branch edge is affected: the
+second cone's pack is flushed before the `jne`, not on the cold edge. **14 of the
+15 instructions, 8.2 % of the region's iteration, and the file is
+`lower/region_emit.rs`** (the region's edge flush), with `lower/flags.rs` as the
+natural home for the shared rule.
+
+### 10.5 Q3 — what replaced the guard, and the break-even
+
+Nothing replaced it. Two structural facts, both visible in the listing:
+
+* **The latch still re-passes the tuple through slots.** Region: 12 reloads + 13
+  respills (`0x…978–0x…9f0`), ten of them exact same-slot load→store pairs — the
+  shape §8.6 proved dead for block #2. Block form on the same binary: 5 reloads +
+  13 respills. The region is 7 *worse* here.
+* **The exit is not 64 stores.** Both exits write the same 19 `str` — 16 GPRs, the
+  flag word at `JitCtx+0x88`, the trip charge and the trip-counter store. The
+  difference is on the other side of the ledger: the region reloads 13 values into
+  the writeback, the block 7, and in total the region's exit through the trip charge
+  is **44 instructions against the block's 52**. The "64 stores" in the question is
+  not the emitted form, so there is no 64-store tax and the break-even it implies is
+  not the constraint.
+
+So the ledger on this block, both forms, one binary: the region saves **8 per exit**
+and costs **15 per iteration**. Break-even is 8 / 15 < 1 iteration: for any loop that
+turns over more than once — the blit turns several hundred times per row — the region
+form is a net loss, and after the 14-instruction flag-pack gap of §10.4 is closed it
+is a dead heat. Neither number is large enough to be a design signal: at
+`opt_level=none` two compiles of the *same* shape differ by ±15 per iteration on
+allocator choices alone (the −8 in the store arm and the +7 at the latch here), so
+anything under ~20 instructions on a single compile is not a structural difference.
+For timings, the region A/B is still the only measurement that settles it.
+
+### 10.6 What this changes
+
+* **The region A/B is not a substitute for the hoist.** For the block that is 54.1 %
+  of guest time, the region form gives back **0** guard instructions, keeps the
+  latch tuple, and lands within allocator noise. §7's spec still needs an
+  implementer, and the answer to "does the hoist need one?" is yes.
+* **The structural explanation is simple and worth recording:** a hot self-loop is
+  already one function in the block path — the block path folds it with its own back
+  edge and its own latch. `form_self_loop_region` matters for the *refusal* case (a
+  self-loop nested inside a larger loop, refused `Irreducible`) and for the region
+  lane's bookkeeping, not for reducing what a self-loop pays per iteration.
+* **A new, cheap fix falls out: the region emitter's inline flag pack, 14
+  instructions per iteration (8.2 % of the region's iteration), file
+  `lower/region_emit.rs`.** Worth doing before the region path is enabled by
+  default, and it is the same rule §8.7 asks for on the block side.
+* **`a2c499f` is worth 18 instructions per iteration on this block, measured end to
+  end:** the block form went 174 (§8.1, pre-`a2c499f`) → **156** on this binary.
+  Both inline flag packs are gone — 14 instructions each — and the latch went 34 →
+  28. That is `doom_startup`'s change landing where §5 said it would.
+* **One number to retire:** §8.1's "174" is the pre-`a2c499f` block form. On the
+  current lowering the same block is **156**, and the difference is entirely the
+  landed flag fix. Blocks #1, #2 and #3 are therefore not comparable to each other
+  on flag rows until all three are re-measured on one binary; the probe, latch and
+  address rows are.
+
+---
+
 ## Appendix: reproducing
 
 ```sh
@@ -1083,6 +1266,21 @@ llvm-objdump --triple=x86_64-pc-windows-msvc -d real_exes/doomretro/SDL2.dll \
 ```
 
 ```sh
+# slice 7: the region form of block #1, and the block form on the SAME binary
+# (WIE_JIT_REGION=1 / off).  Binary built 20:42 from a dirty tree, sha256 a54d8d2b...
+cp target/release/wie /tmp/wie-region-a54d8d2b
+WIE_JIT_REGION=1 WIE_JIT_MAP=/tmp/r1map.txt WIE_JIT_DUMP_IR=/tmp/r1.clif \
+  WIE_JIT_DUMP_IR_RIP=0x1800d8fb0 \
+  timeout -k 5 -s INT 120 /tmp/wie-region-a54d8d2b run --bottle doomretro --gui doomretro.exe \
+  -- -iwad 'C:\Program Files\DoomRetro\freedoom2.wad'
+grep -E ' 0x1800d8fb0 ' /tmp/r1map.txt      # one line: 0x155940000 0x1800d8fb0 8 Base
+head -1 /tmp/r1.clif                       # ; region 0 rip=0x1800d8fb0 insns=8
+PID=$(pgrep -f 'wie-region-a54d8d2b run' | tail -1)
+lldb -p $PID --batch -o 'disassemble --start-address 0x155940000 --count 1200' -o detach -o quit
+# 675-instruction region; back edge 0x155940a00 -> 0x1559400fc
+# repeat with WIE_JIT_REGION unset -> /tmp/r2*; 609-instruction block form,
+# back edge 0x15d0848c0 -> 0x15d0840fc
+
 # slice 6: block #3 (0x1800cef0b), one bounded run; the binary is copied first so a
 # concurrent rebuild by another lane cannot change what was measured
 cp target/release/wie /tmp/wie-block3-a2c499f      # sha256 a9eadd04a3e100b6ca3697af...
