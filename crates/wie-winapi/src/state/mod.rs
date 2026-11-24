@@ -1282,6 +1282,7 @@ impl WinApiState {
                 import_resolver: None,
                 get_proc_address_cache: ahash::HashMap::with_capacity(64),
                 next_module_handle: ModuleHandle::from(crate::dll_loader::REAL_MODULE_HANDLE_BASE),
+                host_exports: ahash::HashMap::new(),
             },
         })
     }
@@ -1357,6 +1358,7 @@ impl WinApiState {
                 import_resolver: None,
                 get_proc_address_cache: ahash::HashMap::new(),
                 next_module_handle: ModuleHandle::from(crate::dll_loader::REAL_MODULE_HANDLE_BASE),
+                host_exports: ahash::HashMap::new(),
             },
         }
     }

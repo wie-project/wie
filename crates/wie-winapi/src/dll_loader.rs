@@ -292,7 +292,7 @@ pub fn parse_dll_exports(pe: &goblin::pe::PE<'_>, pe_bytes: &[u8]) -> Result<Dll
 }
 
 /// Normalize a DLL name: strip path, lowercase, ensure .dll extension.
-fn normalize_dll_name(name: &str) -> String {
+pub(crate) fn normalize_dll_name(name: &str) -> String {
     let clean = name.trim().trim_matches('"');
     let basename = clean
         .rsplit(['/', '\\'])
@@ -888,6 +888,46 @@ pub fn load_dll(
 /// not found, or the export is missing — the caller leaves the pass-1
 /// placeholder, so the guest sees the same "unsupported API" stop as before
 /// (graceful degradation). `Err` means the DLL exists but could not be loaded.
+/// Serve `library!name` from a host handler when the registry claims it.
+///
+/// Two paths reach a guest DLL's export: this one (static/IAT imports) and
+/// `GetProcAddress`. Both must agree, or a guest that looks a symbol up at run
+/// time would get the module's code while its static imports got the host's.
+///
+/// Returns the fake VA to patch into the caller's IAT slot, or `None` to let
+/// the module's own code answer. Three conditions, all of them necessary:
+///
+/// 1. the registry serves `library!name` (see [`crate::host_exports`]);
+/// 2. the module is already mapped — the whole point is to redirect *its*
+///    export, and the module must still load and run its `DllMain`;
+/// 3. the module really exports that name, so a fall-through has somewhere to
+///    go. Without this a handler that declined would jump to address 0.
+fn host_export_override(
+    engine: &mut dyn CpuEngine,
+    state: &mut crate::WinApiState,
+    library: &str,
+    name: &str,
+    fake_resolve: &mut dyn FnMut(&str, &str, u64) -> anyhow::Result<u64>,
+) -> Result<Option<u64>> {
+    if !crate::host_exports::is_host_export(library, name) {
+        return Ok(None);
+    }
+    let norm = normalize_dll_name(library);
+    let exports = state
+        .module_state
+        .loaded_modules
+        .get(&norm)
+        .is_some_and(|module| module.get_export_va(name).is_some());
+    if !exports {
+        return Ok(None);
+    }
+    // Slot 0: the fake entry's `iat_slot_va` is trace metadata only, and this
+    // path resolves before the caller patches the slot.
+    let fake_va = fake_resolve(library, name, 0)?;
+    crate::host_exports::record(engine, state, library, name, fake_va);
+    Ok(Some(fake_va))
+}
+
 pub fn resolve_static_guest_import(
     engine: &mut dyn CpuEngine,
     state: &mut crate::WinApiState,
@@ -904,9 +944,14 @@ pub fn resolve_static_guest_import(
 
     let norm = normalize_dll_name(library);
 
-    // Already loaded (a dependency resolved earlier in pass 2): export lookup.
+    // Already loaded (a dependency resolved earlier in pass 2): export lookup,
+    // unless a host handler serves this export.
     if let Some(module) = state.module_state.loaded_modules.get(&norm) {
-        return Ok(module.get_export_va(name));
+        let export_va = module.get_export_va(name);
+        if let Some(fake_va) = host_export_override(engine, state, library, name, fake_resolve)? {
+            return Ok(Some(fake_va));
+        }
+        return Ok(export_va);
     }
 
     // Host search: app dir → guest system dirs → drive_c, then the main
@@ -1027,6 +1072,9 @@ pub fn resolve_static_guest_import(
         restored?;
     }
 
+    if let Some(fake_va) = host_export_override(engine, state, library, name, fake_resolve)? {
+        return Ok(Some(fake_va));
+    }
     Ok(result.module.get_export_va(name))
 }
 

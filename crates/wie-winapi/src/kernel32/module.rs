@@ -415,8 +415,27 @@ pub fn handle_get_proc_address(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             } else {
                 module.get_export_va(&proc_name)
             };
+            // A guest-DLL export served by a host handler must answer with the
+            // fake VA here too: a guest that resolves its imports at run time
+            // would otherwise get the module's own code while its static
+            // imports got the host's, and the two paths would disagree about
+            // what the process looks like.
+            let module_name = module.name.clone();
 
             if let Some(address) = va {
+                let address = if crate::host_exports::is_host_export(&module_name, &proc_name) {
+                    match crate::host_exports::resolve_fake_va(
+                        engine,
+                        state,
+                        &module_name,
+                        &proc_name,
+                    )? {
+                        Some(fake_va) => fake_va,
+                        None => address,
+                    }
+                } else {
+                    address
+                };
                 // Cache and return.
                 state.module_state.get_proc_address_cache.insert(
                     name_key,

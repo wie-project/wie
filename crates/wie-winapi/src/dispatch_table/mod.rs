@@ -167,6 +167,15 @@ pub fn dispatch_winapi(
     {
         return Ok(r);
     }
+    // SDL2 — a *guest* module whose pixel movers a host handler serves.
+    // `is_winapi_library("sdl2.dll")` stays false on purpose: the DLL must
+    // still be mapped and its `DllMain` still run, and every export this
+    // registry does not claim resolves to the module's own code.
+    if library.eq_ignore_ascii_case("sdl2.dll")
+        && let Some(r) = crate::sdl2::dispatch(ctx, name)?
+    {
+        return Ok(r);
+    }
     // ntdll Nt*/Rtl* surface (string dispatch, forwards to kernel32/ucrt).
     if library.eq_ignore_ascii_case("ntdll.dll")
         && let Some(r) = crate::ntdll::dispatch_ntdll(ctx, name)?

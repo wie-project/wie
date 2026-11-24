@@ -119,6 +119,7 @@ fn test_state() -> WinApiState {
             import_resolver: None,
             get_proc_address_cache: HashMap::new(),
             next_module_handle: ModuleHandle::from(crate::dll_loader::REAL_MODULE_HANDLE_BASE),
+            host_exports: HashMap::new(),
         },
     }
 }

@@ -644,6 +644,7 @@ mod tests {
                 next_module_handle: crate::ModuleHandle::from(
                     crate::dll_loader::REAL_MODULE_HANDLE_BASE,
                 ),
+                host_exports: ahash::HashMap::default(),
             },
         }
     }

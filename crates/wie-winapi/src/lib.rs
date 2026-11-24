@@ -62,6 +62,11 @@ mod registry;
 pub mod seh;
 pub mod setupapi;
 pub mod shell32;
+// Guest-DLL export override mechanism (host handlers for a guest module's
+// exports) and the SDL2 pixel movers it serves. Both are crate-internal: the
+// only public surface stays `port` (ADR-0006).
+mod host_exports;
+mod sdl2;
 mod soft_dispatch;
 pub mod sync_obj;
 pub mod thread;

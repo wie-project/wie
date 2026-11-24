@@ -183,6 +183,14 @@ pub struct ModuleState {
     pub import_resolver: Option<ImportResolver>,
     pub get_proc_address_cache: ahash::HashMap<String, GetProcAddressCacheEntry>,
     pub next_module_handle: ModuleHandle,
+    /// Guest-DLL exports a host handler serves instead of the module's own
+    /// code, keyed by lowercased `"library!name"`.
+    ///
+    /// Lives beside `loaded_modules` because it is per-module state: the entry
+    /// records the module's own entry point (the fall-through target) and, when
+    /// the build dispatches exports through a writable pointer, that slot.
+    /// See [`crate::host_exports`].
+    pub(crate) host_exports: ahash::HashMap<String, crate::host_exports::HostExportSite>,
 }
 
 #[derive(Debug, Clone)]

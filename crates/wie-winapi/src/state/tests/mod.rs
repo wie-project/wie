@@ -170,6 +170,7 @@ pub(crate) fn winapi_state_default() -> WinApiState {
             import_resolver: None,
             get_proc_address_cache: HashMap::new(),
             next_module_handle: crate::ModuleHandle::from(dll_loader::REAL_MODULE_HANDLE_BASE),
+            host_exports: HashMap::new(),
         },
     }
 }
@@ -733,6 +734,7 @@ mod phase2_stubs;
 mod phase3_stubs;
 mod registry;
 mod repaint;
+mod sdl2_tests;
 mod seh_dispatch;
 mod setfont;
 mod shell;
