@@ -44,10 +44,29 @@ pub(super) const COOLDOWN_THRESHOLD_CAP: u32 = WORK_THRESHOLD_CEILING * 4;
 
 /// JIT memory lower mode (`WIE_JIT_MEM`).
 ///
-/// - unset / `sticky` — sticky-TLB IR + **stack pin** (4.1b); helpers use all
-///   pin slots (stack / heaps / VirtualAlloc) via `pin_resolve`
+/// - unset / `sticky` (**default**) — sticky-TLB IR + stack pin (4.1b); helpers
+///   use all pin slots (stack / heaps / VirtualAlloc) via `pin_resolve`
 /// - `slow` — helper-only loads/stores (oracle / bisect; no host ptr in IR)
 /// - `pin` — sticky + stack + **top-2 data pin IR** (heaps/VA); helpers same
+///
+/// **Why `sticky` is the default and `pin` is the opt-in.** The data-pin stage
+/// adds a third probe ahead of the helper on *every* memory op, and that IR
+/// volume is not free: measured on the two load-heavy classes, `pin` costs
+/// **25 % on `7za h`** (ratio 0.745, range 0.721–0.750, 6/6 interleaved pairs)
+/// and **22.5 % on `7za x`** (0.775, 0.766–0.779, 6/6) with byte-identical
+/// output and the same retired guest instruction count. It does cut host
+/// load-helper calls 43 %, which is why it looked like a win on the DOOM Retro
+/// *startup* helper count (21 M → 2.4 M) that the old default was justified by
+/// — a startup counter, never a throughput pairing. Per-compile cost is higher
+/// at every block-size bucket (``7za x``: 119/253/519/720/1741/5205/17600 µs for
+/// sticky vs 89/194/375/510/1322/3936/14701 for pin at 1/2/4/8/16/32/64 insns),
+/// so the loss is IR volume, not scheduling luck.
+///
+/// `pin` stays reachable for the case that motivated it, and the experiment that
+/// would bring it back is a paired run on a real GPU-bound guest: if data-pin IR
+/// buys throughput there, it should win that class *on throughput*.
+/// See `docs/architecture/performance-ceiling.md` and
+/// `docs/architecture/compile-selection-policy.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum JitMemMode {
     Slow,
@@ -161,9 +180,10 @@ impl JitConfig {
                     JitMemMode::Sticky
                 }
                 _ => {
-                    // Pin mode reduces helper-path memory ops by ~89% on
-                    // Doom Retro startup (21M→2.4M load helpers).
-                    JitMemMode::Pin
+                    // Sticky, not pin: pin's data-pin stage measures 22–25 %
+                    // *slower* on both load-heavy classes (see the doc comment
+                    // on `JitMemMode`). `WIE_JIT_MEM=pin` opts back in.
+                    JitMemMode::Sticky
                 }
             },
             // Opt-in mem helper resolution histogram (also dumps when residual

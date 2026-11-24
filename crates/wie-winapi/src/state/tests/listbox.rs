@@ -670,7 +670,7 @@ fn test_invalidate_rect_partial_publish_region() {
         .get(&crate::handles::Hwnd::from(hwnd))
         .expect("full frame");
     assert_eq!((frame.width, frame.height), (200, 100));
-    assert_eq!(frame.pixels.len(), 256 * 100); // stride 200 → 64-padded 256
+    assert_eq!(frame.pixels.len(), 200 * 100); // stride = logical width
     // Every publish is full — no region.
     // Partial InvalidateRect(hwnd, {10,20,40,60}): the WM_PAINT synthesis
     // flag is set AND the publish-side dirty rect accumulates the rect.
@@ -719,7 +719,7 @@ fn test_invalidate_rect_partial_publish_region() {
         .expect("partial frame");
     // Every publish is full — no region.
     assert_eq!((frame.width, frame.height), (200, 100));
-    assert_eq!(frame.pixels.len(), 256 * 100); // stride 200 → 64-padded 256
+    assert_eq!(frame.pixels.len(), 200 * 100); // stride = logical width
 
     // A subsequent full-window repaint also publishes full — every
     // publish is full under the rework, regardless of coverage.
@@ -741,5 +741,5 @@ fn test_invalidate_rect_partial_publish_region() {
         .get(&crate::handles::Hwnd::from(hwnd))
         .expect("full frame 2");
     assert_eq!((frame.width, frame.height), (200, 100));
-    assert_eq!(frame.pixels.len(), 256 * 100); // stride 200 → 64-padded 256
+    assert_eq!(frame.pixels.len(), 200 * 100); // stride = logical width
 }

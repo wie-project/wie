@@ -801,11 +801,21 @@ impl JitCpu {
             }
         }
         let hook = self.thread.hooks.as_ref();
-        let result = exec::step(
-            &read_unpoisoned(&self.shared.mem),
-            &mut self.thread.regs,
-            hook,
-        )?;
+        // No lock: the guest-memory address is captured once per engine and
+        // cannot move or be replaced (see `PerThreadJitState::guest_mem`), the
+        // same argument `run_compiled` uses. This path still took the memory
+        // read lock per *interpreted instruction* — a guard acquire plus a
+        // release — which is the 3.47 ns the dispatcher entry stopped paying
+        // when the frame became persistent. It is the residue that runs when a
+        // block is not compiled yet, i.e. exactly a startup/spin loop.
+        //
+        // SAFETY: `guest_mem` points into the `Arc<JitShared>` payload that
+        // this engine holds a share of, and the pointee is never moved or
+        // replaced for the life of the session. The borrow does not alias
+        // `thread.regs`, which is the only mutable access below.
+        #[expect(unsafe_code)]
+        let mem: &GuestMemory = unsafe { &*self.thread.guest_mem };
+        let result = exec::step(mem, &mut self.thread.regs, hook)?;
         if matches!(result, StepResult::Continue) {
             self.thread.iced_steps = self.thread.iced_steps.saturating_add(1);
             self.shared.record_guest_insns(1);

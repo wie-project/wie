@@ -1122,10 +1122,11 @@ pub(super) fn compile_block(
 
         // Hoist pin descriptors on the **entry** block (once per run_compiled).
         // Slot 0 = stack. Slots 1.. = size-ranked data (heap + VirtualAlloc).
-        // Data-pin IR is opt-in via `WIE_JIT_MEM=pin` (see hoist below). Default
-        // sticky keeps stack + sticky only; helpers still `pin_resolve` all 8
-        // slots (VA/heaps) so walks collapse without IR cascade tax on 7za.
-        // Set `WIE_JIT_MEM=pin` to also probe top-2 data pins after sticky.
+        // Data-pin IR is opt-in via `WIE_JIT_MEM=pin` (see hoist below). The
+        // default, sticky, keeps stack + sticky only; helpers still
+        // `pin_resolve` all 8 slots (VA/heaps) so walks collapse — without the
+        // IR cascade tax that measured 22–25 % on `7za h`/`x` (see
+        // `JitMemMode`). Set `WIE_JIT_MEM=pin` to probe top-2 data pins too.
         let (stack_pin, mut data_pins) = if JitConfig::get().mem_inline_enabled() {
             let stack = Some(hoist_pin_slot(&mut bcx, ctx_ptr, flags, 0));
             // Default sticky: no data-pin IR (helpers cover VA via pin_resolve).

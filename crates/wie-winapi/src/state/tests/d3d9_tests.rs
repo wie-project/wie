@@ -433,16 +433,16 @@ fn test_d3d9_present_publishes_surface_frame() {
         .get(&crate::handles::Hwnd::from(0x7777))
         .expect("Present must publish a SurfaceFrame");
     assert_eq!((frame.width, frame.height), (4, 3));
-    // The row pitch is 64-padded (ADR-0001); the logical 4×3 content sits at
-    // the start of each row and the padding tail stays zero.
-    assert_eq!(frame.stride, 64);
+    // The pitch IS the logical width: ADR-0001's 64-px padding was retired
+    // when the presenter began borrowing frames at their own pitch.
+    assert_eq!(frame.stride, 4);
     for (i, px) in (0_u32..12).enumerate() {
         let y = i / 4;
         let x = i % 4;
         assert_eq!(
             frame.pixel(x.try_into().unwrap_or(0), y.try_into().unwrap_or(0)),
             Some(px),
-            "logical pixel ({x}, {y}) round-trips through the padded stride"
+            "logical pixel ({x}, {y}) round-trips through the row pitch"
         );
     }
 }

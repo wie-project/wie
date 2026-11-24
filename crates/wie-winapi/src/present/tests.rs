@@ -358,7 +358,10 @@ fn publish_reports_the_union_of_partial_writes() {
         }),
         "the frame region is the union of the cycle's writes"
     );
-    assert_eq!(frame.stride, 256, "the row pitch is 64-padded (ADR-0001)");
+    assert_eq!(
+        frame.stride, frame.width,
+        "the row pitch is the logical width (ADR-0001 padding retired)"
+    );
     assert_eq!(
         frame.pixels.len(),
         usize::try_from(frame.stride * frame.height).unwrap_or(0),

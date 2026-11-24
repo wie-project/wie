@@ -25,7 +25,7 @@ Conventions that apply to every wave: workspace lints deny
 | Item | Status |
 | --- | --- |
 | 1a. `PresentChannel`: latest-wins slot, wake gate (`published_seq`/`taken_seq`), presenter reads without the big lock | ✅ — `wie-winapi/src/present/mod.rs`, `GuestHandle` wired; hand-back now zero-ALLOC via the channel's spare pool (displaced slots + presented buffers); `pending_frames()` re-arm wired into `RedrawRequested` |
-| 1b. ADR-0001: 64-px pitch padding (`padded_stride`, `WIE_SURFACE_PAD=0` opt-out), stride-aware blits/text/DIB/D3D9/BMP, reused wgpu upload scratch | ✅ — region packs pad to COPY width, not source pitch |
+| 1b. ADR-0001: 64-px pitch padding (`padded_stride`, `WIE_SURFACE_PAD=0` opt-out), stride-aware blits/text/DIB/D3D9/BMP, reused wgpu upload scratch | ⚠️ **partly superseded** — stride-aware writers remain, but the padding itself is retired: `Queue::write_texture` requires no `bytes_per_row` alignment (`wgpu-core-30.0.0/src/device/queue.rs:888-895`, Metal `buffer_copy_pitch` = 4), so surfaces are pitched at the logical width and the upload is a borrow for regions too. `WIE_SURFACE_PAD` deleted |
 | 1c. D3D9 wake coalescing + `WIE_PRESENT_PACING_HZ` pacing knob | ✅ — wake gate in the channel; pacing sleep in `d3d9/device.rs::present_pacing_wait` |
 | 1d. GDI DIB host_slice zero-copy fast path | ✅ — whole-DIB borrow + one-row fallback (`gdi32/dib.rs`); note: `dib_row_offset` returns a ROW index — callers scale by the byte stride |
 

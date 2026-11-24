@@ -35,26 +35,27 @@ Pooled `Arc<Vec<u32>>` with 64 px padding + host-reusable scratch:
 
 ## Reversibility
 
-Pad width and pool depth are **default on** (64 px padded per-HWND pool + reused `WgpuPresenter` scratch) — steady zero-alloc with no env required. Opt-out via `WIE_SURFACE_PAD=0` (on-demand alloc) for bisect; Wave3 flipped the gate (was `WIE_SURFACE_PAD=64` opt-in).
+~~Pad width and pool depth are **default on** (64 px padded per-HWND pool + reused `WgpuPresenter` scratch) — steady zero-alloc with no env required. Opt-out via `WIE_SURFACE_PAD=0`.~~
+
+**Superseded 2026-11: the pitch padding is retired and `WIE_SURFACE_PAD` is deleted.** The padding existed so `stride * 4` would be a multiple of wgpu's 256-byte `COPY_BYTES_PER_ROW_ALIGNMENT` and a full-frame `write_texture` could borrow the buffer. That requirement does not exist on the queue path: `Queue::write_texture` validates with "alignment not required for buffer offset or bytes per row" (`wgpu-core-30.0.0/src/device/queue.rs:888-895`), and on Metal `buffer_copy_pitch` is 4 (`wgpu-hal-30.0.0/src/metal/adapter.rs:1498`), so `stage_bytes_per_row == bytes_per_row` for *any* pitch and the single-memcpy fast path is taken. Meanwhile a padded pitch *defeated* that fast path: the upload was `stride * 4 != width * 4`, so wgpu re-copied row by row, and every producer (blit tail, capture stream, GL present) also had to loop per row instead of one `copy_from_slice`. Surfaces are now pitched at the logical width (`surface_stride`) and the upload borrows the frame for regions as well as full frames. The pool depth part of this ADR stands.
 
 
 ## Implementation status (2026-09-02 audit)
 
 **Implemented — with these deviations from the original text:**
 
-1. The 64-px pitch padding is real: `WindowSurface.stride = padded_stride(width)`
-   (`width.div_ceil(64) * 64`), `SurfaceFrame` carries `stride`, full-frame
-   `write_texture` uploads borrow the buffer zero-copy with
-   `bytes_per_row = stride * 4`. Opt-out `WIE_SURFACE_PAD=0` exists as
-   described.
+1. ~~The 64-px pitch padding is real~~ **Retired** — see "Reversibility". `WindowSurface.stride = surface_stride(width) = width`, `SurfaceFrame` still carries `stride` (callers stay stride-aware, which is what makes the change safe), and `write_texture` borrows the buffer with `bytes_per_row = stride * 4` for a full frame *and* for a region.
 2. The pool is NOT a per-HWND `BufferPool` + steady `Arc::try_unwrap`: since
    ADR-0003 the presenter channel pins a clone of every published frame, so
    `try_unwrap` never succeeds in the hand-back. The zero-ALLOC path is the
    per-HWND **spare pool** (displaced channel slots + presented-buffer
    hand-backs); the first cycle pays one clone. `hand_back_unwrap` therefore
    stays 0 in steady state — `hand_back_clone` counts only real clones.
-3. The reused `WgpuPresenter` upload scratch is real; region packs pad to the
-   COPY width (256-aligned), not the source pitch — a padded surface stride
-   would ship the padding tail on every narrow-region upload.
+3. ~~The reused `WgpuPresenter` upload scratch is real; region packs pad to the
+   COPY width.~~ **Retired** — the scratch survives only as the fallback for a
+   frame buffer too short to cover the copy. Regions borrow: the upload is a
+   slice at `(top * stride + left)` with `bytes_per_row = stride * 4`, and wgpu
+   walks the rows internally (`queue.rs:1003-1026`). Packing first meant the
+   region was copied twice.
 4. Blit paths (GDI fill/BitBlt, DIB blits, text, D3D9 blit_frame, screenshot
    BMP) are stride-aware; `stretch_nearest_strided` handles stretched blits.

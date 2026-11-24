@@ -110,29 +110,22 @@ impl Drop for LiveRenderThread {
 /// color — notepad's client and the common case.
 pub(crate) const DEFAULT_BACKGROUND_COLOR: u32 = 0x00FF_FFFF;
 
-/// Surface pitch padding gate (ADR-0001 reversibility): `WIE_SURFACE_PAD=0`
-/// allocates surfaces at the logical width (stride == width); any other
-/// value or unset keeps the default 64-pixel pitch padding so a full-frame
-/// host upload is always zero-copy (`stride * 4` is a multiple of 256).
-fn surface_padding_enabled() -> bool {
-    static PAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PAD.get_or_init(|| !std::env::var("WIE_SURFACE_PAD").is_ok_and(|v| v == "0"))
-}
-
-/// The row pitch (in pixels) for a surface of logical `width`: padded up to a
-/// multiple of 64 so `stride * 4` bytes satisfies wgpu's 256-byte
-/// `bytes_per_row` alignment and the presenter can borrow the pixel buffer
-/// zero-copy. `WIE_SURFACE_PAD=0` restores the unpitched layout for bisect.
+/// The row pitch (in pixels) of a surface of logical `width`.
+///
+/// It is exactly `width`. ADR-0001 padded it to a 64-pixel multiple so that
+/// `stride * 4` would be a multiple of wgpu's `COPY_BYTES_PER_ROW_ALIGNMENT`
+/// (256) and the presenter could borrow the pixel buffer for
+/// `Queue::write_texture`. That premise does not hold: `write_texture` requires
+/// no such alignment (`wgpu-core-30.0.0/src/device/queue.rs:888-895`, "alignment
+/// not required for buffer offset or bytes per row"), and on Metal
+/// `buffer_copy_pitch` is 4 (`wgpu-hal-30.0.0/src/metal/adapter.rs:1498`). The
+/// presenter now borrows at the frame's own pitch, so padding bought nothing
+/// and cost: every tight-stride row copy in the blit, stream and GL present
+/// paths only runs when `stride != width`. The `WIE_SURFACE_PAD` knob is gone
+/// with the premise.
 #[must_use]
-pub fn padded_stride(width: u32) -> u32 {
-    if width == 0 {
-        return 0;
-    }
-    if surface_padding_enabled() {
-        width.div_ceil(64).saturating_mul(64)
-    } else {
-        width
-    }
+pub fn surface_stride(width: u32) -> u32 {
+    width
 }
 
 /// A frame of 0RGB pixels ready for display.
@@ -142,7 +135,7 @@ pub struct SurfaceFrame {
     pub width: u32,
     /// Row pitch of `pixels` in pixels. `stride >= width`; the tail of every
     /// row (`stride - width` pixels) is padding that carries no content.
-    /// Equal to `width` for unpitched frames (tests, `WIE_SURFACE_PAD=0`).
+    /// Always equal to `width` now that the pitch padding is retired.
     /// The host presenter uses it as the source `bytes_per_row` for
     /// `write_texture`, which keeps the full-frame upload zero-copy.
     pub stride: u32,
@@ -826,12 +819,12 @@ impl PresentState {
     /// Ensure a surface exists for `hwnd` with the given dimensions.
     /// Resizes or reallocates if dimensions changed; never shrinks.
     ///
-    /// The buffer is pitch-padded: `stride = padded_stride(width)` (a
-    /// multiple of 64 unless `WIE_SURFACE_PAD=0`), so `stride * 4` satisfies
-    /// wgpu's 256-byte row alignment and the presenter's full-frame upload is
-    /// zero-copy. Every row-major writer must index `row * stride + x`.
+    /// The buffer is row-major at `stride = surface_stride(width)` — the
+    /// logical width, since ADR-0001's 64-px pitch padding was retired (it
+    /// existed for a `write_texture` pitch alignment that turns out not to be
+    /// required). Every row-major writer must index `row * stride + x`.
     pub fn ensure_surface(&mut self, hwnd: crate::handles::Hwnd, width: u32, height: u32) {
-        let stride = padded_stride(width);
+        let stride = surface_stride(width);
         let needed = usize::try_from(stride.checked_mul(height).unwrap_or(0)).unwrap_or(0);
         // B1 double-buffer hand-back: a prior publish moved the painted buffer
         // into the published Arc, leaving the surface empty. Hand the buffer

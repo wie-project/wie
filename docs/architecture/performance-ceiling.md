@@ -1558,6 +1558,41 @@ numbers were real; the doc's row was wrong three times over.
    inside that spread. The harness is right; §2's row and §6's "entries, not wall" aside
    are corrected in place.
 
+### 11.6a The memory-lowering default was the losing arm (measured, fixed)
+
+`WIE_JIT_MEM` shipped with **pin** as its default, justified in
+`config.rs` by a DOOM Retro startup counter: data-pin IR cut host load-helper
+calls 89 % there (21 M → 2.4 M). Helper *count* is not helper *time*, and the
+data-pin stage is a third probe (stack → sticky → data pin → helper) emitted
+ahead of every memory op, so the whole IR welfare of the block grows to avoid
+a walk that `pin_resolve` already collapses.
+
+Two independent paired samples, two binaries, same result:
+
+| class | arm | median ratio | spread | pairs agreeing | insns/entry |
+|---|---|---|---|---|---|
+| `7za h` | `sticky` vs `pin` | **0.745** | 0.721–0.750 | 6/6 | identical |
+| `7za x` | `sticky` vs `pin` | **0.775** | 0.766–0.779 | 6/6 | identical |
+| `7za h` (second binary) | `sticky` vs `pin` | **0.759** | 0.745–0.766 | 8/8 | identical |
+| `7za x` (second binary) | `sticky` vs `pin` | **0.771** | 0.766–0.776 | 8/8 | identical |
+
+Retired guest instructions match to within the adaptive-spin count, and the
+extraction-tree cksum manifest was `3496821080` in all 64 `x` runs in the
+larger sample — the work done is the same, in a quarter less time. Compile
+cost is higher at *every* block-size bucket (`x`: 119/253/519/720/1741/5205/
+17600 µs sticky vs 89/194/375/510/1322/3936/14701 pin at 1/2/4/8/16/32/64
+insns), which names the mechanism as IR volume rather than a scheduling
+accident.
+
+**Shipped:** `sticky` is now the default; `WIE_JIT_MEM=pin` is the opt-in.
+`pin` returns only on *throughput* evidence from the class that motivated it —
+a paired run on a GPU-bound guest — not on a helper-call count.
+
+This also reframes row 4 of §11.7 ("the ceiling needs better pin/TLB coverage,
+not a faster helper"): better coverage is what `pin` already was, and it cost
+22–25 %. The remaining headroom there has to be bought with *cheaper* inline
+lowering, not more of it.
+
 ### 11.7 The ranking, as it now stands
 
 | # | Lever | Measured cost at HEAD | Ceiling | Effort | Status |

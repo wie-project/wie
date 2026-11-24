@@ -300,7 +300,7 @@ fn capture_thread(channel: Arc<super::PresentChannel>, wake: Box<dyn Fn() + Send
             continue;
         }
         let t0 = super::frame_timing_enabled().then(Instant::now);
-        let stride = super::padded_stride(flush.win_w);
+        let stride = super::surface_stride(flush.win_w);
         let dims = (
             usize::try_from(stride).unwrap_or(0),
             usize::try_from(flush.win_h).unwrap_or(0),
