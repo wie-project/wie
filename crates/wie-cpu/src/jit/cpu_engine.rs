@@ -443,7 +443,6 @@ impl CpuEngine for JitCpu {
     }
 
     fn return_from_win64_api(&mut self, rax: u64) -> Result<u64, CpuError> {
-        self.thread.ctx.shadow_sp = 0;
         let rsp = self.thread.regs.rsp();
         let mut ret_bytes = [0_u8; 8];
         read_unpoisoned(&self.shared.mem)

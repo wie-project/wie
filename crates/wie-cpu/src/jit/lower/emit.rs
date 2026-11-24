@@ -1,5 +1,5 @@
 //! Block emission: `emit_body_and_term`, the block-wide stack guard, and the
-//! terminator helpers (chaining, shadow stack, self-loops, fast UCRT inline ops).
+//! terminator helpers (chaining, self-loops, fast UCRT inline ops).
 
 use super::analysis::{ensure_gprs_loaded, ensure_xmm_loaded};
 use super::flags::{FlagState, decompose_packed, iconst_u64, resync_state};
@@ -10,8 +10,7 @@ use super::string::lower_string;
 use super::{
     EDGE_IC_SLOTS, MAX_CHAIN_DEPTH, OFF_CHAIN_DEPTH, OFF_CHAIN_HOPS, OFF_CHAIN_STORE_OPS,
     OFF_EDGE_IC_FN, OFF_EDGE_IC_VA, OFF_FAULT, OFF_INSN_ACC, OFF_INV_GEN_BAKED, OFF_INV_GEN_PTR,
-    OFF_RIP, OFF_SHADOW_RET, OFF_SHADOW_SP, SHADOW_DEPTH, TLB_PROT_R, TLB_PROT_W, flag_cond,
-    flag_cond_fs, lower_term,
+    OFF_RIP, TLB_PROT_R, TLB_PROT_W, flag_cond, flag_cond_fs, lower_term,
 };
 
 use super::super::block::{BlockStackPinPlan, BlockTerm, DecodedInsn};
@@ -242,67 +241,6 @@ pub(super) fn loop_header_args(
         args.push(BlockArg::Value(rflags));
     }
     args
-}
-
-/// Push guest `return_ip` onto the software shadow return stack.
-pub(super) fn shadow_push(
-    bcx: &mut FunctionBuilder<'_>,
-    ctx_ptr: Value,
-    flags: MemFlagsData,
-    return_ip: u64,
-) {
-    let sp_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_SHADOW_SP));
-    let sp = bcx.ins().load(types::I64, flags, sp_ptr, 0);
-    let mask = iconst_u64(bcx, (SHADOW_DEPTH as u64) - 1);
-    let idx = bcx.ins().band(sp, mask);
-    let base = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_SHADOW_RET));
-    let three = iconst_u64(bcx, 3);
-    let off = bcx.ins().ishl(idx, three); // * sizeof(u64)
-    let slot = bcx.ins().iadd(base, off);
-    let retv = iconst_u64(bcx, return_ip);
-    bcx.ins().store(flags, retv, slot, 0);
-    let sp1 = bcx.ins().iadd_imm(sp, 1);
-    bcx.ins().store(flags, sp1, sp_ptr, 0);
-}
-
-/// On `ret`: if shadow top matches `ret_va`, pop; else clear shadow (mispredict / longjmp).
-/// Returns `ret_va` unchanged (prediction only affects chaining likelihood via continuity).
-pub(super) fn shadow_pop_check(
-    bcx: &mut FunctionBuilder<'_>,
-    ctx_ptr: Value,
-    flags: MemFlagsData,
-    ret_va: Value,
-) -> Value {
-    let sp_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_SHADOW_SP));
-    let sp = bcx.ins().load(types::I64, flags, sp_ptr, 0);
-    let zero = iconst_u64(bcx, 0);
-    let has = bcx.ins().icmp(IntCC::NotEqual, sp, zero);
-    let do_blk = bcx.create_block();
-    let cont = bcx.create_block();
-    bcx.append_block_param(cont, types::I64); // ret_va passthrough
-    // Always continue with ret_va; side-effect is shadow maintenance.
-    bcx.ins()
-        .brif(has, do_blk, &[], cont, &[BlockArg::Value(ret_va)]);
-
-    bcx.switch_to_block(do_blk);
-    bcx.seal_block(do_blk);
-    let sp1 = bcx.ins().iadd_imm(sp, -1);
-    let mask = iconst_u64(bcx, (SHADOW_DEPTH as u64) - 1);
-    let idx = bcx.ins().band(sp1, mask);
-    let base = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_SHADOW_RET));
-    let three = iconst_u64(bcx, 3);
-    let off = bcx.ins().ishl(idx, three);
-    let slot = bcx.ins().iadd(base, off);
-    let predicted = bcx.ins().load(types::I64, flags, slot, 0);
-    let ok = bcx.ins().icmp(IntCC::Equal, predicted, ret_va);
-    // Match → commit pop; mismatch → clear entire shadow.
-    let new_sp = bcx.ins().select(ok, sp1, zero);
-    bcx.ins().store(flags, new_sp, sp_ptr, 0);
-    bcx.ins().jump(cont, &[BlockArg::Value(ret_va)]);
-
-    bcx.switch_to_block(cont);
-    bcx.seal_block(cont);
-    bcx.block_params(cont)[0]
 }
 
 /// Emit the cross-thread code-invalidation guard for a chained edge.
@@ -1080,9 +1018,6 @@ pub(super) fn emit_body_and_term(
                 trip,
             )?;
         } else {
-            if let BlockTerm::Call { return_ip, .. } | BlockTerm::CallDyn { return_ip } = t {
-                shadow_push(bcx, ctx_ptr, flags, return_ip);
-            }
             let exit_rip = lower_term(
                 bcx,
                 t,
@@ -1094,11 +1029,6 @@ pub(super) fn emit_body_and_term(
                 term_ip,
                 term_insn.map(|ti| &ti.instr),
             )?;
-            let exit_rip = if matches!(t, BlockTerm::Ret) {
-                shadow_pop_check(bcx, ctx_ptr, flags, exit_rip)
-            } else {
-                exit_rip
-            };
             match t {
                 BlockTerm::Jcc {
                     mnemonic,

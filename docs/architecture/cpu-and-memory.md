@@ -43,14 +43,14 @@ flowchart TD
     I --> D
     C -->|Never| G
     E -->|no| G
-    D --> J["persist TLB / pins / chain / shadow"]
+    D --> J["persist TLB / pins / chain table"]
     J --> K["drain_pending_code_writes<br/>(SMC invalidation)"]
 ```
 
 Key design points:
 
 - **Hotness threshold.** A block must be visited a few times before it earns compilation; self-loops and UCRT fast-API calls compile eagerly. Cold one-shot code never pays the compile tax.
-- **Chaining.** Compiled blocks `call` their known successors directly (late-bound via `wie_jit_chain_lookup` when unknown). A shadow return stack validates `ret` targets; mispredicted returns zero the shadow state and fall back to the dispatcher. Chain depth is capped (`MAX_CHAIN_DEPTH = 48`) to protect the host stack.
+- **Chaining.** Compiled blocks `call` their known successors directly (late-bound via `wie_jit_chain_lookup` when unknown). Chain depth is capped (`MAX_CHAIN_DEPTH = 48`) to protect the host stack. The old "shadow return stack" is **removed** (2026-11): it pushed on every guest `call` and ran a three-block diamond on every `ret`, but nothing consumed the result — `shadow_pop_check` returned `ret_va` unchanged and `chain_tail` looked successors up in the chain table, never in the shadow. It was pure per-call/per-ret work, so it is gone.
 - **The super path.** Stack-heavy self-loops can get a block-wide guard: one prologue check, then *bare host pointer arithmetic* (region-pin slot 0) for the loop body — the biggest single speedup for pure compute.
 - **Trampolines.** 1–3 instruction micro-stubs (`ret`, `xor eax,eax; ret`, `GetLastError` reading the TEB slot, …) skip Cranelift entirely.
 - **SMC correctness.** Guest stores to code pages are recorded; after each block run, any `Ready` block overlapping a written page is dropped (`drain_pending_code_writes`).
@@ -98,7 +98,7 @@ Two protection encodings exist on purpose: `RwxPerms` (rwx bits) and `PageProtec
 ## Invariants and gotchas
 
 - **`unsafe` confinement**: workspace-wide `unsafe_code = deny`, except `wie-cpu/src/jit` and `mem/arena.rs` — the JIT entry helpers and mmap wrappers are the only legitimate uses.
-- **`return_from_win64_api` clears the shadow stack** — the shadow contract only holds within a chain of compiled blocks; crossing into a host API handler and back breaks it, so it resets.
+- **`return_from_win64_api` used to clear the shadow stack** for the same reason the stack existed at all; both are gone with it.
 - **`host_span(write)` denies executable spans** — JIT code pages never get a direct writable host pointer; SMC invalidation never depends on a returned slice.
 - **Background-compiled blocks are validated at install** — if `mem_gen` moved or a code page was written while the worker compiled, the result is dropped.
 - **`exec::step` stubs**: `Cpuid` returns 0, `Rdtsc` reads host monotonic time — honest minimal answers, documented per instruction.

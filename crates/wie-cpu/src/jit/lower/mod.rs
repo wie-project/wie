@@ -95,8 +95,6 @@ impl XmmSlot {
 
 /// Open-addressing slots for guest-VA → host block fn (block chaining).
 pub(super) const CHAIN_SLOTS: usize = 512;
-/// Shadow return-stack depth (power of two; modular index).
-pub(super) const SHADOW_DEPTH: usize = 32;
 /// Region-direct pin slots (stack + primary heap).
 /// Must match [`crate::mem::JIT_REGION_PIN_SLOTS`] (stack + heap + VA pins).
 pub(super) const PIN_SLOTS: usize = crate::mem::JIT_REGION_PIN_SLOTS;
@@ -295,7 +293,7 @@ impl MemPin {
 ///   the dirty masks, `chain_depth`, `insn_acc`, `chain_hops`,
 ///   `chain_store_ops`, `load_calls`, `store_calls`) because the frame now
 ///   outlives a run. Everything else (`tlb`, `pins`, `sticky_*`, `edge_ic_*`,
-///   `shadow_*`, `tlb_hot_*`) is *meant* to persist and already did — it used
+///   `tlb_hot_*`) is *meant* to persist and already did — it used
 ///   to be copied back into the thread after each run.
 #[repr(C)]
 pub(super) struct JitCtx {
@@ -325,10 +323,6 @@ pub(super) struct JitCtx {
     pub tlb: GenTlb<u64, TlbValue, TLB_SETS, TLB_WAYS_PER_SET>,
     /// XMM0..XMM15 as 16-byte aligned slots (lo/hi layout for IR offsets).
     pub xmm: [XmmSlot; 16],
-    /// Shadow return stack: push count (modular index via `sp & (SHADOW_DEPTH-1)`).
-    pub shadow_sp: u64,
-    /// Predicted guest return addresses for `call`/`ret` chaining.
-    pub shadow_ret: [u64; SHADOW_DEPTH],
     /// Pointer to [`CHAIN_SLOTS`] `(va, fn_ptr)` pairs (owned by `JitCpu`,
     /// live for `run_compiled`). AoS layout — one 16-byte pair per probe
     /// stays inside a single cache line, halving L1 traffic vs. the previous
@@ -492,8 +486,6 @@ impl JitCtx {
             fault_access: 0,
             tlb: GenTlb::new(),
             xmm: [XmmSlot::ZERO; 16],
-            shadow_sp: 0,
-            shadow_ret: [0; SHADOW_DEPTH],
             chain_slots: std::ptr::null_mut(),
             tlb_hot_page: TLB_EMPTY,
             tlb_hot_ptr: std::ptr::null_mut(),
@@ -569,9 +561,7 @@ pub(super) const OFF_RFLAGS: i32 = std::mem::offset_of!(JitCtx, rflags) as i32;
 pub(super) const OFF_RIP: i32 = std::mem::offset_of!(JitCtx, rip) as i32;
 pub(super) const OFF_GS_BASE: i32 = std::mem::offset_of!(JitCtx, gs_base) as i32;
 pub(super) const OFF_FAULT: i32 = std::mem::offset_of!(JitCtx, fault) as i32;
-pub(super) const OFF_SHADOW_SP: i32 = std::mem::offset_of!(JitCtx, shadow_sp) as i32;
 pub(super) const OFF_XMM: i32 = std::mem::offset_of!(JitCtx, xmm) as i32;
-pub(super) const OFF_SHADOW_RET: i32 = OFF_SHADOW_SP + 8;
 pub(super) const OFF_TLB_HOT_PAGE: i32 = std::mem::offset_of!(JitCtx, tlb_hot_page) as i32;
 pub(super) const OFF_TLB_HOT_PTR: i32 = std::mem::offset_of!(JitCtx, tlb_hot_ptr) as i32;
 pub(super) const OFF_TLB_HOT_PROT: i32 = std::mem::offset_of!(JitCtx, tlb_hot_prot) as i32;
@@ -610,8 +600,6 @@ const _: () = {
     assert!(std::mem::offset_of!(JitCtx, gs_base) as i32 == OFF_GS_BASE);
     assert!(std::mem::offset_of!(JitCtx, fault) as i32 == OFF_FAULT);
     assert!(std::mem::offset_of!(JitCtx, xmm) as i32 == OFF_XMM);
-    assert!(std::mem::offset_of!(JitCtx, shadow_sp) as i32 == OFF_SHADOW_SP);
-    assert!(std::mem::offset_of!(JitCtx, shadow_ret) as i32 == OFF_SHADOW_RET);
     assert!(std::mem::offset_of!(JitCtx, tlb_hot_page) as i32 == OFF_TLB_HOT_PAGE);
     assert!(std::mem::offset_of!(JitCtx, tlb_hot_ptr) as i32 == OFF_TLB_HOT_PTR);
     assert!(std::mem::offset_of!(JitCtx, tlb_hot_prot) as i32 == OFF_TLB_HOT_PROT);
@@ -642,7 +630,6 @@ const _: () = {
     assert!(std::mem::align_of::<XmmSlot>() >= 16);
     assert!(std::mem::align_of::<GenTlb<u64, TlbValue, TLB_SETS, TLB_WAYS_PER_SET>>() >= 16);
     assert!(TLB_SETS.is_power_of_two());
-    assert!(SHADOW_DEPTH.is_power_of_two());
     assert!(CHAIN_SLOTS.is_power_of_two());
     assert!(EDGE_IC_SLOTS > 0);
 };

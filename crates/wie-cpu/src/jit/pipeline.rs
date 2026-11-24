@@ -771,8 +771,6 @@ impl JitCpu {
             }
         }
 
-        // Iced does not maintain the shadow return stack — drop prediction.
-        self.thread.ctx.shadow_sp = 0;
         self.stats.exec.iced_insns = self.stats.exec.iced_insns.saturating_add(1);
         self.stats.profile.iced_fallbacks = self.stats.profile.iced_fallbacks.saturating_add(1);
         // Sampled opcode histogram over the interpreted residue (Phase-0
@@ -1196,7 +1194,7 @@ impl JitCpu {
     /// - The `GuestMemory` read guard drops before native execution — the block
     ///   runs on the per-thread TLB/pins and `JitCtx` pointers only.
     /// - Chain-table slots and the shadow return stack are per-thread owned
-    ///   (`chain_slots` / `shadow_ret`), live for the call, and persist back
+    ///   (`chain_slots`), live for the call, and persist back
     ///   into `self.thread` from `JitCtx` on return; pending code writes are
     ///   drained (SMC invalidation) before returning.
     ///
@@ -1266,7 +1264,7 @@ impl JitCpu {
         let ctx = &mut self.thread.ctx;
         let regs = &mut self.thread.regs;
         // Entry state, and *only* entry state. This used to build a whole
-        // `JitCtx` by value — 3,744 B in all (`tlb` 2.3 KB + `pins` + `shadow_ret`
+        // `JitCtx` by value — 3,744 B in all (`tlb` 2.3 KB + `pins`
         // + 16 GPRs + 16 XMM slots) copied in here and copied back out below, on
         // every dispatcher entry (≈8.9% of the guest thread on `7za a -mx9`
         // came from `_platform_memmove` alone). The frame is now owned by this
@@ -1482,8 +1480,6 @@ impl JitCpu {
         ctx.edge_ic_va = [0; lower::EDGE_IC_SLOTS];
         ctx.edge_ic_fn = [0; lower::EDGE_IC_SLOTS];
         ctx.edge_ic_rr = 0;
-        ctx.shadow_sp = 0;
-        ctx.shadow_ret = [0; lower::SHADOW_DEPTH];
         // The table is empty now; force a full re-sync from the cache on the
         // next dispatch (picks up worker-installed Ready blocks too).
         self.chain_sync_epoch = u64::MAX;

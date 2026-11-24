@@ -3,14 +3,12 @@
 //! Ultra-short fake-API bodies (`ret`, `xor eax,eax; ret`, GetLastError, …)
 //! skip Cranelift entirely: lower peak init RAM and cut compile tax on every
 //! process start. Semantics match the Cranelift-lowered path (guest `ret`,
-//! shadow stack, optional late-bound chain).
+//! optional late-bound chain).
 
 use super::ALL_DIRTY_BITS;
 use super::block::{BlockTerm, DecodedInsn};
 use super::config::JitConfig;
-use super::lower::{
-    CHAIN_SLOTS, JitCtx, MAX_CHAIN_DEPTH, SHADOW_DEPTH, chain_hash, wie_jit_load, wie_jit_store,
-};
+use super::lower::{CHAIN_SLOTS, JitCtx, MAX_CHAIN_DEPTH, chain_hash, wie_jit_load, wie_jit_store};
 use crate::guest_layout::TEB_LAST_ERROR_OFFSET;
 use iced_x86::{Mnemonic, OpKind, Register};
 use std::sync::atomic::Ordering;
@@ -370,7 +368,7 @@ fn enter_stub(ctx: &mut JitCtx, stub: MicroStub) {
     ctx.insn_acc = ctx.insn_acc.saturating_add(u64::from(stub.insn_count()));
 }
 
-/// Pop guest return address, update RSP / shadow, set RIP.
+/// Pop guest return address, update RSP, set RIP.
 fn guest_ret(ctx: &mut JitCtx) {
     if ctx.fault != 0 {
         return;
@@ -381,23 +379,7 @@ fn guest_ret(ctx: &mut JitCtx) {
         return;
     }
     ctx.gpr[4] = rsp.wrapping_add(8);
-    shadow_pop_check(ctx, ret_va);
     ctx.rip = ret_va;
-}
-
-fn shadow_pop_check(ctx: &mut JitCtx, ret_va: u64) {
-    let sp = ctx.shadow_sp;
-    if sp == 0 {
-        return;
-    }
-    let sp1 = sp.wrapping_sub(1);
-    let idx = (sp1 as usize) & (SHADOW_DEPTH - 1);
-    let predicted = ctx.shadow_ret[idx];
-    if predicted == ret_va {
-        ctx.shadow_sp = sp1;
-    } else {
-        ctx.shadow_sp = 0;
-    }
 }
 
 /// Late-bound chain into the next Ready block (same host ABI as Cranelift).

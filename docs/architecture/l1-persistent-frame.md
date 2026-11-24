@@ -18,8 +18,16 @@ offsets are unchanged, so `CODE_FORMAT_VERSION` stays at **3** (see §3).
 `JitCtx` (`crates/wie-cpu/src/jit/lower/mod.rs`) is the `#[repr(C)]` struct that
 compiled code receives as `*mut JitCtx`. Its layout is the ABI: emitted IR
 loads `rflags`, `rip`, `xmm`, `pins`, the sticky/hot TLB slot, `edge_ic_*`,
-`shadow_sp`/`shadow_ret`, `chain_depth`, `inv_gen_*` and the per-run counters
+`chain_depth`, `inv_gen_*` and the per-run counters (the `shadow_sp`/`shadow_ret`
+pair is gone — see `cpu-and-memory.md`, the shadow return stack was removed)
 through `OFF_*` constants.
+
+**The layout is part of the code-cache key.** Because those offsets are immediates
+in the emitted block, a persisted blob compiled against a different layout would
+read and write the wrong fields at full speed with no diagnostic. So
+`JitConfig::emit_fingerprint` mixes in `size_of::<JitCtx>()` and a hand-bumped
+`FRAME_LAYOUT_VERSION` (bump it when a change *reorders* fields without changing
+the size). Any edit to this struct invalidates every cached blob by construction.
 
 Before this change `run_compiled` built one **per dispatcher entry**, by value:
 

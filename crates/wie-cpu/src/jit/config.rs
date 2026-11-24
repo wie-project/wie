@@ -344,6 +344,13 @@ impl JitConfig {
     /// [`Self::opt_level`]: opt level is already folded into the ledger key, but
     /// a knob flip must not invalidate a user's metadata ledger, and folding it
     /// into the code-cache key instead keeps the two files independent.
+    /// Bump when `JitCtx`'s field ORDER changes without changing its size:
+    /// emitted code bakes every field offset into the block, so a persisted
+    /// blob is only valid against the layout it was compiled with.
+    ///
+    /// 2 — the shadow return stack (`shadow_sp`, `shadow_ret`) was removed.
+    pub(super) const FRAME_LAYOUT_VERSION: u64 = 2;
+
     #[must_use]
     pub(super) fn emit_fingerprint(&self) -> u64 {
         fn mix(h: u64, v: u64) -> u64 {
@@ -371,6 +378,14 @@ impl JitConfig {
         // debug-built test process can never accept a release blob.
         h = mix(h, u64::from(cfg!(debug_assertions)));
         h = mix(h, std::mem::size_of::<usize>() as u64);
+        // Frame layout. Emitted code carries every `JitCtx` field offset as an
+        // immediate (`OFF_*`), so a blob compiled against a different struct
+        // layout does not merely miss — it reads and writes the wrong fields,
+        // at full speed, with no diagnostic. Size catches the common case
+        // (add/remove a field); `FRAME_LAYOUT_VERSION` must be bumped by hand
+        // for a change that reorders fields without moving the size.
+        h = mix(h, std::mem::size_of::<super::lower::JitCtx>() as u64);
+        h = mix(h, Self::FRAME_LAYOUT_VERSION);
         h = mix(h, u64::from(u8::MAX)); // fingerprint-format v1 marker
         h
     }

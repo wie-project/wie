@@ -16,15 +16,15 @@
 //!    masks, `chain_depth`, `insn_acc`, `chain_hops`, `chain_store_ops`, the
 //!    load/store counters and `mem_path` accumulate during a run and must start
 //!    at zero again on the next entry. Everything else — `tlb`, `pins`,
-//!    `sticky_*`, `edge_ic_*`, `shadow_*`, the hot page — must *survive* an
+//!    `sticky_*`, `edge_ic_*`, the chain table, the hot page — must *survive* an
 //!    entry, because it was already persisted across runs before the frame
 //!    became permanent. Over-resetting is as wrong as under-resetting: it turns
-//!    every entry back into a cold start, and it silently discards the shadow
-//!    return stack and edge IC that chaining depends on.
+//!    every entry back into a cold start, and it silently discards the chain
+//!    table and edge IC that chaining depends on.
 //!
 //! Both are checked the same way: run the same guest bytes down both entry
 //! paths, and compare the resulting guest-visible state field by field —
-//! including XMM and the shadow return stack, which is where this project's
+//! including XMM, which is where this project's
 //! worst frame bugs (notepad's CRLF `movd` zeros, Doom Retro's dropped `xmm`
 //! def) actually lived.
 //!
@@ -35,10 +35,10 @@
 //! B (+0x20): movdqu xmm3,[r15]          <- xmm path
 //!            movdqu [r15+0x10],xmm3     <- xmm write-through, observable in memory
 //!            add rax,0x1234
-//!            call C                     <- shadow push
+//!            call C                     <- a real call/ret pair
 //!            add rax,rbx
 //!            jmp STOP
-//! C (+0x50): inc rax ; ret              <- shadow pop check + chain back
+//! C (+0x50): inc rax ; ret              <- ret pops, chains back
 //! ```
 
 use super::harness::map_code_region;
@@ -46,7 +46,7 @@ use super::*;
 use crate::exec::StepResult;
 use crate::regs::Rflags;
 use config::JitConfig;
-use lower::{MAX_CHAIN_DEPTH, SHADOW_DEPTH};
+use lower::MAX_CHAIN_DEPTH;
 
 /// Code + data page pair for this file (no other fixture uses this base).
 const FRAME_BASE: u64 = 0x10b0_0000;
@@ -57,17 +57,8 @@ const STOP_OFF: u64 = 0x100;
 /// Block `B` — entered by the chain edge in the chained arm, and directly in
 /// the dispatched arm.
 const B_OFF: u64 = 0x20;
-/// Return address `call C` pushes, i.e. the shadow-stack slot `ret` must pop.
-const RET_ADDR_OFF: u64 = 0x36;
 /// `A`'s `mov rax,0` + 0x1234 + `C`'s `inc` + `rbx`.
 const EXPECTED_RAX: u64 = 0x1234 + 1 + 0x1000;
-/// Seeded shadow depth. Non-zero on purpose: an implementation that clears the
-/// frame's shadow state per entry reports 0 here instead of 5.
-const SEEDED_SHADOW_SP: u64 = 5;
-/// Untouched shadow slot that must keep its seeded value (catches a blanket
-/// `shadow_ret = [0; _]` reset, which would still pass the `sp` check alone).
-const SHADOW_SENTINEL_SLOT: usize = 9;
-const SHADOW_SENTINEL: u64 = 0x9999_9999_9999_9999;
 /// 16 bytes loaded into `xmm3`, stored back out to `FRAME_DATA + 0x10`.
 const XMM_PATTERN: [u8; 16] = [
     0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x0f, 0xf0,
@@ -105,8 +96,12 @@ struct FrameView {
     rflags: u64,
     rip: u64,
     xmm: [u128; 16],
-    shadow_sp: u64,
-    shadow_ret: [u64; SHADOW_DEPTH],
+    /// Digest of the chain table, compared ACROSS ARMS rather than against a
+    /// seed: both arms run the same fixture, so an entry path that reinitialised
+    /// the table (or failed to learn the same edges) shows up here. Seeding the
+    /// table directly was wrong — it desynchronises `chain_sync_epoch`, which
+    /// then never refills it and the control edge under test disappears.
+    chain_digest: u64,
     /// The guest-memory pointer the block was handed: captured once per engine
     /// at construction and re-stamped from the frame on every entry, so both
     /// entry paths must see the engine's canonical address (a stale one here
@@ -126,8 +121,15 @@ impl FrameView {
             rflags: u64::from(regs.rflags),
             rip: regs.rip,
             xmm: std::array::from_fn(|i| ctx.xmm[i].to_u128()),
-            shadow_sp: ctx.shadow_sp,
-            shadow_ret: ctx.shadow_ret,
+            chain_digest: cpu.thread.chain_slots.iter().fold(
+                0xcbf2_9ce4_8422_2325_u64,
+                |mut h, slot| {
+                    h ^= slot.va;
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                    h ^= slot.fn_ptr;
+                    h.wrapping_mul(0x0000_0100_0000_01b3)
+                },
+            ),
             mem: ctx.mem as usize,
             hops: cpu.stats().chain.hops,
         }
@@ -153,8 +155,10 @@ impl FrameView {
                 self.xmm[i], other.xmm[i]
             );
         }
-        assert_eq!(self.shadow_sp, other.shadow_sp, "{a} vs {b}: shadow_sp");
-        assert_eq!(self.shadow_ret, other.shadow_ret, "{a} vs {b}: shadow_ret");
+        assert_eq!(
+            self.chain_digest, other.chain_digest,
+            "{a} vs {b}: chain table contents"
+        );
         assert_eq!(
             self.mem, other.mem,
             "{a} vs {b}: the guest-memory pointer differs ({:#x} vs {:#x})",
@@ -174,10 +178,6 @@ fn seed(cpu: &mut JitCpu) {
     regs.set_gpr(3, 0x1000); // rbx: read-only live-in for `add rax,rbx`
     regs.set_rsp(FRAME_DATA + 0x800);
     regs.set_rflags_checked(Rflags::from(0x202_u64));
-    let ctx = &mut cpu.thread.ctx;
-    ctx.shadow_sp = SEEDED_SHADOW_SP;
-    ctx.shadow_ret = [0xAAAA_5555_AAAA_5555; SHADOW_DEPTH];
-    ctx.shadow_ret[SHADOW_SENTINEL_SLOT] = SHADOW_SENTINEL;
 }
 
 /// Make the previous run's leftovers maximally visible. If the dispatcher does
@@ -256,23 +256,7 @@ fn arm(cpu: &mut JitCpu, entry_rip: u64) -> FrameView {
         stored, XMM_PATTERN,
         "arm at {entry_rip:#x}: `movdqu [r15+0x10],xmm3` must land in memory"
     );
-    assert_eq!(
-        view.shadow_sp, SEEDED_SHADOW_SP,
-        "arm at {entry_rip:#x}: the call/ret pair must leave the seeded shadow \
-         depth intact — a reset here means the dispatcher is clearing state it \
-         must preserve"
-    );
-    assert_eq!(
-        view.shadow_ret[usize::try_from(SEEDED_SHADOW_SP).unwrap_or(0)],
-        FRAME_BASE + RET_ADDR_OFF,
-        "arm at {entry_rip:#x}: the shadow slot the `call` pushed must hold the \
-         return address"
-    );
-    assert_eq!(
-        view.shadow_ret[SHADOW_SENTINEL_SLOT], SHADOW_SENTINEL,
-        "arm at {entry_rip:#x}: an untouched shadow slot must keep its seeded \
-         value — the frame must persist, not be rebuilt"
-    );
+
     view
 }
 
