@@ -680,6 +680,10 @@ pub struct PresentState {
     /// Number of clone-fallback hand-backs in `ensure_surface` (the host
     /// still held the previous frame's Arc, so the buffer had to be copied).
     pub hand_back_clone: u64,
+    /// Hand-backs by a full-surface painter that took a fresh allocation
+    /// instead of copying the previous frame into the paint base. Counts the
+    /// copies `ensure_surface_for_full_repaint` avoided when no spare was free.
+    pub hand_back_full_repaint: u64,
     /// B9: accumulated publish wall time (ns).
     pub publish_ns: u128,
     /// B9: duration of the most recent publish (ns).
@@ -781,6 +785,7 @@ impl PresentState {
             frames_published: 0,
             hand_back_unwrap: 0,
             hand_back_clone: 0,
+            hand_back_full_repaint: 0,
             publish_ns: 0,
             publish_ns_last: 0,
             blit_copy_ns: 0,
@@ -824,6 +829,40 @@ impl PresentState {
     /// existed for a `write_texture` pitch alignment that turns out not to be
     /// required). Every row-major writer must index `row * stride + x`.
     pub fn ensure_surface(&mut self, hwnd: crate::handles::Hwnd, width: u32, height: u32) {
+        self.ensure_surface_inner(hwnd, width, height, false);
+    }
+
+    /// [`Self::ensure_surface`] for a painter that is about to overwrite **every**
+    /// logical pixel (a D3D9 or GL present that blits or stretches the whole
+    /// frame into the surface).
+    ///
+    /// The hand-back below normally copies the just-published frame into the
+    /// next paint base so a composite keeps accumulating across publishes. A
+    /// full-surface painter replaces that base wholesale, so the copy is pure
+    /// waste: at 1080p it is a 8.3 MB memcpy per frame, and it is on every
+    /// frame rather than occasionally — the channel pins a clone of every
+    /// published frame, so `Arc::try_unwrap` in the hand-back can never
+    /// succeed. This variant takes the destination allocation (spare, or a
+    /// fresh one) and skips the copy.
+    ///
+    /// A partial painter must keep using [`Self::ensure_surface`]: it reads the
+    /// base it does not write.
+    pub fn ensure_surface_for_full_repaint(
+        &mut self,
+        hwnd: crate::handles::Hwnd,
+        width: u32,
+        height: u32,
+    ) {
+        self.ensure_surface_inner(hwnd, width, height, true);
+    }
+
+    fn ensure_surface_inner(
+        &mut self,
+        hwnd: crate::handles::Hwnd,
+        width: u32,
+        height: u32,
+        full_repaint: bool,
+    ) {
         let stride = surface_stride(width);
         let needed = usize::try_from(stride.checked_mul(height).unwrap_or(0)).unwrap_or(0);
         // B1 double-buffer hand-back: a prior publish moved the painted buffer
@@ -875,13 +914,23 @@ impl PresentState {
                     // the spare is only the DESTINATION allocation — the
                     // current frame is copied into it (zero-alloc, one copy).
                     // No spare → count a real clone.
+                    //
+                    // `full_repaint` drops the copy: the caller is about to
+                    // replace every pixel, so which pixels the base holds is
+                    // irrelevant. The allocation still comes from the spare
+                    // pool, so this stays zero-alloc.
                     if let Some(mut spare) = self.channel.take_spare(hwnd) {
                         spare.resize(needed, 0);
-                        let src = &shared[..];
-                        if let Some(dst) = spare.get_mut(0..src.len().min(needed)) {
-                            dst.copy_from_slice(&src[..dst.len()]);
+                        if !full_repaint {
+                            let src = &shared[..];
+                            if let Some(dst) = spare.get_mut(0..src.len().min(needed)) {
+                                dst.copy_from_slice(&src[..dst.len()]);
+                            }
                         }
                         spare
+                    } else if full_repaint {
+                        self.hand_back_full_repaint = self.hand_back_full_repaint.saturating_add(1);
+                        vec![0u32; needed]
                     } else {
                         self.hand_back_clone = self.hand_back_clone.saturating_add(1);
                         if needed < 1024 * 1024 {

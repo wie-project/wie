@@ -513,6 +513,10 @@ pub trait PresentAccess {
     /// Make sure `window` has a paint surface of at least this size.
     fn ensure_surface(&mut self, window: Hwnd, width: u32, height: u32);
 
+    /// [`Self::ensure_surface`] for a painter that overwrites every pixel, so
+    /// the previous frame is not copied into the paint base.
+    fn ensure_surface_for_full_repaint(&mut self, window: Hwnd, width: u32, height: u32);
+
     /// The paint surface for `window`, if one was created.
     fn surface(&mut self, window: Hwnd) -> Option<&WindowSurface>;
 
@@ -573,6 +577,11 @@ impl PresentAccess for WinApiState {
 
     fn ensure_surface(&mut self, window: Hwnd, width: u32, height: u32) {
         self.present().ensure_surface(window, width, height);
+    }
+
+    fn ensure_surface_for_full_repaint(&mut self, window: Hwnd, width: u32, height: u32) {
+        self.present()
+            .ensure_surface_for_full_repaint(window, width, height);
     }
 
     fn surface(&mut self, window: Hwnd) -> Option<&WindowSurface> {

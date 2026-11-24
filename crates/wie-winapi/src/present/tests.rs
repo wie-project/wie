@@ -803,3 +803,55 @@ fn unregister_top_level_drops_the_revision_bookkeeping() {
     assert!(!state.revisions.content_rev.contains_key(&hwnd));
     assert!(!state.revisions.last_published_rev.contains_key(&hwnd));
 }
+
+/// A full-surface painter (a D3D9/GL present) replaces every pixel, so the
+/// hand-back must NOT copy the previous frame into the new paint base — that
+/// copy was one full-surface memcpy per frame at 1080p. The partial-painter
+/// path must keep doing it: it reads the base it does not write.
+#[test]
+fn full_repaint_hand_back_skips_the_previous_frame_copy() {
+    let hwnd = Hwnd::from(0x5150);
+    let mut state = PresentState::new();
+    // Cycle 1: paint a recognisable pattern and publish (which empties the
+    // surface by moving its buffer into the published Arc).
+    state.ensure_surface(hwnd, 64, 32);
+    if let Some(surface) = state.surfaces.get_mut(&hwnd) {
+        surface.pixels.fill(0x00AB_CDEF);
+    }
+    state.publish(hwnd);
+    assert!(
+        state
+            .surfaces
+            .get(&hwnd)
+            .is_some_and(|s| s.pixels.is_empty()),
+        "publish moves the buffer out"
+    );
+
+    // Cycle 2, full repaint: the base must not carry cycle 1's pixels.
+    state.ensure_surface_for_full_repaint(hwnd, 64, 32);
+    let surface = state.surfaces.get(&hwnd).expect("surface");
+    assert_eq!(surface.pixels.len(), 64 * 32);
+    assert!(
+        surface.pixels.iter().all(|&px| px == 0),
+        "a full repaint does not inherit the previous frame"
+    );
+}
+
+#[test]
+fn partial_hand_back_still_carries_the_previous_frame() {
+    let hwnd = Hwnd::from(0x5151);
+    let mut state = PresentState::new();
+    state.ensure_surface(hwnd, 64, 32);
+    if let Some(surface) = state.surfaces.get_mut(&hwnd) {
+        surface.pixels.fill(0x0012_3456);
+    }
+    state.publish(hwnd);
+
+    // Cycle 2, partial painter: the base is the previous frame, unchanged.
+    state.ensure_surface(hwnd, 64, 32);
+    let surface = state.surfaces.get(&hwnd).expect("surface");
+    assert!(
+        surface.pixels.iter().all(|&px| px == 0x0012_3456),
+        "a partial painter reads the base, so the hand-back keeps it"
+    );
+}

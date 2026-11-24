@@ -198,7 +198,15 @@ pub(crate) fn handle_wgl_swap_buffers(ctx: &mut HandlerContext<'_>) -> Result<Wi
     // back via spare-buffer pooling) with no intermediate `Vec<u32>` copy. If
     // the GL framebuffer size differs from the surface, stretch_nearest writes
     // directly into the pooled slice (no temp).
-    state.ensure_surface(hwnd, width, height);
+    // `gl_frame_into` below writes every logical pixel, so the paint base's
+    // previous content is not read: skip the hand-back copy. Without a current
+    // GL context the swap falls back to publishing whatever the surface holds,
+    // which is the one case that still needs the real base.
+    if with_current_gl(|_| true).unwrap_or(false) {
+        state.ensure_surface_for_full_repaint(hwnd, width, height);
+    } else {
+        state.ensure_surface(hwnd, width, height);
+    }
     // Take the pooled surface Vec out (pointer move, no copy), hand its
     // mutable slice to the GL present as render target, then restore it.
     let (logical_w, h, padded_w) = {
