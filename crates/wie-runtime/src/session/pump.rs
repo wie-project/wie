@@ -604,6 +604,28 @@ impl QuantumHooks for SessionPumpHooks<'_> {
         Ok(Step::Next)
     }
 
+    /// A fake-API stop ended the guest's current no-hook run: bank the run's
+    /// length (the watchdog's headroom, reported with `WIE_RUNTIME_PROFILE`)
+    /// and start the next run at zero.
+    ///
+    /// The counter is per *run*, not per session. A guest that alternates API
+    /// calls with 20M-instruction computes — 7-Zip compressing a block, Doom
+    /// Retro building a light table — never approaches the limit, while a guest
+    /// that spins with no API in sight still trips it after
+    /// `no_hook_slice_limit` consecutive slices. Counting the session total
+    /// instead (what this did before) kills any long run at the 40th slice
+    /// regardless of how often it talked to the host in between.
+    ///
+    /// The two safety nets now measure different things and neither is a
+    /// duplicate: a guest that loops *through* API calls is bounded by
+    /// `--max-api` (every stop is charged), and a guest that never stops at all
+    /// is bounded by this counter.
+    fn on_hook_stop(&mut self, core: &mut QuantumCore<'_>) {
+        self.profile
+            .note_no_hook_stretch(*self.no_hook_slices, core.layout().instruction_budget);
+        *self.no_hook_slices = 0;
+    }
+
     fn on_run_error(
         &mut self,
         core: &mut QuantumCore<'_>,

@@ -11,6 +11,7 @@ mod chain_tests;
 mod cmpxchg_tests;
 mod code_cache_tests;
 mod code_inv_tests;
+mod frame_entry_tests;
 mod gs_teb_tests;
 mod harness;
 mod heap_isolation_tests;
@@ -89,7 +90,7 @@ impl JitCpu {
             chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
         }
         // Simulate edge IC hit for S6.
-        self.thread.edge_ic_va[0] = rip;
-        self.thread.edge_ic_fn[0] = dummy_block as *const () as usize as u64;
+        self.thread.ctx.edge_ic_va[0] = rip;
+        self.thread.ctx.edge_ic_fn[0] = dummy_block as *const () as usize as u64;
     }
 }

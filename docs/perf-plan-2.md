@@ -16,7 +16,7 @@ debug builds until done, one 40 s SIGINT release benchmark per validation round.
 | Worker saturated | 26 001 promotions vs 10 253 compiles; `compile_us` 12.8 s; cpu % 130.5 | Cooldown churn inflates promotions ×2.4; capacity is the ceiling |
 | Opcode cliff is fatal | 7za dies: `unimplemented mnemonic Movlpd` at msvcrt `fputs` call site — interpreter has NO path, so it is an **error**, not a slowdown | Real-app corpus blocked by correctness, not speed |
 | Idle unvalidated | All captures still `idle_policy=yield`; noisy exits ~306 K | P1 landed but its benefit never measured |
-| Micro-suite regression open | Earlier `run_micro … 40 slices` failure report, unresolved | Exe-level gate is local-only; CI cannot catch it (ci.yml has no micro-suite) |
+| Micro-suite regression open | ~~Earlier `run_micro … 40 slices` failure report, unresolved~~ **Closed 2026-11-24**: the watchdog counted *session-total* no-hook slices, never resetting on an API stop, so any long run died at the 40th slice however often it had talked to the host. It is now per-run (`SessionPumpHooks::on_hook_stop`, driven by the shared quantum loop, resets it), the default is 512 slices from measurement (mx9's legitimate peak is 84), and `7za a -mx1`/`-mx9` complete at defaults | Exe-level gate is local-only; CI cannot catch it (ci.yml has no micro-suite) |
 | Two anomalies unexplained | `winapi_lock_wait` max 46 µs → 881 µs; `closehandle` ≈ 2 ms/call | Sub-0.1 % today; must be attributed before they grow |
 
 Dispatch efficiency recovered: 8.58 insns/cache-hit (from 6.6). Handler layer remains a
@@ -72,8 +72,11 @@ blocked-by-cap / epoch-resync count). Then, data-driven:
   matrix-gated.
 
 ### G6 — Regression safety net
-- Reproduce and fix the open micro-suite `40 slices` failure (selective-stash bisect
-  across Lane A/B/integration edits if needed).
+- ~~Reproduce and fix the open micro-suite `40 slices` failure (selective-stash bisect
+  across Lane A/B/integration edits if needed).~~ **Done 2026-11-24.** Not a guest regression:
+  the counter measured the wrong quantity. Root cause, fix and the measured per-run peak
+  (84 slices on `7za a -mx9`, hence the 512 default) are in `docs/RUNBOOK.md`
+  (`WIE_NO_HOOK_SLICES`) and `RuntimeMemoryLayout::no_hook_slice_limit`.
 - Add the exe-level micro-suite to CI as a nightly job (it is currently local-only —
   the reason the regression reached us late). Gate G1 on it too.
 - Attribute the two anomalies (lock-wait max spike ≈ resync/install window?;

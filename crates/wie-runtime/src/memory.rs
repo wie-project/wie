@@ -56,7 +56,10 @@ pub struct RuntimeMemoryLayout {
     // ── tuning scalars (not regions) ─────────────────────────────────────
     /// Maximum guest instructions to execute between fake API hooks.
     pub instruction_budget: usize,
-    /// Maximum number of consecutive no-hook instruction slices before stopping.
+    /// Maximum number of **consecutive** no-hook instruction slices before
+    /// stopping the session (each slice is at most `instruction_budget` guest
+    /// instructions, so this bounds one run of pure compute between two API
+    /// stops — see `SessionPumpHooks::on_hook_stop`).
     pub no_hook_slice_limit: usize,
     // ── fake process heap ────────────────────────────────────────────────
     /// Fake process heap handle returned by `GetProcessHeap`.
@@ -145,7 +148,35 @@ impl RuntimeMemoryLayout {
         };
         Self {
             instruction_budget: 20_000_000,
-            no_hook_slice_limit: 40,
+            // 512 consecutive slices ≈ 10.2 G guest instructions of pure
+            // compute between two API stops before the run is called runaway.
+            //
+            // The number is measured, not guessed. On the calibrated real-guest
+            // corpus the heaviest *legitimate* no-hook run is LZMA at `-mx9`:
+            // 84 slices (1.68 G instructions ≈ 18 s of guest compute, one
+            // match-finder pass over an incompressible block, zero Win32 calls
+            // by construction). `a -mx1` peaks at 3, `long_loop` at 1. A limit
+            // below the mx9 figure kills the heaviest real workload we have,
+            // which is exactly the failure this knob was being raised by hand
+            // for; 512 keeps 6x headroom over it while still stopping a guest
+            // that spins forever with no API in sight in about two minutes
+            // rather than never. `WIE_RUNTIME_PROFILE` prints the peak observed
+            // on every run (`no_hook: slices_max=`), so the headroom on a new
+            // workload is a measurement too — raise it when that line gets
+            // close, and prefer that over raising this default on a hunch.
+            //
+            // Why a measured constant and not an adaptive budget: an adaptive
+            // rule can only widen the cap *after* a long legitimate run has
+            // survived, and the run that kills the session is the first one.
+            // Progress signals do not separate the two cases either. Measured
+            // here: `long_loop` reaches `slices_max=1` while retiring 1.1 G
+            // instructions (a hot self-loop's IR loop does not return to the
+            // dispatcher), and the `-mx9` no-hook stop reported `begin == rip`
+            // inside the match-finder loop — neither a quantum count nor rip
+            // stagnation distinguishes "long legitimate compute" from "hung".
+            // Instruction count is the only load-independent signal this layer
+            // can see, so its limit belongs here, measured.
+            no_hook_slice_limit: 512,
             process_heap_handle: 0x0000_0000_5000_0000,
             process_heap,
             process_heap_shadow_delta: 0x0000_0001_0000_0000,

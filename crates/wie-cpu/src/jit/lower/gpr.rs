@@ -241,6 +241,31 @@ pub(super) fn read_op(
     }
 }
 
+/// Read the branch target of a near **indirect** branch (`call r64`,
+/// `call [r/m64]`) as a runtime value.
+///
+/// The exit path already carries a runtime RIP (`ret` leaves a block that way),
+/// so an indirect call needs nothing more than this value: the operand is read
+/// here, before the caller pushes the return address, which is the order
+/// `call [rsp+disp]` requires.
+pub(super) fn indirect_branch_target(
+    bcx: &mut FunctionBuilder<'_>,
+    instr: &Instruction,
+    gpr: &[Value; 16],
+    mem: &mut MemEnv,
+    ip: u64,
+) -> Result<Value, LowerError> {
+    match instr.op0_kind() {
+        OpKind::Register => read_gpr(gpr, instr.op_register(0)),
+        OpKind::Memory => {
+            let addr = effective_addr(bcx, instr, gpr, mem)?;
+            let rflags = iconst_u64(bcx, 0);
+            call_load(bcx, mem, gpr, rflags, addr, 8, ip)
+        }
+        _ => Err(LowerError::form("branch_target")),
+    }
+}
+
 pub(super) fn effective_addr(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,

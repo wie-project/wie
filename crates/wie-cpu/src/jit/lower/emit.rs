@@ -31,7 +31,8 @@ pub(super) fn term_chain_targets(t: BlockTerm) -> Vec<u64> {
         BlockTerm::Jcc {
             taken, not_taken, ..
         } => vec![taken, not_taken],
-        BlockTerm::Ret => vec![],
+        // No chain edge: the target is a runtime value.
+        BlockTerm::CallDyn { .. } | BlockTerm::Ret => vec![],
     }
 }
 
@@ -1007,8 +1008,10 @@ pub(super) fn emit_body_and_term(
         if let Some(ti) = term_insn {
             ensure_gprs_loaded(bcx, ctx_ptr, gpr_vals, gpr_loaded, &ti.instr, flags);
         }
-        if matches!(t, BlockTerm::Call { .. } | BlockTerm::Ret)
-            && call_fast.is_none()
+        if matches!(
+            t,
+            BlockTerm::Call { .. } | BlockTerm::CallDyn { .. } | BlockTerm::Ret
+        ) && call_fast.is_none()
             && !gpr_loaded[4]
         {
             let p = bcx.ins().iadd_imm(ctx_ptr, 4 * 8);
@@ -1077,7 +1080,7 @@ pub(super) fn emit_body_and_term(
                 trip,
             )?;
         } else {
-            if let BlockTerm::Call { return_ip, .. } = t {
+            if let BlockTerm::Call { return_ip, .. } | BlockTerm::CallDyn { return_ip } = t {
                 shadow_push(bcx, ctx_ptr, flags, return_ip);
             }
             let exit_rip = lower_term(
@@ -1089,6 +1092,7 @@ pub(super) fn emit_body_and_term(
                 flag_state.as_ref(),
                 mem_env,
                 term_ip,
+                term_insn.map(|ti| &ti.instr),
             )?;
             let exit_rip = if matches!(t, BlockTerm::Ret) {
                 shadow_pop_check(bcx, ctx_ptr, flags, exit_rip)
@@ -1146,7 +1150,9 @@ pub(super) fn emit_body_and_term(
                         &trip,
                     );
                 }
-                BlockTerm::Ret => {
+                // `call r/m64`: the exit RIP is a runtime value, so there is
+                // no direct chain edge — exactly like `ret`.
+                BlockTerm::CallDyn { .. } | BlockTerm::Ret => {
                     emit_chain_or_exit(
                         bcx,
                         ctx_ptr,

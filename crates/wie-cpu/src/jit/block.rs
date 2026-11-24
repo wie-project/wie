@@ -1,6 +1,6 @@
 //! Decode a lowerable straight-line block for Cranelift (GPR + simple mem + jcc/jmp term).
 
-use super::lower::err::LowerError;
+use super::lower::err::{self, LowerError};
 use super::lower::opclass::{self, TermForm};
 use crate::exec::HookWindow;
 use crate::mem::GuestMemory;
@@ -33,6 +33,13 @@ pub(super) enum BlockTerm {
     },
     /// Near `call rel` — push `return_ip`, exit at `target`.
     Call { target: u64, return_ip: u64 },
+    /// Near indirect `call r/m64` — push `return_ip`, exit at a target the
+    /// lowering computes at run time from the register or memory operand.
+    ///
+    /// Separate from [`BlockTerm::Call`] because there is no compile-time
+    /// target: the exit emits no chain edge (same shape as a `ret`, whose exit
+    /// RIP is also a runtime value). The return address is still constant.
+    CallDyn { return_ip: u64 },
     /// Near `ret` (no imm) — pop exit RIP.
     Ret,
 }
@@ -74,6 +81,11 @@ pub(super) fn decode_pure_gpr_block(
     let mut rip = start;
     let mut bytes_len = 0_u32;
     let mut term: Option<BlockTerm> = None;
+    // The instruction that ended the walk because the operation-class table
+    // does not admit it. Kept so the `NotPure` verdict below can name its
+    // reason: without this the gate refuses a block and the report has nothing
+    // to say about why (see `err::note_gate_refusal`).
+    let mut refused: Option<Instruction> = None;
 
     if let Some(h) = hooks
         && h.should_host_stop(start)
@@ -108,13 +120,15 @@ pub(super) fn decode_pure_gpr_block(
             rip = match t {
                 BlockTerm::Jmp { target } | BlockTerm::Call { target, .. } => target,
                 BlockTerm::Jcc { not_taken, .. } => not_taken,
-                // Dynamic; placeholder for decode end only (not used as fallthrough).
-                BlockTerm::Ret => next,
+                // Dynamic target; placeholder for decode end only (not used
+                // as fallthrough).
+                BlockTerm::CallDyn { .. } | BlockTerm::Ret => next,
             };
             break;
         }
 
         if !is_lowerable(&instr) {
+            refused = Some(instr);
             break;
         }
         let ends_string = opclass::is_string_op(&instr);
@@ -142,6 +156,13 @@ pub(super) fn decode_pure_gpr_block(
         MIN_BLOCK_INSNS
     };
     if insns.len() < min {
+        // `NotPure` because of the instruction we stopped at, not because of a
+        // host-stop window or an unreadable page (`refused` stays `None` for
+        // those): this is the case that runs at interpreter speed forever, so
+        // it is the one the refusal report has to be able to name.
+        if let Some(instr) = &refused {
+            err::note_gate_refusal(instr);
+        }
         BlockKind::NotPure
     } else {
         BlockKind::Pure {
@@ -180,10 +201,22 @@ pub(super) fn term_is_self_loop(term: Option<&BlockTerm>, start: u64) -> bool {
 fn classify_terminator(instr: &Instruction) -> Option<BlockTerm> {
     match opclass::term_of(instr)? {
         TermForm::Ret => Some(BlockTerm::Ret),
-        TermForm::Call => Some(BlockTerm::Call {
-            target: instr.near_branch_target(),
-            return_ip: instr.next_ip(),
-        }),
+        TermForm::Call => {
+            let return_ip = instr.next_ip();
+            if matches!(
+                instr.op0_kind(),
+                OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+            ) {
+                Some(BlockTerm::Call {
+                    target: instr.near_branch_target(),
+                    return_ip,
+                })
+            } else {
+                // `call r/m64`: the gate admitted it, so the operand is a
+                // register or memory shape whose value the lowering reads.
+                Some(BlockTerm::CallDyn { return_ip })
+            }
+        }
         TermForm::Jmp => Some(BlockTerm::Jmp {
             target: instr.near_branch_target(),
         }),
@@ -228,7 +261,34 @@ pub(super) struct BlockStackPinPlan {
 /// Analyse body (+ optional term insn) for block-wide stack-pin eligibility.
 ///
 /// Returns `None` when any memop is not simple stack-relative, bases differ,
-/// the base register is written, stack ops modify RSP, or there is no memory.
+/// the base register is written **anywhere** in the block, stack ops modify
+/// RSP, or there is no memory.
+///
+/// The whole-block base-write rule is the one the lowering cannot do without.
+/// [`super::lower::emit_block_wide_stack_guard`] proves a range on the base
+/// register's value at **block entry**, and
+/// [`super::lower::mem::call_load`]'s super path then computes
+/// `host = (pin.host_base - pin.guest_base) + addr` with no per-access probe.
+/// Both are only about the same addresses if `addr = entry_base + disp` for
+/// every access — so a base register that the block assigns to is not a stack
+/// base at all, whatever iced calls it:
+///
+/// ```text
+/// 48 89 d8        mov  rax, rbx
+/// 48 6b c0 28     imul rax, rax, 0x28
+/// 48 bd <imm64>   mov  rbp, <guest pointer>    ; rbp is NOT a stack base here
+/// 48 01 c5        add  rbp, rax
+/// 4c 39 55 00     cmp  [rbp], r10              ; reads through that pointer
+/// ```
+///
+/// That is the planted in-guest `GetFileSize` helper
+/// (`wie-runtime/src/guest_io.rs`, `getfs_impl_va + 0x17`), and it is why
+/// `WIE_JIT_SUPER=all` used to die with SIGSEGV on `7za h`: the entry guard
+/// passed on the *caller's* `rbp` (a real stack address) while the emitted
+/// load used the pointer the block had just built, so the biased host address
+/// landed in the guest address space. A check that only fires once a base has
+/// already been seen misses every write that comes before the first access,
+/// which is exactly this shape.
 #[must_use]
 pub(super) fn analyze_block_stack_pin(
     body: &[DecodedInsn],
@@ -240,13 +300,18 @@ pub(super) fn analyze_block_stack_pin(
     let mut needs_r = false;
     let mut needs_w = false;
     let mut saw_mem = false;
+    // Whole-block writes to the two candidate bases, in `[RSP, RBP]` order.
+    // Order-independent on purpose: a write either side of the accesses
+    // invalidates the same entry-value proof.
+    let mut base_written = [false; 2];
 
     let mut consider = |instr: &Instruction| -> Option<()> {
         if insn_modifies_stack_ptr(instr) {
             return None;
         }
         // Reject if this insn writes RSP/RBP before we know which base we need —
-        // checked again once base is known.
+        // checked again once base is known, and again over the whole block
+        // below.
         if let Some(b) = base_reg
             && insn_writes_full_gpr(instr, b)
         {
@@ -291,8 +356,16 @@ pub(super) fn analyze_block_stack_pin(
         Some(())
     };
 
+    let mut note_base_writes = |instr: &Instruction| {
+        let rsp = insn_writes_gpr(instr, Register::RSP);
+        let rbp = insn_writes_gpr(instr, Register::RBP);
+        base_written[0] |= rsp;
+        base_written[1] |= rbp;
+    };
+
     for d in body {
         consider(&d.instr)?;
+        note_base_writes(&d.instr);
     }
     if let Some(t) = term_insn {
         // Call/ret touch the stack — not eligible.
@@ -303,6 +376,7 @@ pub(super) fn analyze_block_stack_pin(
             return None;
         }
         consider(&t.instr)?;
+        note_base_writes(&t.instr);
     }
 
     if !saw_mem || min_disp == i64::MAX || max_end == i64::MIN {
@@ -314,6 +388,17 @@ pub(super) fn analyze_block_stack_pin(
     }
     let base_reg = base_reg?;
     let base_idx = stack_base_gpr_index(base_reg)?;
+    // The entry guard proves a range on the base register's entry value; a
+    // block that writes that register anywhere has accesses relative to a
+    // different value, so the proof is about the wrong address.
+    let written = match base_idx {
+        4 => base_written[0],
+        5 => base_written[1],
+        _ => true,
+    };
+    if written {
+        return None;
+    }
     Some(BlockStackPinPlan {
         base_idx,
         min_disp,
@@ -365,6 +450,33 @@ fn insn_modifies_stack_ptr(instr: &Instruction) -> bool {
             | Mnemonic::Enter
             | Mnemonic::Leave
     )
+}
+
+/// Whether `instr` may write `reg` (or a GPR that aliases it) — **any** operand
+/// position, not just the destination operand 0.
+///
+/// [`insn_writes_full_gpr`] answers the narrower question "is operand 0 this
+/// register", which is what the per-access checks want. The block-wide
+/// stack-pin analysis needs the wider one: it is proving that a register keeps
+/// its entry value for the whole block, and a missed write there puts a guest
+/// pointer into the super path's bare host load (see
+/// [`analyze_block_stack_pin`]). Errs toward "writes": a false positive costs a
+/// block its super path, a false negative costs a SIGSEGV.
+fn insn_writes_gpr(instr: &Instruction, reg: Register) -> bool {
+    if insn_writes_full_gpr(instr, reg) {
+        return true;
+    }
+    // Read-modify-write forms whose non-zero operand is also a destination:
+    // `xchg r/m, r` and `xadd r/m, r` write both sides, so with a memory
+    // destination operand 0 the register is still written.
+    if matches!(instr.mnemonic(), Mnemonic::Xchg | Mnemonic::Xadd) {
+        return (0..instr.op_count()).any(|op| {
+            instr.op_kind(op) == OpKind::Register
+                && instr.op_register(op) != Register::None
+                && gpr_aliases(instr.op_register(op), reg)
+        });
+    }
+    false
 }
 
 /// Whether `instr` writes the full 64-bit `reg` (or a GPR that aliases it).
@@ -598,5 +710,104 @@ pub(super) fn mem_width_bytes(instr: &Instruction) -> Result<u32, LowerError> {
         Ok(u32::try_from(sz).unwrap_or(0))
     } else {
         Err(LowerError::form("memory_width"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DecodedInsn, analyze_block_stack_pin};
+    use iced_x86::{Decoder, DecoderOptions};
+
+    /// Decode `bytes` into the block-body form the analysis takes.
+    fn decode(bytes: &[u8]) -> Vec<DecodedInsn> {
+        let mut dec = Decoder::with_ip(64, bytes, 0x1000, DecoderOptions::NONE);
+        let mut out = Vec::new();
+        while dec.can_decode() {
+            out.push(DecodedInsn {
+                instr: dec.decode(),
+            });
+        }
+        out
+    }
+
+    /// The body of the planted in-guest `GetFileSize` helper
+    /// (`wie-runtime/src/guest_io.rs`, `getfs_impl_va + 0x17`):
+    ///
+    /// ```text
+    /// mov  rax, rbx
+    /// imul rax, rax, 0x28        ; slot stride
+    /// mov  rbp, 0x7000_0040_3000 ; handle-table guest VA — rbp is not a stack base
+    /// add  rbp, rax
+    /// cmp  [rbp], r10            ; reads through that pointer
+    /// jne  ..
+    /// ```
+    const GETFILESIZE_LOOP_BODY: [u8; 26] = [
+        0x48, 0x89, 0xd8, // mov rax, rbx
+        0x48, 0x6b, 0xc0, 0x28, // imul rax, rax, 0x28
+        0x48, 0xbd, 0x00, 0x30, 0x40, 0x00, 0x00, 0x70, 0x00,
+        0x00, // mov rbp, 0x7000_0040_3000
+        0x48, 0x01, 0xc5, // add rbp, rax
+        0x4c, 0x39, 0x55, 0x00, // cmp [rbp+0], r10
+        0x75, 0x00, // jne +0
+    ];
+
+    /// The exact shape that made `WIE_JIT_SUPER=all` segfault on `7za h`.
+    ///
+    /// The block writes RBP *before* its only memory access, so the entry-value
+    /// guard passed on the caller's RBP while the emitted bare host load used
+    /// the table pointer the block had just built — a far-out-of-pin guest
+    /// address plus the stack pin's bias. It must not be eligible.
+    #[test]
+    fn block_that_builds_its_own_base_is_not_stack_pinned() {
+        let body = decode(&GETFILESIZE_LOOP_BODY);
+        assert_eq!(body.len(), 6);
+        let (term, instructions) = body.split_last().expect("non-empty fixture");
+        assert!(
+            analyze_block_stack_pin(instructions, Some(term)).is_none(),
+            "a block that assigns RBP and then dereferences it has no stack base"
+        );
+        // Same instructions with the access removed: still no plan (nothing to
+        // prove), which pins that the rejection is not coming from the access.
+        assert!(analyze_block_stack_pin(&instructions[..3], None).is_none());
+    }
+
+    /// Positive control: an unmodified RBP used as the base *is* eligible, so
+    /// the rule above cannot be passing by rejecting everything.
+    #[test]
+    fn plain_stack_access_still_plans() {
+        // mov rax, [rbp-8] ; add rax, rcx ; jne ..
+        let body = decode(&[0x48, 0x8b, 0x45, 0xf8, 0x48, 0x01, 0xc8, 0x75, 0x00]);
+        let (term, instructions) = body.split_last().expect("non-empty fixture");
+        let plan = analyze_block_stack_pin(instructions, Some(term)).expect("stack-only block");
+        assert_eq!(plan.base_idx, 5, "RBP");
+        assert_eq!(plan.min_disp, -8);
+        assert_eq!(plan.max_end, 0);
+        assert!(
+            plan.needs_r && !plan.needs_w,
+            "a load needs read rights only"
+        );
+    }
+
+    /// A base written *between* two accesses is the same unsoundness as one
+    /// written before them: the guard proves the entry value, the accesses use
+    /// two different values.
+    #[test]
+    fn base_written_between_accesses_is_not_stack_pinned() {
+        // mov rax, [rbp] ; add rbp, 8 ; mov rcx, [rbp] ; jne ..
+        let body = decode(&[
+            0x48, 0x8b, 0x45, 0x00, 0x48, 0x83, 0xc5, 0x08, 0x48, 0x8b, 0x4d, 0x00, 0x75, 0x00,
+        ]);
+        let (term, instructions) = body.split_last().expect("non-empty fixture");
+        assert!(analyze_block_stack_pin(instructions, Some(term)).is_none());
+    }
+
+    /// `xchg r/m64, r64` writes both sides, so a memory destination hides a
+    /// register write from the operand-0 check alone.
+    #[test]
+    fn xchg_through_memory_writes_the_base() {
+        // xchg [rbp+0], rbp
+        let body = decode(&[0x48, 0x87, 0x6d, 0x00, 0x75, 0x00]);
+        let (term, instructions) = body.split_last().expect("non-empty fixture");
+        assert!(analyze_block_stack_pin(instructions, Some(term)).is_none());
     }
 }

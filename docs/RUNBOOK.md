@@ -56,8 +56,27 @@ WIE_RUNTIME_PROFILE=1 ./target/release/wie run micro-exes/out/long_loop.exe
 ```
 
 With `WIE_JIT_OPCODE_HISTO=1` the profile block also ends with the sampled
-iced-residue opcode histogram (top 60 mnemonics) and, when anything was
-recorded, the `[wie] jit_bg_ledger:` promotion-outcome line. Both are part of
+iced-residue opcode histogram (top 60 mnemonics), a
+`[wie] jit_lower_refusals: unsupported=… form=… verifier=…` split, and, when
+anything was recorded, the `[wie] jit_bg_ledger:` promotion-outcome line.
+
+The histogram's buckets have **two producers** and they are not comparable: iced
+residue is sampled 1/64, while a JIT refusal is counted once per rejected block
+and is not sampled (a rejected block is compiled at most once per VA, so 1/64
+would hide it). For ranking *residue* prefer the exact interpreter counts from
+`WIE_EXEC_TRACE=1`, which prints its own `iced-interp mnemonic counts` section
+with no sampling and no refusals mixed in.
+
+`jit_lower_refusals` splits the refusals by *why*, which the mnemonic-keyed
+histogram cannot: `unsupported` is "the JIT does not implement this
+instruction", `form` is "it does, but not this operand shape", and `verifier` is
+a Cranelift/IR failure. Both counters cover the **admission gate** (a block that
+starts at an instruction the operation-class table refuses) as well as the
+lowering itself, because the gate refuses most real residue and used to report
+nothing. A guest whose `form` count is high is a lowering gap; a high
+`unsupported` count is by design (x87, `cpuid`, locked RMW). The per-instruction
+detail — rip, `kind`, `site=gate|lower`, and the operand-shape name — is a debug
+line: `RUST_LOG=error,wie_cpu::jit::lower::err=debug`. Both are part of
 the report itself — they print on SIGINT (`kill -INT`) exactly like the rest,
 no `RUST_LOG` needed. Capture long-running targets only: micro-exes exit in
 milliseconds and the SIGINT path never arms.
@@ -146,6 +165,27 @@ reading during development:
 
 Not wired into CI on purpose: a timing gate is meaningless on a shared runner.
 
+**Real guests are measured by `scripts/real-guest-perf.sh`**, not by `long_loop`:
+`long_loop` is a compute micro and says nothing about file I/O, compilation or
+allocation. The harness owns a deterministic corpus (`--make-corpus`, verified by
+CRC on every run), writes every archive under `--corpus` so it is deleted from a
+host directory (a `C:`-relative archive cannot be deleted — guest `C:` is the
+bottle — and the next `7za a` silently becomes an *update*, halving the work),
+interleaves reps across arms, warms the per-arm code-cache ledger, and prints
+per-class ratios from the median of per-rep pairs:
+
+```bash
+./scripts/real-guest-perf.sh --make-corpus /tmp/wie-perf-corpus
+./scripts/real-guest-perf.sh                    # mx1s, mx9s, h × def/super_all/chain0/opt_speed
+./scripts/real-guest-perf.sh --classes mx9 --reps 2     # ~1 min per run, opt-in
+```
+
+It follows the `perf` step's load convention (`WIE_PERF_MAX_LOAD`, default 2.0):
+above it a rep is skipped and says so, and a sweep with nothing measurable exits
+non-zero rather than reporting the host. Absolute times are printed as a spread
+and are **not** results; the ratios are. Calibration is a guest-instruction count
+per class (load-independent), which is also the number the archive hazard moves.
+
 ## Environment knobs (full table)
 
 The README keeps the shortlist; the complete set lives here.
@@ -176,7 +216,7 @@ merely *mentions* a dead knob does not keep its row alive.
 | `WIE_JIT_MEM=sticky` \| `pin` \| `slow` | JIT mem lower (default **pin** = sticky + stack pin + top-2 data pins; `sticky` = stack pin only; `slow` = helper-only oracle) |
 | `WIE_JIT_MEM_TRACE=1` | Dump helper mem-path histogram on finalize |
 | `WIE_JIT_OPCODE_HISTO=1` | Sample an opcode histogram over the iced residue (top 60 mnemonics), appended to the `WIE_RUNTIME_PROFILE` report. Set it together with `WIE_RUNTIME_PROFILE` and SIGINT a long-running target to see which instructions keep escaping the JIT. Capture long-running targets only — micro-exes exit in milliseconds and the SIGINT path never arms |
-| `WIE_JIT_SUPER=loop` \| `0` \| `all` | Block-wide stack super path: default **loop** (self-loops only) |
+| `WIE_JIT_SUPER=loop` \| `0` \| `all` | Block-wide stack super path: default **loop** (self-loops only). `all`/`1` extends it to every block whose memory operands are **all** `base+disp` on one RSP/RBP base — the entry guard then proves the whole range once and each access is a bare host load/store. A block that *assigns* that base is refused (assigning it makes it a data pointer, not a stack base), and so is any block with an index register, a non-stack memory operand, a string op or a fast call. Safe as a measurement arm since the in-guest accelerator helpers (`7za h`) were fixed: a block that built `rbp` from a table and then dereferenced it used to reach the super path and segfault. Compare arms with `scripts/real-guest-perf.sh --arms def,super_all` |
 | `WIE_JIT_CHAIN=0` | Disable FuncRef chaining / chain table / edge IC |
 | `WIE_STRING_BULK=0` | Disable host-span bulk REP MOVS/STOS |
 | `WIE_STRING_INLINE=0` | Disable inline 16–64 B REP Neon path |
@@ -204,7 +244,7 @@ merely *mentions* a dead knob does not keep its row alive.
 | `WIE_PRESENT_PACING_HZ` | Pace `Present` to a target frame rate (e.g. `60`); unset = no pacing. Sleeps out the remainder of each interval, so it is a **throttle**, not a vsync — useful for making a guest that busy-loops between Presents behave like a 60 fps app. Resolved once per process; non-numeric or `<= 0` is ignored |
 | `WIE_RUNTIME_PROFILE=1` | Wall/CPU%, host stops, JIT counters, `mem_backend`. While armed, **Ctrl+C** stops the session cleanly at the next quantum/API-stop boundary, dumps the report to stderr and exits 130; guest Ctrl+C delivery is suppressed while profiling |
 | `WIE_PROCESS_HEAP_MB` | Guest process-heap size in MiB (default **512**) |
-| `WIE_NO_HOOK_SLICES` | Cap on the no-hook slice lookahead (a positive integer; an invalid value warns and keeps the default). Lower it to stop the quantum from speculating past a block boundary; raise it when a long straight-line region is being cut into too many slices |
+| `WIE_NO_HOOK_SLICES` | Cap on **consecutive** no-hook slices (default **512**; a positive integer, an invalid value warns and keeps the default). One slice is at most `instruction_budget` (20 M) guest instructions, so this bounds one *run* of pure compute between two fake-API stops: it is a runaway net, not a workload budget, and the count resets on every API stop. Measured peaks on the calibrated corpus: `7za h` 1, `7za a -mx1` 3, `7za a -mx9` **84** (1.68 G instructions without a single Win32 call — LZMA's match finder), so 512 leaves ~6x headroom over the heaviest legitimate run; `WIE_RUNTIME_PROFILE=1` prints the observed peak (`no_hook: slices_max=`) on every run, which is the number to read before raising or lowering this |
 | `WIE_GUEST_ENV="NAME=VALUE;NAME2=VALUE2"` | Inject pairs into the guest environment of every new session (upsert, case-insensitive names like Windows). This is how headless CLI runs reach the micro-exes' self-test modes (`WIE_GUEST_ENV=WIE_SELFTEST=2`) without a dedicated flag; the tests' `set_guest_env` path stays authoritative and this is unset there, so CI is unaffected. A pair without `=` is dropped with a warning |
 | `WIE_API_JOURNAL=path` | Per-API journal for backend A/B diffs (cached once per process; see `crates/wie-runtime/src/knobs.rs`) |
 | `WIE_ROOT` / `--root` | Optional bottle override for guest `C:\` file APIs (default: per-user app-data bottle at `~/Library/Application Support/WIE/bottle`, created on demand) |

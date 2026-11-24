@@ -59,6 +59,12 @@ pub struct RuntimeProfile {
     presenter_lock_wait_ns: u128,
     /// Largest single presenter-side `shared_winapi` wait (ns).
     presenter_lock_wait_max_ns: u128,
+    /// Largest *finished* run of consecutive no-hook slices (the no-hook
+    /// watchdog's observed peak; see `note_no_hook_stretch`).
+    no_hook_slice_max: usize,
+    /// Largest finished no-hook run in guest instructions (`slices x` the
+    /// quantum's instruction budget).
+    no_hook_insns_max: usize,
 }
 
 impl RuntimeProfile {
@@ -252,6 +258,28 @@ impl RuntimeProfile {
         self.presenter_lock_wait_max_ns
     }
 
+    /// Largest finished run of consecutive no-hook slices.
+    ///
+    /// The session stops when the *current* run reaches the layout's
+    /// `no_hook_slice_limit`; this is the biggest run that completed without
+    /// tripping it, i.e. the headroom the watchdog actually had on this guest.
+    #[must_use]
+    pub fn no_hook_slice_max(&self) -> usize {
+        self.no_hook_slice_max
+    }
+
+    /// Largest finished no-hook run, in guest instructions.
+    ///
+    /// Approximate by construction: it is `slices x` the quantum's instruction
+    /// budget, and a hot self-loop stays inside compiled code past its budget
+    /// (measured: `long_loop` retires 1.1 G instructions while reporting one
+    /// slice). Read it as a floor — the watchdog's own decision is made on the
+    /// exact slice count, not on this.
+    #[must_use]
+    pub fn no_hook_insns_max(&self) -> usize {
+        self.no_hook_insns_max
+    }
+
     /// Accumulate one `run_until_stop` quantum into `emu_ns`.
     pub(crate) fn add_emu_ns(&mut self, ns: u128) {
         self.emu_ns = self.emu_ns.saturating_add(ns);
@@ -260,6 +288,21 @@ impl RuntimeProfile {
     /// Accumulate hook-address-resolution time into `resolve_ns`.
     pub(crate) fn add_resolve_ns(&mut self, ns: u128) {
         self.resolve_ns = self.resolve_ns.saturating_add(ns);
+    }
+
+    /// Record one finished run of consecutive no-hook slices, and the guest
+    /// instruction budget that one slice covers.
+    ///
+    /// The no-hook watchdog stops the session when the *current* run reaches
+    /// `RuntimeMemoryLayout::no_hook_slice_limit`; keeping the largest finished
+    /// run makes the watchdog's headroom a measurement instead of a guess. The
+    /// instruction figure is the one that is comparable across budget changes,
+    /// so it is what the report prints next to the slice count.
+    pub(crate) fn note_no_hook_stretch(&mut self, slices: usize, slice_budget: usize) {
+        self.no_hook_slice_max = self.no_hook_slice_max.max(slices);
+        self.no_hook_insns_max = self
+            .no_hook_insns_max
+            .max(slices.saturating_mul(slice_budget));
     }
 
     /// Count one host stop on a fake-API hook.
@@ -459,6 +502,13 @@ impl RuntimeProfile {
             total as f64 / 1e6,
             self.init_ns() as f64 / 1e6,
         ));
+        if self.no_hook_slice_max() > 0 {
+            lines.push(format!(
+                "no_hook: slices_max={} insns_max={:.1}M",
+                self.no_hook_slice_max(),
+                (self.no_hook_insns_max() as f64) / 1e6,
+            ));
+        }
         if let Some(j) = self.jit() {
             lines.push(format!(
                 "jit: insns={} iced={} compiles={} skip={} bg_compiles={} bg_stalls={} bg_stall_us={} bg_fallback={} cache_hits={} load={} store={}",

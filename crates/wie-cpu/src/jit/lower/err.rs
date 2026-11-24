@@ -155,12 +155,12 @@ pub(super) fn refusal_reason(instr: &Instruction, err: &LowerError) -> String {
 /// `WIE_JIT_OPCODE_HISTO` report as an `Unsupported` one. The counters and the
 /// log line are what separate the two.
 pub(super) fn note_refusal(instr: &Instruction, err: &LowerError) {
-    note_refusal_counted(instr, err, JitConfig::get().opcode_hist_enabled());
+    note_refusal_counted(instr, err, JitConfig::get().opcode_hist_enabled(), "lower");
 }
 
 /// [`note_refusal`] with the histogram gate injected, so the recording path is
 /// testable without depending on process-wide env.
-fn note_refusal_counted(instr: &Instruction, err: &LowerError, hist: bool) {
+fn note_refusal_counted(instr: &Instruction, err: &LowerError, hist: bool, site: &'static str) {
     let counter = match err {
         LowerError::Unsupported => &REFUSALS_UNSUPPORTED,
         LowerError::Form(_) => &REFUSALS_FORM,
@@ -178,6 +178,7 @@ fn note_refusal_counted(instr: &Instruction, err: &LowerError, hist: bool) {
     tracing::debug!(
         rip = format_args!("{:#x}", instr.ip()),
         kind = err.kind(),
+        site,
         reason = %refusal_reason(instr, err),
         "jit lowering refused an instruction — the block falls back to the interpreter"
     );
@@ -188,6 +189,52 @@ fn note_refusal_counted(instr: &Instruction, err: &LowerError, hist: bool) {
 pub(super) fn noted(instr: &Instruction, err: LowerError) -> LowerError {
     note_refusal(instr, &err);
     err
+}
+
+/// Why the **admission gate** refused `instr`, or `None` when it admits it.
+///
+/// The gate ([`opclass::admits`]) refuses before any emitter runs, so it has no
+/// `LowerError` of its own to hand up — but it is the only place that can tell
+/// the two classes apart, and it refuses the majority of real guest code: a
+/// block that *starts* at an unlowerable instruction is `NotPure` and marked
+/// `Never` without ever entering the lowerer. That made the per-variant
+/// counters report zero on a guest whose refusals were almost all gate
+/// refusals — the report could not see the residue it exists to rank.
+///
+/// The classification is the same two values the emitter path uses, derived
+/// from the table rather than guessed:
+/// - a `Refused` row (no implementation at all) is [`LowerError::Unsupported`];
+/// - a row that exists but whose operand contract rejects this instruction is
+///   [`LowerError::Form`], carrying the contract's stable name, so
+///   "`movaps` store form" and "`fld`" report differently.
+pub(crate) fn gate_refusal(instr: &Instruction) -> Option<LowerError> {
+    let row = opclass::row_of(instr);
+    if row.admits(instr) {
+        return None;
+    }
+    Some(match row.class {
+        opclass::OpClass::Gpr(form) => LowerError::Form(form.name()),
+        opclass::OpClass::Sse(form) => LowerError::Form(form.name()),
+        opclass::OpClass::String(form) => LowerError::Form(form.name()),
+        // A terminator row whose shape `term_of` rejects (`ret imm16`, a far
+        // branch) is the same class of failure as a bad operand form.
+        opclass::OpClass::Term(form) => LowerError::Form(form.name()),
+        // No row at all, or the always-admitting `Noop` class (unreachable:
+        // `Noop` admits every encoding).
+        opclass::OpClass::Noop | opclass::OpClass::Refused => LowerError::Unsupported,
+    })
+}
+
+/// Record one refusal the *admission gate* made, for the same report the
+/// emitter's refusals feed.
+///
+/// Called from `block::decode_pure_gpr_block` where a non-admitted instruction
+/// ends (and therefore refuses) a block. Nothing here changes what compiles:
+/// the gate's verdict is already taken, and this only makes it visible.
+pub(crate) fn note_gate_refusal(instr: &Instruction) {
+    if let Some(err) = gate_refusal(instr) {
+        note_refusal_counted(instr, &err, JitConfig::get().opcode_hist_enabled(), "gate");
+    }
 }
 
 #[cfg(test)]
@@ -374,12 +421,13 @@ mod tests {
             OPCODE_HISTO.get(bucket).map(|b| b.load(Ordering::Relaxed)),
         );
 
-        note_refusal_counted(&instr, &LowerError::Unsupported, true);
-        note_refusal_counted(&instr, &LowerError::Form("div_width"), true);
+        note_refusal_counted(&instr, &LowerError::Unsupported, true, "lower");
+        note_refusal_counted(&instr, &LowerError::Form("div_width"), true, "lower");
         note_refusal_counted(
             &instr,
             &LowerError::Verifier("internal: t".to_string()),
             true,
+            "lower",
         );
 
         assert_eq!(REFUSALS_UNSUPPORTED.load(Ordering::Relaxed), before.0 + 1);
@@ -397,11 +445,61 @@ mod tests {
         // The gate-off case must not touch the histogram (lazy 2048-slot
         // allocation) but must still count.
         let untouched = OPCODE_HISTO.get(bucket).map(|b| b.load(Ordering::Relaxed));
-        note_refusal_counted(&instr, &LowerError::Form("div_width"), false);
+        note_refusal_counted(&instr, &LowerError::Form("div_width"), false, "lower");
         assert_eq!(
             OPCODE_HISTO.get(bucket).map(|b| b.load(Ordering::Relaxed)),
             untouched
         );
         assert_eq!(REFUSALS_FORM.load(Ordering::Relaxed), before.1 + 2);
+    }
+
+    /// The admission gate refuses *before* any emitter runs, so its verdict
+    /// never became a `LowerError` and the per-variant counters read zero on a
+    /// guest whose refusals were almost all gate refusals. The gate now
+    /// classifies through the same table: no row is `Unsupported`, a row whose
+    /// operand contract rejects this encoding is `Form`.
+    #[test]
+    fn gate_refusals_use_the_same_two_variants_as_the_emitter() {
+        // `ud2` has no row: the JIT does not implement the instruction.
+        let absent = decode(&[0x0F, 0x0B]);
+        assert_eq!(gate_refusal(&absent), Some(LowerError::Unsupported));
+
+        // `push ax`: the JIT implements `push` and refuses the 16-bit form.
+        let wrong_form = decode(&[0x66, 0x50]);
+        assert_eq!(wrong_form.mnemonic(), Mnemonic::Push);
+        assert!(opclass::admits_mnemonic(Mnemonic::Push));
+        match gate_refusal(&wrong_form) {
+            Some(LowerError::Form(shape)) => assert_eq!(shape, "gpr_push"),
+            other => panic!("expected a form refusal, got {other:?}"),
+        }
+
+        // An admitted instruction is not a refusal at all.
+        assert_eq!(gate_refusal(&decode(&[0x8B, 0x03])), None);
+    }
+
+    /// Reachability of both variants *through the gate reporting path*, which
+    /// is what the refusal report in `jit::diag` renders.
+    #[test]
+    fn the_gate_path_reaches_the_variant_counters_and_names_the_reason() {
+        let absent = decode(&[0x0F, 0x0B]);
+        let wrong_form = decode(&[0x66, 0x50]);
+        let before = refusal_counts();
+
+        note_gate_refusal(&absent);
+        note_gate_refusal(&wrong_form);
+
+        let after = refusal_counts();
+        assert_eq!(after.0, before.0 + 1, "one unsupported gate refusal");
+        assert_eq!(after.1, before.1 + 1, "one form gate refusal");
+        assert_eq!(
+            after.2, before.2,
+            "the gate cannot produce a verifier error"
+        );
+
+        let reason = refusal_reason(&wrong_form, &LowerError::Form("gpr_push"));
+        assert!(
+            reason.contains("gpr_push") && reason.contains("Push"),
+            "{reason}"
+        );
     }
 }

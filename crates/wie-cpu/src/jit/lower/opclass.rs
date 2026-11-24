@@ -173,6 +173,17 @@ pub(crate) enum StrForm {
 }
 
 impl StrForm {
+    /// Stable name of this operand contract, for a refusal report.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::B1 => "string_b1",
+            Self::W2 => "string_w2",
+            Self::D4 => "string_d4",
+            Self::Q8 => "string_q8",
+            Self::D4String => "string_d4_movsd",
+        }
+    }
+
     /// Element width in bytes.
     pub(crate) const fn width(self) -> u32 {
         match self {
@@ -191,7 +202,12 @@ pub(crate) enum TermForm {
     Jmp,
     /// Near `jcc rel`.
     Jcc,
-    /// Near `call rel`.
+    /// Near `call rel`, and the near indirect `call r/m64`.
+    ///
+    /// The indirect form is admitted because the *block exit* already carries a
+    /// runtime RIP (that is how `ret` leaves a block): the return address this
+    /// call pushes is still the constant `next_ip`, so only the target is
+    /// dynamic. See [`is_call_rm64`].
     Call,
     /// Near `ret` with no immediate (`ret imm16` needs an interpreter).
     Ret,
@@ -664,6 +680,32 @@ pub(crate) fn implicit_gprs(instr: &Instruction) -> &'static [usize] {
 }
 
 impl GprForm {
+    /// Stable name of this operand contract, for a refusal report.
+    ///
+    /// Names the *admitted* shape, which is what a refusal needs to say: an
+    /// instruction refused against `gpr_rm_atomic` was refused because it is
+    /// not that shape, and the shape name tells a reader what the lowering
+    /// expects without re-reading this file.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Bare => "gpr_bare",
+            Self::Lea => "gpr_lea",
+            Self::Rm => "gpr_rm",
+            Self::RmAtomic => "gpr_rm_atomic",
+            Self::Unary => "gpr_unary",
+            Self::UnaryAtomic => "gpr_unary_atomic",
+            Self::RegRm => "gpr_reg_rm",
+            Self::Push => "gpr_push",
+            Self::Pop => "gpr_pop",
+            Self::Bswap => "gpr_bswap",
+            Self::Imul => "gpr_imul",
+            Self::Div => "gpr_div",
+            Self::RmwOnly => "gpr_rmw",
+            Self::Shift => "gpr_shift",
+            Self::XaddCmpxchg => "gpr_xadd_cmpxchg",
+        }
+    }
+
     fn admits(self, instr: &Instruction) -> bool {
         match self {
             Self::Bare => true,
@@ -695,6 +737,22 @@ impl GprForm {
 }
 
 impl SseForm {
+    /// Stable name of this operand contract, for a refusal report.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::XmmRm => "sse_xmm_rm",
+            Self::Mov => "sse_mov",
+            Self::Movq => "sse_movq",
+            Self::Movd => "sse_movd",
+            Self::MovHl => "sse_movhl",
+            Self::Movmsk => "sse_movmsk",
+            Self::MovmskGpr => "sse_movmsk_gpr",
+            Self::CvtGprToXmm => "sse_cvt_gpr",
+            Self::CvtXmmToGpr => "sse_cvt_xmm",
+            Self::Shift => "sse_shift",
+        }
+    }
+
     fn admits(self, instr: &Instruction) -> bool {
         match self {
             Self::XmmRm => xmm_rm_is_lowerable(instr),
@@ -764,11 +822,22 @@ impl SseForm {
 }
 
 impl TermForm {
+    /// Stable name of this terminator shape, for a refusal report.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Jmp => "term_jmp",
+            Self::Jcc => "term_jcc",
+            Self::Call => "term_call",
+            Self::Ret => "term_ret",
+        }
+    }
+
     fn admits(self, instr: &Instruction) -> bool {
         match self {
             // `ret imm16` needs the interpreter (stack adjust after the pop).
             Self::Ret => instr.op_count() == 0,
-            Self::Jmp | Self::Call | Self::Jcc => is_near_branch(instr),
+            Self::Call => is_near_branch(instr) || is_call_rm64(instr),
+            Self::Jmp | Self::Jcc => is_near_branch(instr),
         }
     }
 }
@@ -778,6 +847,35 @@ fn is_near_branch(instr: &Instruction) -> bool {
         instr.op0_kind(),
         OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
     )
+}
+
+/// `call r64` / `call [r/m64]`: a near indirect call whose pushed return
+/// address is a full 64-bit `next_ip`.
+///
+/// This is the single largest interpreter residue on real guests (82.5 % of
+/// 7-Zip's interpreted instructions, measured with `WIE_EXEC_TRACE=1`), because
+/// every C++ virtual call, function pointer and import thunk goes through it —
+/// and a block that *contains* one used to be refused wholesale, taking its
+/// `mov` prologue to the interpreter with it.
+///
+/// In 64-bit mode a near call's operand size is forced to 64 bits, so the
+/// `66 FF /2` form is *also* `call r64` (iced decodes it as `Call_rm64`; see
+/// `dyn_call_tests::admission_of_indirect_calls_is_the_table_not_the_encoder`).
+/// What stays on the interpreter is the **far** call (`FF /3`, a 16-byte
+/// m16:64 pointer) — hence the 8-byte size check rather than an operand-kind
+/// check — and `stack_pointer_increment` is the same delta the interpreter's
+/// push assumes, so the two cannot disagree about the pushed width.
+fn is_call_rm64(instr: &Instruction) -> bool {
+    // iced reports the stack delta as a signed number: -8 for a 64-bit push,
+    // -2 for the 16-bit operand-size form.
+    if instr.stack_pointer_increment() != -8 {
+        return false;
+    }
+    match instr.op0_kind() {
+        OpKind::Register => instr.op_register(0).size() == 8,
+        OpKind::Memory => instr.memory_size().size() == 8 && mem_ea_ok(instr),
+        _ => false,
+    }
 }
 
 /// `movsd` mnemonic is shared with string MOVS DWORD — only XMM forms are SSE.

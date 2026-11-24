@@ -28,12 +28,8 @@ use super::engine::{
     CodeCache, CodeRestoreOutcome, JitEngine, PersistedCode, classify_capture_relocs,
 };
 use super::fast_api::{FastApiKind, LargeFreeList};
-use super::gen_tlb::GenTlb;
 use super::lower::err::LowerError;
-use super::lower::{
-    self, CHAIN_SLOTS, CompiledBlock, MemPin, PIN_SLOTS, STICKY_WAYS, TLB_EMPTY, TLB_SETS,
-    TLB_WAYS_PER_SET, TlbValue, compile_block,
-};
+use super::lower::{self, CHAIN_SLOTS, CompiledBlock, JitCtx, compile_block};
 use super::pipeline::resolve_thunk_va;
 use super::profile::BgCompileProfile;
 use super::trampolines::match_micro_stub;
@@ -1512,8 +1508,8 @@ impl Drop for JitShared {
     }
 }
 
-/// Per-thread JIT execution state: registers, TLB, chain table, shadow stack.
-/// One instance per guest thread. Not shared.
+/// Per-thread JIT execution state: registers, the persistent compiled-code
+/// frame, chain table, shadow stack. One instance per guest thread. Not shared.
 #[doc(hidden)]
 pub struct PerThreadJitState {
     /// x86-64 register file.
@@ -1528,32 +1524,29 @@ pub struct PerThreadJitState {
     pub rip_trace_n: usize,
     /// Instructions retired via the iced interpreter (diagnostic counter).
     pub iced_steps: u64,
-    /// Persistent set-associative page TLB across chained blocks.
-    pub tlb: GenTlb<u64, TlbValue, TLB_SETS, TLB_WAYS_PER_SET>,
-    /// Sticky last-hit page for inline IR mem path.
-    pub tlb_hot_page: u64,
-    pub tlb_hot_ptr: *mut u8,
-    pub tlb_hot_prot: u64,
-    pub tlb_hot_gen: u64,
-    /// Multi sticky ways.
-    pub sticky_page: [u64; STICKY_WAYS],
-    pub sticky_ptr: [*mut u8; STICKY_WAYS],
-    pub sticky_prot: [u64; STICKY_WAYS],
-    pub sticky_gen: [u64; STICKY_WAYS],
-    pub sticky_rr: u64,
-    /// Region-direct pins.
-    pub pins: [MemPin; PIN_SLOTS],
-    /// Generation at which pins were last rebuilt.
+    /// The one [`JitCtx`] this engine ever hands to compiled code.
+    ///
+    /// This is the frame, allocated once at engine construction and passed by
+    /// pointer on every dispatcher entry instead of being built and torn down
+    /// by value (`tlb` alone is 2.3 KB; the copy cost ~8.9% of the guest thread
+    /// on `7za a -mx9`). It therefore also *holds* the state that used to be
+    /// duplicated here and copied back after each run: the page TLB, the region
+    /// pins, the sticky/hot page ways, the edge inline-cache and the shadow
+    /// return stack all live in this field now, and nowhere else, so there is
+    /// no second copy that a chain edge and a dispatcher entry could disagree
+    /// about. See the ownership contract on [`JitCtx`]: the dispatcher re-stamps
+    /// every raw pointer in it per entry and resets the per-run counters, which
+    /// is what keeps the frame valid across a move of the owning engine.
+    ///
+    /// Reached only through `&mut` from this engine's own `run_compiled`
+    /// (and, during that call, by the host helpers the compiled block calls
+    /// with the same pointer).
+    #[doc(hidden)]
+    pub ctx: JitCtx,
+    /// Generation at which the frame's pins were last rebuilt.
     pub pins_gen: u64,
     /// Open-addressing guest VA → host block fn (late-bound block chaining).
     pub chain_slots: Box<[lower::ChainSlot; CHAIN_SLOTS]>,
-    /// Monomorphic edge IC.
-    pub edge_ic_va: [u64; lower::EDGE_IC_SLOTS],
-    pub edge_ic_fn: [u64; lower::EDGE_IC_SLOTS],
-    pub edge_ic_rr: u64,
-    /// Shadow return-stack depth.
-    pub shadow_sp: u64,
-    pub shadow_ret: [u64; lower::SHADOW_DEPTH],
     /// Sampling counter for the iced-residue opcode histogram (increments
     /// every iced step; the decode+bucket happens only every Nth step and
     /// only when `WIE_JIT_OPCODE_HISTO` is on).
@@ -1580,8 +1573,15 @@ pub struct PerThreadJitState {
     pub large_free: LargeFreeList,
 }
 
-// SAFETY: TLB/pin raw pointers are non-owning views of guest mmap arenas.
-// Each PerThreadJitState is owned by one host thread; never moved between threads.
+// SAFETY: the raw pointers in `ctx` (guest `mem`, `chain_slots`, `large_free`,
+// `inv_gen_ptr`, and the TLB/pin/sticky page bases) are non-owning views of
+// mmap arenas and caches that outlive the state; `Send` moves the *owner*, not
+// the pointees, and every one of them is owned by the `Arc<JitShared>` /
+// mmap that the moving engine also owns a share of. Each `PerThreadJitState`
+// is owned by one host thread and never moved between threads while a frame is
+// live; `Sync` is deliberately NOT implemented, so the frame can never be
+// reached from two threads at once — that is the property the dispatcher's
+// `&mut` relies on.
 #[expect(unsafe_code)]
 unsafe impl Send for PerThreadJitState {}
 
@@ -1594,24 +1594,9 @@ impl PerThreadJitState {
             rip_trace_i: 0,
             rip_trace_n: 0,
             iced_steps: 0,
-            tlb: GenTlb::new(),
-            tlb_hot_page: TLB_EMPTY,
-            tlb_hot_ptr: std::ptr::null_mut(),
-            tlb_hot_prot: 0,
-            tlb_hot_gen: 0,
-            sticky_page: [TLB_EMPTY; STICKY_WAYS],
-            sticky_ptr: [std::ptr::null_mut(); STICKY_WAYS],
-            sticky_prot: [0; STICKY_WAYS],
-            sticky_gen: [0; STICKY_WAYS],
-            sticky_rr: 0,
-            pins: [MemPin::EMPTY; PIN_SLOTS],
+            ctx: JitCtx::new_persistent(),
             pins_gen: u64::MAX,
             chain_slots: Box::new([lower::ChainSlot::empty(); CHAIN_SLOTS]),
-            edge_ic_va: [0; lower::EDGE_IC_SLOTS],
-            edge_ic_fn: [0; lower::EDGE_IC_SLOTS],
-            edge_ic_rr: 0,
-            shadow_sp: 0,
-            shadow_ret: [0; lower::SHADOW_DEPTH],
             opcode_sample_i: 0,
             pending_promote_thr: 0,
             large_free: LargeFreeList::new(),

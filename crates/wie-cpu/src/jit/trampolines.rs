@@ -25,15 +25,22 @@ use std::sync::atomic::Ordering;
 ///
 /// # Safety
 ///
-/// The caller must guarantee `raw` is non-null and points at a `JitCtx` that
-/// stays alive and is not otherwise borrowed for the whole lifetime `'a`.
+/// The caller must guarantee `raw` is non-null, points at a `JitCtx`, and that
+/// no other reference to that frame is used for the lifetime `'a`.
 ///
 /// That holds at every call site by the [`MicroStub::func`] / Cranelift-import
-/// contract: a stub or fast-API helper is only ever entered from
-/// `JitCpu::run_compiled`, which owns the `JitCtx` for the entire native frame
-/// and does not touch it until the frame returns. The `'a` is not derived from
-/// the raw pointer, so this function must not be used to extend a borrow past
-/// the owning frame.
+/// contract: a stub or fast-API helper is only ever entered with the very
+/// pointer `JitCpu::run_compiled` handed to the compiled block, and
+/// `run_compiled` creates no reference to the frame while the call is in
+/// flight — it stashes the frame's address with `&raw mut` and touches the
+/// frame again only after the call returns. The frame outlives the call: it is
+/// owned by the engine's
+/// [`PerThreadJitState`](super::PerThreadJitState), one per host thread, never
+/// reachable from another thread (`Send`, deliberately not `Sync`), and never
+/// re-entered while a frame is live — nothing on the compiled path calls back
+/// into the dispatcher. The `'a` is not derived from the raw pointer, so this
+/// function must not be used to extend a borrow past the call that received
+/// the pointer.
 #[must_use]
 pub(super) unsafe fn ctx_mut<'a>(raw: *mut JitCtx) -> &'a mut JitCtx {
     // SAFETY: delegated to the caller — see the `# Safety` contract above.

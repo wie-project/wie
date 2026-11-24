@@ -270,6 +270,33 @@ impl MemPin {
 /// Guest register file snapshot for a compiled block (C ABI).
 ///
 /// Layout is fixed; host mem helpers and Cranelift use the same offsets.
+///
+/// # One instance per engine, not per dispatcher entry
+///
+/// The struct is **persistent per-thread state**, owned by
+/// [`PerThreadJitState`](super::PerThreadJitState) and built once at engine
+/// construction (see [`JitCtx::new_persistent`]). The dispatcher hands compiled
+/// code a pointer to that one instance instead of materialising a stack value
+/// per call: `tlb` alone is 2.3 KB, and copying the frame in and out on every
+/// entry cost ~145 ns on `7za a -mx9` over 200 M+ entries per run.
+///
+/// Consequences that keep this honest, all of them invariants rather than
+/// conventions:
+///
+/// * **Same frame on both entry paths.** A chain edge (`chain_tail`, or the
+///   emitted successor call) receives the very pointer the dispatcher passed
+///   in, so a block cannot observe different state depending on how it was
+///   entered — there is no second copy that could disagree.
+/// * **Every raw pointer in the frame is re-stamped at each dispatcher entry**
+///   (`mem`, `chain_slots`, `large_free`, `inv_gen_ptr`). That is what makes a
+///   persistent frame safe across a move of the owning engine: nothing stored
+///   inside the frame points at the frame's own address once the call returns.
+/// * **Per-run fields must be reset by the dispatcher** (`fault`, `mem_path`,
+///   the dirty masks, `chain_depth`, `insn_acc`, `chain_hops`,
+///   `chain_store_ops`, `load_calls`, `store_calls`) because the frame now
+///   outlives a run. Everything else (`tlb`, `pins`, `sticky_*`, `edge_ic_*`,
+///   `shadow_*`, `tlb_hot_*`) is *meant* to persist and already did — it used
+///   to be copied back into the thread after each run.
 #[repr(C)]
 pub(super) struct JitCtx {
     pub gpr: [u64; 16],
@@ -438,6 +465,67 @@ pub(super) struct JitCtx {
     /// the helper's access to one `&mut` with no `Drop` glue in the
     /// `#[repr(C)]` C-ABI context. Same idiom as [`Self::chain_slots`].
     pub large_free: *mut LargeFreeList,
+}
+
+impl JitCtx {
+    /// The empty persistent frame an engine starts from.
+    ///
+    /// Called exactly once per [`PerThreadJitState`](super::PerThreadJitState),
+    /// never on the dispatch path. The values are the cold state the old
+    /// per-call frame was initialised with, so a fresh engine behaves
+    /// identically: an empty TLB, `TLB_EMPTY` sticky/hot pages, no pins (the
+    /// first `run_compiled` sees `pins_gen != mem_gen` and rebuilds them), no
+    /// shadow-return entries, and no raw pointers — every pointer field is
+    /// stamped per entry, and a null here would fault loudly if one were ever
+    /// missed rather than silently reading a stale address.
+    #[must_use]
+    pub(super) fn new_persistent() -> Self {
+        Self {
+            gpr: [0; 16],
+            rflags: 0,
+            rip: 0,
+            gs_base: 0,
+            mem: std::ptr::null_mut(),
+            fault: 0,
+            fault_addr: 0,
+            fault_size: 0,
+            fault_access: 0,
+            tlb: GenTlb::new(),
+            xmm: [XmmSlot::ZERO; 16],
+            shadow_sp: 0,
+            shadow_ret: [0; SHADOW_DEPTH],
+            chain_slots: std::ptr::null_mut(),
+            tlb_hot_page: TLB_EMPTY,
+            tlb_hot_ptr: std::ptr::null_mut(),
+            gpr_dirty_bits: 0,
+            load_calls: 0,
+            store_calls: 0,
+            tlb_hot_prot: 0,
+            mem_gen: 0,
+            tlb_hot_gen: 0,
+            pins: [MemPin::EMPTY; PIN_SLOTS],
+            edge_ic_va: [0; EDGE_IC_SLOTS],
+            edge_ic_fn: [0; EDGE_IC_SLOTS],
+            edge_ic_rr: 0,
+            xmm_dirty_bits: 0,
+            mem_path: MemPathSlice::default(),
+            sticky_page: [TLB_EMPTY; STICKY_WAYS],
+            sticky_ptr: [std::ptr::null_mut(); STICKY_WAYS],
+            sticky_prot: [0; STICKY_WAYS],
+            sticky_gen: [0; STICKY_WAYS],
+            sticky_rr: 0,
+            chain_depth: 0,
+            inv_gen_ptr: std::ptr::null(),
+            inv_gen_baked: 0,
+            insn_acc: 0,
+            chain_hops: 0,
+            chain_store_ops: 0,
+            heap_ctrl_va: 0,
+            heap_base: 0,
+            heap_end: 0,
+            large_free: std::ptr::null_mut(),
+        }
+    }
 }
 
 /// Per-`run_compiled` mem helper resolution counters (appended after IR-stable layout).
@@ -647,7 +735,11 @@ mod string;
 mod tlb;
 
 #[cfg(test)]
+mod dyn_call_tests;
+#[cfg(test)]
 mod opclass_tests;
+#[cfg(test)]
+mod poison_tests;
 
 use analysis::{
     analyze_def_xmm, analyze_live_gprs, analyze_live_xmm, block_has_fp, block_has_mem,
@@ -659,8 +751,8 @@ use emit::{
 };
 use flags::{FlagState, flag_bit, iconst_u64, mask_width, select_flag};
 use gpr::{
-    bool_to_i64, effective_addr, flag_set, mark_dirty, op_width_bits, read_op_mem, reg_index,
-    sext_to_i64, write_gpr, write_op_mem,
+    bool_to_i64, effective_addr, flag_set, indirect_branch_target, mark_dirty, op_width_bits,
+    read_op_mem, reg_index, sext_to_i64, write_gpr, write_op_mem,
 };
 use insn::{PendingFlags, ShiftKind, flush_pending};
 use mem::{call_load, call_store, hoist_pin_slot};
@@ -747,7 +839,10 @@ pub(super) fn compile_block(
     let needs_flags = block_needs_flags(insns, term);
     let has_fast_call = call_fast.is_some();
     let has_mem = block_has_mem(insns)
-        || matches!(term, Some(BlockTerm::Call { .. } | BlockTerm::Ret))
+        || matches!(
+            term,
+            Some(BlockTerm::Call { .. } | BlockTerm::CallDyn { .. } | BlockTerm::Ret)
+        )
         || has_fast_call;
     // A block may only WRITE xmm (pure converts like cvttpd2dq) without ever
     // reading one — defs must count too, or helper refs stay None and the
@@ -811,6 +906,20 @@ pub(super) fn compile_block(
         .module
         .declare_anonymous_function(&eng.block_sig)
         .map_err(|e| LowerError::verifier(e.to_string()))?;
+
+    // The shared `ctx.func` / `func_ctx` outlive one compile. The success path
+    // finalizes the builder and clears the context at the end, but a lowering
+    // that returns `Err` part-way leaves both dirty — and Cranelift then panics
+    // on the *next* block compiled on this engine (`ssa.rs: you have declared a
+    // non-branch instruction as a predecessor to a block!`, or
+    // `frontend.rs: func_ctx.is_empty()`). Refusals are routine on real guests
+    // (an operand shape the emitter does not cover, a verifier text); found by
+    // driving `real_exes/2048.exe` through a few moves, which refuses one block
+    // and then compiles the next. Both resets are idempotent and cheap next to
+    // one block compile, and doing them unconditionally means the clean state
+    // does not depend on how the previous attempt ended.
+    eng.module.clear_context(&mut eng.ctx);
+    eng.func_ctx = FunctionBuilderContext::new();
 
     eng.ctx.func.signature = eng.block_sig.clone();
     eng.ctx.func.name = UserFuncName::user(0, func_id.as_u32());
@@ -956,8 +1065,15 @@ pub(super) fn compile_block(
                         .insert(va, eng.module.declare_func_in_func(fid, bcx.func));
                 }
             }
-            // Also pre-declare return_ip for Call (common after callee returns).
-            if let BlockTerm::Call { return_ip, .. } = t
+            // Also pre-declare return_ip for either call form (common after
+            // the callee returns).
+            let call_return_ip = match t {
+                BlockTerm::Call { return_ip, .. } | BlockTerm::CallDyn { return_ip } => {
+                    Some(return_ip)
+                }
+                _ => None,
+            };
+            if let Some(return_ip) = call_return_ip
                 && return_ip != start_rip
                 && let Some(fid) = chain.chain_func(return_ip)
             {
@@ -1408,6 +1524,7 @@ pub(super) fn lower_term(
     flag_state: Option<&FlagState>,
     mem: &mut MemEnv,
     term_ip: u64,
+    term_instr: Option<&Instruction>,
 ) -> Result<Value, LowerError> {
     match term {
         BlockTerm::Jmp { target } => Ok(iconst_u64(bcx, target)),
@@ -1434,6 +1551,22 @@ pub(super) fn lower_term(
             gpr[4] = new_rsp;
             mark_dirty(dirty, 4);
             Ok(iconst_u64(bcx, target))
+        }
+        BlockTerm::CallDyn { return_ip } => {
+            // `call r/m64`: read the target from its operand, then push the
+            // return address — operand first, because `call [rsp+…]` addresses
+            // through the *pre-push* RSP (Intel SDM, and the interpreter's
+            // `exec_call` says so explicitly).
+            let instr = term_instr.ok_or_else(|| {
+                LowerError::verifier("internal: dynamic call without its instruction")
+            })?;
+            let target = indirect_branch_target(bcx, instr, gpr, mem, term_ip)?;
+            let ret = iconst_u64(bcx, return_ip);
+            let new_rsp = bcx.ins().iadd_imm(gpr[4], -8);
+            call_store(bcx, mem, gpr, rflags, new_rsp, 8, ret, term_ip)?;
+            gpr[4] = new_rsp;
+            mark_dirty(dirty, 4);
+            Ok(target)
         }
         BlockTerm::Ret => {
             let rsp = gpr[4];

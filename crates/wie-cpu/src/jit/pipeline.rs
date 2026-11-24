@@ -737,7 +737,7 @@ impl JitCpu {
         }
 
         // Iced does not maintain the shadow return stack — drop prediction.
-        self.thread.shadow_sp = 0;
+        self.thread.ctx.shadow_sp = 0;
         self.stats.exec.iced_insns = self.stats.exec.iced_insns.saturating_add(1);
         self.stats.profile.iced_fallbacks = self.stats.profile.iced_fallbacks.saturating_add(1);
         // Sampled opcode histogram over the interpreted residue (Phase-0
@@ -1172,7 +1172,7 @@ impl JitCpu {
         if self.thread.pins_gen != mem_gen {
             let mem = read_unpoisoned(&self.shared.mem);
             let infos = mem.jit_region_pins();
-            self.thread.pins = std::array::from_fn(|i| MemPin::from_info(infos[i]));
+            self.thread.ctx.pins = std::array::from_fn(|i| MemPin::from_info(infos[i]));
             self.thread.pins_gen = mem_gen;
         }
         // Gen-bump + pin-shape diagnostics (cheap; always on for stats).
@@ -1188,7 +1188,7 @@ impl JitCpu {
             self.stats.mem.gen_peak = mem_gen;
         }
         {
-            let stack = self.thread.pins[0];
+            let stack = self.thread.ctx.pins[0];
             self.stats.mem.pin_stack_bytes = if stack.is_empty() {
                 0
             } else {
@@ -1199,7 +1199,7 @@ impl JitCpu {
             if !stack.is_empty() {
                 bits |= stack.allow & 0b11;
             }
-            for (i, pin) in self.thread.pins.iter().enumerate().skip(1) {
+            for (i, pin) in self.thread.ctx.pins.iter().enumerate().skip(1) {
                 if pin.is_empty() {
                     continue;
                 }
@@ -1215,11 +1215,20 @@ impl JitCpu {
         }
         let mem_guard = read_unpoisoned(&self.shared.mem);
         let mem_ptr = (&raw const *mem_guard).cast_mut();
+        let ctx = &mut self.thread.ctx;
         let regs = &mut self.thread.regs;
+        // Entry state, and *only* entry state. This used to build a whole
+        // `JitCtx` by value — 2.3 KB `tlb` + `pins` + `shadow_ret` + 16 GPRs +
+        // 16 XMM slots, ~4.6 KB copied in here and copied back out below, on
+        // every dispatcher entry (≈8.9% of the guest thread on `7za a -mx9`
+        // came from `_platform_memmove` alone). The frame is now owned by this
+        // engine, so the state that must persist between entries (`tlb`,
+        // `pins`, `sticky_*`, `edge_ic_*`, `shadow_*`, `tlb_hot_*`) is simply
+        // still there and nothing is copied.
+        //
         // Full GPR snapshot on entry: late-bound chaining reloads live regs from
         // JitCtx, so every architectural GPR must be valid for successors.
-        let mut gpr = [0_u64; 16];
-        for (i, slot) in gpr.iter_mut().enumerate() {
+        for (i, slot) in ctx.gpr.iter_mut().enumerate() {
             *slot = regs.gpr(i);
         }
         // Full xmm snapshot: a chained successor may load any live xmm from
@@ -1228,76 +1237,68 @@ impl JitCpu {
         // ctx.xmm for GPR blocks, so a chained SSE successor read zeros — e.g.
         // notepad's CRLF expansion `movd [rcx], xmm0` wrote 0x0000 pairs and
         // the loaded file truncated at the first such NUL.
-        let mut xmm = [XmmSlot::ZERO; 16];
         for i in 0..16 {
             let v = regs.xmm_at(i);
-            if let Some(slot) = xmm.get_mut(i) {
+            if let Some(slot) = ctx.xmm.get_mut(i) {
                 *slot = XmmSlot::from_u128(v);
             }
         }
-        let mut ctx = JitCtx {
-            gpr,
-            rflags: u64::from(regs.rflags),
-            rip: entry_rip,
-            gs_base: regs.gs_base(),
-            mem: mem_ptr,
-            fault: 0,
-            fault_addr: 0,
-            fault_size: 0,
-            fault_access: 0,
-            tlb: self.thread.tlb,
-            xmm,
-            shadow_sp: self.thread.shadow_sp,
-            shadow_ret: self.thread.shadow_ret,
-            chain_slots: self.thread.chain_slots.as_mut_ptr(),
-            tlb_hot_page: self.thread.tlb_hot_page,
-            tlb_hot_ptr: self.thread.tlb_hot_ptr,
-            // 0 = Cranelift path (host falls back to full writeback);
-            // trampolines OR their dirty bits; chain sets 0xffff.
-            gpr_dirty_bits: 0,
-            load_calls: 0,
-            store_calls: 0,
-            tlb_hot_prot: self.thread.tlb_hot_prot,
-            mem_gen,
-            tlb_hot_gen: self.thread.tlb_hot_gen,
-            pins: self.thread.pins,
-            edge_ic_va: self.thread.edge_ic_va,
-            edge_ic_fn: self.thread.edge_ic_fn,
-            edge_ic_rr: self.thread.edge_ic_rr,
-            xmm_dirty_bits: 0,
-            mem_path: MemPathSlice::default(),
-            sticky_page: self.thread.sticky_page,
-            sticky_ptr: self.thread.sticky_ptr,
-            sticky_prot: self.thread.sticky_prot,
-            sticky_gen: self.thread.sticky_gen,
-            sticky_rr: self.thread.sticky_rr,
-            // Fresh dispatcher entry always starts a new host-chain budget.
-            chain_depth: 0,
-            // Emitted guards + chain_tail compare the live shared generation
-            // against the block's compile-time bake; any bump observed here
-            // sends control back to this dispatcher (purge + fresh decode).
-            inv_gen_ptr: std::ptr::from_ref(&self.shared.invalidate_gen),
-            inv_gen_baked: meta.inv_gen,
-            // Blocks (and chained successors / micro-stubs) fold their dynamic
-            // instruction count in here; read back below.
-            insn_acc: 0,
-            // Chain edges taken by this frame and the GPR stores they did.
-            // Folded into `stats.chain` below, like `insn_acc`.
-            chain_hops: 0,
-            chain_store_ops: 0,
-            // UCRT malloc/free fast path: this session's heap layout, published
-            // from the shared config at init. Plain copies — this frame owns the
-            // context exclusively, so no atomicity is needed on the read side
-            // (the Acquire on the publish is what orders the init writes).
-            heap_ctrl_va: self.shared.heap[0].load(Ordering::Acquire),
-            heap_base: self.shared.heap[1].load(Ordering::Acquire),
-            heap_end: self.shared.heap[2].load(Ordering::Acquire),
-            large_free: &raw mut self.thread.large_free,
-        };
+        ctx.rflags = u64::from(regs.rflags);
+        ctx.rip = entry_rip;
+        ctx.gs_base = regs.gs_base();
+        // Every raw pointer in the frame is re-stamped per entry, so no field
+        // can outlive a move of the owning engine with a stale target.
+        ctx.mem = mem_ptr;
+        ctx.chain_slots = self.thread.chain_slots.as_mut_ptr();
+        ctx.large_free = &raw mut self.thread.large_free;
+        // Emitted guards + chain_tail compare the live shared generation
+        // against the block's compile-time bake; any bump observed here
+        // sends control back to this dispatcher (purge + fresh decode).
+        ctx.inv_gen_ptr = std::ptr::from_ref(&self.shared.invalidate_gen);
+        ctx.inv_gen_baked = meta.inv_gen;
+        ctx.mem_gen = mem_gen;
+        // Per-run fields: these MUST be reset, because the frame now outlives a
+        // run. Everything above them is either re-stamped here or meant to
+        // persist. A stale `fault` would turn the next entry into a spurious
+        // access violation; a stale dirty mask would make the host skip
+        // writeback of GPRs/XMMs the run really did change.
+        ctx.fault = 0;
+        ctx.fault_addr = 0;
+        ctx.fault_size = 0;
+        ctx.fault_access = 0;
+        // 0 = Cranelift path (host falls back to full writeback);
+        // trampolines OR their dirty bits; chain sets 0xffff.
+        ctx.gpr_dirty_bits = 0;
+        ctx.xmm_dirty_bits = 0;
+        ctx.load_calls = 0;
+        ctx.store_calls = 0;
+        ctx.mem_path = MemPathSlice::default();
+        // Fresh dispatcher entry always starts a new host-chain budget.
+        ctx.chain_depth = 0;
+        // Blocks (and chained successors / micro-stubs) fold their dynamic
+        // instruction count in here; read back below.
+        ctx.insn_acc = 0;
+        // Chain edges taken by this frame and the GPR stores they did.
+        // Folded into `stats.chain` below, like `insn_acc`.
+        ctx.chain_hops = 0;
+        ctx.chain_store_ops = 0;
+        // UCRT malloc/free fast path: this session's heap layout, published
+        // from the shared config at init. Plain copies — this frame's owner
+        // holds it exclusively, so no atomicity is needed on the read side
+        // (the Acquire on the publish is what orders the init writes).
+        ctx.heap_ctrl_va = self.shared.heap[0].load(Ordering::Acquire);
+        ctx.heap_base = self.shared.heap[1].load(Ordering::Acquire);
+        ctx.heap_end = self.shared.heap[2].load(Ordering::Acquire);
         drop(mem_guard); // GuestMemory read lock already released; compiled block runs on TLB/pins.
-        // SAFETY: func is a finalized Cranelift block; TLB/pins resolve to stable mmap pointers.
+        // SAFETY: func is a finalized Cranelift block, and `ctx` is this
+        // engine's one persistent frame: `&mut` here is the only outstanding
+        // borrow for the duration of the call, the engine is owned by this host
+        // thread (`PerThreadJitState` is `Send` but not `Sync`), and every
+        // pointer the frame carries was stamped above and resolves into mmap
+        // arenas that outlive the call. Chain edges and micro-stubs hand the
+        // same pointer to successors, so no second copy of the frame exists.
         unsafe {
-            (meta.func)(std::ptr::from_mut(&mut ctx));
+            (meta.func)(std::ptr::from_mut(ctx));
         }
         // Charge what the native frame ACTUALLY retired, not the block's static
         // length: a self-looping block bumps the emitted trip counter once per
@@ -1336,24 +1337,11 @@ impl JitCpu {
             s.mem.addr_heap_pin = s.mem.addr_heap_pin.saturating_add(m.addr_in_heap_pin);
             s.mem.addr_outside = s.mem.addr_outside.saturating_add(m.addr_outside_pins);
         }
-        // Guest stores via `GuestMemory::write` leave a pending range;
-        // apply selective code invalidation only after the native frame returns.
-        // Persist per-thread execution state from JitCtx.
-        self.thread.tlb = ctx.tlb;
-        self.thread.tlb_hot_page = ctx.tlb_hot_page;
-        self.thread.tlb_hot_ptr = ctx.tlb_hot_ptr;
-        self.thread.tlb_hot_prot = ctx.tlb_hot_prot;
-        self.thread.tlb_hot_gen = ctx.tlb_hot_gen;
-        self.thread.sticky_page = ctx.sticky_page;
-        self.thread.sticky_ptr = ctx.sticky_ptr;
-        self.thread.sticky_prot = ctx.sticky_prot;
-        self.thread.sticky_gen = ctx.sticky_gen;
-        self.thread.sticky_rr = ctx.sticky_rr;
-        self.thread.edge_ic_va = ctx.edge_ic_va;
-        self.thread.edge_ic_fn = ctx.edge_ic_fn;
-        self.thread.edge_ic_rr = ctx.edge_ic_rr;
-        self.thread.shadow_sp = ctx.shadow_sp;
-        self.thread.shadow_ret = ctx.shadow_ret;
+        // Nothing is persisted from `ctx` here: the TLB, pins, sticky ways,
+        // edge IC, shadow stack and hot page ARE the frame, which this engine
+        // owns. This used to be ~25 field copies back into `self.thread` plus
+        // the whole 2.3 KB `tlb`, on every entry.
+        //
         // Prefer cumulative trampoline dirty bits (partial writeback when a
         // micro-stub does not chain). Cranelift leaves bits at 0 → full sync
         // (internal block chaining can dirty arbitrary GPRs).
@@ -1417,33 +1405,38 @@ impl JitCpu {
         } else {
             None
         };
-        // Safe point: drop Ready blocks overlapping any stores from this block.
+        // Safe point: guest stores via `GuestMemory::write` leave a pending
+        // range, so drop Ready blocks overlapping any store from this block —
+        // but only after the native frame has returned.
         self.drain_pending_code_writes();
         (fault, dynamic_insns)
     }
 
     pub(super) fn invalidate_tlb(&mut self) {
-        self.thread.tlb = GenTlb::new();
-        self.thread.tlb_hot_page = TLB_EMPTY;
-        self.thread.tlb_hot_ptr = std::ptr::null_mut();
-        self.thread.tlb_hot_prot = 0;
-        self.thread.tlb_hot_gen = 0;
-        self.thread.sticky_page = [TLB_EMPTY; STICKY_WAYS];
-        self.thread.sticky_ptr = [std::ptr::null_mut(); STICKY_WAYS];
-        self.thread.sticky_prot = [0; STICKY_WAYS];
-        self.thread.sticky_gen = [0; STICKY_WAYS];
-        self.thread.sticky_rr = 0;
-        self.thread.pins = [MemPin::EMPTY; PIN_SLOTS];
+        // The TLB/pins/sticky ways live in the engine's persistent frame.
+        let ctx = &mut self.thread.ctx;
+        ctx.tlb = GenTlb::new();
+        ctx.tlb_hot_page = TLB_EMPTY;
+        ctx.tlb_hot_ptr = std::ptr::null_mut();
+        ctx.tlb_hot_prot = 0;
+        ctx.tlb_hot_gen = 0;
+        ctx.sticky_page = [TLB_EMPTY; STICKY_WAYS];
+        ctx.sticky_ptr = [std::ptr::null_mut(); STICKY_WAYS];
+        ctx.sticky_prot = [0; STICKY_WAYS];
+        ctx.sticky_gen = [0; STICKY_WAYS];
+        ctx.sticky_rr = 0;
+        ctx.pins = [MemPin::EMPTY; PIN_SLOTS];
         self.thread.pins_gen = u64::MAX;
     }
 
     pub(super) fn invalidate_chain_and_shadow(&mut self) {
         chain_table_clear(self.thread.chain_slots.as_mut());
-        self.thread.edge_ic_va = [0; lower::EDGE_IC_SLOTS];
-        self.thread.edge_ic_fn = [0; lower::EDGE_IC_SLOTS];
-        self.thread.edge_ic_rr = 0;
-        self.thread.shadow_sp = 0;
-        self.thread.shadow_ret = [0; lower::SHADOW_DEPTH];
+        let ctx = &mut self.thread.ctx;
+        ctx.edge_ic_va = [0; lower::EDGE_IC_SLOTS];
+        ctx.edge_ic_fn = [0; lower::EDGE_IC_SLOTS];
+        ctx.edge_ic_rr = 0;
+        ctx.shadow_sp = 0;
+        ctx.shadow_ret = [0; lower::SHADOW_DEPTH];
         // The table is empty now; force a full re-sync from the cache on the
         // next dispatch (picks up worker-installed Ready blocks too).
         self.chain_sync_epoch = u64::MAX;

@@ -1,0 +1,917 @@
+# The performance ceiling: what to change, in what order
+
+Date: 2026-11-24. Branch `feat/dll-coverage`, base commit `2e0a1dd`. All figures below
+were measured in this session on the real guests in `real_exes/`, not on micro fixtures.
+
+This document answers one question: **what must we change or add so that a real
+Windows application runs as fast as it can under WIE?** It is a ranked list of
+levers with a *measured* current cost, an *upper bound* on what removing it can buy,
+and an explicit list of dead ends with the number that kills each one.
+
+A 5% win is not the answer here. The two levers that are worth 1.4x and 1.9x are
+both architectural, and both are in the same place: the boundary between the
+dispatcher and compiled code.
+
+---
+
+## 0. TL;DR — the ranked table
+
+`Ceiling` is an upper bound on wall-clock gain on the named workload if that lever
+were made free and nothing else changed: `1 / (1 - measured share)`.
+
+| # | Lever | Measured current cost (real guest) | Ceiling | Effort | Risk | Reversible | Kind |
+|---|---|---|---|---|---|---|---|
+| **L1** | Per-dispatch-entry frame marshalling: `JitCtx` is built by value and copied back on every dispatcher entry (4.6 KB of struct copy + ~100 scalar copies) | **32% of the guest thread on `7za a -mx9`** (memmove alone 8.9%); ≈180 ns/entry × 225.9M entries ≈ 40 s of 102.6 s. `x`: 24% | **≤1.45x on mx9/mx1** (1/(1−0.32)) | M (≈400–600 LOC, 2 files) | Medium: ABI + lifetime; must keep chain-entry and dispatcher-entry state identical | Yes (feature flag) | Architecture (`jit/pipeline.rs` + peer-owned `jit/lower/mod.rs`) |
+| **L2** | Compile serialisation: one `Mutex<JitEngine>` held across Cranelift's `compile_function` for every block, on every thread | **`x`: 24% of the guest thread blocked at `lock_unpoisoned(&self.engine)` (`shared.rs:1137`) + 25% compiling = 49%**; mx9 startup window: 53% lock-wait; mx9 steady state: 1% | **1.5–1.9x on the extraction class** (1/(1−0.49) = 1.96); ≤1.05x mx9 | L (per-thread `JITModule`s, chain table gains a module dimension) | High: `FuncId` is module-local; cache/chain keys must carry the module | Hard | Architecture |
+| **L3** | Cranelift codegen cost per block (88% of compile time is Cranelift's own regalloc+isel, 4% is our CLIF emission) | compile CPU: 20.3 s (`mx9`), 12.7 s (`mx1`), 6.5 s (`x`), 3.2 s (`h`); guest-visible stall 0.5 / 1.6 / 10.8 / **10.6%** | **≤1.12x on `h`** (1/(1−0.106)); ~1.1x on `x` when loaded; 1.005x on mx9 | XL (second backend: no-regalloc baseline emitter + tiering) | High | Yes (tier choice) | Architecture |
+| **L4** | First-execution compiles: a block executed **once** is compiled anyway | eager compiles: 7592 (`mx9`), 7173 (`mx1`), 5784 (`x`), 1893 (`h`); `h` compiles 2087 blocks to retire 5.5M instructions | bounded by the stall it removes: **1.11x `h`**, ~1.1x `x`, ≈1.005x mx9 | S–M | Low | Yes | Patch-ish (needs a "compile on 2nd execution" decision, not a knob) |
+| **L5** | Emitted-code quality: base tier compiles at Cranelift `opt_level=none` | emitted code = **58% of mx9's guest thread**; `WIE_JIT_OPT=speed` on mx9 (below) | see §4.5 measurement | S (default flip) | Medium: compile cost per block ~1.5–1.7x (already measured in `docs/status.md`) | Yes (knob) | Patch |
+| **L6** | Chain-hop machinery | chain edges are already winning: `WIE_JIT_CHAIN=0` costs **1.53x** on `mx1` (median of 2 interleaved pairs) | no gain available by *removing* work; the gain is in making entries cheap (L1) and fewer (L7) | — | — | — | Landed |
+| **L7** | Region/trace formation: entries per guest instruction | 41.6 guest insns/entry on mx9; 19.9 on `x`; **226M entries on mx9** | multiplies L1: 400-insn regions would cut the 32% entry share to ~3%, i.e. **≈1.4x alone** | L (region discovery + exit stubs) | High (exactness on faults/SMC) | Yes | Architecture |
+| **L8** | Host stops / API resolution / handler dispatch | `handler_ms` ≤ **1.2%** of wall on every measured class (0.11% mx9, 0.22% mx1, 1.18% `x`, 0.50% `h`); `resolve_ms` ≤ 0.54 ms | **≤1.2%** — dead end for load-heavy guests | S | Low | Yes | Patch |
+| **L9** | Threading / N guest threads | 4 compile workers are **85–90% idle** while the guest blocks on the compile mutex 24% of the time; the mutex, not CPU, is the serialising resource | bounded by L2; not independently measurable here | L | High | — | Architecture (peer-owned measurement) |
+
+**Dead ends, with the number that kills each:** guest-VA==host-VA translation
+(≤1.4%), iced residue (≤0.8%), in-guest stubs for hot exports (≤1.2%), guest-heap
+allocation patterns (0.004%), WinAPI name resolution (0.01%), the existing
+`WIE_JIT_TARGET_WORK` lazy-compile knob (0.996 median). See §5.
+
+---
+
+## 1. Method, and how to read the numbers
+
+**Binary.** `/tmp/bins/h_sym`: release build of `2e0a1dd` with
+`CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=1` so `/usr/bin/sample`
+resolves symbols (the shipped release profile sets `strip = true`, which turns every
+frame into `???`). Every A/B in this document is one binary with an env or source
+difference — never two independently built trees.
+
+**Host.** Shared machine, 7 users, 1-minute load average **3.3–7.4** across the
+session. Every absolute time below is therefore a *spread*; ratios are interleaved
+A/B pairs (A,B,A,B,…) reported as the median of per-pair ratios, plus the raw
+samples. When a single number appears it is the median of that arm, and the spread is
+given when the spread is bigger than the effect.
+
+**Workloads** (calibrated so one run of the expensive mode lands in ~30–100 s):
+
+| Class | Command | Notes |
+|---|---|---|
+| compute | `7za a -mx9 -y D:\out9.7z D:\rnd D:\txt D:\mid` over `/tmp/corpus` (6.7 MB: 4 MB incompressible random, 2 MB compressible text, 1 MB mid) | LZMA, the CPU-heaviest real mode |
+| IO+compress | same with `-mx1` | contrast |
+| extraction | `7za x -y -oD:\ex C:\out.7z` | read + I/O path |
+| read+hash | `7za h D:\rnd\r0.bin` | least allocation-churny |
+| GUI | `notepad.exe C:\big.txt` (1.5 MB, 23k lines) | see §2.1 for what is not drivable |
+
+**A measurement hazard worth recording.** Guest `C:\` is the host bottle
+(`~/Library/Application Support/WIE/bottle/drive_c`), so `rm -f /tmp/corpus/out.7z`
+does **not** delete the archive a previous run produced: the next `7za a -y` *updates*
+an existing archive instead of compressing from scratch, and the instruction count
+silently drops by ~4x (measured: `insns=1.92G` on a fresh archive vs `0.507G` on an
+**unchanged** one). Every benchmark below writes its archive to `D:` (the host
+directory passed as `--drive-d`), where `rm` works. Any future harness that leaves the
+archive in the bottle is measuring the wrong thing.
+
+**How the counts are obtained.** `WIE_RUNTIME_PROFILE=1` prints wall/CPU, `emu_ms`,
+`handler_ms`, `resolve_ms`, host-stop counts, and the `jit:` line
+(`insns`, `iced`, `cache_hits` = dispatcher entries, `bg_stalls`/`bg_stall_us` = time
+the *guest thread* waited for a background compile, `load`/`store` = host memory-helper
+calls). `/usr/bin/sample <pid> 5` gives the per-thread split. Note that
+`WIE_RUNTIME_PROFILE` adds two `Instant::now()` calls **per quantum**, not per
+instruction (20,424 quanta on mx9 ⇒ ~2 ms), so the profiling overhead does not distort
+the stack attribution.
+
+---
+
+## 2. The workload matrix
+
+Profiled, `/tmp/bins/h_sym`, corpus `/tmp/corpus`. Each row is one full run; the
+archive was created from scratch in that run.
+
+| | `a -mx9` | `a -mx1` | `x` | `h` |
+|---|---|---|---|---|
+| wall_ms | 102 711 | 36 686 | 9 462 | 2 057 |
+| emu_ms | 102 581 (99.9%) | 36 581 (99.8%) | 9 333 (98.8%) | 2 038 (99.5%) |
+| handler_ms | 111.6 (0.11%) | 79.1 (0.22%) | 109.8 (1.18%) | 10.3 (0.50%) |
+| host_stops / charged | 20 424 / 9 687 | 12 922 / 6 108 | 19 560 / 9 143 | 5 218 / 2 545 |
+| guest insns | 9.370 G | 3.162 G | 178.1 M | 5.53 M |
+| iced insns | 34.3 M (0.36%) | 28.2 M (0.89%) | 29.7 k | 10.9 k |
+| dispatcher entries | **225.86 M** | 32.37 M | 8.97 M | 4 601 |
+| guest insns / entry | 41.6 | 97.7 | 19.9 | 1202 |
+| chain hops | 1.147 G | 374.6 M | 3.09 M | 11.3 k |
+| compile CPU (all threads) | 20.32 s | 12.70 s | 6.50 s | 3.20 s |
+| guest waits for compile | 0.495 s (0.5%) | 0.569 s (1.6%) | 0.028 s (0.3%) | **0.218 s (10.6%)** |
+| guest insn rate | 91.3 M/s | 86.1 M/s | 19.0 M/s | 2.7 M/s |
+
+`x` re-run while the host was at load 6 (`/tmp/ceil/prof_x_full.log`): wall 7 664 ms,
+emu 7 580 ms, 6.92 M entries, **`bg_stall_us=826 604` = 10.8% of wall**. Compile cost
+is not a constant: on a loaded machine it stops being hidden behind the workers.
+
+### 2.1 What could not be measured, and why
+
+* **`notepad.exe` with `--gui` is not drivable in this environment.** With
+  `WIE_INPUT_SCRIPT` and a 1.5 MB document it blocks in
+  `CFUserNotificationDisplayAlert: called from main application thread, will block
+  waiting for a response` and never reaches the input script (rc=124 after 120 s).
+  That is a host-dialog/harness limitation, not a WIE perf result.
+* **`notepad.exe --screenshot`** does run headless (rc=0, one frame, 192 ms wall) but
+  captures the frame *before* the document is loaded: it retired 1772 instructions
+  total. It is a **startup** measurement, not a load measurement — see §3.5.
+* **DOOM Retro is not measurable headlessly here.** `--persistent` (the only mode that
+  does not need a window server) rejects guest argv, so the `-iwad` argument it needs
+  cannot be passed: it falls into `comdlg32!getOpenFileNameA` (an IWAD picker) and
+  exits. `--gui` needs a window server, which this environment does not have. The
+  existing `docs/jit-architecture-review.md` figure (startup 364 M instructions in
+  ~22 s ⇒ 16.5 M insn/s) remains the only Doom datum and it is a startup number.
+* **2048.exe** was not driven: it needs keystrokes and a window; no headless input
+  path exists for it (`--input-script` requires `--gui`).
+
+Nothing in the ranking below depends on the GUI/game classes: they are *startup*
+workloads (sub-second, handler-dominated), and §3.5 shows why a startup-dominated
+guest is a different optimisation problem that does not make the cut.
+
+---
+
+## 3. Where the time actually goes, per class
+
+### 3.1 Compute (`7za a -mx9`) — the guest thread, steady state
+
+`/usr/bin/sample` over a 5 s window in LZMA's steady state (late window, 4208 samples
+on the guest thread):
+
+| Bucket | Share of guest thread |
+|---|---|
+| emitted code (`???`, no symbol — Cranelift output) | 58% |
+| **dispatcher (`finish_compiled`/`run_compiled` + engine loop)** | **32%** |
+| host memory helpers (`wie_jit_load`/`store` misses) | 7% |
+| compile-lock wait | 1% |
+
+Within the 32% dispatch bucket, the largest single leaf is `_platform_memmove`:
+**373 of the guest thread's 4208 samples (8.9%)**, and its caller chain is
+`run_until_stop → CpuEngine::run_until_stop → JitCpu::finish_compiled → memmove`
+(`run_compiled` is inlined into `finish_compiled`). The rest is
+`finish_compiled` self (5.8%), `run_until_stop` self (3.3%), `step_one` (1.5%) — the
+field-by-field `JitCtx` construction, the ~25 `saturating_add` stat folds, and the
+`RegFile` ⇄ `JitCtx` register copies.
+
+**Why there is a memmove at all.** `JitCtx` holds the per-thread JIT state *by value*:
+`tlb: GenTlb<u64, TlbValue, 16, 4>`, `pins: [MemPin; 8]`, `shadow_ret: [u64; 32]`,
+`gpr: [u64; 16]`, `xmm: [XmmSlot; 16]`, plus ~50 scalars. `run_compiled` copies
+`self.thread.tlb` into the frame and copies it back on return. One `GenSet` is
+`tags[4]·8 + values[4]·16 + gens[4]·8 + rr + pad = 144 B`, so **the TLB alone is
+2304 B, copied in and out = 4.6 KB per dispatcher entry**. At 225.9 M entries that is
+**~1.0 TB of struct copy per mx9 run**, which is what the 8.9% memmove share is.
+
+The share is not an artefact of one sample: the early window (first ~8 s) is
+`compile-lock-wait 53%, compile 44%` on the same thread — i.e. mx9 has a compile-bound
+startup and a dispatch-bound steady state, and the steady state is 95% of the run.
+
+**Independent confirmation from an ablation.** `WIE_JIT_CHAIN=0` forces every block
+edge back through the dispatcher. On `mx1s` (same binary, interleaved, identical
+instruction counts in both arms — `insns=507 240–242 k`):
+
+```
+mx1s,def,    23135.91   (pair 1)      mx1s,nochain,26535.73
+mx1s,def,    11996.83   (pair 2)      mx1s,nochain,22984.96
+per-pair ratios 1.147, 1.916 — median 1.53
+```
+
+Chaining is worth ~1.5x. Turning the same measurement around: the baseline run has
+~5.2 M entries and ~60 M hops; with chaining off there are ~65 M entries. One extra
+dispatcher entry therefore costs **≈180 ns (~550 cycles)** — the same order as the
+32% × 102.6 s / 225.9 M = 145 ns/entry the stack profile implies. Two independent
+methods, same answer.
+
+### 3.2 IO + compression (`a -mx1`)
+
+Same shape as 3.1 with more compile: 35% of wall is compile CPU (12.7 s), of which
+the guest sees 1.6% as stalls. iced is 0.89% of retired instructions here (the highest
+of the set) but that is still ≤0.9% of wall at iced's ~8x per-instruction cost.
+
+### 3.3 Extraction (`7za x`) — **the compile-lock class**
+
+```
+   thread (guest)  n=3350   compile=25%  compile-lock-wait=24%  emitted=24%  dispatch=24%
+   wie-jit-bg-0..3 n=3350   idle/wait=88-90%  compile=6-7%  compile-lock-wait=4-5%
+```
+
+The guest thread spends **811/3350 = 24.2%** of its samples in
+`_pthread_mutex_firstfit_lock_wait`, and the parent frame is unambiguous:
+
+```
+_RNvMs1_..._JitShared24compile_from_kind_shared  (in h_sym) + 2088  shared.rs:1137
+  _pthread_mutex_firstfit_lock_slow  → _pthread_mutex_firstfit_lock_wait   810 samples
+```
+
+`shared.rs:1137` is `let mut eng_guard = lock_unpoisoned(&self.engine);` — the one
+mutex every compiling thread serialises on, held for the whole `compile_block` call.
+The four background workers are simultaneously **88–90% idle**: the guest is not
+competing for CPU, it is waiting for a lock held by whichever worker is compiling. The
+`bg_stall_us` counter (826 ms = 10.8% on this run) counts the same phenomenon from the
+runtime's side.
+
+Meanwhile `handler_ms` is 1.18% and `resolve_ms` 0.54 ms: this class is not I/O-bound
+in the emulator, it is **compile-bound**.
+
+### 3.4 Startup / read+hash (`7za h`)
+
+2 087 background compiles and 1 893 eager compiles to retire 5.53 M instructions;
+**10.6% of wall is the guest waiting for those compiles**. `h` is a startup workload
+wearing a benchmark's clothes: 4 601 entries, 1202 instructions per entry.
+
+### 3.5 GUI (`notepad --screenshot`, 1.5 MB document)
+
+192 ms wall, 118 ms emu, **`handler_ms`=68.5 ms = 36.7% of emu**, 246 host stops for
+1772 retired instructions (`stops_per_1k = 126`). For a GUI launch the cost is host
+API work, not guest execution — and the absolute number is 0.2 s. This class optimises
+*differently* (fewer stops, cheaper handlers) and does not move the needle on a
+load-heavy guest. It is the reason L8 appears in the table at all, and the reason its
+ceiling is 1.2%.
+
+### 3.6 The one thing all classes share
+
+Whatever the class, the emulator's own overhead is concentrated in exactly two places:
+**the dispatcher entry** (L1, L7) and **the compile path** (L2, L3, L4). Emitted-code
+quality (L5) is the third, and it is the only one that touches the 58% "emitted" share
+on the compute class.
+
+---
+
+## 4. The levers
+
+### 4.1 L1 — Stop rebuilding the frame on every dispatcher entry (≈1.45x on mx9/mx1)
+
+**Current cost.** 32% of the guest thread on mx9, 24% on `x`; ≈145–180 ns per entry,
+over 225.9 M entries on mx9, 32.4 M on `mx1` and 9.0 M on `x`.
+
+**What is actually necessary.** Reading `run_compiled` (`crates/wie-cpu/src/jit/pipeline.rs`),
+per entry the code:
+
+1. refreshes pins when `mem_gen` changed (cheap, gated),
+2. recomputes pin/gen *diagnostic* stats (8 pins, every entry, though it only changes
+   when pins change),
+3. copies `tlb` (2304 B), `pins`, `shadow_ret`, `gpr[16]`, `xmm[16]` into a stack
+   `JitCtx`,
+4. initialises ~50 more fields, 25 of them straight copies of `self.thread.*`,
+5. calls the block, then
+6. folds ~40 statistics counters,
+7. copies ~25 fields back out, and writes `gpr[16]`, `xmm[16]`, `rflags`, `rip` into
+   `RegFile`.
+
+Steps 3 and 7 are 4.6 KB + 512 B of memory traffic each way. Steps 4/7 for
+`tlb`/`pins`/`sticky`/`edge_ic`/`shadow`/`heap`/`chain_slots`/`large_free`/`inv_gen_ptr`
+exist only because the frame is a **temporary**: the successor block reads and writes
+the TLB and pins *through the frame*, so a fresh frame every entry forces a copy in
+and a copy out.
+
+**Patch shape (small enough to land, big enough to matter).**
+
+* Own the frame per thread instead of per call: `PerThreadJitState { ctx: JitCtx, … }`
+  (or a `Box<JitCtx>`), allocated at session init. `run_compiled` passes
+  `&mut *thread.ctx` to `(meta.func)`.
+* Per entry write only what the guest can have changed between entries:
+  `gpr[16]`, `xmm[16]`, `rflags`, `rip`, `gs_base`, `mem`, `mem_gen`, `inv_gen_baked`,
+  and reset the per-run counters (`chain_depth=0`, `insn_acc=0`, `chain_hops=0`,
+  `chain_store_ops=0`, `load_calls=0`, `store_calls=0`, `fault=0`,
+  `gpr_dirty_bits=0`, `xmm_dirty_bits=0`, `mem_path=default`). ≈40 stores, no 4.6 KB.
+* Per exit read back `gpr`/`xmm` (already mask-gated on `gpr_dirty_bits`),
+  `rflags`, `rip`, and fold the counters. Nothing to copy back for the TLB.
+* Also fold the pin/gen *diagnostic* block into the existing
+  `if self.thread.pins_gen != mem_gen` branch — it is a pure function of `pins`, so
+  the reported numbers stay bit-identical while the per-entry cost goes away.
+
+**Why it is safe, and the invariant to state.** The invariant that keeps this honest:
+*a compiled block must observe exactly the same `JitCtx` whether it was entered from
+the dispatcher or from a chain edge.* Today that is guaranteed by both paths
+dereferencing the same pointer for the duration of the run. With a persistent frame it
+is guaranteed **structurally** — there is one frame, and both paths hand out
+`&mut` to it — which is a strengthening, not a weakening. The two ways to break it are
+(a) keeping a stale `RegFile` view alive while the frame changes (fix: `RegFile` is
+only the authoritative source at the *call boundary*, as today; nothing else reads it
+during a run), and (b) two engine threads sharing one `PerThreadJitState` (fix: it is
+per-thread by construction, and `JitCtx` contains raw pointers, so the owning type
+needs one audited `unsafe impl Send` site — or, cleaner, the bulk fields become
+references: `tlb: &'a mut GenTlb<…>`). The alternative shape, changing `JitCtx`'s bulk
+fields to references, is a peer-owned file (`jit/lower/mod.rs`), so the two shapes
+should be decided together.
+
+**How to verify it.** (1) The existing chain/dispatcher differential: `chain_hops` /
+`JitCtx` chain tests, the notepad CRLF case and the Doom `movdqu` case recorded in the
+comments at the XMM writeback — both were *caused* by a frame that disagreed with
+itself across an entry, so they are the right regression tests. (2) A new test that runs
+one block from a chain edge and from the dispatcher and asserts the resulting `RegFile`
+is identical. (3) The full `WIE_CPU=iced` differential suite. (4) `insns`/`entries`
+must be unchanged on every workload in §2 (they are deterministic today).
+
+**Expected gain, honestly bounded.** The memmove component (8.9%) is provably pure
+copy and goes to zero. The scalar copies (part of the remaining 23%) mostly go to
+zero too. I would expect **1.25–1.4x on mx9/mx1** and less on compile-dominated guests
+(`x` is 24% dispatch, so ≤1.3x even if perfect). I have *not* implemented it: the
+frame type lives in `crates/wie-cpu/src/jit/lower/mod.rs`, which a peer holds this
+round, and the `Send` question above is a design decision, not a typo fix. This is the
+single highest-value change in the document.
+
+### 4.2 L2 — Stop serialising every compile on one mutex (up to ~1.9x on extraction)
+
+**Current cost.** `x`: 24% of the guest thread blocked on the engine mutex, plus 25%
+inside the compile it is waiting for. `mx9` startup: 53% lock-wait. Steady-state mx9:
+1%.
+
+**Why it is serialised.** `JitShared::compile_from_kind_shared` takes
+`lock_unpoisoned(&self.engine)` (`shared.rs:1137`) and calls `compile_block`, which
+runs Cranelift's `define_function` — the whole ABI-level pipeline (isel + regalloc,
+88% of compile time, §4.3) — while holding it. `JITModule::define_function` needs
+`&mut JITModule`, so *any* concurrent compile must serialise unless there is more than
+one module.
+
+**Patch shape.** Give each compile worker its **own** `JITModule` per tier (N modules
+per tier instead of one). The code base already proves the pattern: `FuncId` is
+module-local and the tier design already pays for it (`chain_ids` entries carry their
+tier, `chain_map_for(tier)` is the single filter). This extends the key by one
+dimension — `(tier, module)` — and the invariant becomes "direct chaining is
+same-tier-**and**-same-module". Everything else (per-block code cache keys, `opt_level`
+records) already carries the tier tag and would gain the module tag.
+
+Costs: N× code memory (a few MB per tier — acceptable), N× `finalize_definitions`, and
+the cache key space grows. The payoff is that the guest thread stops blocking behind
+other threads' compiles, which is exactly the 24% on `x`.
+
+**Cheaper partial win, worth trying first.** The guest thread's wait is for *any*
+module lock. If the guest's inline compile path took a *dedicated* module (guest
+inline = module 0, workers = modules 1..N), the single-threaded case would never
+contend: the workers' compiles become invisible to the guest. That is the same
+mechanism with 2 modules instead of N+1 and no change to the chain-table dimension
+(worker-compiled blocks would still be chained only within their own module, which is
+already the tier rule). This is the version I would prototype first.
+
+### 4.3 L3 — Cranelift's own codegen is 88% of compile time (≤1.11x, small guests only)
+
+```
+compile_block inclusive = 2846 samples (mx9 early window)
+  2511 (88.2%)  cranelift AArch64Backend::compile_function  (isel + regalloc)
+   121 ( 4.3%)  lower::emit::emit_body_a   (our CLIF emission)
+    40 ( 1.4%)  remove_constant_phis
+    31 ( 1.1%)  JITModule::finalize_definitions
+```
+
+Nothing we write dominates; the third-party ABI pipeline does. A tier-0 backend that
+emits host code directly from the decoded block (no CLIF, no regalloc) would therefore
+delete ~88% of compile CPU. What it must trade: emitted code quality. The cheapest
+honest tier-0 is a slot-based emitter (every guest GPR op becomes ctx→reg, op, reg→ctx),
+which is roughly Cranelift-without-regalloc: plausible 1.5–3x more host instructions
+for the blocks that use it.
+
+**Ceiling by class:** the guest-visible stall is 0.5% (mx9), 1.6% (mx1), 10.8% (`x`
+loaded), 10.6% (`h`). Even a *free* baseline emitter is worth **1.005x on mx9** and
+**1.11x on `h`**. Its real value is different: it makes short-lived guests and
+one-shot blocks cheap, and it removes the CPU burn that competes with the guest on a
+loaded or N-threaded host. Do it for `h`-shaped workloads, not for 7-Zip `-mx9`.
+
+### 4.4 L4 — Never compile a block that runs once (≤1.11x, and the knob does not do it)
+
+`h` compiles 2 087 blocks (1 893 of them **eager**, i.e. on first sight) to retire
+5.53 M instructions. If a block executed once is never compiled, that compile CPU and
+its 10.6% of stall disappear.
+
+The existing knob does **not** buy this. `WIE_JIT_TARGET_WORK=1800` (the "compile on
+the 2nd execution" proxy) measured on `h`, 5 interleaved pairs:
+
+```
+hs,def, 1429.45   hs,tw, 1058.13   ratio 0.740
+hs,def, 1124.07   hs,tw, 1108.71   ratio 0.986
+hs,def, 1109.30   hs,tw, 1110.36   ratio 1.001
+hs,def, 1116.87   hs,tw, 1112.32   ratio 0.996
+hs,def, 1109.34   hs,tw, 1106.22   ratio 0.997
+median 0.996 (4/5 pairs)
+```
+
+Only the first pair (cold start, 1429 ms outlier) showed a win; the steady pairs are
+flat. `TARGET_WORK` moves the *hotness promotion threshold*, not eager compilation, and
+`h` is eager-dominated. The same knob on `xs`: ratios 0.987, 1.085, 0.952 → median
+0.987 (2/3). **Conclusion: the lazy-compile lever is real but has no knob; it needs a
+policy inside the promotion decision** ("compile on the second execution, never the
+first"), which is a small, contained change in the miss path — and it must be gated so
+the compute class, whose blocks are hot, is unaffected.
+
+### 4.5 L5 — Emitted-code quality: `WIE_JIT_OPT` and region size
+
+The base tier compiles at `opt_level=none` because compile cost dominates real guests
+(`docs/status.md` measured 1.46–1.74x wall and 1.5–1.9x compile_us for `speed` on
+`7za i`). With per-block tier-up, only self-loop blocks get `speed`. On mx9 the emitted
+share is 58% of the guest thread, and mx9 has 18 self-loops (per `docs/status.md`), so
+the question "is `speed` worth it for a second class of block?" is live.
+
+Measured here on mx9s, 2 interleaved pairs (`WIE_JIT_OPT=speed` forces every block,
+including the 18 LZMA self-loops, through Cranelift's full optimizer):
+
+```
+mx9s,def,   29778.22  compile_us 8490676      mx9s,speed,35912.76  compile_us 19935508   ratio 1.206
+mx9s,def,   34157.02  compile_us 2588169      mx9s,speed,40491.01  compile_us 20162238   ratio 1.187
+insns within 0.0001% in both arms (1 921 148 860 vs 1 921 146 608; the difference is
+background-compile timing, which trades a chain edge for a dispatcher entry)
+```
+
+**`speed` costs 1.19–1.21x on the compute class.** The compile cost triples
+(2.6 → 20.2 s) and buys less than that back in emitted-code quality. So the answer to
+"should we optimise the emitted code harder?" is *not* "turn on the optimiser": the
+1.46–1.74x win recorded in `docs/status.md` for `speed` was measured on `7za i`
+(a compile-dominated startup command), and it reverses sign on `-mx9` (an
+emitted-code-dominated one). The current design — `none` by default, per-block tier-up
+to `speed` for hot self-loops — is the right shape, and L5 is largely *closed*: the
+remaining lever there is better **lowering** (fewer CLIF ops per guest instruction),
+not a different `opt_level`.
+
+**Region formation could not be measured, and that is itself a finding.**
+`WIE_JIT_SUPER=all` — the documented knob for block-wide super regions — **segfaults**
+(rc=139, no output beyond `guest_args`) on `7za a -mx9`:
+
+```
+$ WIE_JIT_SUPER=all ... wie run ... 7za.exe -- a -mx9 -y 'D:\out9.7z' 'D:\rnd'
+guest_args: ["a", "-mx9", "-y", "D:\\out9.7z", "D:\\rnd"]
+rc=139
+```
+
+So the region lever (L7) cannot be bounded with the existing mechanism, and any work
+on it must first make the super path survive a real guest. That is a correctness bug
+in a diagnostic knob today, and it sits in `crates/wie-cpu/src/jit/lower/` (peer-owned
+this round).
+
+> **Update, 2026-11-24 — fixed, and the L7 lever is now measurable.** The crash was
+> not in the lowering's super branch but in the eligibility proof that decides whether
+> to emit it (`crates/wie-cpu/src/jit/block.rs::analyze_block_stack_pin`). It rejected
+> a block that wrote the base register *after* the first stack access but not one that
+> wrote it *before*, and the guard is computed on the base register's **entry** value.
+> The shape that fired is WIE's own in-guest `GetFileSize` helper
+> (`wie-runtime/src/guest_io.rs`, `getfs_impl_va + 0x17`): `mov rbp, <handle-table VA>`
+> → `add rbp, rax` → `cmp [rbp], r10`. Under `SUPER=all` the entry guard passed on the
+> caller's real `rbp`, while the emitted load used the table pointer, so
+> `host = (pin.host_base - pin.guest_base) + addr` landed on `0x7000_e9cf_f000` — a
+> guest address read as a host pointer. Reproduced deterministically with
+> `WIE_JIT_SUPER=all … 7za.exe -- h D:\rnd\r0.bin` (rc=139; the faulting arm64
+> instruction was `ldr x5, [x23, x0]` with
+> `x23 = 0x00000000e98fc000` (the stack pin bias) and
+> `x0 = 0x0000700000403000` (the handle-table guest VA)), not with `a -mx9`:
+> the crash needs the accelerator helper, which is why the guest *mode* mattered
+> as much as the corpus. The analysis now refuses any block that
+> writes its base anywhere (plus `xchg`/`xadd` register operands, which the operand-0
+> check missed), four unit tests pin the rule, and with it the super path is
+> byte-exact: `a -mx1` and `a -mx9` produce identical archive MD5s with and without
+> `SUPER=all` over the calibrated corpus, and the whole micro-suite passes under
+> `WIE_JIT_SUPER=all`. L7 can be planned now — measure it with
+> `scripts/real-guest-perf.sh --arms def,super_all`.
+
+### 4.6 L6 — Chaining is already the best thing in the emulator
+
+`WIE_JIT_CHAIN=0` costs 1.53x (median, `mx1s`). Round 2 of this workstream already
+proved that the *stores* inside a hop are free (removing 27–75% of
+`hop_store_ops` gave 0.9955/1.0264 paired medians, reverted), so the hop's cost is the
+guard + the chain-table lookup + the call itself — all already small. Do not spend
+more time on the hop; spend it on the *entry* (L1) and on *fewer entries* (L7).
+
+### 4.7 L7 — Fewer entries: the multiplier on L1
+
+Entries per guest instruction on mx9 is 41.6; on `x` it is 19.9. Entry cost ~145–180 ns
+means mx9 pays ~40 s and `x` pays ~1.6 s of its 7.6 s in dispatcher entries. Region
+formation (superblocks/traces) attacks the *count*:
+
+* A 400-instruction region would cut entries ~10x: dispatch 32% → ~3%, i.e. **≈1.4x
+  on mx9 by itself, and it stacks with L1** (1.45x × 1.4x ≈ 2.0x, bounded by the
+  emitted 58% that neither lever touches).
+* `WIE_JIT_SUPER` today only turns *self-loops* into a super path (`SUPER=all` measured
+  below in §4.5's batch). Turning general straight-line runs into regions needs block
+  discovery across edges plus exact exit stubs for faults/SMC/protect — that is why it
+  is an architecture change, and it is the one that also makes the code cache more
+  effective (fewer, larger units to persist).
+
+### 4.8 L8 — Host stops, resolution, handlers (≤1.2%)
+
+Measured: `handler_ms` 0.11% (mx9), 0.22% (mx1), 1.18% (`x`), 0.50% (`h`); the top
+exporter by time on `x` is `findfirstfilew` at 38 ms and `createfilew` at 30 ms, of a
+9.3 s run. `resolve_ms` is 0.54 ms *total*. A completely free handler layer buys
+**≤1.2%**. In-guest stubs for `malloc`/`free`/`memcpy` are pointless for wall clock
+(4380 `free` calls cost 1.82 ms in total on mx9 — 0.002%); the guest's own allocator
+work is already guest code. The one place handlers matter is GUI startup (36.7% of a
+192 ms run), which is not a load-heavy class.
+
+### 4.9 L9 — Threading
+
+The measured fact for the single-threaded ceiling: **the compile mutex serialises, and
+the workers are idle while the guest waits** (`x`: guest 24% lock-wait, workers 88–90%
+idle). Under N guest threads the same mutex is taken for every compile from every
+thread, and `chain_ids`/ready-map reads are shared. `WIE_JIT_WORKERS=1` on `mx1s`
+measured 1.146 and 0.925 (median 1.03, 2 pairs) — i.e. worker *count* is not the
+lever; access to the module is. Cross-thread scaling measurement is a peer's lane.
+
+> **Cross-thread scaling: measured, §10.** The placeholder above is now filled in with a
+> 5-repetition interleaved sweep of 7-Zip's own `-mmt` against a native control. Three of
+> its results contradict the expectations this section was written under, and are worth
+> reading before acting on L2 or on any lock: (i) at N guest threads the compile mutex is
+> **4.9%** of wall on `-mx9`, not 50% — it is 32% only on `-mx1`, where guest compute is
+> cheap; (ii) the big `WinApiState` lock costs **1.4 ms per 60 s** and **0.8% of sampled
+> thread-time**, so partitioning it cannot pay; (iii) the emulator's threading loss at
+> `-mx9` is mostly that the *second* guest thread costs **+51% host CPU for −13% wall**,
+> which is cycles, not waits. Note also that `-mmt=8` starts only 2–3 real encoder threads
+> on a corpus this size, so no cell in §10 is an 8-thread measurement — the native control
+> gets 1.57–1.69x there, which is what the host was actually willing to give.
+
+---
+
+## 5. Dead ends — do not spend time here
+
+| Idea | The number that kills it |
+|---|---|
+| `guest_va == host_va` mapping / a faster soft-translate fast path | `WIE_JIT_MEM=slow` (helper-only oracle) costs **+0.7% median** on mx9s (pairs 1.0135, 1.0007). The inline translation path is worth ≤1.4% on the compute class, so perfect translation buys at most that. The 4K-guest/16K-host page problem, the fake range and the software permission checks are a large risk for a ≤1.4% prize. |
+| iced-residue work (`perf-plan-2` G2) | iced is 0.36% (mx9), 0.89% (mx1), 0.02% (`x`), 0.2% (`h`) of retired instructions. At iced's ~8x per-instruction cost the wall ceiling is **≤0.8%**. G2's <1% target is already met. |
+| In-guest stubs / accelerator coverage for hot exports | `handler_ms` ≤1.2% of wall on every load-heavy class, and `resolve_ms` ≤0.54 ms. Boosted `malloc`/`free`/`memcpy` stubs cannot pay: 4380 `free` calls = 1.82 ms on mx9. |
+| Guest-heap allocation patterns | Same number: 3877 `malloc` + 4380 `free` = 3.98 ms of 102.6 s (**0.004%**). |
+| WinAPI name resolution (`resolve_winapi_id` linear scan, `is_winapi_library` list) | `resolve_ms = 0.54` on `x`, `0.00` elsewhere — it is not on the hot path at all. Making it a perfect hash changes nothing measurable. |
+| The existing lazy-compile knob (`WIE_JIT_TARGET_WORK`) | 0.996 median on `h` (4/5 pairs), 0.987 on `x` (2/3). It does not gate eager first-execution compiles, which is where `h`'s cost is. |
+| Chain-hop store elimination | Already measured in round 2: removing 27–75% of the hop's GPR stores gave paired medians 0.9955/1.0264 → reverted. The stores are free; the hop is not where the time is. |
+| More compile workers | `WIE_JIT_WORKERS=1` was indistinguishable from the default on `mx1s` (1.146, 0.925 — median 1.03, opposite signs). |
+| Tuning `--max-api` / stop counts | Stops are bounded by handler time (≤1.2%) and `resolve_ms`; mx9 does 20 424 stops in 102.6 s. |
+
+---
+
+## 6. What was implemented this round
+
+> **Update (later the same day): L1 landed.** One persistent `JitCtx` per engine
+> (`size_of` = 3744 B, so §4.1's "4.6 KB" was ~25% high) instead of that value
+> being built and torn down per dispatcher entry. Measured
+> **1.33x wall / 1.31x CPU on `7za a -mx9`** (median of 12 interleaved pairs,
+> output byte-identical), `_platform_memmove` under `finish_compiled` **31.4% →
+> 0.9%** of the guest thread, `long_loop` unchanged (0.9986). `JitCtx`'s layout
+> is unaltered, so `CODE_FORMAT_VERSION` stays 3. Details, the invariant and its
+> tests, and what is left in the entry path: [`l1-persistent-frame.md`](l1-persistent-frame.md).
+
+**One change was written, measured, and reverted, and nothing shipped from it.**
+That is the result, and here is the number that produced it.
+
+**S1 — hoist the pin/gen diagnostic block out of the per-entry path** (`jit/pipeline.rs`).
+The block at the top of `run_compiled` recomputed eight pin spans, `pin_allow_bits`,
+`gen_bumps` and `gen_peak` on **every** dispatcher entry, although `pins` is written in
+exactly one place (the refresh branch immediately above it) and `mem_gen` only advances.
+The patch moved the whole block under the same `gen_moved` condition that refreshes the
+pins, keeping the reported stats identical by construction. Two binaries from the same
+base (`/tmp/bins/h_sym` = `2e0a1dd`, `/tmp/bins/s1_sym` = `2e0a1dd` + the patch), 3
+interleaved pairs on mx9s:
+
+```
+mx9s,base, 32164.60   mx9s,s1, 33875.15    ratio 1.0532
+mx9s,base, 34450.33   mx9s,s1, 34779.65    ratio 1.0096
+mx9s,base, 38395.70   mx9s,s1, 36431.43    ratio 0.9488
+median 1.0096 (1/3 pairs better); insns 1 921 171 081 in 5 of the 6 runs
+(the sixth differs by 0.00005% — background-compile timing trades a chain edge for a
+dispatcher entry, which is why entries, not wall, is the stable counter across arms)
+```
+
+**Reverted.** Median +1.0%, 1/3 pairs — indistinguishable from the host drift, which
+moved the base arm from 32.2 s to 38.4 s across the three pairs. The useful part of the
+result: ~50 instructions of scalar diagnostics are *not* where the 32% goes, which is
+what the memmove evidence already said (8.9% of the guest thread is the 4.6 KB struct
+copy alone). It sharpens L1: fix the copies, not the scalars.
+
+Gates after the revert (repo tree, which also carried a peer's in-flight
+`jit/lower/**` edits): `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+--all-targets` **0 warnings**, and the same with `-D warnings`; `cargo nextest run
+--workspace` **2028/2028 passed** (1 leaky), 0 skipped; `scripts/check.sh --only
+file-sizes --only dep-direction --only winapi-port --only state-bindings` all pass,
+`whole-state bindings ok (439 = budget 439)`.
+
+Everything else on the lever list is either already landed (chaining, tier-up,
+`opt_level=none`), measured to be worthless (§5), or too large and too cross-cutting to
+land inside a measurement round with a peer holding `jit/lower/**` (L1, L2, L3, L7).
+L1 in particular is the one I would dispatch next: it is ~400–600 lines in two files, it
+has a provable mechanism, and its measured share is 32% of the heaviest real workload.
+
+
+---
+
+## 7. What I could not verify, and the risks I would insist on
+
+* **L1's `Send` question.** `JitCtx` holds raw pointers (`mem`, `chain_slots`,
+  `large_free`, `tlb_hot_ptr`, …). Owning one per thread requires either one audited
+  `unsafe impl Send` on the owning per-thread struct or converting the bulk fields to
+  references. Both are decisions for whoever lands L1; I did not guess.
+* **L2's memory cost.** N modules per tier multiplies code memory and
+  `finalize_definitions` cost. I bounded the *time* win (24% on `x`) but did not
+  measure the memory.
+* **`x`'s 19.0 M insn/s vs mx9's 91.3 M/s.** Two thirds of that gap is explained
+  (49% compile+lock on `x`) and the rest is fewer instructions per entry (19.9 vs 41.6)
+  and I/O; I did not isolate the remainder.
+* **All absolute times.** Host load moved mx9s between 32.5 s and 39.7 s within one
+  session. Only ratios in this document should be reused.
+* **GUI and game classes** are startup measurements only (§2.1). A statement about
+  "GUI performance" would need a window server.
+* ~~**`WIE_JIT_SUPER=all` segfaults on a real guest** (§4.5, rc=139 on `7za a -mx9`), so
+  the region-formation lever has no working measurement harness.~~ **Fixed 2026-11-24**
+  — see the update in §4.5. The root cause was the super-path *eligibility* proof, not
+  the lowering: a block that assigns its own base register was accepted, so the
+  entry-value guard proved the wrong address. `scripts/real-guest-perf.sh --arms
+  def,super_all` is the harness L7 needs.
+* **The gates were run with a peer's in-flight edits in the tree** (`jit/lower/*`,
+  `jit/block.rs`). They are green as reported in §6, but a peer's next edit can change
+  that; my own change this round was a Markdown file.
+
+---
+
+## 8. What we must add, in order
+
+1. **A persistent per-thread frame (L1).** One `JitCtx` per engine thread, not one per
+   call. ~40 stores per entry instead of 4.6 KB of copies and ~100 scalar copies.
+   Measured share 32% on mx9, 24% on `x`. Expected 1.25–1.4x on the compute and
+   I/O classes. This is the single change I would dispatch first.
+2. **A compile path that does not serialise the guest (L2).** Per-thread
+   `JITModule`s (or at minimum a dedicated module for the guest's inline compiles).
+   Measured: the guest blocks on `lock_unpoisoned(&self.engine)` 24% of `x`.
+3. **A first-execution compile policy (L4).** Never compile a block on its first
+   execution. Measured ceiling 1.11x on `h`, and it removes the eager compile storm
+   that makes short guests expensive.
+4. **Region formation (L7)** — but only after the `WIE_JIT_SUPER=all` segfault above is
+   fixed, and only because it multiplies L1: entries per guest instruction is the
+   number that turns a 145 ns entry cost into (or out of) a wall-clock problem.
+5. **A real-guest perf harness.** `./scripts/run-micro-suite.sh` and `--only perf` gate
+   `long_loop`, a compute micro that tells us nothing about file I/O, compilation or
+   allocation. Everything in this document came from ad-hoc scripts plus the
+   archive-in-the-bottle hazard in §1. **Landed 2026-11-24** as
+   `scripts/real-guest-perf.sh`: deterministic corpus generator + CRC manifest
+   (`--make-corpus`, verified on every run), every archive written under `--corpus` and
+   deleted there (a corpus inside the guest bottle is refused, a run whose archive
+   survives the delete is refused), interleaved reps with a per-(class, arm) cache
+   warmup so no arm pays a cold compile the baseline did not, per-class ratios from the
+   median of per-rep pairs, and the `scripts/check.sh --only perf` load convention
+   (`WIE_PERF_MAX_LOAD`, default 2.0) — over the limit a rep is skipped and says so, and
+   a sweep with no measurable rep exits non-zero instead of reporting the host.
+6. **Not a lever, but a prerequisite for trusting any of this:** the differential
+   suites (`WIE_CPU=iced`, `WIE_JIT_MEM=slow`, chain tests) must stay green through
+   L1/L2, because both change the frame/ABI boundary where this project's worst
+   historical bugs (notepad's CRLF `movd` zeros, Doom Retro's dropped `xmm` def) lived.
+
+## 9. Appendix — reproduce
+
+```bash
+# symbol-bearing release binary (the shipped profile is stripped)
+CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release
+
+# the checked-in harness: corpus, interleaved arms, per-class ratios
+./scripts/real-guest-perf.sh --make-corpus /tmp/wie-perf-corpus
+./scripts/real-guest-perf.sh                       # mx1s, mx9s, h x def/super_all/chain0/opt_speed
+./scripts/real-guest-perf.sh --classes mx9,mx1 --reps 2
+
+# one workload, one run, counters (no slice knob needed since 2026-11-24: the
+# watchdog counts consecutive slices and its default covers mx9's 84-slice peak)
+WIE_RUNTIME_PROFILE=1 ./target/release/wie run \
+    --max-api 40000000 --drive-d /tmp/corpus real_exes/7za.exe -- \
+    a -mx9 -y 'D:\out9.7z' 'D:\rnd' 'D:\txt' 'D:\mid'
+
+# stack attribution (needs the symbol-bearing binary)
+/usr/bin/sample <pid> 5 -file /tmp/sym.txt
+
+# interleaved A/B of one knob (arms: label + env spec)
+./ab.sh 3 mx9s def '' slow 'WIE_JIT_MEM=slow'
+```
+
+Corpus (`/tmp/corpus`, deterministic, seed 20261124): `rnd/r0.bin`, `rnd/r1.bin`
+(2 MB each, incompressible), `txt/t0.txt` (2 MB, highly compressible), `mid/m0.bin`
+(1 MB). The 1.3 MB subset `/tmp/corpus_s` (512 kB + 512 kB + 256 kB) is the same mix
+scaled down for knob ablations.
+
+---
+
+## 10. Threading — does a real multithreaded app scale? (measured)
+
+L9 above is the single-threaded half of this question: one guest thread, blocked on the
+compile mutex. This section is the other half — **N guest threads, same real app**, and
+the `-mmt` knob is 7-Zip's own, so the workload is the app's own parallel code, not a
+benchmark's. Instrument: `scripts/mt-scaling.sh` (new; interleaves the emulator arm with
+a **native 7-Zip control** in the same window, so "the emulator loses X" is separable
+from "the host was busy").
+
+### 10.1 First: `-mmt` does not mean N threads on this corpus, and that is not a detail
+
+7-Zip caps its encoder threads at the number of solid *blocks*, and blocks come from the
+data size and `-ms`. Measured directly (`WIE_MT_DEBUG=1`, counting `worker_main start`):
+
+| `-mmt` | guest worker threads created, `-mx1` | `-mx9 -ms=64k` |
+|---|---|---|
+| 8 | **3** | **2** |
+
+The same count comes back from the profile: at `-mmt` 2, 4 and 8 the guest retires an
+identical 3.870 G instructions and makes an identical 244 `WaitForSingleObject` calls.
+So **every `-mmt≥2` cell below is a 2–3 thread cell**; `-mmt=8` is not an 8-thread
+measurement and this document does not claim it is. Two consequences:
+
+* The curve below is a **1 → 2–3 thread** curve, which is exactly where an emulator's
+  threading either works or does not.
+* An honest 8-thread ceiling needs a corpus large enough (or `-ms` small enough) that
+  7-Zip really starts 8 encoders, *and* a host that can give 8 cores. Neither was
+  available: this Mac is **4 performance + 4 efficiency cores** and peers held it at
+  load 3.3–7.4 for the whole session. The native control quantifies what the host was
+  actually willing to give: **1.57–1.69x at 8**, never more.
+
+### 10.2 The curve
+
+Release `2e0a1dd`, `WIE_RUNTIME_PROFILE=1`, corpus 2.9 MB / 13 files (mixed
+compressibility: 48% text, 12% random, 24% structured, 16% interleaved), private
+`WIE_CACHE_DIR` warmed once per level, `WIE_NO_HOOK_SLICES=1000000` (see §10.7),
+**5 interleaved repetitions** (repetitions outermost, whole matrix re-walked), medians:
+
+| level | threads | wall median | cpu% | native wall | native speedup | **emulator speedup** | paired n |
+|---|---|---|---|---|---|---|---|
+| `-mx1` | 1 | 15.03 s | 100.6% | 97 ms | 1.00 | 1.00 | — |
+| `-mx1` | 2 | 14.42 s | 163.3% | 68 ms | 1.52 | 0.996 | 5 |
+| `-mx1` | 4 | 13.14 s | 178.1% | 63 ms | 1.57 | **1.14** | 5 |
+| `-mx1` | 8 | 12.35 s | 182.7% | 63 ms | 1.57 | **1.20** | 5 |
+| `-mx9` | 1 | 64.12 s | 99.5% | 485 ms | 1.00 | 1.00 | — |
+| `-mx9` | 2 | 55.65 s | 174.2% | 310 ms | 1.61 | **1.12** | 5 |
+| `-mx9` | 4 | 59.90 s | 174.3% | 333 ms | 1.54 | **1.07** | 5 |
+| `-mx9` | 8 | 59.86 s | 174.8% | 292 ms | 1.69 | **1.03** | 5 |
+
+Speedups are the median of per-repetition ratios `T(1)/T(N)`, which is what makes them
+robust to the load moving under the sweep (load averages during the sweep: 2.98–6.22,
+median 4.2). They are therefore **not** the ratio of the two median columns beside them;
+dividing those gives a slightly different number (e.g. `-mx9` threads=2: 485/310 = 1.56
+against the paired 1.61), because the medians of two noisy columns do not divide into the
+median of their ratios. Cost per added thread, i.e. `T(N)·N / T(1)` — **the number the brief asks
+for**, because it shows what each additional thread *costs* rather than what it buys:
+
+| level | threads | emulator cost/thread | native cost/thread |
+|---|---|---|---|
+| `-mx1` | 1 | 1.00 | 1.00 |
+| `-mx1` | 2 | 2.01 | 1.32 |
+| `-mx1` | 4 | 3.50 | 2.56 |
+| `-mx1` | 8 | **6.67** | 5.08 |
+| `-mx9` | 1 | 1.00 | 1.00 |
+| `-mx9` | 2 | 1.78 | 1.24 |
+| `-mx9` | 4 | 3.74 | 2.60 |
+| `-mx9` | 8 | **7.75** | 4.73 |
+
+**Read it as: a thread that buys 1.03–1.20x of throughput is being charged 6.7–7.8x the
+single-thread price.** Absolute slowness is not the story (the emulator is 130–155x
+slower than native at `-mmt=1`); the story is that the ratio *gets worse* as threads are
+added, monotonically, at both compression levels.
+
+### 10.3 Where the loss is *not*: the locks
+
+Two independent instruments, both at `-mmt=8`:
+
+| instrument | `WinApiState` (the big lock) |
+|---|---|
+| `WIE_RUNTIME_PROFILE=1` `winapi_lock_wait` (`lock_wait`, `mt_runtime.rs:142`) | **1.43 ms of guest wait over a 59.8 s run** (`-mx9`); 0.40 ms on `-mx1`; worst single acquisition **0.027 ms** |
+| `/usr/bin/sample`, 24 s of two 12 s windows | **1091 of 134 539 leaf samples = 0.81%** of all sampled thread-time, and **3.2%** of the busiest thread's time |
+
+So the answer the previous round could not give: **at N guest threads the big
+`Mutex<WinApiState>` costs ~0.002% of wall clock. It is not a bottleneck, it is not close
+to being one, and no amount of partitioning it would pay for itself.** `lock_order.rs`
+ranks it `State`, outermost, load-bearing for correctness (the `State → Queue → Channel`
+order is what keeps the macOS UI thread from deadlocking) — and it is *performance*
+irrelevant on a console workload.
+
+Full leaf classification, same two windows (buckets exclusive, first match wins):
+
+| bucket | `-mmt=1` | `-mmt=8` |
+|---|---|---|
+| `__psynch_cvwait` / condvar | 78.05% | 76.45% |
+| mutex (`__psynch_mutexwait`, `pthread_mutex_lock`) | **0.11%** | **0.81%** |
+| Cranelift | **0.05%** | **0.03%** |
+| emitted code (anonymous JIT pages) | 9.47% | 5.97% |
+| `_platform_memmove` | 6.11% | 8.00% |
+| JIT memory helper (`wie_jit_load`, TLB) | 1.71% | 1.97% |
+| other (`wie` + libs) | 4.24% | 6.32% |
+
+Of the **running** (non-parked) 22.5% of thread-time at `-mmt=8`, the split is
+`memmove` 35.6%, other 28.1%, emitted code 26.6%, memory helper 8.8%, **mutex 0.8%**.
+
+Naming the mutexes, and why the sample cannot go further: every mutex sample's caller
+frame collapses onto `DYLD-STUB$$memcpy`, because the waiter is *inside emitted guest
+code* and `sample` resolves the caller to the nearest exported symbol of an anonymous
+JIT page. So attribution to `JitShared::engine` vs `GuestHeap` vs the `RwLock<GuestMemory>`
+read refcount has to come from the counters, not the stack:
+
+| lock | in `lock_order.rs`? | measured cost at N=8 | avoidable in principle? |
+|---|---|---|---|
+| `Mutex<WinApiState>` | **yes** — `Lock::State`, outermost | 1.43 ms / 59.8 s (0.002%) | No. Load-bearing order; and it is free. |
+| `JitShared::engine` (`shared.rs:1137`), held across `compile_block` | no (its order — guest memory → engine — is prose in `shared.rs`) | Cranelift **0.03%** of samples; `bg_stall_us` **2.93 s = 4.9%** of wall at `-mx9`, **3.95 s = 32%** at `-mx1` | Yes, but see §10.5 — the ceiling is 5% here, not 50%. |
+| `Mutex<GuestHeap>` (heap fast path, `quantum.rs:370`) | no | `malloc`/`free` together are 0.004% of wall (peer's §4.9); sample shows `hash/alloc` 0.16% | Yes, and pointless. |
+| `RwLock<GuestMemory>` read | no | memory helper 8.8% of *running* time, and it is shared-read | Only via per-thread arenas — see §10.6. |
+| `MessageQueue`, `PresentChannel` | yes — ranks 2, 3 | not reached by a console workload | — |
+
+The two `lock_order.rs` locks that a console workload touches at all are the two it
+cannot avoid; the locks that a *console* workload could avoid are not contended.
+
+### 10.4 Where the loss *is*: the price of the second thread
+
+`-mx9`, profile medians (`n=5`):
+
+| threads | wall | cpu_user | cpu_sys | guest insns (JIT-retired) | compile CPU | guest waits for compile |
+|---|---|---|---|---|---|---|
+| 1 | 64.12 s | 63.90 s | 0.19 s | 4.182 G | 2.56 s (4.0%) | 2.19 s (3.4%) |
+| 2 | 55.60 s | 96.70 s | 0.32 s | 3.870 G | 3.08 s (5.5%) | 2.74 s (4.9%) |
+| 4 | 59.84 s | 104.49 s | 0.41 s | 3.870 G | 3.20 s (5.3%) | 2.82 s (4.7%) |
+| 8 | 59.81 s | 102.38 s | 0.30 s | 3.870 G | 3.37 s (5.6%) | 2.93 s (4.9%) |
+
+The row that matters is **threads=2**: the guest retires *7.5% fewer* instructions
+(4.182 G → 3.870 G) and burns **51% more CPU** (63.90 s → 96.70 s). Wall drops only 13%
+(64.12 s → 55.60 s). From 2 threads onwards nothing changes at all —
+CPU, instruction count, compile time and wall are all flat. So:
+
+* The overlap itself works: 102.4 s of CPU inside 59.8 s of wall is 1.75 cores busy, and
+  `wall ≈ cpu/1.75` holds at every thread count. The scheduler is not serialising the
+  guest.
+* **The price per unit of guest work rises ~1.7x the moment a second guest thread
+  exists**, and that is the whole loss. Same 3.87 G instructions, 1.51x the CPU.
+* The mix of work per instruction does not change (§10.3 table, `-mmt=1` vs `-mmt=8` are
+  within noise of each other), so this is not "the emulator does something extra when
+  threads appear" — it is **the same work costing more host cycles**.
+
+The three candidate explanations, and what rules each in or out:
+
+| hypothesis | verdict from the data |
+|---|---|
+| Lock contention | **Ruled out.** 0.81% of samples, 1.43 ms of instrumented wait (§10.3). |
+| Compile serialisation on `JitShared::engine` | **Ruled out as the main term.** Cranelift is 0.03% of samples at N=8 and `bg_stall` is 4.9% of wall at `-mx9`. It *is* the dominant term at `-mx1` (32% of wall) — see §10.5. |
+| Host-core heterogeneity + shared-cache pressure | **Consistent with everything.** 4P+4E: the second guest thread lands on an E-core and costs ~2.5–3x the cycles per instruction for the same work. It also predicts the saturation at 2 threads and the flatness beyond it, and it is the same wall the *native* control hit (1.69x of a nominal 8). |
+
+This is a hypothesis with a mechanism, not a measurement: separating "E-core placement"
+from "shared-cache pressure on the guest arena" needs either thread pinning or a
+homogeneous host, and neither was available. **That experiment is the first thing the
+next round should run** (§10.8).
+
+### 10.5 The compile serialisation, bounded under real N
+
+`WIE_JIT_WORKERS` at `-mx9 -mmt=8`, 3 interleaved repetitions each (a window in which the
+host load ran 3.9–39.7, i.e. too noisy for absolutes; the ordering is 3/3 vs 3/3, so the
+sign is unambiguous):
+
+| `WIE_JIT_WORKERS` | wall (3 reps) | median |
+|---|---|---|
+| 0 (compiles on the visiting thread) | 100.13, 82.61, 69.25 s | **82.6 s** |
+| 1 | 76.31, 109.49, 80.60 s | **80.6 s** |
+| 4 (default) | 42.67, 44.81, 41.08 s | **44.8 s** |
+
+The background pool is worth **1.7–1.8x** on this workload (median-to-median 1.84;
+min-to-min 69.25/41.08 = 1.68), and **every** `workers=4` run beat **every** `workers=0`
+run. So the compile path is not a 5% curiosity once threads exist: serialising it on the
+visiting thread costs most of the wall clock, and the existing pool is what hides it.
+That is also the bound on per-thread `JITModule`s as a lever: they can only recover the
+part the pool does not already hide, and `bg_stall_us` says that part is **4.9% of wall at
+`-mx9`** (32% at `-mx1`, where guest compute is cheap and compile is not).
+
+Ceiling for per-thread `JITModule`s + late-bound cross-module calls, per level:
+**≤1.05x on `-mx9`, ≤1.4x on `-mx1`.** Effort L, risk high (`FuncId` is module-local;
+the chain table gains a module dimension — the peer's §4.2 L2 analysis of that risk
+applies unchanged).
+
+### 10.6 Levers, with ceilings
+
+| lever | measured cost now | ceiling | effort | risk |
+|---|---|---|---|---|
+| Partition `WinApiState` per-thread / shard it | 1.43 ms per 60 s at N=8 (0.002%) | **≤1.001x** | L (touches every handler) | High: `lock_order.rs` is the correctness backbone and `ThreadState.active` is process-global |
+| Eliminate compile serialisation (per-thread `JITModule` + late-bound cross-module calls) | Cranelift 0.03% of samples; `bg_stall` 4.9% of wall (`-mx9`) / 32% (`-mx1`) | **≤1.05x `-mx9`, ≤1.4x `-mx1`** | L | High (`FuncId` module-local; chain table) |
+| Epoch/RCU read path for shared state (`RwLock<GuestMemory>`) | shared-read; memory helper 8.8% of *running* time | ≤1.09x if the read refcount is what costs | M–L | Medium (generation/TLB invalidation correctness) |
+| Per-thread heap shards | `HeapAlloc`/`Free` = 0.004% of wall | **≤1.0001x** | M | Low, and not worth it |
+| Park/wake cost (`WaitTarget::wait`, 50 ms slices, `park_brief`'s 14 × `yield_now`) | 244 guest waits per run; `host_stops` 11 862; sys time 0.30 s of 59.8 s | ≤1.005x on this class | S–M | Low — but nothing to win on a compression workload |
+| Thread creation (1:1 host threads + per-thread engine) | 3 guest workers × `CreateThread`; not in the top-14 exports | unmeasurable at this scale | S | Low |
+| **The price of the 2nd thread itself** (§10.4) | **+51% CPU for −13% wall at threads=2** | **1.5x on this class** — the single largest term in the table | — | — (this is the one to chase) |
+
+The last row is not a lever yet, it is the *finding*: the biggest threading term in the
+emulator is not a lock, not Cranelift, and not the heap. It is that the second guest
+thread costs half again as much host CPU for the same work, and everything visible in the
+sample says that price is paid in cycles, not in waits.
+
+### 10.7 Two measurement hazards this section had to work around
+
+* **`WIE_NO_HOOK_SLICES` default (`40`) kills real single-threaded runs.** `7za a -mx9`
+  over a multi-MB file legitimately runs ~800 M guest instructions with no Win32 call;
+  at the default the run dies with `emulation stopped without hitting fake API hook after
+  40 slices` and returns a *fast* wall time. This is the single easiest way to produce a
+  beautiful, wrong scaling curve (the 1-thread arm is killed early and looks cheap).
+  Every number above ran with `WIE_NO_HOOK_SLICES=1000000`. Worth asking whether 40 is
+  the right default for a real app.
+* **Archive reuse.** The peer's §1 hazard applies here too: every run in this section
+  writes `D:\out.7z` (host `--drive-d`) and removes it first, so each run compresses from
+  scratch. `7za a -y` over an existing archive *updates* it and the instruction count
+  falls ~4x.
+
+### 10.8 What this section does not establish, and what to run next
+
+1. **A genuine 8-thread point.** Needs a corpus large enough that 7-Zip starts 8
+   encoders (or `-ms` small enough), on a host with 8 idle *comparable* cores. Until
+   then "the emulator does not scale to 8" is **not** what was measured; "it does not
+   scale to 2–3, where the native control gets 1.57–1.69x" is.
+2. **E-core vs cache pressure**, which is the §10.4 hypothesis. Pin the guest's host
+   threads to the 4 performance cores (`thread_policy_set` / `taskpolicy -c 1`) and
+   re-run the same 1→2 comparison: if the +51% CPU collapses, the emulator's threading is
+   not the problem and "full multithreading" is bounded by the scheduler, not by WIE.
+3. **The handoff path itself.** `WaitForSingleObject(INFINITE)` is sliced into 50 ms
+   chunks (`quantum.rs:824`), each re-check taking `WinApiState`. At 244 handoffs per run
+   that is invisible; on a workload with millions of handoffs it would not be.
+4. **`emu_ms` is unusable for N threads.** The profile's `emu_ms` is the *primary*
+   thread's accounted time only (measured: 3.1 s of emu inside an 18.6 s wall at
+   `-mmt=2`). Every scaling figure above therefore uses wall clock and process `cpu%`.
+   Merging worker `emu_ms` the way `JitStats` is already merged would make the profile
+   honest at N threads, and is cheap.
+
+**Nothing was shipped this round.** The sample does not justify a lock removal: the two
+`lock_order.rs` locks that a console workload touches cost 0.002% and 0.8% of thread-time
+respectively, and the non-`lock_order` locks are further down than that. The one thing
+this section produced for the tree is the instrument, `scripts/mt-scaling.sh`, so the
+next round can re-run the curve — including the native control — instead of trusting it.

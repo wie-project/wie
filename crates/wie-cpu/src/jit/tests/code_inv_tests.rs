@@ -12,7 +12,7 @@ fn code_inv_x_loss_drops_ready() {
         .expect("x-loss");
     assert!(!cpu.has_ready_at(base));
     assert!(!cpu.code_pages_overlap(base, 16));
-    assert_eq!(cpu.thread.edge_ic_va[0], 0);
+    assert_eq!(cpu.thread.ctx.edge_ic_va[0], 0);
     assert!(cpu.stats().exec.code_invs >= 1);
 }
 
@@ -26,7 +26,7 @@ fn code_inv_smc_write_drops_ready() {
     // Guest/host store into compiled range.
     cpu.mem_write(base + 0x12, &[0x90, 0x90]).expect("smc");
     assert!(!cpu.has_ready_at(base + 0x10));
-    assert_eq!(cpu.thread.edge_ic_fn[0], 0);
+    assert_eq!(cpu.thread.ctx.edge_ic_fn[0], 0);
 }
 
 #[test]
@@ -46,7 +46,7 @@ fn code_inv_data_write_leaves_code() {
     cpu.mem_write(data, &[1, 2, 3, 4]).expect("data write");
     assert!(cpu.has_ready_at(code));
     assert_eq!(cpu.stats().exec.code_invs, invs);
-    assert_eq!(cpu.thread.edge_ic_va[0], code);
+    assert_eq!(cpu.thread.ctx.edge_ic_va[0], code);
 }
 
 #[test]
@@ -123,7 +123,7 @@ fn code_inv_smc_across_page_boundary() {
     // Store on page1 half of the range.
     cpu.mem_write(base + 0x1000, &[0x90, 0x90]).expect("smc p1");
     assert!(!cpu.has_ready_at(entry));
-    assert_eq!(cpu.thread.edge_ic_va[0], 0);
+    assert_eq!(cpu.thread.ctx.edge_ic_va[0], 0);
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn code_inv_multi_region_protect_and_free() {
         .expect("protect a");
     assert!(!cpu.has_ready_at(a));
     assert!(cpu.has_ready_at(b));
-    assert_eq!(cpu.thread.edge_ic_va[0], 0); // edge IC cleared on any selective drop
+    assert_eq!(cpu.thread.ctx.edge_ic_va[0], 0); // edge IC cleared on any selective drop
     // Free B.
     cpu.virtual_free(b, 0, MEM_RELEASE).expect("free b");
     assert!(!cpu.has_ready_at(b));

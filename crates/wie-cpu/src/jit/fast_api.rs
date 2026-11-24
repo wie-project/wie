@@ -134,21 +134,25 @@ fn heap_layout(ctx: &JitCtx) -> JitHeapLayout {
 /// in one place, exactly as [`mem_mut`] does for `ctx.mem`.
 ///
 /// The invariant this relies on: the pointer is always
-/// [`JitCtx::large_free`], set by `run_compiled` from `&mut self.thread`,
-/// which is not touched again until the frame returns. Both `wie_ucrt_malloc`
-/// and `wie_ucrt_free` read it out of their own context and pass it straight
-/// here, so no other value can reach this function.
+/// [`JitCtx::large_free`], re-stamped by `run_compiled` at every dispatcher
+/// entry from `&raw mut self.thread.large_free`, and the owning engine is not
+/// borrowed again until the frame returns. Both `wie_ucrt_malloc` and
+/// `wie_ucrt_free` read it out of their own context and pass it straight here,
+/// so no other value can reach this function.
 #[inline]
 fn large_free_mut<'a>(ptr: *mut LargeFreeList) -> &'a mut LargeFreeList {
-    // SAFETY: `ptr` is the running frame's own context field, installed by
-    // `run_compiled` from `&mut self.thread` and live and unaliased for the
-    // whole native frame — the same one claim `ctx_mut` makes for the context
-    // itself. The pointee is disjoint from the `ctx.mem` the caller holds.
+    // SAFETY: `ptr` is the running frame's own context field, stamped by
+    // `run_compiled` from `&raw mut self.thread.large_free` and live and
+    // unaliased for the whole native call — the same one claim `ctx_mut` makes
+    // for the context itself. The pointee is a field of the engine that owns
+    // the frame (`PerThreadJitState`) and is disjoint from the `ctx.mem` the
+    // caller holds, so both can be `&mut` at once.
     unsafe { &mut *ptr }
 }
 
 fn mem_mut(ctx: &mut JitCtx) -> &mut GuestMemory {
-    // SAFETY: `mem` is set by `run_compiled` for the duration of the block.
+    // SAFETY: `mem` is stamped by `run_compiled` for the duration of the block
+    // and points at the shared guest map, which outlives every engine.
     unsafe { &mut *ctx.mem }
 }
 
@@ -238,9 +242,10 @@ fn large_alloc(
 }
 
 // SAFETY: the `wie_ucrt_*` helpers below are Cranelift import symbols, entered
-// only from `JitCpu::run_compiled`, which owns the `JitCtx` for the whole native
-// frame. The `unsafe { ctx_mut(ctx) }` in each body is that one claim, discharged
-// by `super::trampolines::ctx_mut` — the single place in the JIT that converts a
+// only from `JitCpu::run_compiled`, which hands them the engine's persistent
+// `JitCtx` and creates no reference to it until the native call returns. The
+// `unsafe { ctx_mut(ctx) }` in each body is that one claim, discharged by
+// `super::trampolines::ctx_mut` — the single place in the JIT that converts a
 // `*mut JitCtx` into a reference. `mem_mut` below derefs a *different* pointer
 // (`ctx.mem`) and keeps its own SAFETY comment.
 

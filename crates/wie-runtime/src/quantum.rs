@@ -131,6 +131,13 @@ pub(crate) trait QuantumHooks {
         Ok(Step::PureCompute)
     }
 
+    /// The guest reached a fake-API hook this quantum, so any *run* of
+    /// consecutive no-hook slices is over. Called before the stop is claimed or
+    /// dispatched (a park retry, a delegate-owned hook and a normal dispatch all
+    /// end the run the same way). The default ignores it — only the primary's
+    /// no-hook accounting cares.
+    fn on_hook_stop(&mut self, _core: &mut QuantumCore<'_>) {}
+
     /// A fake-API hook the delegate owns (the primary's static DllMain return
     /// trampoline), handled under the WinAPI lock. `Some(step)` claims the
     /// hook; `None` falls through to the shared callback / SEH / resolve /
@@ -558,6 +565,17 @@ impl<'a> QuantumCore<'a> {
                     return Ok(step);
                 }
             }
+        }
+
+        // A fake-API stop ends the guest's run of consecutive no-hook work,
+        // whatever claims it below (heap fast path, delegate-owned hook,
+        // callback return, SEH continuation, dispatch). Reported here, once,
+        // so every claim path resets the same counter and no path can forget.
+        if let Ok(result) = &run
+            && result.code.hit
+            && !result.invalid_memory.hit
+        {
+            hooks.on_hook_stop(self);
         }
 
         // Heap fast path: before taking the global WinApiState mutex, check

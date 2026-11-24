@@ -950,6 +950,23 @@ fn terminators_are_admitted_only_as_a_block_end() {
         (&[0xC2, 0x08, 0x00], false),                  // ret imm16 → interpreter
         (&[0xFF, 0xE0], false),                        // jmp rax (not a near branch)
         (&[0x48, 0x89, 0xD8], false),                  // mov rax,rbx is not one
+        // ── Deliberate admission change (indirect calls) ──────────────────────
+        // `call r/m64` became a terminator because the block exit already
+        // carries a runtime RIP (`ret` leaves a block that way), which made the
+        // largest interpreter residue on real guests — 82.5 % of 7-Zip's
+        // interpreted instructions (`WIE_EXEC_TRACE=1`) — a lowering instead of
+        // a permanent `mark_never`. Both shapes below were `false` before, and
+        // `dyn_call_tests` compares them against `IcedCpu` byte for byte
+        // (RIP, RSP, pushed return address, RFLAGS, untouched memory) before
+        // this fixture change was made.
+        (&[0xFF, 0xD1], true),       // call rcx
+        (&[0xFF, 0x13], true),       // call [rbx]
+        (&[0xFF, 0x14, 0x24], true), // call [rsp]
+        // Still refused, on purpose: a far call carries an m16:64 pointer, and
+        // the JIT's exit is a single 8-byte target. `jmp r/m64` above stays
+        // refused for the same reason it always was — it was not measured as
+        // residue and lowering it is a separate change, not a free one.
+        (&[0xFF, 0x1B], false), // call far [rbx]
     ];
     for &(bytes, want) in cases {
         let instr = decode_ok(bytes);

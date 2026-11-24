@@ -13,6 +13,8 @@
 | [D3D9](d3d9.md) | Software renderer, shader pipeline, state tracking |
 | [Runtime](runtime.md) | RuntimeSession, PE loading, API hooks, run loop, threading |
 | [C++ Exceptions](cpp-exceptions.md) | Exception handling across the translation boundary |
+| [Performance Ceiling](performance-ceiling.md) | Where the remaining time is, per real workload, with a ranked lever table and the dead ends |
+| [L1: persistent frame](l1-persistent-frame.md) | The landed L1 lever: one `JitCtx` per engine instead of 4.6 KB of struct copy per dispatcher entry — invariant, ABI rules, measurement |
 
 ## Design Overview
 
