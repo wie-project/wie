@@ -576,7 +576,7 @@ impl JitCpu {
                 if self.shared.persist_active() {
                     let probe = {
                         let mem = self.shared.mem.read().unwrap();
-                        self.shared.persist_probe(&mem, rip)
+                        self.shared.restore_or_probe(&mem, rip)
                     };
                     if probe.is_some() {
                         persist_eager = true;

@@ -143,7 +143,7 @@ fn counts_via_shared(cpu: &JitCpu) -> CodeCacheCounts {
 /// unlike the visit-threshold / bg-worker race a full dispatch would race.
 fn force_probe(cpu: &JitCpu) -> Option<LedgerProbe> {
     let mem = cpu.shared.mem.read().expect("mem lock");
-    cpu.shared.persist_probe(&mem, CODE_BASE)
+    cpu.shared.restore_or_probe(&mem, CODE_BASE)
 }
 
 // ---------------------------------------------------------------------------
