@@ -153,6 +153,10 @@ That second observation is the useful one, and it is the whole of experiment 2.
 genuine rather than a shift of work into the interpreter: retired instructions are
 identical, and the extra interpreted instructions are 0.02-0.03 % of the run.
 
+Neutral on `mx9s`, by construction: boot mode is 0.27 % of that class's 1.84 G
+instructions, and a cross-commit check gives a paired median of **0.998** with
+byte-identical output archives and retired instructions matching to 0.003 %.
+
 The mechanism matters, because a similar-looking change was refuted before
 (`performance-ceiling.md` §11.4 A1: deleting the inline baseline made every block fall
 into the promotion machinery, the queue saturated, and the engine compiled 1.9x as many

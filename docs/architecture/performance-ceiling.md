@@ -1453,6 +1453,16 @@ bucket is spent). They were unchanged during the measurement above, so the repor
 does not depend on them; they are a separate candidate, and their intent — "do not apply
 backoff during warmup" — is not the same as "compile everything immediately".
 
+**`mx9s` is neutral, and that is the prediction, not a disappointment.** Boot mode is
+0.27 % of a 1.84 G-instruction run, so the override could only ever have mattered on the
+short classes. Cross-commit check (previous commit's binary vs this one, 2 usable
+interleaved pairs after discarding a cold first run, load 2.5): paired ratios 1.0042 and
+0.9916, **median 0.998**; retired instructions 1.8393 G vs 1.8393 G, and the produced
+archive is byte-identical (`crc32 eb3cd188` both arms). Compile counts differ by 0.5 %
+(4 801/4 810 vs 4 826/4 835), inside run-to-run noise. A long-running guest eventually
+crosses every threshold anyway, which is the same reason the flat-threshold experiment
+found nothing on `x`.
+
 **Mechanism confirmed by re-sampling** (`r3_d2`, same windows as §11.2): the `x` guest
 thread is still 98% compile-path (72% compiling, 26% mutex wait) and `h` is 65% compile +
 14% wait — the *share* is unchanged because the *run* is now about 1.6x shorter. That is
