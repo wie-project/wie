@@ -1,4 +1,9 @@
 [build]
+# Incremental artifacts cost gigabytes per lane and buy wall-clock we do not
+# need: every build in this campaign is either a gate (cold anyway) or an
+# isolated worktree with its own target dir. Turned off after target/debug/
+# incremental reached 4.6 GB and the volume ran out.
+incremental = false
 
 [env]
 RUST_BACKTRACE = "1"
