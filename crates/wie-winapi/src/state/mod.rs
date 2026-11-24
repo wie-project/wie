@@ -26,8 +26,12 @@ mod input;
 mod process;
 mod window;
 
+// `pub(crate)` so the shared test fixtures (`winapi_state_default` and its
+// heap-seeded variant) are reachable from the `#[cfg(test)]` blocks in
+// non-test modules (version.rs, ole_clipboard.rs, kernel32/file_io/path.rs,
+// advapi32/tests.rs). Test-only, so it does not ship.
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use d3d9::*;
 pub use input::*;
@@ -613,6 +617,20 @@ impl WinApiState {
     /// API handler — the caller and any concurrent one on another host
     /// thread — runs while holding it, so the take and the put cannot
     /// interleave.
+    /// Borrow-split access to the font engine: hand out `&mut WinApiState` and
+    /// `&mut FontEngine` at once, which the borrow checker cannot express
+    /// directly, by taking the engine out and putting it back.
+    ///
+    /// Not unwind-safe, and deliberately so: the take/put has no RAII guard, so a
+    /// panicking `f` would drop the engine's four caches and leave defaults
+    /// behind. That cannot happen in a shipped binary — `[profile.release]` sets
+    /// `panic = "abort"`, so a panic aborts the process rather than unwinding,
+    /// and nothing in production wraps a handler in `catch_unwind`. The caches
+    /// die with the process.
+    ///
+    /// Do not "fix" this with a drop guard without first removing
+    /// `panic = "abort"`: that would trade a real property (a handler panic is
+    /// never survivable) for one that is not needed.
     pub fn with_font_engine<T>(
         &mut self,
         f: impl FnOnce(&mut Self, &mut gdi32::FontEngine) -> T,

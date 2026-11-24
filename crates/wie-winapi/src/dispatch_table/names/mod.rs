@@ -848,6 +848,40 @@ pub fn is_winapi_implemented(library: &str, name: &str) -> bool {
     }
 }
 
+/// Every soft (string-dispatched) export census, paired with the library it
+/// belongs to — the single table the cross-registry drift guard walks.
+///
+/// One row per `(library, census list)` pair, in the same order as the arms of
+/// [`is_winapi_implemented`]. This is *not* a replacement for that oracle; it
+/// exists so the guard can enumerate the hand-kept lists without duplicating
+/// them a fifth time. A name added to a census list below but not to the
+/// corresponding `is_winapi_implemented` arm is caught by
+/// `every_census_arm_is_reachable` in `dispatch_table/census_tests`.
+#[cfg(test)]
+pub(crate) const SOFT_EXPORT_CENSUS: &[(&str, &[&str])] = &[
+    ("ucrtbase.dll", UCRT_CALLABLE),
+    ("ole32.dll", OLE32_DLL_EXPORTS),
+    ("shell32.dll", SHELL32_DLL_EXPORTS),
+    ("oleaut32.dll", OLEAUT32_DLL_EXPORTS),
+    ("user32.dll", USER32_DLL_EXPORTS),
+    ("gdi32.dll", GDI32_DLL_EXPORTS),
+    ("comctl32.dll", COMCTL32_DLL_EXPORTS),
+    ("winmm.dll", WINMM_DLL_EXPORTS),
+    ("advapi32.dll", ADVAPI32_DLL_EXPORTS),
+    ("kernel32.dll", KERNEL32_DLL_EXPORTS),
+    ("ws2_32.dll", WS2_32_DLL_EXPORTS),
+    ("crypt32.dll", CRYPT32_DLL_EXPORTS),
+    ("msimg32.dll", MSIMG32_DLL_EXPORTS),
+    ("imm32.dll", IMM32_DLL_EXPORTS),
+    ("uxtheme.dll", UXTHEME_DLL_EXPORTS),
+    ("winhttp.dll", WINHTTP_DLL_EXPORTS),
+    ("setupapi.dll", SETUPAPI_CFGMGR32),
+    ("cfgmgr32.dll", SETUPAPI_CFGMGR32),
+    ("dbghelp.dll", DBGHELP_IMAGEHLP),
+    ("imagehlp.dll", DBGHELP_IMAGEHLP),
+    ("dinput8.dll", DINPUT8_DLL_EXPORTS),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;

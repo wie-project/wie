@@ -7,14 +7,12 @@
 //!    by export name (Windows forwards every family to `ucrtbase.dll`), so the
 //!    contract per family is classification (`is_ucrt_library`) plus one
 //!    callable export.
-//! 2. The ntdll Nt*/Rtl* surface is reported by the oracle.
-//! 3. Known gaps fail gracefully: `api-ms-win-core-*` (non-CRT sets) and CRT
+//! 2. Known gaps fail gracefully: `api-ms-win-core-*` (non-CRT sets) and CRT
 //!    exports with no host handler return `false` from the oracle — never a
 //!    panic. `NtCreateProcess` / `NtCreateUserProcess` stay unimplemented
 //!    (kernel process creation is a non-goal).
 
 use wie_winapi::is_winapi_implemented;
-use wie_winapi::ntdll::is_export;
 use wie_winapi::ucrt::is_ucrt_library;
 
 /// Representative `api-ms-win-crt-*` families (SDK api-set names).
@@ -43,40 +41,6 @@ const CRT_FAMILIES: &[(&str, &str)] = &[
     ("api-ms-win-crt-misc-l1-1-0.dll", "fopen"),
 ];
 
-/// Every ntdll export the implementation lane dispatches. Must stay in sync
-/// with `crate::ntdll::NTDL_EXPORTS` (the in-module dispatch sweep test
-/// enforces that the const and the match arms agree; this list pins the
-/// user-facing contract).
-const NTDL_EXPORTS: &[&str] = &[
-    "ntallocatevirtualmemory",
-    "ntclose",
-    "ntdelayexecution",
-    "ntfreevirtualmemory",
-    "ntprotectvirtualmemory",
-    "ntqueryinformationprocess",
-    "ntqueryperformancecounter",
-    "ntquerysysteminformation",
-    "ntquerysystemtime",
-    "ntqueryvirtualmemory",
-    "rtlallocateheap",
-    "rtlcapturecontext",
-    "rtlclosehandle",
-    "rtlcomparememory",
-    "rtlcopymemory",
-    "rtldeletecriticalsection",
-    "rtlentercriticalsection",
-    "rtlfreeheap",
-    "rtlgetcurrentpeb",
-    "rtlgetcurrentthread",
-    "rtlinitializecriticalsection",
-    "rtlinitunicodestring",
-    "rtlleavecriticalsection",
-    "rtlmovememory",
-    "rtlreallocateheap",
-    "rtlunwindex",
-    "rtlzeromemory",
-];
-
 /// Every CRT family classifies as a UCRT library and resolves a callable
 /// export through the name-based dispatch namespace.
 #[test]
@@ -91,20 +55,6 @@ fn crt_families_are_classified_and_dispatch_by_name() {
             "{dll}!{probe} must resolve through the UCRT name dispatch"
         );
     }
-}
-
-/// The ntdll Nt*/Rtl* surface is reported by the oracle, case-insensitively.
-#[test]
-fn ntdll_exports_are_reported_by_the_oracle() {
-    for name in NTDL_EXPORTS {
-        assert!(is_export(name), "{name} must be reported by is_export");
-        assert!(
-            is_winapi_implemented("ntdll.dll", name),
-            "ntdll.dll!{name} must resolve through the dispatch oracle"
-        );
-    }
-    assert!(is_export("NtClose"));
-    assert!(is_winapi_implemented("ntdll.dll", "NtClose"));
 }
 
 /// Documented gaps fail gracefully: `api-ms-win-core-*` (non-CRT sets) and
@@ -132,3 +82,9 @@ fn non_crt_api_sets_and_unimplemented_exports_fail_gracefully() {
     ));
     assert!(!is_winapi_implemented("ntdll.dll", "ntcreateprocess"));
 }
+
+// The ntdll Nt*/Rtl* oracle contract moved in-crate to
+// `src/ntdll/tests.rs::ntdll_census_names_all_dispatch` (via
+// `dispatch_table::census_tests`). It used to live here behind a hand-copied
+// duplicate of `ntdll::NTDL_EXPORTS` whose own comment admitted it "must stay
+// in sync"; importing the original removes the copy that could silently rot.

@@ -3,6 +3,7 @@
 pub mod advapi32;
 pub mod bottle;
 pub mod clipboard;
+pub mod color;
 pub mod comctl32;
 pub mod comdlg32;
 pub mod console;

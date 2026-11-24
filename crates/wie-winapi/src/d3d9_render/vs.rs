@@ -35,6 +35,7 @@ use super::operand::{
 };
 use super::ps::color_to_float4;
 use super::vertex::{FvfLayout, GuestVertex};
+use crate::color::pack_rgba_unit;
 use crate::d3d9_shader::{
     Operand, PsInstruction, PsOp, RegType, VS_BOOL_CONST_COUNT, VS_CONST_COUNT, VS_INT_CONST_COUNT,
 };
@@ -211,14 +212,12 @@ fn read_operand_row(regs: &VsRegisters, op: &Operand, row_offset: usize) -> [f32
 /// clamped to 0..255). The shader's `oD0` is `[r, g, b, a]`.
 #[must_use]
 fn float4_to_0argb(color: [f32; 4]) -> u32 {
-    let channel = |v: f32| {
-        let rounded = (v * 255.0).round().clamp(0.0, 255.0);
-        rounded as u32
-    };
-    (channel(comp(color, 3)) << 24)
-        | (channel(comp(color, 0)) << 16)
-        | (channel(comp(color, 1)) << 8)
-        | channel(comp(color, 2))
+    pack_rgba_unit([
+        comp(color, 0),
+        comp(color, 1),
+        comp(color, 2),
+        comp(color, 3),
+    ])
 }
 
 /// Decode one FVF vertex into the vs input registers `v0..v15`.

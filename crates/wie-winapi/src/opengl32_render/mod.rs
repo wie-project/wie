@@ -391,21 +391,18 @@ fn current_matrix_ref(ctx: &GlCtx) -> &[Mat4] {
 }
 // ── Color packing ───────────────────────────────────────────────────────
 
+use crate::color::{pack_rgba_unit, unpack_rgba, unpack_rgba_unit};
+
 /// Pack RGBA (0..1) to `0xAARRGGBB` (rounded, clamped).
 #[must_use]
 fn pack_color(c: [f32; 4]) -> u32 {
-    let ch = |v: f32| u8::try_from((v.clamp(0.0, 1.0) * 255.0).round() as i32).unwrap_or(0);
-    (u32::from(ch(c[3])) << 24)
-        | (u32::from(ch(c[0])) << 16)
-        | (u32::from(ch(c[1])) << 8)
-        | u32::from(ch(c[2]))
+    pack_rgba_unit(c)
 }
 
 /// Unpack `0xAARRGGBB` to RGBA (0..1).
 #[must_use]
 fn unpack_color(c: u32) -> [f32; 4] {
-    let ch = |shift: u32| f32::from(u8::try_from((c >> shift) & 0xFF).unwrap_or(0)) / 255.0;
-    [ch(16), ch(8), ch(0), ch(24)]
+    unpack_rgba_unit(c)
 }
 // ── Transform + primitive emission ──────────────────────────────────────
 
@@ -1494,10 +1491,9 @@ pub(crate) fn gl_read_pixels(
             } else {
                 0
             };
-            out.push(u8::try_from((pixel >> 16) & 0xFF).unwrap_or(0));
-            out.push(u8::try_from((pixel >> 8) & 0xFF).unwrap_or(0));
-            out.push(u8::try_from(pixel & 0xFF).unwrap_or(0));
-            out.push(u8::try_from((pixel >> 24) & 0xFF).unwrap_or(0));
+            // glReadPixels hands back RGBA byte order, which is the unpack
+            // order directly.
+            out.extend_from_slice(&unpack_rgba(pixel));
         }
     }
     out

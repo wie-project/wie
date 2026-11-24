@@ -28,6 +28,14 @@ mod edit;
 mod listbox;
 mod paint;
 mod r#static;
+mod statusbar;
+// Pixel-level tests for the relocated paint paths (pressed faces, the rect
+// repaint scope, the LISTBOX/COMBOBOX rows, the EDIT row band, the status-bar
+// strip). Test-only, so the lib build carries none of it. Named `paint_tests`
+// rather than `tests` because the `new_state` seed test below already owns
+// `mod tests` in this file.
+#[cfg(test)]
+mod paint_tests;
 
 // ── Paint-context bundles ───────────────────────────────────────────────
 //
@@ -86,13 +94,13 @@ pub(crate) struct HitTestLayout {
     pub alignment: u32,
 }
 
-use button::{button_invalidate_pressed, label_reset_invalid_full, paint_control};
+use paint::{button_invalidate_pressed, label_reset_invalid_full, paint_control};
 // The text-change invalidation is also called from the SetWindowText handlers
 // in `user32::window` (they write control text outside the control dispatch).
-pub(crate) use button::label_invalidate_text_change;
 /// `UndoSnapshot` is the type of the public `ControlState::Edit::undo_snapshot`
 /// field, so it must be reachable at the same visibility as the enum.
 pub use edit::UndoSnapshot;
+pub(crate) use paint::label_invalidate_text_change;
 // The EDIT dispatch arms live in `edit::messages` (`dispatch_edit_message`);
 // `controls` only keeps the cross-cutting call sites: the generic WM_LBUTTONUP
 // arm ends an EDIT's drag session, and the WM_SETFONT / WM_SETTEXT arms reset
@@ -1210,7 +1218,7 @@ impl ControlClassKind {
             // status bar inherits the shared control behaviors — and this
             // arm only sees what falls through (the SB_* messages plus
             // WM_SIZE, which repositions the bar in its parent).
-            (ControlClassKind::StatusBar, _) => crate::comctl32::dispatch_status_bar_message(
+            (ControlClassKind::StatusBar, _) => statusbar::dispatch_status_bar_message(
                 engine,
                 state,
                 hwnd,

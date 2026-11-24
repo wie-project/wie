@@ -1,11 +1,7 @@
 use super::*;
 use crate::registry::HKEY_CURRENT_USER;
-use crate::state::{
-    DllStateMap, FileIoState, HeapState, KernelState, ModuleState, ProcessState, WinApiEnvironment,
-};
-use crate::sync_obj::SyncState;
-use crate::vfs::VolumeConfig;
-use crate::{HandlerContext, RegistryKeyHandle, ThreadState, WinApiState};
+use crate::state::WinApiEnvironment;
+use crate::{HandlerContext, WinApiState};
 use wie_cpu::{CpuEngine, IcedCpu};
 
 const STACK_VA: u64 = 0x100_0000;
@@ -75,76 +71,7 @@ fn test_env() -> WinApiEnvironment {
 
 /// Default state with a bump heap covering [0x2000, 0x10000).
 fn default_winapi_state() -> WinApiState {
-    WinApiState {
-        display: crate::DisplayMetrics::default(),
-        heap_state: HeapState {
-            heap: std::sync::Arc::new(std::sync::Mutex::new(crate::guest_heap::GuestHeap::new(
-                0x2000, 0x10000,
-            ))),
-            next_fls_index: 0,
-            fls_slots: Vec::new(),
-            guest_fls_table_va: 0,
-        },
-        file_io: FileIoState {
-            executable_file_size: 0,
-            executable_file_bytes: std::sync::Arc::new(Vec::new()),
-            executable_file_cursor: 0,
-            next_find_handle: crate::FindFileHandle::from(0),
-            find_handles: Vec::new(),
-            host_file_mounts: Vec::new(),
-            virtual_files: Vec::new(),
-            open_files: ahash::HashMap::default(),
-            next_file_handle: crate::FileHandle::from(0),
-            next_resource_handle: crate::ResourceHandle::from(0),
-            resources: Vec::new(),
-            current_directory_wide: Vec::new(),
-            bottle_root: None,
-            volumes: VolumeConfig::default(),
-            guest_file_data_next: 0,
-            guest_io: None,
-            stdin_bytes: Vec::new(),
-            stdin_cursor: 0,
-            stdin_mode: crate::GuestStdinMode::InjectOnly,
-            ucrt_files: ahash::HashMap::default(),
-            ucrt_next_file_va: 0x0000_0000_6900_0000,
-            cached_streams: ahash::HashMap::default(),
-        },
-        process: ProcessState {
-            last_error: 0,
-            next_registry_key_handle: RegistryKeyHandle::from(0),
-            registry_keys: Vec::new(),
-            main_module_file_name: String::new(),
-            main_module_path: String::new(),
-            main_module_host_dir: None,
-            error_mode: 0,
-            suspended_threads: ahash::HashMap::default(),
-            environment: crate::DEFAULT_ENVIRONMENT
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                .collect(),
-            main_module_dialogs: Vec::new(),
-            main_module_menus: Vec::new(),
-            main_module_strings: Vec::new(),
-            main_module_accelerators: Vec::new(),
-        },
-        kernel: KernelState {
-            threads: ThreadState::primary(),
-            sync: SyncState::new(),
-            seh_pending: ahash::HashMap::default(),
-        },
-        dll_states: DllStateMap::new(),
-        message_queue: std::sync::Arc::new(std::sync::Mutex::new(
-            crate::present::MessageQueue::default(),
-        )),
-        module_state: ModuleState {
-            loaded_modules: ahash::HashMap::default(),
-            import_resolver: None,
-            get_proc_address_cache: ahash::HashMap::default(),
-            next_module_handle: crate::ModuleHandle::from(
-                crate::dll_loader::REAL_MODULE_HANDLE_BASE,
-            ),
-        },
-    }
+    crate::state::tests::winapi_state_default_with_bump_heap()
 }
 
 /// The Notepad key record exists under HKCU, as RNotepad creates it.

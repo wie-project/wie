@@ -11,6 +11,9 @@ pub use decl::{WinApiId, dispatch_winapi_id};
 mod names;
 pub use names::{is_winapi_implemented, is_winapi_library, resolve_winapi_id, winapi_id_export};
 
+#[cfg(test)]
+mod census_tests;
+
 mod traits;
 pub use traits::WinApiTraits;
 

@@ -67,7 +67,7 @@ type UrlmonHandler = fn(&mut HandlerContext<'_>) -> Result<WinApiHandlerResult>;
 
 /// Every implemented `urlmon.dll` export — the single source shared by
 /// [`dispatch_urlmon`] and the census oracle [`is_export`].
-const URLMON_EXPORTS: &[(&str, UrlmonHandler)] = &[
+pub(crate) const URLMON_EXPORTS: &[(&str, UrlmonHandler)] = &[
     ("urldownloadtofilew", handle_url_download_to_file_w),
     ("urldownloadtofilea", handle_url_download_to_file_a),
     (

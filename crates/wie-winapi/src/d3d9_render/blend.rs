@@ -9,6 +9,7 @@ use super::{
     D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DCMP_NEVER, D3DCMP_NOTEQUAL, D3DFOG_EXP, D3DFOG_EXP2,
     D3DFOG_LINEAR,
 };
+use crate::color::unpack_rgba;
 
 // ── Typed render-state values (D3DRS_* / D3DTSS_* / D3DSAMP_*) ─────────
 //
@@ -285,8 +286,8 @@ fn blend_channel(
 #[must_use]
 pub(super) fn blend_fragment(dst: u32, src: u32, alpha: u8, frag: &FragmentState<'_>) -> u32 {
     let src_alpha = u32::from(alpha);
-    let (sr, sg, sb) = ((src >> 16) & 0xFF, (src >> 8) & 0xFF, src & 0xFF);
-    let (dr, dg, db) = ((dst >> 16) & 0xFF, (dst >> 8) & 0xFF, dst & 0xFF);
+    let [sr, sg, sb, _] = unpack_rgba(src).map(u32::from);
+    let [dr, dg, db, _] = unpack_rgba(dst).map(u32::from);
     let channel = |src_ch: u32, dst_ch: u32| {
         let sf = blend_factor(frag.src_blend, src_ch, dst_ch, src_alpha);
         let df = blend_factor(frag.dest_blend, src_ch, dst_ch, src_alpha);
@@ -386,18 +387,9 @@ pub(super) fn edge_inside(e: f32, dx: f32, dy: f32) -> bool {
 /// and sign-loss are impossible.
 #[must_use]
 pub(super) fn blend_colors(wa: f32, ca: u32, wb: f32, cb: u32, wc: f32, cc: u32) -> u32 {
-    let ra = f32::from(u8::try_from((ca >> 16) & 0xFF).unwrap_or(0));
-    let ga = f32::from(u8::try_from((ca >> 8) & 0xFF).unwrap_or(0));
-    let ba = f32::from(u8::try_from(ca & 0xFF).unwrap_or(0));
-    let aa = f32::from(u8::try_from((ca >> 24) & 0xFF).unwrap_or(0));
-    let rb = f32::from(u8::try_from((cb >> 16) & 0xFF).unwrap_or(0));
-    let gb = f32::from(u8::try_from((cb >> 8) & 0xFF).unwrap_or(0));
-    let bb = f32::from(u8::try_from(cb & 0xFF).unwrap_or(0));
-    let ab = f32::from(u8::try_from((cb >> 24) & 0xFF).unwrap_or(0));
-    let rc = f32::from(u8::try_from((cc >> 16) & 0xFF).unwrap_or(0));
-    let gc = f32::from(u8::try_from((cc >> 8) & 0xFF).unwrap_or(0));
-    let bc = f32::from(u8::try_from(cc & 0xFF).unwrap_or(0));
-    let ac = f32::from(u8::try_from((cc >> 24) & 0xFF).unwrap_or(0));
+    let [ra, ga, ba, aa] = unpack_rgba(ca).map(f32::from);
+    let [rb, gb, bb, ab] = unpack_rgba(cb).map(f32::from);
+    let [rc, gc, bc, ac] = unpack_rgba(cc).map(f32::from);
     let r = (wa * ra + wb * rb + wc * rc).round() as u32;
     let g = (wa * ga + wb * gb + wc * gc).round() as u32;
     let b = (wa * ba + wb * bb + wc * bc).round() as u32;
