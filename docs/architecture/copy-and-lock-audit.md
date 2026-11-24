@@ -45,47 +45,68 @@ meant for.
 
 ## 2. What is left, ranked
 
-Ordered by expected payoff per unit of risk. Each is real — these are not
-nice-to-haves invented to fill a list.
+Three of the four items closed. One was refuted by measurement, and the thing
+that measurement exposed was fixed instead. What remains is at the bottom.
 
-1. **32-bit ALU typing in the JIT.** `mask_width` ANDs both operands *and* the
-   result of every 32-bit ALU/cmp/test/inc/dec with `0xffffffff` as an I64 value
-   (`lower/flags.rs:93-105`). `0xffffffff` is not an encodable AArch64 logical
-   immediate, so the backend materialises it in a register, and at
-   `opt_level = none` nothing folds the repeats. Doing the op in I32 plus a
-   per-register known-zero-extended bit should take `add ecx,eax` from ~5 host
-   instructions to ~2. This is the dominant x86-64 instruction class and no
-   experiment has touched it. *Needs:* a disassembly knob to confirm the shapes
-   before and after (`Context::compile` already takes `want_disasm`).
-2. **The XMM split-pair round trip.** XMM lives as 32 scalar I64 halves, so one
-   `paddb` becomes ~17 host ops around one real one — convert both operands,
-   operate, convert back, then re-convert to store
-   (`sse.rs:846-860`, `analysis.rs:101-160`). Pays on SSE-heavy guests (the DOOM
-   Retro class), ~0 on 7-Zip (SSE is 0.36 % of its instructions). *Needs:* the
-   write-through to stay (it is a fault-semantics guard, and removing it once
-   caused the notepad CRLF bug); only the repack in `store_xmm_pair` is free.
-3. **D3D9 buffer and texture snapshots.** Each buffer-form draw clones the whole
-   vertex stream and index buffer (`d3d9/draw.rs:131-158`); each recorded draw
-   clones every texture's texels and every mip (`d3d9/capture.rs:258-268`) — 4 MB
-   per draw for a 1024² texture. Render targets already use `Arc<Vec<u32>>` with
-   `make_mut`; buffers and textures are the same fix. Only when the capture
-   stream is on.
-4. **`wcscpy`/`wcscat`/`wcsncpy`/`wcsnicmp`/`wcsrchr`/`wcsstr`** still read per
-   unit, and `handle_strstr` also grows a `Vec` byte by byte. The page-sliced
-   helpers this round added (`utf16_len`, `utf16_cmp`) are the shape to follow.
-5. **The dead shadow return stack.** `shadow_push` on every guest `call`,
-   `shadow_pop_check` (a three-block diamond) on every `ret` — and nothing reads
-   the result: `shadow_pop_check` returns `ret_va` unchanged and `chain_tail`
-   never consults it. `docs/architecture/cpu-and-memory.md:53` still claims it
-   "validates ret targets". Removal touches `frame_entry_tests`.
-6. **D3D9 readback row buffers** (`d3d9/texture.rs:603,687-698,868`): one
+### Closed
+
+- **The XMM split-pair round trip.** `store_xmm_pair` always rebuilt the vector
+  from `(lo, hi)` with a splat, two `insertlane`s and a `bitcast`, even when the
+  caller still held the vector it had just produced. `PackedXmm { vec, lo, hi }`
+  plus `store_xmm_packed` write through the vector when it exists (`vec: Some`)
+  and keep the old rebuild otherwise (`vec: None`). The store itself is
+  unchanged — same `MemEnv`, same point in the block — because the write-through
+  is a fault-semantics guard and removing it is what caused the notepad CRLF
+  bug; only the *recomputation* is gone, which is four host instructions around
+  every packed integer op.
+- **D3D9 buffer and texture snapshots.** `BufferRecord::data` and
+  `TextureRecord::{pixels, mips}` are now `Arc<Vec<_>>` written with
+  `Arc::make_mut`, so a draw that does not write a texture refcount-bumps
+  instead of cloning 4 MB. `stream_base` is a *suffix*, so a bare `Arc` clone
+  would have shifted every vertex; the payload is a `StreamBytes { bytes,
+  offset }` handle and `as_slice()` reports the suffix. `state/d3d9.rs` needed
+  no change (`Arc::unwrap_or_clone` at Release).
+- **The dead shadow return stack.** `JitCtx::shadow_sp`/`shadow_ret`,
+  `SHADOW_DEPTH`, `OFF_SHADOW_*`, `emit::shadow_push`/`shadow_pop_check`,
+  `trampolines::shadow_pop_check` and its three reset sites are gone:
+  `shadow_pop_check` returned `ret_va` unchanged and `chain_tail` never
+  consulted it, so it was a three-block diamond on every `ret` for a value
+  nothing read. Removing it exposed a real gap it had been hiding —
+  `emit_fingerprint` did not cover the `JitCtx` layout at all, so a restored
+  blob would have used stale offsets. It now mixes `size_of::<JitCtx>()` and
+  `JitConfig::FRAME_LAYOUT_VERSION`.
+
+### Refuted with numbers, and what replaced it
+
+**32-bit ALU typing in the JIT** was ranked first here on the premise that
+masked 32-bit ALU ops are the dominant class. `WIE_JIT_DUMP_IR=<path>` now
+dumps CLIF (every 50th compile, capped at 2000 blocks, so it samples the whole
+run rather than its prologue), and counting `band` against `iconst` widths says
+the premise is false for everything measurable: **zero 32-bit masks** in both
+7-Zip `x` and DOOM Retro, against 4,137 and 109 **8-bit** masks. There is
+nothing to retype on these guests, so the I32-plus-known-zero-extended plan is
+documented and not done — worth revisiting only when a guest actually shows
+32-bit masks in the dump.
+
+What the dump did find is a smaller, real waste: **9.0 % (7-Zip) / 5.5 % (DOOM
+Retro) of masks were exact `(value, width)` duplicates inside one block**,
+because the arithmetic lowering masks its operands and result and
+`add_sub_preds` then re-masks all three. `mask_width` now memoises per block in
+a `thread_local!` cleared by `flags::reset_mask_cache()` at block start.
+
+### Still open, ranked
+
+1. **`wcscpy`/`wcscat`/`wcsncpy`/`wcsnicmp`/`wcsrchr`/`wcsstr`** still read per
+   unit, and `handle_strstr` grows a `Vec` byte by byte. The page-sliced
+   `utf16_len`/`utf16_cmp` helpers are the shape to follow.
+2. **D3D9 readback row buffers** (`d3d9/texture.rs:603,687-698,868`): one
    allocation per scan line inside a LockRect loop.
-7. **Scalar fills that cannot vectorise as written**: `fill_rect_surface`
+3. **Scalar fills that cannot vectorise as written**: `fill_rect_surface`
    (`gdi32/blit.rs:555-562`), `fill_backbuffer_rect` (`d3d9/raster.rs:77-90`),
    `host_fill_pattern` (`exec/string.rs:190-215`). Each stores one u32 per
-   iteration; a splat + 4-wide store is the same change `write_run` already made
-   for the present path. *Settle first:* whether the autovectoriser already
-   fires (repo notes say LTO suppresses it) — `cargo asm` on the one function.
+   iteration; a splat + 4-wide store is the change `write_run` already made for
+   the present path. *Settle first:* whether the autovectoriser already fires
+   (repo notes say LTO suppresses it) — `cargo asm` on the one function.
 
 ## 3. Deliberately not done
 
@@ -100,7 +121,7 @@ nice-to-haves invented to fill a list.
 
 ## 4. How this was verified
 
-`cargo nextest run --workspace` (2053 tests) · `cargo clippy --workspace
+`cargo nextest run --workspace` (2059 tests) · `cargo clippy --workspace
 --all-targets` (zero warnings, `deny`-level table in `Cargo.toml`) ·
 `scripts/check.sh --only file-sizes --only dep-direction --only winapi-port
 --only state-bindings`. Behavioural evidence where a test cannot reach it:
