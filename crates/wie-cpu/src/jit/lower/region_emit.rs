@@ -659,6 +659,11 @@ pub(in crate::jit) fn try_compile_region(
             let live = region.live_in();
             tracing::info!(
                 start = format_args!("{rip:#x}"),
+                block_starts = ?region
+                    .blocks()
+                    .iter()
+                    .map(|b| format!("{:#x}", b.start()))
+                    .collect::<Vec<_>>(),
                 blocks = region.blocks().len(),
                 insns = region.insn_count(),
                 live_in = live.reg_count(),

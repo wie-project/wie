@@ -495,3 +495,216 @@ fn straight_line_code_is_not_a_region() {
     );
     assert_eq!(compiled.guest_end, STRAIGHT_ENTRY + 4);
 }
+
+// ── 5. the boot seam: a latch compiles its loop's header ────────────────
+
+/// Compile `rip` as a **block** and install it — the shape the boot tier's
+/// first-sighting compile produces (`baseline::try_compile_baseline` →
+/// `compile_from_kind_shared`), which never asks about a region at `rip` itself.
+fn install_boot_block(cpu: &mut JitCpu, rip: u64) -> lower::CompiledBlock {
+    let baked = cpu
+        .shared
+        .invalidate_gen
+        .load(std::sync::atomic::Ordering::Acquire);
+    let kind = {
+        let mem = cpu.shared.mem.read().expect("mem guard");
+        block::decode_pure_gpr_block(&mem, cpu.thread.hooks.as_ref(), rip)
+    };
+    let compiled = cpu
+        .try_compile_from_kind(rip, kind, baked)
+        .expect("compile the fixture block");
+    cpu.insert_ready(rip, compiled);
+    compiled
+}
+
+/// The cache entry at `rip`, which is where the dispatcher looks next.
+fn ready_entry(cpu: &JitCpu, rip: u64) -> lower::CompiledBlock {
+    let cache = cpu.shared.cache.pin();
+    match cache.get(&rip).cloned() {
+        Some(CacheEntry::Ready(compiled)) => compiled,
+        None => panic!("no cache entry at {rip:#x}"),
+        Some(_) => panic!("expected a Ready entry at {rip:#x}, got a non-Ready one"),
+    }
+}
+
+/// **The reachability pin.** Boot mode compiles the first sighting of every block
+/// and installs it `Ready`, and nothing re-compiles a `Ready` entry — so a loop
+/// header first reached during boot used to stay a per-block, per-iteration hop
+/// for the rest of the process. DOOM Retro's entire hot set is in that window,
+/// which is why `WIE_JIT_REGION=1` had never had a region to measure on a real
+/// guest.
+///
+/// This pins the fix at the seam that matters rather than at `try_compile` (which
+/// always could fold a header it was pointed at): compile the header as a *block*
+/// the way boot does, then compile the **latch**, and the header's entry must have
+/// become the region. With the latch off it must still be the two-instruction
+/// block — the knob must not touch the block path.
+#[test]
+fn a_latch_compile_folds_the_loop_at_a_boot_compiled_header() {
+    for region in [true, false] {
+        let mut cpu = jit_with(CROSS_FLAGS_ENTRY, &CROSS_FLAGS_LOOP, region);
+        let header = install_boot_block(cpu.as_mut(), CROSS_FLAGS_ENTRY);
+        assert_eq!(
+            header.insn_count, 2,
+            "precondition: the block path's view of the header (sub + jmp)"
+        );
+        let latch = install_boot_block(cpu.as_mut(), CROSS_FLAGS_ENTRY + 0x0B);
+        assert_eq!(latch.insn_count, 1, "the latch is a block too (the `jg`)");
+
+        let folded = ready_entry(cpu.as_ref(), CROSS_FLAGS_ENTRY);
+        if region {
+            assert_eq!(
+                folded.insn_count, 3,
+                "the latch compile must fold the whole loop into the header's \
+                 entry: 2 + 1 guest instructions"
+            );
+            assert_eq!(
+                folded.guest_start, CROSS_FLAGS_ENTRY,
+                "the region is keyed by the header and replaces that entry"
+            );
+            assert_eq!(
+                folded.guest_end,
+                CROSS_FLAGS_ENTRY + 0x0D,
+                "the region owns the latch's bytes too, so a write to either \
+                 block invalidates it"
+            );
+        } else {
+            assert_eq!(
+                folded.insn_count, 2,
+                "knob off: the header must still be exactly the block the boot \
+                 tier installed"
+            );
+            assert_eq!(folded.guest_end, CROSS_FLAGS_ENTRY + 0x05);
+        }
+    }
+}
+
+/// …and the region that fold installed is *correct*: entered from the header
+/// (where a stale chain slot from the earlier block compile used to point), it
+/// counts down in registers, takes no chain hop, and leaves the exit `rip` and
+/// register file the interpreter has.
+///
+/// This is the differential for the folded shape specifically: the header was
+/// first compiled as a **block**, so the entry state, the chain slot and the
+/// cache entry were all built by the block path before the region replaced them.
+#[test]
+fn the_folded_region_matches_the_interpreter() {
+    let mut results: Vec<ThreadContext> = Vec::new();
+    for backend in [Backend::Iced, Backend::Jit] {
+        let mut engine = open(backend);
+        if let Engine::Jit(cpu) = &mut engine {
+            cpu.shared_jit()
+                .region_force
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        {
+            let cpu = engine.cpu();
+            cpu.virtual_alloc(
+                CROSS_FLAGS_ENTRY,
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                protect::PAGE_EXECUTE_READWRITE,
+            )
+            .expect("map the fixture page");
+            cpu.mem_write(CROSS_FLAGS_ENTRY, &CROSS_FLAGS_LOOP)
+                .expect("write the fixture");
+            let mut ctx = cpu.snapshot_thread_context();
+            ctx.gpr[1] = 3;
+            ctx.rip = CROSS_FLAGS_ENTRY;
+            cpu.restore_thread_context(&ctx);
+        }
+        if let Engine::Jit(cpu) = &mut engine {
+            // Boot order: the header first, the latch later. The fold happens on
+            // the latch, i.e. after the header is already installed and its chain
+            // slot already points at the block.
+            let _ = install_boot_block(cpu.as_mut(), CROSS_FLAGS_ENTRY);
+            let _ = install_boot_block(cpu.as_mut(), CROSS_FLAGS_ENTRY + 0x0B);
+            assert_eq!(
+                ready_entry(cpu.as_ref(), CROSS_FLAGS_ENTRY).insn_count,
+                3,
+                "precondition: the latch folded the header's loop"
+            );
+        }
+        results.push(run_to_exit(
+            &mut engine,
+            CROSS_FLAGS_EXIT,
+            CROSS_FLAGS_ENTRY,
+        ));
+    }
+    let (iced, jit) = (&results[0], &results[1]);
+    assert_eq!(
+        jit.rip, iced.rip,
+        "the folded region must leave at the interpreter's exit RIP"
+    );
+    assert_eq!(
+        jit.gpr, iced.gpr,
+        "the folded region's exit writes back every slot; a difference is a \
+         missing or wrong writeback"
+    );
+    assert_eq!(jit.rflags, iced.rflags, "the flags leaving the loop differ");
+    assert_eq!(jit.gpr[1], 0, "the loop counted RCX down to zero");
+}
+
+/// The cross-flags loop plus one block **outside** it that jumps back into the
+/// loop's interior block (`+0x0B`):
+///
+/// ```text
+/// A +0x00: sub rcx, 1        ; 48 FF C9
+///   +0x03: jmp B
+/// B +0x0B: jg A              ; 7F F3   (fallthrough +0x0D = ud2, the exit)
+///   +0x0D: ud2
+/// E +0x0F: jmp B             ; EB FA   a second backward edge, into the interior
+/// ```
+///
+/// `E` is what makes the duplicate test possible: it is not part of A's loop, so
+/// region formation would happily fold *another* region at `B` — the same guest
+/// code, translated twice.
+const INTERIOR_JMP: [u8; 0x11] = [
+    0x48, 0xFF, 0xC9, // sub rcx, 1
+    0xEB, 0x06, // jmp +0x0B
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding
+    0x7F, 0xF3, // jg +0x00
+    0x0F, 0x0B, // ud2
+    0xEB, 0xFA, // jmp +0x0B
+];
+const INTERIOR_JMP_ENTRY: u64 = 0x10b5_0000;
+
+/// A loop is folded **once**: a second backward edge into the same loop must not
+/// compile the same guest bytes a second time.
+///
+/// The case is real — DOOM Retro's hot loop was folded at both `0x140066570` and
+/// its interior `0x1400665c4` before this guard, and any loop with two backward
+/// branches hits it. Both copies are *correct* (that is not the risk); the risk is
+/// paying a region compile per extra latch for the rest of the run.
+#[test]
+fn a_loop_is_folded_once_even_with_two_backward_edges_into_it() {
+    let mut cpu = jit_with(INTERIOR_JMP_ENTRY, &INTERIOR_JMP, true);
+    let loop_header = INTERIOR_JMP_ENTRY;
+    let loop_latch = INTERIOR_JMP_ENTRY + 0x0B;
+    let outside = INTERIOR_JMP_ENTRY + 0x0F;
+
+    let _ = install_boot_block(cpu.as_mut(), loop_header);
+    let _ = install_boot_block(cpu.as_mut(), loop_latch);
+    assert_eq!(
+        ready_entry(cpu.as_ref(), loop_header).insn_count,
+        3,
+        "precondition: the latch folded the loop at its header"
+    );
+
+    // `outside` branches back into the *interior* block, so formation would build a
+    // second region with the same two blocks in the other order.
+    let before = cpu.stats().compile.compiles;
+    let block = install_boot_block(cpu.as_mut(), outside);
+    assert_eq!(block.insn_count, 1, "the `jmp` block itself compiles");
+    assert_eq!(
+        cpu.stats().compile.compiles,
+        before + 1,
+        "exactly one compile — the block — means no second region was emitted; \
+         a delta of 2 is the duplicate this guard exists to stop"
+    );
+    assert_eq!(
+        ready_entry(cpu.as_ref(), loop_header).insn_count,
+        3,
+        "the region at the header is untouched by the later latch"
+    );
+}

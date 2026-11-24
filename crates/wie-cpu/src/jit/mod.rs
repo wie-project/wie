@@ -76,6 +76,12 @@ pub struct JitCpu {
     /// sentinel so the next resync fully rebuilds the (possibly stale) chain
     /// table.
     pub(crate) seen_invalidate_gen: u64,
+    /// Which loop headers region formation has already been asked about on this
+    /// thread, and which ranges a region already covers (`WIE_JIT_REGION=1`).
+    /// Per-thread because it only ever short-circuits *this* thread's extra
+    /// formation work; a second guest thread repeating an attempt costs a fold,
+    /// not correctness.
+    pub(crate) region_probe: pipeline::RegionProbe,
 }
 
 // SAFETY: Arc<JitShared> is Send + Sync (via unsafe impl above).

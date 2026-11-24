@@ -56,6 +56,42 @@ pub(super) static OPCODE_SAMPLES: AtomicU64 = AtomicU64::new(0);
 /// re-check the cache at this cadence until the budget runs out.
 const BG_COWAIT_QUANTUM: Duration = Duration::from_micros(200);
 
+/// Failed region-formation attempts allowed per invalidation epoch on one
+/// thread (`WIE_JIT_REGION=1`).
+///
+/// Formation is not free: it decodes up to `RegionLimits::max_explore_blocks`
+/// (512) blocks to prove the loop has no other entry, and measured 42 µs
+/// (a debug build, on DOOM Retro's hot loop). Almost every backward branch in a
+/// real guest is a loop *we cannot fold* — a call in the body, a string op, an
+/// irreducible shape — so the attempts that find nothing are the ones that need
+/// a bound, while the attempts that find a region are the ones worth paying for
+/// and stay uncapped. 128 misses is ~5 ms of formation on this host per epoch,
+/// once, and a candidate past the cap keeps the per-block path it would have
+/// had anyway: a missed fold, never a wrong one.
+const REGION_PROBE_MISSES_PER_EPOCH: u32 = 128;
+
+/// Per-thread memory of which loop headers have already been offered to region
+/// formation (`WIE_JIT_REGION=1`).
+///
+/// Nothing on the block path reads this; it exists so the *extra* work the knob
+/// turns on stays proportional to the number of loops rather than to the number
+/// of block compiles.
+#[derive(Default)]
+pub(crate) struct RegionProbe {
+    /// [`JitShared::invalidate_gen`] the fields below were built under.
+    ///
+    /// A mismatch means guest code bytes, or the hook window that formation
+    /// decodes against, may have changed since a verdict was reached, so both
+    /// memories are dropped rather than trusted. Invalidation is already the
+    /// trigger for dropping compiled code, so this costs one comparison on a
+    /// path that is about to do a compile.
+    epoch: u64,
+    /// Loop headers formation has already been asked about at `epoch`.
+    tried: std::collections::HashSet<u64>,
+    /// Formation attempts that produced no region, this epoch.
+    misses: u32,
+}
+
 /// Queue depth at or above which waiting for this entry's compile is futile:
 /// the worker is several block-latencies behind, so the wait budget would
 /// expire unserved. At sustained backlog nearly every full-budget stall timed
@@ -99,6 +135,7 @@ impl JitCpu {
             chain_sync_epoch: 0,
             chain_watermark: 0,
             seen_invalidate_gen: 0,
+            region_probe: RegionProbe::default(),
         }
     }
 
@@ -120,6 +157,7 @@ impl JitCpu {
             chain_sync_epoch: 0,
             chain_watermark: 0,
             seen_invalidate_gen: 0,
+            region_probe: RegionProbe::default(),
         }
     }
 
@@ -678,6 +716,20 @@ impl JitCpu {
                     if is_loop {
                         drop(self.enqueue_bg(rip, &kind, inv_gen, false));
                     }
+                    // `WIE_JIT_REGION=1`: this block is a latch of every loop it
+                    // branches back into, and this is the **only** look those
+                    // headers get. A baseline compile installs `Ready` on the
+                    // first sighting of a RIP and nothing re-compiles a `Ready`
+                    // entry, so a header compiled here would stay a per-block,
+                    // per-iteration hop for the rest of the process. Fold the
+                    // loop now, while the guest thread's hook window (which
+                    // formation decodes against) is in hand.
+                    //
+                    // Ordered after the self-loop enqueue above and before the
+                    // install: a self-loop's successor is excluded from
+                    // `backward_targets`, so the two paths never claim the same
+                    // RIP here.
+                    self.promote_loop_headers(rip, baseline::backward_targets(rip, &kind), inv_gen);
                     let meta = CompiledRunMeta::from(&baseline);
                     self.insert_ready(rip, baseline);
                     self.stats.profile.eager_compiles =
@@ -1245,6 +1297,156 @@ impl JitCpu {
         Some(compiled)
     }
 
+    /// Fold the loop that the block just compiled at `rip` is the latch of
+    /// (`WIE_JIT_REGION=1`).
+    ///
+    /// `backward` is [`baseline::backward_targets`] of that block: its
+    /// successors that sit *below* it, each of which is by definition a loop
+    /// header. For every candidate this asks [`form_loop_region`] to describe the
+    /// loop and compiles the answer as one native function, then installs it over
+    /// whatever translation the header had.
+    ///
+    /// # The gap this closes
+    ///
+    /// The other two region hooks (`try_compile` and `enqueue_bg`) fire on the
+    /// RIP **being promoted**. That covers a hot block reached through the Hot
+    /// threshold or an urgent background job — but not a loop header first
+    /// touched during boot, which `baseline::try_compile_baseline` compiles and
+    /// installs `Ready` on its *first* sighting. Nothing re-compiles a `Ready`
+    /// entry except a self-loop's tier-up, so before this the header of every
+    /// loop entered during boot stayed a per-block translation for the rest of
+    /// the process — measured on DOOM Retro, whose entire hot set is in that
+    /// window, which is why the knob had never had a region to measure.
+    ///
+    /// The latch is compiled *after* the header it closes the loop back to, so
+    /// this is the first moment the pipeline can know a loop exists, and it
+    /// knows it on the guest thread with the hook window formation needs.
+    ///
+    /// # Why overwriting a `Ready` entry is allowed here
+    ///
+    /// The header is usually already `Ready` (that is the whole problem), so this
+    /// replaces it — the same last-writer-wins patch
+    /// [`JitShared::insert_ready`] performs when a background tier-1 compile
+    /// lands on a tier-0 entry. Two properties make that safe:
+    ///
+    /// * the superseded function stays mapped and stays *correct* (code pages are
+    ///   only ever unmapped on a full flush), so another guest thread whose chain
+    ///   slot still points at it runs the same guest instructions, only slower,
+    ///   until its next resync;
+    /// * the region's `[guest_start, guest_end)` covers the block it replaces, so
+    ///   range-selective invalidation still drops the region for any write to
+    ///   either block's bytes.
+    ///
+    /// # Cost
+    ///
+    /// One call, two comparisons and one atomic load when the knob is off — the
+    /// [`RegionProbe`] check runs inside. When it is on, one formation per
+    /// distinct loop header per invalidation epoch, with
+    /// [`REGION_PROBE_MISSES_PER_EPOCH`] bounding the attempts that find nothing.
+    fn promote_loop_headers(&mut self, latch: u64, backward: ([u64; 2], usize), inv_gen: u64) {
+        let (slots, len) = backward;
+        if len == 0 || !self.shared.region_enabled_here() {
+            return;
+        }
+        if self.region_probe.epoch != inv_gen {
+            self.region_probe.epoch = inv_gen;
+            self.region_probe.tried.clear();
+            self.region_probe.misses = 0;
+        }
+        for &header in &slots[..len] {
+            if !self.region_probe.tried.insert(header) {
+                continue;
+            }
+            if self.already_folded(header) {
+                // Debug, not a counter: this is the answer to "why is this loop
+                // still hopping?", and it is routine (most loops are folded once
+                // and then have every other backward edge into them skipped).
+                tracing::debug!(
+                    header = format_args!("{header:#x}"),
+                    latch = format_args!("{latch:#x}"),
+                    "loop header already inside a compiled unit — not folding"
+                );
+                continue;
+            }
+            if self.region_probe.misses >= REGION_PROBE_MISSES_PER_EPOCH {
+                return;
+            }
+            match self.try_compile_region(header, inv_gen) {
+                Some(compiled) => {
+                    tracing::debug!(
+                        header = format_args!("{header:#x}"),
+                        latch = format_args!("{latch:#x}"),
+                        insns = compiled.insn_count,
+                        "jit loop region folded from its latch"
+                    );
+                    self.insert_ready(header, compiled);
+                }
+                None => self.region_probe.misses = self.region_probe.misses.saturating_add(1),
+            }
+        }
+    }
+
+    /// Whether `header` already sits inside a **folded region**, which makes a
+    /// region entry there a second copy of guest code that is already one
+    /// function.
+    ///
+    /// Two shapes reach this, and both are a fold worth **not** making: the loop
+    /// was already folded at some block of it — by one of the other two region
+    /// hooks, by this one on an earlier epoch, or by this one just now at a
+    /// *different* block of the same loop (a loop with two backward branches into
+    /// it has several candidate headers) — and folding it again compiles the same
+    /// guest bytes twice. Both copies would be correct; the second one is dead
+    /// code that cost a region compile to produce.
+    ///
+    /// # Why this is not just a span test
+    ///
+    /// "Inside some translation" is too weak: a block that **falls through** into a
+    /// loop header already owns the header's bytes, because its span is every byte
+    /// it decoded and the decoder walks forward until a terminator. A plain span
+    /// test therefore refuses to fold almost every loop whose header follows
+    /// straight-line code — measured on `cpp_dtor`, where it took the folds from 2
+    /// to 1 and skipped a real loop.
+    ///
+    /// A per-block translation's span is *exactly* the byte length of the block at
+    /// its own entry ([`compile_block`](super::lower::compile_block) sets
+    /// `guest_end = start_rip + bytes_len`), so one decode of the covering unit's
+    /// entry separates the two: a span wider than that block cannot be one block.
+    /// The entry **at** `header` is not consulted (`va != header`) — that one is the
+    /// boot block this hook exists to replace, and a re-attempt at a header already
+    /// folded into a region is stopped by `tried` for the epoch, which is as long as
+    /// an unchanged-code verdict is worth keeping.
+    /// If the bytes no longer decode (the unit was compiled from instructions the
+    /// decoder now refuses), the wider answer is taken, which costs a fold rather
+    /// than risking a duplicate.
+    fn already_folded(&self, header: u64) -> bool {
+        let spans: Vec<(u64, u64)> = {
+            let cache = self.shared.cache.pin();
+            cache
+                .iter()
+                .filter_map(|(&va, entry)| match entry {
+                    CacheEntry::Ready(c)
+                        if va != header && c.guest_start <= header && header < c.guest_end =>
+                    {
+                        Some((c.guest_start, c.guest_end))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        if spans.is_empty() {
+            return false;
+        }
+        let mem = read_unpoisoned(&self.shared.mem);
+        spans.into_iter().any(|(start, end)| {
+            let one_block =
+                match block::decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), start) {
+                    BlockKind::Pure { bytes_len, .. } => Some(u64::from(bytes_len)),
+                    BlockKind::NotPure => None,
+                };
+            one_block.is_none_or(|bytes| end.saturating_sub(start) > bytes)
+        })
+    }
+
     /// Compile a block from an already-decoded [`BlockKind`], skipping the
     /// full iced-decode pass that would otherwise repeat previous work.
     ///
@@ -1252,7 +1454,11 @@ impl JitCpu {
     /// this wrapper adds the per-thread side effects: compile stats and the
     /// thread-local chain-table entry. `inv_gen` must be the generation
     /// snapshot taken before `kind`'s bytes were decoded.
-    fn try_compile_from_kind(
+    ///
+    /// `pub(super)` so `jit::tests` can compile a block the way boot mode does
+    /// and pin that the *latch* of a loop folds its header
+    /// ([`Self::promote_loop_headers`]) without needing a live boot run.
+    pub(super) fn try_compile_from_kind(
         &mut self,
         rip: u64,
         result: BlockKind,
@@ -1261,6 +1467,9 @@ impl JitCpu {
         // Compile timing lives at the rare compile seam, so it is always
         // recorded (no cost-model gate needed).
         let start = Instant::now();
+        // Read the loop-header candidates off the decoded block before it is
+        // moved into the lowering; see `promote_loop_headers`.
+        let backward = baseline::backward_targets(rip, &result);
         let compiled = self
             .shared
             .compile_from_kind_shared(&self.fast_api, rip, result, inv_gen);
@@ -1281,6 +1490,8 @@ impl JitCpu {
             chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
             self.stats.chain.inline_inserts = self.stats.chain.inline_inserts.saturating_add(1);
         }
+        // This block is a latch of any loop its backward edges lead into.
+        self.promote_loop_headers(rip, backward, inv_gen);
         tracing::debug!(
             start = format_args!("{rip:#x}"),
             insns = compiled.insn_count,
