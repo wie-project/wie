@@ -151,16 +151,22 @@ pub(super) fn decode_pure_gpr_block(
 #[must_use]
 pub(super) fn pure_is_self_loop(kind: &BlockKind, start: u64) -> bool {
     match kind {
-        BlockKind::Pure {
-            term: Some(BlockTerm::Jmp { target }),
-            ..
-        } => *target == start,
-        BlockKind::Pure {
-            term: Some(BlockTerm::Jcc {
-                taken, not_taken, ..
-            }),
-            ..
-        } => *taken == start || *not_taken == start,
+        BlockKind::Pure { term, .. } => term_is_self_loop(term.as_ref(), start),
+        _ => false,
+    }
+}
+
+/// Whether a decoded block's terminator branches back to the block's own
+/// entry. Split out of [`pure_is_self_loop`] because the tier-up policy
+/// ([`crate::jit::tier`]) asks the same question of an already-destructured
+/// `BlockKind`, and one definition of "self-loop" must back both.
+#[must_use]
+pub(super) fn term_is_self_loop(term: Option<&BlockTerm>, start: u64) -> bool {
+    match term {
+        Some(BlockTerm::Jmp { target }) => *target == start,
+        Some(BlockTerm::Jcc {
+            taken, not_taken, ..
+        }) => *taken == start || *not_taken == start,
         _ => false,
     }
 }

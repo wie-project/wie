@@ -3,11 +3,12 @@
 //! The TLB/pin/sticky constants, `JitCtx` layout, and the per-block compile
 //! entry point (`compile_block`) live here.
 
-use super::JitEngine;
 use super::block::{BlockTerm, DecodedInsn, analyze_block_stack_pin};
 use super::config::JitConfig;
+use super::engine::IsaEngine;
 use super::fast_api::FastApiKind;
 use super::gen_tlb::GenTlb;
+use super::tier::OptTier;
 use crate::mem::GuestMemory;
 use crate::regs::Rflags;
 use ahash::HashMap;
@@ -498,6 +499,10 @@ pub(super) struct CompiledBlock {
     /// Module function id (for block-chaining `declare_func_in_func`).
     /// `None` for hand-written trampolines (late-bound chain only).
     pub func_id: Option<FuncId>,
+    /// The opt-level tier (hence the Cranelift module) that compiled this
+    /// block. A `FuncId` is only meaningful inside its own module, so this is
+    /// also what makes the block chainable: see [`ChainTarget`](super::tier::ChainTarget).
+    pub tier: OptTier,
     pub insn_count: u32,
     /// Guest code range covered by this block `[guest_start, guest_end)`.
     /// Used for range-selective cache invalidation on `mem_write`.
@@ -604,10 +609,25 @@ fn empty_chain_refs() -> &'static HashMap<u64, FuncRef> {
     EMPTY.get_or_init(HashMap::new)
 }
 
-// The wide signature is a load-bearing JIT lowering entry point carrying the whole lowering env.
+/// Lower one block into `eng`'s module and finalize it.
+///
+/// `chain` MUST contain only `FuncId`s declared by the SAME module `eng`
+/// belongs to (see [`IsaEngine`]): every id in it is handed to
+/// `Module::declare_func_in_func`, which indexes this module's own function
+/// table. The caller enforces that by building the map from a tier-filtered
+/// snapshot of `JitShared::chain_ids`
+/// ([`JitShared::chain_map_for`](super::shared::JitShared::chain_map_for));
+/// a cross-tier successor is instead left to the late-bound chain hop or the
+/// dispatcher, which is the supported fallback.
+///
+/// `tier` is the opt level `eng` was built for; it is recorded in the returned
+/// block so the chaining table can tag the `FuncId` with the module it is
+/// valid in.
+///
+/// The wide signature is a load-bearing JIT lowering entry point carrying the whole lowering env.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compile_block(
-    eng: &mut JitEngine,
+    eng: &mut IsaEngine,
     start_rip: u64,
     insns: &[DecodedInsn],
     end_rip: u64,
@@ -616,6 +636,7 @@ pub(super) fn compile_block(
     chain: &HashMap<u64, FuncId>,
     bytes_len: u32,
     inv_gen_baked: u64,
+    tier: OptTier,
 ) -> Result<CompiledBlock, String> {
     let live = analyze_live_gprs(insns);
     let live_xmm = analyze_live_xmm(insns);
@@ -1259,6 +1280,7 @@ pub(super) fn compile_block(
     Ok(CompiledBlock {
         func,
         func_id: Some(func_id),
+        tier,
         insn_count: u32::try_from(insns.len()).unwrap_or(0),
         guest_start: start_rip,
         guest_end,

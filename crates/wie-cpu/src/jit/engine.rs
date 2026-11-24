@@ -1,6 +1,26 @@
-//! `JitEngine` construction: the Cranelift `JITModule` plus import declarations.
+//! `JitEngine` construction: one Cranelift `JITModule` per opt-level tier,
+//! each with its own import declarations.
 //!
-//! Fields are `pub(super)` because `lower.rs` mutates `JitEngine` fields
+//! # Why one module per tier, not one module with two opt levels
+//!
+//! `cranelift_jit::JITModule` binds its `TargetIsa` — and therefore its
+//! `opt_level` — in a **private field with no setter** (checked against
+//! cranelift-jit 0.133.1: `pub struct JITModule { isa: OwnedTargetIsa, .. }`,
+//! and `JITBuilder::with_isa` is construction-only). So a single module can
+//! only ever compile at ONE opt level, and per-block tier-up needs one module
+//! per level. `TargetIsa::flags()` is a dead end for a *live* module: mutating
+//! the flags behind an `Arc` would require reaching into that private field,
+//! i.e. a layout-dependent `unsafe` transmute of a `#[repr(Rust)]` struct with
+//! no API guarantee. Two modules cost one extra `JITModule` allocation and keep
+//! the whole thing on public API.
+//!
+//! The cost of two modules is that a `cranelift_module::FuncId` is only
+//! meaningful **inside its declaring module** (`Module::declare_func_in_func`
+//! indexes that module's own `compiled_functions`). That invariant is enforced
+//! by tier-tagging `JitShared::chain_ids` and by compiling against a
+//! same-tier-only snapshot — see [`super::shared::JitShared::chain_map_for`].
+//!
+//! Fields are `pub(super)` because `lower.rs` mutates [`IsaEngine`] fields
 //! directly during block compilation (visible across `crate::jit`).
 
 #![allow(
@@ -19,8 +39,11 @@ use super::lower::{
     wie_jit_store, wie_jit_string, wie_sse_cvt, wie_sse_fp_binop, wie_sse_fp_unop,
     wie_sse_int_binop, wie_sse_pshufb_hi, wie_sse_pshufb_lo, wie_sse_shift,
 };
+use super::tier::{OptTier, TIER_OPT_LEVEL};
 
-pub(crate) struct JitEngine {
+/// The per-tier Cranelift machinery: one `JITModule`, one compile `Context`,
+/// and that module's own import `FuncId`s.
+pub(crate) struct IsaEngine {
     pub(super) module: cranelift_jit::JITModule,
     pub(super) ctx: cranelift_codegen::Context,
     pub(super) func_ctx: cranelift::prelude::FunctionBuilderContext,
@@ -58,17 +81,75 @@ pub(crate) struct JitEngine {
     /// UCRT fast-path imports (malloc, free, memcpy, …).
     pub(super) ucrt: UcrtImportIds,
 }
+
+/// The engine: a base-tier module plus, when tiering is armed, a tier-up
+/// module compiled at [`TIER_OPT_LEVEL`].
+pub(crate) struct JitEngine {
+    /// Compiles at `WIE_JIT_OPT` (default `none`). Present iff the JIT works
+    /// at all.
+    pub(super) base: IsaEngine,
+    /// Compiles at [`TIER_OPT_LEVEL`], used only by blocks that earn the tier
+    /// (self-loops). `None` when tiering is off, when the budget is zero, or
+    /// when the two levels coincide — in all three cases every compile resolves
+    /// to `OptTier::Base` and this is exactly the pre-tiering behaviour.
+    pub(super) tier: Option<IsaEngine>,
+}
+
 impl JitEngine {
     pub(super) fn new() -> Result<Self, String> {
+        let base = IsaEngine::new(OptTier::Base.opt_level())?;
+        // A tier module is only worth building when it can actually be used:
+        // the knob is on, the budget allows at least one tier-up, and the two
+        // opt levels differ (otherwise tiering is inert — every decision would
+        // resolve to the base level the process already uses).
+        let armed = JitConfig::get().tier_enabled() && JitConfig::get().tier_budget() > 0;
+        let tier = if armed && OptTier::Base.opt_level() != TIER_OPT_LEVEL {
+            match IsaEngine::new(TIER_OPT_LEVEL) {
+                Ok(e) => Some(e),
+                // Losing the tier module must NOT cost us the whole JIT: base
+                // compiles are still correct, just unoptimized.
+                Err(e) => {
+                    tracing::warn!(error = %e, "jit tier module unavailable; tier-up disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Self { base, tier })
+    }
+
+    /// The module that compiles at `tier`. `None` only if a tier-up was
+    /// decided without a tier module existing — which [`Self::new`] makes
+    /// impossible, and which callers treat as "fall back to interpretation"
+    /// rather than as a silent retarget.
+    pub(super) fn module_for(&mut self, tier: OptTier) -> Option<&mut IsaEngine> {
+        match tier {
+            OptTier::Base => Some(&mut self.base),
+            OptTier::Speed => self.tier.as_mut(),
+        }
+    }
+
+    /// Whether a tier-up module exists (i.e. tiering is armed at all).
+    pub(super) fn has_tier_module(&self) -> bool {
+        self.tier.is_some()
+    }
+}
+
+impl IsaEngine {
+    /// Build one module at `opt_level`. Everything except the opt level is
+    /// identical between tiers, so the emitted code for the same block differs
+    /// only in optimisation strength.
+    pub(super) fn new(opt_level: &'static str) -> Result<Self, String> {
         use cranelift::prelude::*;
         use cranelift_codegen::settings::Configurable;
         use cranelift_jit::{JITBuilder, JITModule};
         use cranelift_module::{Linkage, Module, default_libcall_names};
 
         let mut flag_builder = settings::builder();
-        // Prefer speed of host code for hot translated blocks.
+        // Per-module: one module per opt level (see the module docs).
         flag_builder
-            .set("opt_level", JitConfig::get().opt_level())
+            .set("opt_level", opt_level)
             .map_err(|e| e.to_string())?;
         // Verifier stays ON unconditionally (see comment above). WIE_JIT_VERIFY
         // is no longer a gate; the per-compile verifier cost on small blocks

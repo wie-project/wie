@@ -541,16 +541,6 @@ impl PersistentJitCache {
     /// Called only after a tier compile has SUCCEEDED: a tier compile that the
     /// verifier rejects falls back to a base compile, and that base verdict
     /// must not be filed as a tier one.
-    // The tier-up policy that calls this is the next change; until then the
-    // hook is unreachable outside the test build (where the routing test below
-    // does use it, which is why the expectation is `not(test)`-gated).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "tier-up policy (jit::tier) is the caller and lands next"
-        )
-    )]
     pub(super) fn mark_tiered(&self, va: u64) {
         if !self.enabled {
             return;

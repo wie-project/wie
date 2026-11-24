@@ -7,6 +7,7 @@ mod inv_gen_tests;
 mod pause_tests;
 mod strlen_repro;
 mod testb_high_byte;
+mod tier_tests;
 mod trip_tests;
 use super::*;
 use crate::exec::StepResult;
@@ -21,6 +22,7 @@ use pipeline::ranges_overlap;
 use shared::{BgEnqueueOutcome, BgPool, BgWaitCell};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+use tier::OptTier;
 
 unsafe extern "C" fn dummy_block(_ctx: *mut JitCtx) {}
 
@@ -32,6 +34,8 @@ impl JitCpu {
             CompiledBlock {
                 func: dummy_block,
                 func_id: None,
+                // Planted, never compiled: no module owns it.
+                tier: OptTier::Base,
                 insn_count: 1,
                 guest_start: rip,
                 guest_end,

@@ -13,6 +13,7 @@
 use super::CacheEntry;
 use super::block::{self, BlockKind};
 use super::cache_persist::{LedgerProbe, PersistentJitCache, jit_cache_pe_hash};
+use super::tier::{ChainTarget, OptTier, TierCounters, TierPlan};
 
 // [verifier-rejection warn rate-limit] First REJECT_WARN_MAX rejections log at
 // WARN; the tail logs at DEBUG so pathological guests don't spam the console.
@@ -258,9 +259,12 @@ pub struct JitShared {
     /// Guest entry VA → CacheEntry.
     #[doc(hidden)]
     pub cache: ConcurrentHashMap<u64, CacheEntry>,
-    /// Ready-block FuncIds for chaining.
+    /// Ready-block FuncIds for chaining, **tagged with the module (tier) that
+    /// declared them** — a `FuncId` is only valid inside its own
+    /// `JITModule`, so the tag is what keeps direct chaining same-tier-only.
+    /// See [`Self::chain_map_for`].
     #[doc(hidden)]
-    pub chain_ids: ConcurrentHashMap<u64, cranelift_module::FuncId>,
+    pub chain_ids: ConcurrentHashMap<u64, ChainTarget>,
     /// Guest page keys covered by Ready blocks (SMC tracking).
     #[doc(hidden)]
     pub code_pages: Mutex<HashMap<u64, u32>>,
@@ -335,6 +339,10 @@ pub struct JitShared {
     /// item). Backpressure signal: a deep queue raises the local promotion
     /// threshold instead of feeding a backlog guests will time out on.
     pub bg_queue_depth: AtomicU64,
+    /// Per-VA opt-level decisions + the run's tier-up budget. One decision per
+    /// VA, taken before the single compile it governs, so nothing is ever
+    /// recompiled at a different level. See [`super::tier`].
+    pub(super) tier_plan: Mutex<TierPlan>,
     /// Retired guest instructions (jit + iced) for boot-mode gating.
     pub(super) guest_insns: AtomicU64,
     /// Boot inline token bucket: `(window_start, used_in_window)` for the
@@ -379,6 +387,16 @@ impl JitShared {
             }
         };
         let engine_ready = has_engine.is_some();
+        // Tiering is armed only if a tier-up module was actually built (knob
+        // on, budget non-zero, and the two opt levels differ). Disarmed, every
+        // decision resolves to `Base` and the JIT behaves exactly as it did
+        // before tiering existed.
+        let tier_plan = TierPlan::new(
+            has_engine
+                .as_ref()
+                .is_some_and(super::engine::JitEngine::has_tier_module),
+            JitConfig::get().tier_budget(),
+        );
         Self {
             engine: Mutex::new(has_engine),
             mem: RwLock::new(GuestMemory::new()),
@@ -401,6 +419,7 @@ impl JitShared {
             bg_fast_api: Mutex::new(Arc::from(Vec::new())),
             bg_compile: BgCompileProfile::default(),
             bg_queue_depth: AtomicU64::new(0),
+            tier_plan: Mutex::new(tier_plan),
             guest_insns: AtomicU64::new(0),
             boot_inline_window: Mutex::new((Instant::now(), 0)),
             persist: Arc::new(PersistentJitCache::new()),
@@ -565,7 +584,13 @@ impl JitShared {
         if JitConfig::get().chain_enabled() {
             let fid = compiled.func_id;
             if let Some(fid) = fid {
-                self.chain_ids.pin().insert(rip, fid);
+                self.chain_ids.pin().insert(
+                    rip,
+                    ChainTarget {
+                        func_id: fid,
+                        tier: compiled.tier,
+                    },
+                );
             }
             // Inline installs are visible to other threads' delta-resyncs too.
             self.recent_installs.lock().unwrap().push(rip);
@@ -751,6 +776,11 @@ impl JitShared {
     /// before the caller decoded the guest bytes: baking an older-or-equal
     /// generation guarantees a guard mismatch whenever the baked bytes went
     /// stale (never bakes a newer gen over pre-invalidation bytes).
+    ///
+    /// This is also where the block's opt-level tier is decided — once per
+    /// VA, before the one compile it governs (see [`TierPlan`]). A tier
+    /// compile the verifier rejects is retried once at the base level and the
+    /// decision is downgraded permanently.
     pub(super) fn compile_from_kind_shared(
         &self,
         fast_api: &[(u64, FastApiKind)],
@@ -771,6 +801,10 @@ impl JitShared {
                     return Some(CompiledBlock {
                         func: micro.func(),
                         func_id: None,
+                        // Hand-written code belongs to no Cranelift module, so it
+                        // carries no opt level: `Base` is the honest tag, and it
+                        // keeps the ledger record on the base file.
+                        tier: OptTier::Base,
                         insn_count: micro.insn_count(),
                         guest_start: rip,
                         guest_end,
@@ -791,56 +825,141 @@ impl JitShared {
                     _ => None,
                 };
                 let chain_on = JitConfig::get().chain_enabled();
-                // Snapshot the chain-id table for this compile (pin guard must
-                // not outlive the snapshot — the engine lock and `compile_block`
-                // run after it drops).
-                let chain_map: HashMap<u64, cranelift_module::FuncId> = if chain_on {
-                    let guard = self.chain_ids.pin();
-                    guard.iter().map(|(&va, &fid)| (va, fid)).collect()
-                } else {
-                    HashMap::new()
-                };
+                // Tier decision: pre-compile, from block shape, memoised per VA.
+                let mut tier = self.decide_tier(rip, block::term_is_self_loop(term.as_ref(), rip));
                 let mut eng_guard = self.engine.lock().unwrap();
-                let eng = eng_guard.as_mut()?;
-                match compile_block(
-                    eng, rip, &insns, end_rip, term, call_fast, &chain_map, bytes_len, inv_gen,
-                ) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        // Verifier/codegen rejection: the block's IR failed a
-                        // lowering or verification pass. Surface it loudly,
-                        // then fall back to interpretation for this block.
-                        // Rate-limited: first REJECT_WARN_MAX rejections at
-                        // WARN (unique enough to triage), the tail at DEBUG.
-                        let n = REJECTION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let msg_args = (format_args!("{rip:#x}"), bytes_len, n + 1, e.to_string());
-                        if n < REJECT_WARN_MAX {
-                            tracing::warn!(
-                                rip = format_args!("{}", msg_args.0),
-                                bytes_len = msg_args.1,
-                                rejection_seq = msg_args.2,
-                                error = %msg_args.3,
-                                "jit compile rejected by verifier/codegen — \
-                                 block falls back to the interpreter"
-                            );
-                        } else {
-                            tracing::debug!(
-                                rip = format_args!("{}", msg_args.0),
-                                bytes_len = msg_args.1,
-                                rejection_seq = msg_args.2,
-                                error = %msg_args.3,
-                                "jit compile rejected by verifier/codegen — \
-                                 block falls back to the interpreter"
-                            );
+                loop {
+                    // Chain-id snapshot for THIS module only (pin guard must not
+                    // outlive the snapshot — the engine lock and `compile_block`
+                    // run after it drops).
+                    let chain_map: HashMap<u64, cranelift_module::FuncId> = if chain_on {
+                        self.chain_map_for(tier)
+                    } else {
+                        HashMap::new()
+                    };
+                    let outcome =
+                        eng_guard
+                            .as_mut()
+                            .and_then(|eng| eng.module_for(tier))
+                            .map(|module| {
+                                compile_block(
+                                    module, rip, &insns, end_rip, term, call_fast, &chain_map,
+                                    bytes_len, inv_gen, tier,
+                                )
+                            });
+                    let Some(outcome) = outcome else {
+                        // No module for this tier (unreachable: a Speed decision
+                        // implies a tier module). Never silently retarget.
+                        tracing::warn!(
+                            rip = format_args!("{rip:#x}"),
+                            "jit tier module missing for a tier-up decision — \
+                             block falls back to the interpreter"
+                        );
+                        return None;
+                    };
+                    match outcome {
+                        Ok(c) => {
+                            if tier == OptTier::Speed {
+                                // File the ledger record under the tier key.
+                                self.persist.mark_tiered(rip);
+                            }
+                            return Some(c);
                         }
-                        use cranelift_module::Module;
-                        eng.module.clear_context(&mut eng.ctx);
-                        None
+                        Err(e) => {
+                            // Verifier/codegen rejection: the block's IR failed a
+                            // lowering or verification pass. Surface it loudly,
+                            // then fall back to interpretation for this block.
+                            // Rate-limited: first REJECT_WARN_MAX rejections at
+                            // WARN (unique enough to triage), the tail at DEBUG.
+                            let n =
+                                REJECTION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let msg_args =
+                                (format_args!("{rip:#x}"), bytes_len, n + 1, e.to_string());
+                            if n < REJECT_WARN_MAX {
+                                tracing::warn!(
+                                    rip = format_args!("{}", msg_args.0),
+                                    bytes_len = msg_args.1,
+                                    rejection_seq = msg_args.2,
+                                    error = %msg_args.3,
+                                    "jit compile rejected by verifier/codegen — \
+                                     block falls back to the interpreter"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    rip = format_args!("{}", msg_args.0),
+                                    bytes_len = msg_args.1,
+                                    rejection_seq = msg_args.2,
+                                    error = %msg_args.3,
+                                    "jit compile rejected by verifier/codegen — \
+                                     block falls back to the interpreter"
+                                );
+                            }
+                            use cranelift_module::Module;
+                            if let Some(eng) = eng_guard.as_mut()
+                                && let Some(module) = eng.module_for(tier)
+                            {
+                                module.module.clear_context(&mut module.ctx);
+                            }
+                            if tier == OptTier::Speed {
+                                // `speed` code the verifier rejects is not
+                                // evidence the base level will accept, but the
+                                // base level is what the guest ran before tiering
+                                // existed: retry there once, and remember the
+                                // downgrade so no later compile of this VA tries
+                                // the tier again.
+                                if self.tier_downgrade_after_reject(rip) {
+                                    tier = OptTier::Base;
+                                    continue;
+                                }
+                            }
+                            return None;
+                        }
                     }
                 }
             }
             BlockKind::NotPure => None,
         }
+    }
+
+    /// The tier `rip` compiles at: one memoised decision per VA, taken before
+    /// the single compile it governs (so no block is ever compiled twice at two
+    /// levels) and charged against the run's tier-up budget at decision time.
+    pub(super) fn decide_tier(&self, rip: u64, is_self_loop: bool) -> OptTier {
+        let mut plan = self.tier_plan.lock().unwrap_or_else(|e| e.into_inner());
+        plan.decide(rip, is_self_loop)
+    }
+
+    /// Record a rejected tier compile; see [`TierPlan::downgrade_after_reject`].
+    fn tier_downgrade_after_reject(&self, rip: u64) -> bool {
+        let mut plan = self.tier_plan.lock().unwrap_or_else(|e| e.into_inner());
+        plan.downgrade_after_reject(rip)
+    }
+
+    /// Tier-up ledger for the profile report (see [`JitCpu::stats`](super::JitCpu::stats)).
+    pub(super) fn tier_counters(&self) -> TierCounters {
+        self.tier_plan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .counters()
+    }
+
+    /// Direct-chaining `FuncId` snapshot for a compile running in `tier`'s
+    /// module — **SAME-TIER ONLY**, and the single place that decides it.
+    ///
+    /// `Module::declare_func_in_func` indexes the *declaring* module's own
+    /// `compiled_functions`, so an id from the other tier's module would either
+    /// panic or silently name a different function and emit a call to the wrong
+    /// address. A cross-tier successor is therefore never offered to it: the
+    /// edge falls back to the late-bound chain-table hop or the dispatcher,
+    /// both of which were already the supported fallback paths and are covered
+    /// by the chaining / edge-IC / dispatcher tests.
+    pub(super) fn chain_map_for(&self, tier: OptTier) -> HashMap<u64, cranelift_module::FuncId> {
+        let guard = self.chain_ids.pin();
+        guard
+            .iter()
+            .filter(|(_, t)| t.tier == tier)
+            .map(|(&va, t)| (va, t.func_id))
+            .collect()
     }
 
     /// Worker-side install of a successfully compiled block: cache + chaining +
@@ -860,7 +979,13 @@ impl JitShared {
             if JitConfig::get().chain_enabled()
                 && let Some(fid) = compiled.func_id
             {
-                self.chain_ids.pin().insert(rip, fid);
+                self.chain_ids.pin().insert(
+                    rip,
+                    ChainTarget {
+                        func_id: fid,
+                        tier: compiled.tier,
+                    },
+                );
             }
             self.code_pages_add_range(compiled.guest_start, compiled.guest_end);
             cache.insert(rip, CacheEntry::Ready(compiled));
