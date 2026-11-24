@@ -8,10 +8,11 @@ use super::flags::{
     lower_inc_dec_lazy, lower_neg_lazy, lower_not, pack_state, replace_flag, select_flag,
 };
 use super::gpr::{
-    Arith, lower_arith, lower_arith_lazy, lower_bit_test_op, lower_bsf, lower_bsr, lower_bswap,
-    lower_cbw, lower_cmp_test_lazy, lower_cmpxchg, lower_cqto, lower_cwd, lower_cwde_cdqe,
-    lower_div, lower_imul, lower_lea, lower_leave, lower_lzcnt, lower_mov, lower_movx, lower_pop,
-    lower_popfq, lower_push, lower_pushfq, lower_xadd, lower_xchg, sext_to_i64,
+    Arith, flags_adc, flags_sbb, lower_arith_carry_lazy, lower_arith_lazy, lower_bit_test_op,
+    lower_bsf, lower_bsr, lower_bswap, lower_cbw, lower_cmp_test_lazy, lower_cmpxchg, lower_cqto,
+    lower_cwd, lower_cwde_cdqe, lower_div, lower_imul, lower_lea, lower_leave, lower_lzcnt,
+    lower_mov, lower_movx, lower_pop, lower_popfq, lower_push, lower_pushfq, lower_xadd,
+    lower_xchg, sext_to_i64,
 };
 use super::sse::{
     lower_sse_int_binop, lower_sse_mov, lower_sse_movd, lower_sse_movhlps, lower_sse_movhps,
@@ -62,6 +63,26 @@ pub(super) enum PendingFlags {
         bits: u32,
     },
     Logic {
+        res: Value,
+        bits: u32,
+    },
+    /// ADC: `res = a + b + cf`. Deferred like every other writer — the chain's
+    /// next link reads CF from the predicate ([`pending_cf`]), not from the
+    /// word, so an `adc` chain never packs one.
+    Adc {
+        a: Value,
+        b: Value,
+        /// Carry-in, as a **widened I64 0/1 lane** (`select_flag`), never an i1:
+        /// `assign_adc` adds it to an operand.
+        cf: Value,
+        res: Value,
+        bits: u32,
+    },
+    /// SBB: `res = a - b - cf`.
+    Sbb {
+        a: Value,
+        b: Value,
+        cf: Value,
         res: Value,
         bits: u32,
     },
@@ -152,6 +173,38 @@ pub(super) fn flush_pending_impl(
                 }
             } else {
                 *rflags = flags_logic(bcx, *rflags, res, bits);
+            }
+        }
+        PendingFlags::Adc {
+            a,
+            b,
+            cf,
+            res,
+            bits,
+        } => {
+            if let Some(fs) = flag_state {
+                fs.assign_adc(bcx, a, b, cf, res, bits);
+                if materialize {
+                    *rflags = pack_state(bcx, fs);
+                }
+            } else {
+                *rflags = flags_adc(bcx, *rflags, a, b, cf, res, bits);
+            }
+        }
+        PendingFlags::Sbb {
+            a,
+            b,
+            cf,
+            res,
+            bits,
+        } => {
+            if let Some(fs) = flag_state {
+                fs.assign_sbb(bcx, a, b, cf, res, bits);
+                if materialize {
+                    *rflags = pack_state(bcx, fs);
+                }
+            } else {
+                *rflags = flags_sbb(bcx, *rflags, a, b, cf, res, bits);
             }
         }
         PendingFlags::Inc { a, res, bits } => {
@@ -474,25 +527,28 @@ pub(super) fn lower_insn(
         Mnemonic::Or => lower_arith_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, Arith::Or),
         Mnemonic::Cmp => lower_cmp_test_lazy(bcx, instr, gpr, rflags, pending, mem, true),
         Mnemonic::Test => lower_cmp_test_lazy(bcx, instr, gpr, rflags, pending, mem, false),
-        // Need live CF / complex flags → flush then eager.
-        Mnemonic::Adc | Mnemonic::Sbb => {
-            flush_pending(bcx, rflags, pending, flag_state);
-            lower_arith(
-                bcx,
-                instr,
-                gpr,
-                dirty,
-                rflags,
-                flag_state.as_mut(),
-                mem,
-                if instr.mnemonic() == Mnemonic::Adc {
-                    Arith::Adc
-                } else {
-                    Arith::Sbb
-                },
-            )?;
-            Ok(())
-        }
+        // ADC/SBB read one bit of the previous writer (CF) and overwrite the
+        // other five, so they are a *lazy* reader and a *lazy* writer both: the
+        // carry comes from the pending predicate, and the result's flags stay
+        // pending. This arm used to flush (applying six predicates to the SSA
+        // state, then packing the 20-instruction word) for a consumer that reads
+        // CF, then pack again for its own result — 2 x 14 instructions per
+        // `adc` on the block body, per iteration, in the measured hot block.
+        Mnemonic::Adc | Mnemonic::Sbb => lower_arith_carry_lazy(
+            bcx,
+            instr,
+            gpr,
+            dirty,
+            rflags,
+            pending,
+            flag_state,
+            mem,
+            if instr.mnemonic() == Mnemonic::Adc {
+                Arith::Adc
+            } else {
+                Arith::Sbb
+            },
+        ),
         // Inc/dec: lazy with CF preserved on flush (Intel: INC/DEC do not touch CF).
         Mnemonic::Inc => lower_inc_dec_lazy(
             bcx, instr, gpr, dirty, rflags, pending, flag_state, mem, true,

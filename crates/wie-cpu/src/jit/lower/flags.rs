@@ -4,7 +4,7 @@
 use super::emit::MemEnv;
 use super::err::LowerError;
 use super::gpr::{bool_to_i64, flag_set, op_width_bits, read_op_mem, sext_to_i64, write_op_mem};
-use super::insn::{PendingFlags, ShiftKind, flush_pending};
+use super::insn::{PendingFlags, ShiftKind, flush_pending, flush_pending_deferred};
 
 use crate::regs::Rflags;
 use cranelift::prelude::*;
@@ -340,21 +340,7 @@ impl FlagState {
         self.of = of_c;
         self.af = af_c;
         // Correct CF for carry-in: CF = d < s + cf (full width; s+cf may exceed).
-        let s_plus_cf = bcx.ins().iadd(s, cf);
-        let cf_b = if bits >= 64 {
-            // 64-bit: overflow of s+cf means always borrow; else d < s+cf.
-            let c_ov = bcx.ins().icmp(IntCC::UnsignedLessThan, s_plus_cf, s); // s+cf wrapped
-            let c_lt = bcx.ins().icmp(IntCC::UnsignedLessThan, d, s_plus_cf);
-            let c_ovi = bool_to_i64(bcx, c_ov);
-            let c_lti = bool_to_i64(bcx, c_lt);
-            let any = bcx.ins().bor(c_ovi, c_lti);
-            let zero = iconst_u64(bcx, 0);
-            bcx.ins().icmp(IntCC::NotEqual, any, zero)
-        } else {
-            // s/d masked to operand width; s+cf may be 2^bits — then CF always set.
-            bcx.ins().icmp(IntCC::UnsignedLessThan, d, s_plus_cf)
-        };
-        self.cf = cf_b;
+        self.cf = sbb_cf_preds(bcx, d, s, cf, bits);
         self.packed = None;
     }
 
@@ -391,25 +377,7 @@ impl FlagState {
         self.of = of_c;
         self.af = af_c;
         // Wide-add CF.
-        let cf_b = if bits >= 64 {
-            let sum_ds = bcx.ins().iadd(d, s);
-            let c1 = bcx.ins().icmp(IntCC::UnsignedLessThan, sum_ds, d);
-            let sum = bcx.ins().iadd(sum_ds, cf);
-            let c2 = bcx.ins().icmp(IntCC::UnsignedLessThan, sum, sum_ds);
-            let c1i = bool_to_i64(bcx, c1);
-            let c2i = bool_to_i64(bcx, c2);
-            let any = bcx.ins().bor(c1i, c2i);
-            let zero = iconst_u64(bcx, 0);
-            bcx.ins().icmp(IntCC::NotEqual, any, zero)
-        } else {
-            let t = bcx.ins().iadd(d, s);
-            let sum = bcx.ins().iadd(t, cf);
-            let sh = iconst_u64(bcx, u64::from(bits));
-            let shifted = bcx.ins().ushr(sum, sh);
-            let zero = iconst_u64(bcx, 0);
-            bcx.ins().icmp(IntCC::NotEqual, shifted, zero)
-        };
-        self.cf = cf_b;
+        self.cf = adc_cf_preds(bcx, d, s, cf, bits);
         self.packed = None;
     }
 
@@ -544,6 +512,173 @@ impl FlagState {
         f = bcx.ins().bor(f, of);
         let af = select_flag(bcx, self.af, Rflags::AF);
         bcx.ins().bor(f, af)
+    }
+}
+
+/// CF of a plain `add`/`sub`: the host's own carry flag where the operand
+/// width makes it free, the arithmetic predicate where it does not.
+///
+/// One implementation, used by both readers of a plain carry — the flag *writer*
+/// (`add_sub_preds`, through `overflow_preds`) and the carry-*in* reader
+/// ([`pending_cf`], for `adc`/`sbb` following a pending `add`/`sub`).
+pub(super) fn cf_preds(
+    bcx: &mut FunctionBuilder<'_>,
+    d: Value,
+    s: Value,
+    r: Value,
+    bits: u32,
+    sub: bool,
+) -> Value {
+    let (d, s) = match bits {
+        64 => (d, s),
+        32 => (
+            bcx.ins().ireduce(types::I32, d),
+            bcx.ins().ireduce(types::I32, s),
+        ),
+        // 8/16-bit: `overflow_op_small` is `uxt`+`add`+`cmp`+`cset`, worse than
+        // the arithmetic predicate, so narrow widths keep it. Same expression
+        // `add_sub_preds` uses for `PredSource::CarryIn`.
+        _ => {
+            return if sub {
+                bcx.ins().icmp(IntCC::UnsignedLessThan, d, s)
+            } else {
+                bcx.ins().icmp(IntCC::UnsignedLessThan, r, d)
+            };
+        }
+    };
+    cf_reduced(bcx, d, s, sub)
+}
+
+/// The carry half of [`cf_preds`], for operands **already at the comparison
+/// width**.
+///
+/// Separate from `cf_preds` because `overflow_preds` reduces its operands to I32
+/// before asking for CF and OF: an `ireduce` here would be an `ireduce.i32` of an
+/// `i32`, which the Cranelift verifier rejects outright — which is exactly how
+/// the first version of this refactor failed, on every block containing a `cmp`.
+fn cf_reduced(bcx: &mut FunctionBuilder<'_>, d: Value, s: Value, sub: bool) -> Value {
+    if sub {
+        bcx.ins().usub_overflow(d, s).1
+    } else {
+        bcx.ins().uadd_overflow(d, s).1
+    }
+}
+
+/// Carry out of `d + s + cf`, as an i1 — the CF an `adc` **writes**.
+///
+/// Shared by [`FlagState::assign_adc`] (the writer) and [`pending_cf`] (the
+/// reader for the next link of a chain), so a chain's carry-in is produced by
+/// exactly the expression that wrote the carry-out. Two implementations of this
+/// predicate that merely ought to agree is the shape that produces a
+/// across-the-chain bug nobody can find.
+pub(super) fn adc_cf_preds(
+    bcx: &mut FunctionBuilder<'_>,
+    d: Value,
+    s: Value,
+    cf: Value,
+    bits: u32,
+) -> Value {
+    if bits >= 64 {
+        let sum_ds = bcx.ins().iadd(d, s);
+        let c1 = bcx.ins().icmp(IntCC::UnsignedLessThan, sum_ds, d);
+        let sum = bcx.ins().iadd(sum_ds, cf);
+        let c2 = bcx.ins().icmp(IntCC::UnsignedLessThan, sum, sum_ds);
+        let c1i = bool_to_i64(bcx, c1);
+        let c2i = bool_to_i64(bcx, c2);
+        let any = bcx.ins().bor(c1i, c2i);
+        let zero = iconst_u64(bcx, 0);
+        bcx.ins().icmp(IntCC::NotEqual, any, zero)
+    } else {
+        let t = bcx.ins().iadd(d, s);
+        let sum = bcx.ins().iadd(t, cf);
+        let sh = iconst_u64(bcx, u64::from(bits));
+        let shifted = bcx.ins().ushr(sum, sh);
+        let zero = iconst_u64(bcx, 0);
+        bcx.ins().icmp(IntCC::NotEqual, shifted, zero)
+    }
+}
+
+/// Borrow out of `d - s - cf`, as an i1 — the CF an `sbb` **writes**.
+///
+/// Note this is *not* the borrow of `d - s`: with a carry-in the subtrahend is
+/// `s + cf`, which can exceed the operand width on its own (`s = 0xffff_ffff`,
+/// `cf = 1`), so the borrow has to be taken against the widened sum. That is why
+/// the shared form matters — the `sbb` chain's carry-in and carry-out are the
+/// same predicate evaluated at different links.
+pub(super) fn sbb_cf_preds(
+    bcx: &mut FunctionBuilder<'_>,
+    d: Value,
+    s: Value,
+    cf: Value,
+    bits: u32,
+) -> Value {
+    let s_plus_cf = bcx.ins().iadd(s, cf);
+    if bits >= 64 {
+        // 64-bit: overflow of s+cf means always borrow; else d < s+cf.
+        let c_ov = bcx.ins().icmp(IntCC::UnsignedLessThan, s_plus_cf, s); // s+cf wrapped
+        let c_lt = bcx.ins().icmp(IntCC::UnsignedLessThan, d, s_plus_cf);
+        let c_ovi = bool_to_i64(bcx, c_ov);
+        let c_lti = bool_to_i64(bcx, c_lt);
+        let any = bcx.ins().bor(c_ovi, c_lti);
+        let zero = iconst_u64(bcx, 0);
+        bcx.ins().icmp(IntCC::NotEqual, any, zero)
+    } else {
+        // s/d masked to operand width; s+cf may be 2^bits — then CF always set.
+        bcx.ins().icmp(IntCC::UnsignedLessThan, d, s_plus_cf)
+    }
+}
+
+/// The carry-in CF of `adc`/`sbb`, read from the **pending** flags when there
+/// are any, as a widened I64 0/1 lane (`select_flag`'s form, which is what
+/// `assign_adc`/`assign_sbb`/`flags_adc`/`flags_sbb` all take).
+///
+/// Why this exists: `adc`/`sbb` used to force a full `flush_pending` — apply the
+/// pending writer's six flag predicates *and* pack the 20-instruction carrier —
+/// purely to read one bit back out of the word it had just written. That is the
+/// eager pack the disassembly shows at `0x12e3a00bc` and `0x12e3a19c` in DOOM
+/// Retro's `adc` block (`mov x, #-0x8d6` + `and` + six `uxtb`/`orr` pairs), and
+/// it is paid on the block body, per iteration. Here the bit is read from the
+/// writer's own predicate: two or three instructions, no word, and — because
+/// `adc`/`sbb` define all six flags — none of the other five predicates that the
+/// flush computed for a consumer that never reads them.
+///
+/// Fidelity notes, since this is a guard-adjacent path:
+/// * `PendingFlags::None`, `Inc`, `Dec` → the [state](FlagState) is already the
+///   authority for CF (INC/DEC preserve it and flush before recording
+///   themselves), so this reads `fs.cf` exactly as the old flush-then-read did.
+/// * `Shift` → CF is the bit shifted out, which only `assign_shift` knows how to
+///   derive; it flushes the pending state **without packing** (`Shift` before an
+///   `adc` is rare enough that this is not worth a second implementation).
+/// * `fs == None` (the `WIE_JIT_SSA_FLAGS=0` path) → the word, exactly as before.
+pub(super) fn pending_cf(
+    bcx: &mut FunctionBuilder<'_>,
+    rflags: &mut Value,
+    pending: &mut PendingFlags,
+    flag_state: &mut Option<FlagState>,
+) -> Value {
+    let pred = match *pending {
+        PendingFlags::Add { a, b, res, bits } => cf_preds(bcx, a, b, res, bits, false),
+        PendingFlags::Sub { a, b, res, bits } => cf_preds(bcx, a, b, res, bits, true),
+        PendingFlags::Adc { a, b, cf, bits, .. } => adc_cf_preds(bcx, a, b, cf, bits),
+        PendingFlags::Sbb { a, b, cf, bits, .. } => sbb_cf_preds(bcx, a, b, cf, bits),
+        // CF = 0 for AND/OR/XOR/TEST, and `iconst(i1 0)` *is* that predicate.
+        PendingFlags::Logic { .. } => bcx.ins().iconst(types::I8, 0),
+        PendingFlags::None | PendingFlags::Inc { .. } | PendingFlags::Dec { .. } => {
+            return live_cf(bcx, flag_state.as_ref(), *rflags);
+        }
+        PendingFlags::Shift { .. } => {
+            flush_pending_deferred(bcx, rflags, pending, flag_state);
+            return live_cf(bcx, flag_state.as_ref(), *rflags);
+        }
+    };
+    select_flag(bcx, pred, Rflags::CF)
+}
+
+/// The CF the [state](FlagState) holds, as a widened 0/1 lane.
+fn live_cf(bcx: &mut FunctionBuilder<'_>, fs: Option<&FlagState>, rflags: Value) -> Value {
+    match fs {
+        Some(fs) => select_flag(bcx, fs.cf, Rflags::CF),
+        None => flag_bit(bcx, rflags, Rflags::CF),
     }
 }
 
@@ -730,11 +865,10 @@ fn overflow_preds(
         let f = bcx.ins().iconst(types::I8, 0);
         return Some((f, of));
     }
-    let cf = if sub {
-        bcx.ins().usub_overflow(d, s).1
-    } else {
-        bcx.ins().uadd_overflow(d, s).1
-    };
+    // `d`/`s` are already at the comparison width here, hence `cf_reduced`.
+    // Same expression `pending_cf` reads a pending ADD/SUB's carry with, so a
+    // chain's carry-in is the predicate its writer published, not a second one.
+    let cf = cf_reduced(bcx, d, s, sub);
     Some((cf, of))
 }
 

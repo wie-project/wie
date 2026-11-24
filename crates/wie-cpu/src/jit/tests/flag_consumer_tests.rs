@@ -722,3 +722,258 @@ fn a_fault_on_the_terminators_stack_access_reports_the_writers_flags() {
         );
     }
 }
+
+// --- adc/sbb: the carry-in is read from the pending predicate, not the word ---
+//
+// `adc`/`sbb` used to force a full `flush_pending`: apply the previous writer's
+// six flag predicates to the SSA state, pack the carrier (fourteen instructions),
+// read one bit back out of the word it had just written, then pack *again* for
+// its own result. Both packs sat on the block body. They now read CF from the
+// pending predicate (`flags::pending_cf`) and leave their own flags pending, so
+// nothing is packed between the links of a chain.
+//
+// The rows below are **chains** — writer, `adc`, `setc`, `sbb`, `setc` — because
+// the property that has to hold is not "the carry is right once" but "each
+// link's carry-in is the previous link's carry-out". `setc` writes no flags, so
+// it observes a link's carry-out without breaking the chain, and each link's
+// answer lands in a GPR where `assert_same_regs` sees it as a value, not just as
+// a compared RFLAGS.
+
+/// `adc esi, esi` — 11 /r, ModRM 0xF6 (mod 11, esi, esi).
+const ADC_ESI_ESI: [u8; 2] = [0x11, 0xF6];
+/// `sbb edi, edi` — 19 /r, ModRM 0xFF.
+const SBB_EDI_EDI: [u8; 2] = [0x19, 0xFF];
+/// `setc dl` — 0F 92 /0.
+const SETC_DL: [u8; 3] = [0x0F, 0x92, 0xC2];
+/// `setc cl` — 0F 92 /0.
+const SETC_CL: [u8; 3] = [0x0F, 0x92, 0xC1];
+
+/// `(name, writer)` — the flag writer whose **pending** state each link reads.
+///
+/// One row per `PendingFlags` variant a carry-in can meet: `Sub` (cmp), `Add`,
+/// `Logic` (CF = 0 by definition), `Inc` (preserves the incoming CF), and `Shift`
+/// (the one arm `pending_cf` cannot derive itself, so it flushes without
+/// packing). `edi`/`esi` cycle through [`LINK_OPERANDS`].
+const CARRY_WRITERS: [(&str, [u8; 2]); 5] = [
+    ("cmp (pending sub)", [0x39, 0xD8]),
+    ("add (pending add)", [0x01, 0xD8]),
+    ("and (pending logic)", [0x21, 0xD8]),
+    ("inc (preserves cf)", [0xFF, 0xC0]),
+    ("shl (pending shift)", [0xD1, 0xE0]),
+];
+
+/// `(esi, edi)` — the chain's own operands, chosen so the two observed
+/// carry-outs disagree: `adc esi,esi` carries out of `0x7fff_ffff`/`0xffff_ffff`
+/// and not out of `1`; `sbb edi,edi` borrows out of `0`.
+const LINK_OPERANDS: [(u64, u64); 3] = [(0x7fff_ffff, 0), (0xffff_ffff, 0xffff_ffff), (1, 1)];
+
+/// [`setup`], with the chain's operands in ESI/EDI and the two observation
+/// destinations cleared so `setc dl` / `setc cl` leave a readable 0/1.
+fn setup_chain(eax: u64, ebx: u64, esi: u64, edi: u64) -> impl Fn(&mut RegFile) + Copy {
+    move |r: &mut RegFile| {
+        setup(eax, ebx)(r);
+        r.set_gpr_public(6, esi);
+        r.set_gpr_public(7, edi);
+        r.set_gpr_public(1, 0);
+        r.set_gpr_public(2, 0);
+    }
+}
+
+/// Every pending writer's carry-in, through a two-link chain.
+///
+/// The writer defines the flags; `adc esi,esi` consumes its CF and produces a
+/// new one; `setc dl` pins that; `sbb edi,edi` consumes *that* CF (so the second
+/// link proves the first link's carry-out reached the pending state, not just a
+/// register); `setc cl` pins the borrow. RFLAGS at the stop is the second link's
+/// word, so the SBB flag set is compared too.
+#[test]
+fn adc_and_sbb_chain_each_links_carry_through_the_pending_state() {
+    for (writer_name, writer) in CARRY_WRITERS {
+        for (case, eax, ebx) in ARITH_CASES {
+            for (esi, edi) in LINK_OPERANDS {
+                let mut code = Vec::from(writer);
+                code.extend_from_slice(&ADC_ESI_ESI);
+                code.extend_from_slice(&SETC_DL);
+                code.extend_from_slice(&SBB_EDI_EDI);
+                code.extend_from_slice(&SETC_CL);
+                let (iced, jit) = simd_dual(&code, &[], setup_chain(eax, ebx, esi, edi));
+                assert_same_regs(
+                    &iced,
+                    &jit,
+                    &format!(
+                        "{writer_name} -> adc -> sbb chain, {case}, esi={esi:#x} edi={edi:#x}"
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// Two `adc` links with **nothing between them**.
+///
+/// The chain above puts a `setc` between the links, and a `setc` is a consumer:
+/// it flushes the pending state, so a second link that read CF from the state
+/// instead of from the pending predicate would still see the right bit. This row
+/// removes the consumer, which is the shape that decides whether the carry is
+/// read from the *predicate* or from the last materialised word. `adc edi,edi`
+/// takes the carry into its own result, so a wrong carry-in changes EDI, and
+/// `setc cl` still pins the second link's carry-out.
+#[test]
+fn adc_links_carry_into_each_other_with_no_consumer_between() {
+    for (writer_name, writer) in CARRY_WRITERS {
+        for (case, eax, ebx) in ARITH_CASES {
+            for (esi, edi) in LINK_OPERANDS {
+                let mut code = Vec::from(writer);
+                code.extend_from_slice(&ADC_ESI_ESI); // 11 F6
+                code.extend_from_slice(&[0x11, 0xFF]); // adc edi, edi
+                code.extend_from_slice(&SETC_CL);
+                let (iced, jit) = simd_dual(&code, &[], setup_chain(eax, ebx, esi, edi));
+                assert_same_regs(
+                    &iced,
+                    &jit,
+                    &format!(
+                        "{writer_name} -> adc -> adc (no consumer between), {case}, \
+                     esi={esi:#x} edi={edi:#x}"
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// A pending **logic** writer clears CF, whatever the block inherited.
+///
+/// AND/OR/XOR/TEST set CF = 0 unconditionally, and the incoming word here has
+/// CF = 1 — so a carry-in read from the state (the last materialised word, or
+/// the word the block was entered with) instead of from the logic writer's own
+/// predicate gets this row wrong. The chain's operands are chosen so a spurious
+/// carry changes the result *and* the carry-out.
+#[test]
+fn a_pending_logic_writer_clears_the_carry_a_chain_would_inherit() {
+    // and eax,ebx · adc esi,esi · setc dl · adc edi,edi · setc cl
+    let writers: [(&str, [u8; 2]); 3] = [
+        ("and", [0x21, 0xD8]),
+        ("or", [0x09, 0xD8]),
+        ("xor", [0x31, 0xD8]),
+    ];
+    for (name, writer) in writers {
+        for (esi, edi) in LINK_OPERANDS {
+            for (flags_name, flags) in [("cf clear", LOOP_FLAGS[0]), ("cf set", LOOP_FLAGS[1])] {
+                let mut code = Vec::from(writer);
+                code.extend_from_slice(&ADC_ESI_ESI);
+                code.extend_from_slice(&SETC_DL);
+                code.extend_from_slice(&[0x11, 0xFF]); // adc edi,edi
+                code.extend_from_slice(&SETC_CL);
+                let setup = move |r: &mut RegFile| {
+                    setup_chain(0xffff_ffff, 1, esi, edi)(r);
+                    r.rflags = Rflags::from(flags);
+                };
+                let (iced, jit) = simd_dual(&code, &[], setup);
+                assert_same_regs(
+                    &iced,
+                    &jit,
+                    &format!(
+                        "pending {name} with incoming {flags_name}, esi={esi:#x} edi={edi:#x}"
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// The incoming CF through a chain that **preserves** it: `stc`-driven rows.
+///
+/// `inc`/`dec` and a zero-count shift define five flags and preserve CF, so their
+/// carry-in to an `adc` is whatever the block inherited. Driven from RFLAGS
+/// rather than from an instruction, because no instruction in the fixture sets CF
+/// to a value the row can choose — and the two rows must differ in CF, or a
+/// reader that dropped CF entirely would pass.
+#[test]
+fn adc_after_inc_reads_the_cf_the_block_inherited() {
+    for (flags_name, flags) in [("cf clear", LOOP_FLAGS[0]), ("cf set", LOOP_FLAGS[1])] {
+        for (esi, _) in LINK_OPERANDS {
+            // inc eax · adc esi,esi · setc dl
+            let code = [0xFF, 0xC0, 0x11, 0xF6, 0x0F, 0x92, 0xC2];
+            let setup = move |r: &mut RegFile| {
+                setup_chain(0xffff_ffff, 0, esi, 0)(r);
+                r.rflags = Rflags::from(flags);
+            };
+            let (iced, jit) = simd_dual(&code, &[], setup);
+            assert_same_regs(
+                &iced,
+                &jit,
+                &format!("inc preserving {flags_name}, then adc, esi={esi:#x}"),
+            );
+        }
+    }
+}
+
+/// `sbb`'s OF is the overflow of `d - s - cf`, **not** of `d - s`.
+///
+/// `d = 0, s = 0x8000_0000, cf = 1` is the discriminating row: `d - s` overflows
+/// (subtracting the most negative value from zero), `d - s - 1 = 0x7fff_ffff`
+/// does not. A lowering that derived OF from the plain subtraction — the
+/// `PredSource::Plain` form, which is right for `sub` — sets OF for this row and
+/// every `jo`/`cmovno` after it goes the wrong way. `seto cl` makes OF a value;
+/// RFLAGS at the stop compares the rest of the byte.
+#[test]
+fn sbb_of_is_the_overflow_of_the_borrow_not_of_the_sub() {
+    // `stc` is not lowered, so CF is set the way a guest would have to if it
+    // wanted a carry without a writer: shift one out.
+    // mov eax,1 · shr eax,1 (CF=1, eax=0) · mov ebx,0x8000_0000 · sbb eax,ebx · seto cl
+    let code = [
+        0xB8, 0x01, 0x00, 0x00, 0x00, 0xD1, 0xE8, 0xBB, 0x00, 0x00, 0x00, 0x80, 0x19, 0xD8, 0x0F,
+        0x90, 0xC1,
+    ];
+    let setup = |r: &mut RegFile| {
+        setup(0, 0)(r);
+        r.set_gpr_public(1, 0);
+    };
+    let (iced, jit) = simd_dual(&code, &[], setup);
+    assert_same_regs(
+        &iced,
+        &jit,
+        "sbb32 OF with a carry-in, d=0 s=0x8000_0000 cf=1",
+    );
+
+    // The 64-bit form takes the two-half-add path for CF, and its own OF.
+    // mov rax,1 · shr rax,1 · mov rbx,0x8000_0000_0000_0000 · sbb rax,rbx · seto cl
+    let mut code64 = vec![0x48, 0xB8];
+    code64.extend_from_slice(&1_u64.to_le_bytes());
+    code64.extend_from_slice(&[0x48, 0xD1, 0xE8, 0x48, 0xBB]);
+    code64.extend_from_slice(&0x8000_0000_0000_0000_u64.to_le_bytes());
+    code64.extend_from_slice(&[0x48, 0x19, 0xD8, 0x0F, 0x90, 0xC1]);
+    let (iced, jit) = simd_dual(&code64, &[], setup);
+    assert_same_regs(
+        &iced,
+        &jit,
+        "sbb64 OF with a carry-in, d=0 s=0x8000_0000_0000_0000 cf=1",
+    );
+}
+
+/// A `pushfq` after a chain observes the packed word, so the deferred `adc`/`sbb`
+/// flags have to survive to the boundary that materialises them.
+///
+/// `add eax,ebx` · `adc ecx,ecx` · `pushfq` · `pop rdi`: the word is the `adc`'s
+/// (which defines all six bits), and it is built at `pushfq` from a state that
+/// was never packed on the way there.
+#[test]
+fn pushfq_after_an_adc_chain_reads_the_chains_word() {
+    for (case, eax, ebx) in ARITH_CASES {
+        for ecx in [0, 0xffff_ffff, 0x7fff_ffff] {
+            // add eax,ebx · adc ecx,ecx · pushfq · pop rdi
+            let code = [0x01, 0xD8, 0x11, 0xC9, 0x9C, 0x5F];
+            let setup = move |r: &mut RegFile| {
+                setup(eax, ebx)(r);
+                r.set_gpr_public(1, ecx);
+                r.set_gpr_public(4, TEST_STACK);
+            };
+            let (iced, jit) = simd_dual(&code, &[], setup);
+            assert_same_regs(
+                &iced,
+                &jit,
+                &format!("pushfq after add->adc, {case}, ecx={ecx:#x}"),
+            );
+        }
+    }
+}

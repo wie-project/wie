@@ -7,8 +7,8 @@
 use super::OFF_GS_BASE;
 use super::emit::MemEnv;
 use super::flags::{
-    FlagState, clear_flags, flag_bit, flags_add, flags_logic, flags_sub, iconst_u64, mask_width,
-    pack_state, replace_flag, select_flag,
+    FlagState, clear_flags, flags_add, flags_sub, iconst_u64, mask_width, pending_cf, replace_flag,
+    select_flag,
 };
 use super::insn::PendingFlags;
 use super::mem::{call_load, call_store};
@@ -767,70 +767,78 @@ pub(super) fn lower_cmp_test_lazy(
     Ok(())
 }
 
-/// Eager ALU (adc/sbb): needs live CF from flushed flags.
+/// ADC/SBB: the carry-in read from the **pending** flags, the result written
+/// now, the flags deferred like every other writer.
+///
+/// This replaces the eager pair `flush_pending` + `lower_arith`. Between them,
+/// an `adc` in a chain paid: the pending writer's six flag predicates, a
+/// 20-instruction pack of the carrier (`mov x, #-0x8d6`, `and`, six
+/// `uxtb`/`orr`), then the `adc`'s own six predicates and a *second* pack. Of
+/// all that, the next link of the chain reads **one bit**: CF. Four of the six
+/// flags the flush computes are dead by construction, because `adc`/`sbb` define
+/// all six — nothing between the previous writer and this instruction can
+/// observe the other five.
+///
+/// So: read CF from the pending predicate ([`pending_cf`]), write the result,
+/// and leave the new flags pending. A chain of `adc`s now costs one CF predicate
+/// per link and packs once, at the block edge, where the word is observed.
+///
+/// Fidelity: the flags this instruction *produces* are assigned by
+/// `assign_adc`/`assign_sbb` at flush time, from the same operands and the same
+/// carry-in lane as before — the `PredSource::CarryIn` distinction (`sbb`'s OF
+/// is the OF of `d - s - cf`, which is not the OF of `d - s`) is untouched,
+/// because the assignment is untouched.
 // The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn lower_arith(
+pub(super) fn lower_arith_carry_lazy(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
     rflags: &mut Value,
-    flag_state: Option<&mut FlagState>,
+    pending: &mut PendingFlags,
+    flag_state: &mut Option<FlagState>,
     mem: &mut MemEnv,
     op: Arith,
 ) -> Result<(), LowerError> {
     let bits = op_width_bits(instr, 0)?;
+    // Before the operand reads: a `Shift` pending state flushes here (without
+    // packing), and the fault edge of a memory operand should see the word from
+    // after that.
+    let cf_val = pending_cf(bcx, rflags, pending, flag_state);
     let a_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
     let b_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
     let a = mask_width(bcx, a_raw, bits);
     let b = mask_width(bcx, b_raw, bits);
-    // Carry-in CF bit value (I64 0/1): live fs.cf (i1) widened, else packed read.
-    let cf_val = if let Some(fs) = flag_state.as_deref() {
-        select_flag(bcx, fs.cf, Rflags::CF)
-    } else {
-        flag_bit(bcx, *rflags, Rflags::CF)
-    };
     let res = match op {
-        Arith::Add => bcx.ins().iadd(a, b),
         Arith::Adc => {
             let t = bcx.ins().iadd(a, b);
             bcx.ins().iadd(t, cf_val)
         }
-        Arith::Sub => bcx.ins().isub(a, b),
         Arith::Sbb => {
             let t = bcx.ins().isub(a, b);
             bcx.ins().isub(t, cf_val)
         }
-        Arith::Xor => bcx.ins().bxor(a, b),
-        Arith::And => bcx.ins().band(a, b),
-        Arith::Or => bcx.ins().bor(a, b),
+        _ => return Err(LowerError::form("carry_lazy_arith_op")),
     };
     let res_m = mask_width(bcx, res, bits);
     write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, res_m, bits)?;
-    match flag_state {
-        // Predicate-direct: write fs i1s once, pack the carrier from fields so
-        // the caller and later packed-boundary reads see the fresh word.
-        Some(fs) => {
-            match op {
-                Arith::Xor | Arith::And | Arith::Or => fs.assign_logic(bcx, res_m, bits),
-                Arith::Add => fs.assign_arith(bcx, a, b, res_m, bits, false, false),
-                Arith::Adc => fs.assign_adc(bcx, a, b, cf_val, res_m, bits),
-                Arith::Sub => fs.assign_arith(bcx, a, b, res_m, bits, true, false),
-                Arith::Sbb => fs.assign_sbb(bcx, a, b, cf_val, res_m, bits),
-            }
-            *rflags = pack_state(bcx, fs);
-        }
-        None => {
-            *rflags = match op {
-                Arith::Xor | Arith::And | Arith::Or => flags_logic(bcx, *rflags, res_m, bits),
-                Arith::Add => flags_add(bcx, *rflags, a, b, res_m, bits),
-                Arith::Adc => flags_adc(bcx, *rflags, a, b, cf_val, res_m, bits),
-                Arith::Sub => flags_sub(bcx, *rflags, a, b, res_m, bits),
-                Arith::Sbb => flags_sbb(bcx, *rflags, a, b, cf_val, res_m, bits),
-            };
-        }
-    }
+    *pending = match op {
+        Arith::Adc => PendingFlags::Adc {
+            a,
+            b,
+            cf: cf_val,
+            res: res_m,
+            bits,
+        },
+        _ => PendingFlags::Sbb {
+            a,
+            b,
+            cf: cf_val,
+            res: res_m,
+            bits,
+        },
+    };
     Ok(())
 }
 
