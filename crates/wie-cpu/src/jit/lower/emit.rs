@@ -1,7 +1,7 @@
 //! Block emission: `emit_body_and_term`, the block-wide stack guard, and the
 //! terminator helpers (chaining, self-loops, fast UCRT inline ops).
 
-use super::analysis::{ensure_gprs_loaded, ensure_xmm_loaded};
+use super::analysis::{ensure_gprs_loaded, ensure_xmm_loaded, entry_decode_needed};
 use super::flags::{FlagState, decompose_packed, iconst_u64, pack_once, packed_word, resync_state};
 use super::gpr::mark_dirty;
 use super::insn::{
@@ -1082,7 +1082,18 @@ pub(super) fn emit_body_and_term(
     // once in the entry block, which is what keeps the bits `FlagState` does not
     // track (DF, IF, reserved) intact when an exit edge packs.
     let mut flag_state: Option<FlagState> = if ssa_flags && needs_flags {
-        Some(decompose_packed(bcx, *rflags_val))
+        // Six `band` + six `icmp` + six `iconst` — twenty host instructions, paid
+        // on every visit, and on a loop head that is every iteration. Decode only
+        // when something hot can observe an individual bit; otherwise carry the
+        // word, which makes every pack in this block the identity
+        // (`FlagState::carried`). The predicate is conservative — see
+        // `analysis::entry_decode_needed` for the shapes that keep the decode and
+        // why iced's own read/modify masks are not sufficient on their own.
+        if entry_decode_needed(body, term) {
+            Some(decompose_packed(bcx, *rflags_val))
+        } else {
+            Some(FlagState::carried(bcx, *rflags_val))
+        }
     } else {
         None
     };

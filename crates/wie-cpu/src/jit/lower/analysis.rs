@@ -259,6 +259,87 @@ pub(super) fn flags_live_in(insns: &[DecodedInsn]) -> bool {
     true
 }
 
+/// Whether this block needs the incoming RFLAGS **decoded** into per-flag i1s
+/// at entry, or can carry the word itself.
+///
+/// The entry decode is six `band` + six `icmp` + six `iconst` — twenty host
+/// instructions — and a loop head pays it on every iteration. In a loop whose
+/// only readers of the individual bits are the **cold** fault packs, that whole
+/// cone exists to be re-encoded: the fault pack masks the same word with
+/// `~CF|~PF|~AF|~ZF|~SF|~OF` and ORs the six bits back in, so decode-then-pack is
+/// an identity round trip that never changes a bit. Measured on `0x1800cef0b`
+/// (a ten-instruction dword-fill loop): 20 of 177 host instructions per
+/// iteration, 11.3 %, from a slot the loop never writes.
+///
+/// So the decode is gated. It is kept whenever anything *hot* can observe an
+/// individual bit **before this block writes all six of them**, and skipped
+/// otherwise; skipping leaves [`FlagState`] holding the carried word with its
+/// `packed` memo set, which makes an exit or fault pack the identity (see
+/// `FlagState::carried`).
+///
+/// # Why this is a scan and not a dataflow answer
+///
+/// The decoded instruction list is in hand before lowering begins, and the
+/// question — "is there a hot reader before the first writer that defines all
+/// six bits?" — has a conservative answer that needs no fixpoint: keep the
+/// decode unless *every* flag-touching instruction in the block is one whose
+/// lowering assigns all six fields from its own operands. Anything the scan does
+/// not recognise, and any writer that could carry an entry bit forward, keeps the
+/// decode.
+///
+/// # The shapes that keep it, and why each one has to
+///
+/// * `iced`'s `rflags_read()` is non-zero — `adc`/`sbb` (CF), `jcc`, `setcc`,
+///   `cmovcc`, `pushfq`, `lahf`, `rcl`/`rcr`, and the string ops.
+/// * A `jcc` terminator, which is not in the body list at all.
+/// * A writer that does **not** define all six *in this lowering*. iced is not a
+///   sufficient oracle here: it reports `and`/`or`/`xor`/`test` as modifying all
+///   six (AF is architecturally undefined, so iced says "modified"), while
+///   `assign_logic` deliberately leaves `af` untouched, so AF would reach a later
+///   pack from the entry state. Same for `shl` (our `assign_shift` keeps the old
+///   CF/OF/ZS/PF when `count % bits == 0`, and derives OF from the old value
+///   otherwise), for `imul`/`mul` (ZF/SF/AF/PF are kept), and for `inc`/`dec`
+///   (CF is kept — iced's modified mask 0x2f vs `add`'s 0x3f confirms).
+///
+/// The failure direction is deliberate: an unrecognised mnemonic keeps the
+/// decode. A missed optimisation costs twenty instructions per block visit; a
+/// wrongly skipped decode hands a fault, or a successor, a word with cleared flag
+/// bits.
+pub(super) fn entry_decode_needed(insns: &[DecodedInsn], term: Option<BlockTerm>) -> bool {
+    if matches!(term, Some(BlockTerm::Jcc { .. })) {
+        return true;
+    }
+    for d in insns {
+        if d.instr.rflags_read() != 0 {
+            return true;
+        }
+        if d.instr.rflags_modified() != 0 && !defines_all_six(d.instr.mnemonic()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Mnemonics whose lowering assigns **all six** architectural flag fields from
+/// the instruction's own operands, leaving nothing for a later pack to inherit
+/// from the entry state.
+///
+/// `assign_arith` covers `Add`/`Sub`/`Cmp`/`Neg` (neg is `0 - a` as a `Sub`) and
+/// `assign_adc`/`assign_sbb` cover the carry forms — but `adc`/`sbb` also *read*
+/// CF, so [`entry_decode_needed`] rejects them one clause earlier and they only
+/// appear here so the "which writer defines everything" question has one answer.
+fn defines_all_six(m: Mnemonic) -> bool {
+    matches!(
+        m,
+        Mnemonic::Add
+            | Mnemonic::Sub
+            | Mnemonic::Cmp
+            | Mnemonic::Neg
+            | Mnemonic::Adc
+            | Mnemonic::Sbb
+    )
+}
+
 pub(super) fn block_has_mem(insns: &[DecodedInsn]) -> bool {
     insns.iter().any(|d| {
         let m = d.instr.mnemonic();
@@ -442,5 +523,104 @@ mod flag_gate_tests {
             !block_needs_flags(&insns, None),
             "mov is not a flag instruction"
         );
+    }
+}
+
+// The entry-decode gate is a guard on a fault-visible value, so its table is
+// here rather than in the differential suite: the question "does this block need
+// the incoming word decoded" is answered from the decoded list alone, and each
+// row below is one shape whose answer has to stay on the conservative side.
+#[cfg(test)]
+mod entry_decode_tests {
+    use super::entry_decode_needed;
+    use crate::jit::block::{BlockTerm, DecodedInsn};
+    use iced_x86::{Decoder, DecoderOptions};
+
+    /// Decode `bytes` into the block shape the predicate sees.
+    fn block(bytes: &[u8]) -> Vec<DecodedInsn> {
+        let mut dec = Decoder::with_ip(64, bytes, 0x1000, DecoderOptions::NONE);
+        let mut out = Vec::new();
+        while dec.can_decode() {
+            let instr = dec.decode();
+            if instr.is_invalid() {
+                break;
+            }
+            out.push(DecodedInsn { instr });
+        }
+        out
+    }
+
+    fn jcc() -> Option<BlockTerm> {
+        Some(BlockTerm::Jcc {
+            mnemonic: iced_x86::Mnemonic::Jne,
+            taken: 0x1000,
+            not_taken: 0x1004,
+        })
+    }
+
+    /// `(name, bytes, terminator, decode needed)`.
+    ///
+    /// The `false` rows are the whole point: they are the shapes where nothing hot
+    /// can read a bit before a writer replaces all six, so the carried word makes
+    /// the packs identities. Every other row keeps the decode, including the ones
+    /// `iced` calls "modified" on all six but this lowering does not
+    /// (`and`/`or`/`xor`/`test` keep AF, `imul` keeps ZF/SF/AF/PF, `inc`/`dec`
+    /// keep CF, shifts keep several).
+    const ROWS: &[(&str, &[u8], bool, bool)] = &[
+        // --- skipped: nothing hot reads a bit, every writer defines all six ---
+        ("no flag insn at all", &[0x89, 0xD8], false, false), // mov eax,ebx
+        ("add only", &[0x01, 0xD8], false, false),
+        (
+            "add, sub, neg, cmp",
+            &[0x01, 0xD8, 0x29, 0xD8, 0xF7, 0xD8, 0x39, 0xD8],
+            false,
+            false,
+        ),
+        ("add then store", &[0x01, 0xD8, 0x89, 0x07], false, false),
+        // --- kept: a hot reader ---
+        ("add + jcc terminator", &[0x01, 0xD8], true, true),
+        ("mov + jcc terminator", &[0x89, 0xD8], true, true),
+        ("adc reads CF", &[0x11, 0xD8], false, true),
+        ("sbb reads CF", &[0x19, 0xD8], false, true),
+        ("pushfq reads the word", &[0x9C], false, true),
+        ("lahf reads the word", &[0x9F], false, true),
+        ("setb reads CF", &[0x0F, 0x92, 0xC1], false, true),
+        ("cmovb reads CF", &[0x0F, 0x42, 0xC1], false, true),
+        ("rcl reads CF", &[0xD1, 0xD0], false, true),
+        // --- kept: a writer that can carry an entry bit forward ---
+        ("inc preserves CF", &[0xFF, 0xC0], false, true),
+        ("dec preserves CF", &[0xFF, 0xC8], false, true),
+        ("and keeps AF in this lowering", &[0x21, 0xD8], false, true),
+        ("or keeps AF in this lowering", &[0x09, 0xD8], false, true),
+        ("xor keeps AF in this lowering", &[0x31, 0xD8], false, true),
+        ("test keeps AF in this lowering", &[0x85, 0xD8], false, true),
+        ("shl reads the old CF/OF/ZS", &[0xD1, 0xE0], false, true),
+        ("imul keeps ZF/SF/AF/PF", &[0x0F, 0xAF, 0xC3], false, true),
+        ("stosd (string op)", &[0xAB], false, true),
+        // --- kept: not recognised as a writer of all six, and the safe
+        // direction is to decode ---
+        (
+            "comiss writes the byte without being an assign_arith writer",
+            &[0x0F, 0x2F, 0xC1],
+            false,
+            true,
+        ),
+        ("bt writes CF only", &[0x0F, 0xA3, 0xD8], false, true),
+        // --- skipped: touches no flag at all ---
+        ("rdtsc touches no flag", &[0x0F, 0x31], false, false),
+    ];
+
+    #[test]
+    fn the_gate_keeps_the_decode_except_for_the_pure_writer_shapes() {
+        for (name, bytes, term, expected) in ROWS {
+            let insns = block(bytes);
+            assert!(!insns.is_empty(), "{name}: fixture did not decode");
+            let term = if *term { jcc() } else { None };
+            assert_eq!(
+                entry_decode_needed(&insns, term),
+                *expected,
+                "{name}: entry_decode_needed(term={term:?}) should be {expected}"
+            );
+        }
     }
 }

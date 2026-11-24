@@ -662,6 +662,31 @@ fn assert_fault_word(iced: Rflags, jit: Rflags, what: &str) {
     );
 }
 
+/// A fault **before** the block's first writer.
+///
+/// This is the shape the entry-decode gate creates: a block whose only flag
+/// writes are full writers (`add`) and which reads no individual bit keeps the
+/// incoming word *carried* rather than decoded, so at a fault nothing has been
+/// assigned to the state and the reported word has to be the carried word —
+/// bit for bit, including the DF/IF/reserved bits the lowering does not track. A
+/// state whose six fields are placeholders must therefore never be *packed*;
+/// only the memo of the word it came from may be handed out.
+///
+/// `mov ecx,[rbx]` faults before `add eax,edx` runs, and iced stops on it.
+#[test]
+fn a_fault_before_the_blocks_first_writer_reports_the_carried_word() {
+    // mov ecx,[rbx] · add eax,edx · ud2
+    let code = [0x8B, 0x0B, 0x01, 0xD0, 0x0F, 0x0B];
+    for (case, eax, edx) in ARITH_CASES {
+        let (iced, jit, _, _) = fault_dual(&code, eax, edx, 0, 0, case);
+        assert_fault_word(
+            iced,
+            jit,
+            &format!("fault before the block's first writer, {case}"),
+        );
+    }
+}
+
 /// A pending writer whose flags nothing in the block consumes: `add eax, edx`
 /// then a faulting `mov ecx, [rbx]`.
 #[test]

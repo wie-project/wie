@@ -236,6 +236,37 @@ pub(super) fn decompose_packed(bcx: &mut FunctionBuilder<'_>, rflags: Value) -> 
 }
 
 impl FlagState {
+    /// A state that **carries** the incoming word without decoding it.
+    ///
+    /// The fields are all false and are meant to be *unread*: the caller has
+    /// established ([`entry_decode_needed`](super::analysis::entry_decode_needed))
+    /// that nothing hot in this block observes an individual flag bit before a
+    /// writer defines all six. What matters is `packed`, which is set to the
+    /// carried word — so every pack in this block ([`pack_state`], [`pack_once`],
+    /// [`packed_word`]) is the identity on the word the block was entered with
+    /// instead of a six-bit re-encode of zeros. `old` is that same word, so a
+    /// *later* rebuild (a writer ran, clearing `packed`) still keeps DF, IF and
+    /// the reserved bit.
+    ///
+    /// This is the entry-side mirror of the cold-path fault pack: twenty
+    /// instructions of decode that exist to be re-encoded by a consumer that
+    /// already has the word are not worth emitting.
+    pub(super) fn carried(bcx: &mut FunctionBuilder<'_>, rflags: Value) -> Self {
+        // One `iconst` reused six times: `opt_level = none` would otherwise emit
+        // six materialisations for a value nothing should read.
+        let f = bcx.ins().iconst(types::I8, 0);
+        Self {
+            zf: f,
+            sf: f,
+            cf: f,
+            of: f,
+            pf: f,
+            af: f,
+            old: rflags,
+            packed: Some(rflags),
+        }
+    }
+
     /// Re-derive every per-flag i1 from a freshly written packed carrier.
     /// Call after each `*rflags` mutation so mid-instruction flag readers
     /// (INC/DEC CF-preserve, adc/sbb carry-in) see the current values.
@@ -695,7 +726,15 @@ pub(super) fn packed_word(
     rflags: Value,
 ) -> Value {
     match fs {
-        Some(fs) => fs.pack(bcx),
+        // The state's own memo first: a word these fields were just written as is
+        // still exact, and a state built by [`FlagState::carried`] has no fields
+        // to rebuild *from* — its whole point is that the word it carries is the
+        // word. Rebuilding there would pack six zeros over the live flag bits at
+        // a fault edge, which is the one place a wrong word is a wrong answer.
+        Some(fs) => match fs.packed {
+            Some(packed) => packed,
+            None => fs.pack(bcx),
+        },
         None => rflags,
     }
 }
