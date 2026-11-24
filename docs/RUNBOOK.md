@@ -120,7 +120,7 @@ The README keeps the shortlist; the complete set lives here.
 | `WIE_STRING_INLINE=0` | Disable inline 16–64 B REP Neon path |
 | `WIE_JIT_SIMD=0` | Scalar XMM lowering (no CLIF SIMD / Neon) |
 | `WIE_TLB_NEON=0` | Scalar 4-way TLB tag scan |
-| `WIE_JIT_OPT=speed\|speed_and_size\|none` | Cranelift opt_level (default **speed**) |
+| `WIE_JIT_OPT=none\|speed_and_size\|speed` | Cranelift opt_level (default **none**). Cheap compile by default: 7-Zip is ~1.5x faster cold / ~1.7x warm; a pure-compute loop (`long_loop`) pays ~38% until hot-block tier-up lands. Set `speed` for compute-bound guests. Also part of the persistent cache key, so the two never share a ledger. |
 | `WIE_JIT_HOTNESS_THRESHOLD` | **Experimental** fixed hotness threshold override (default **100**; clamped to `[1, 1_000_000]`) |
 | `WIE_JIT_WORKERS` | Background compile worker count (default ≈ `available_parallelism()/2`, clamped `[1, 4]`). More workers cut boot-time compile latency on multicore hosts; workers compete with guest threads for cores while active. |
 | `WIE_JIT_VERIFY=1` | Enable Cranelift IR verifier outside tests |
