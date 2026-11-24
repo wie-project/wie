@@ -17,6 +17,7 @@
 | [L1: persistent frame](l1-persistent-frame.md) | The landed L1 lever: one `JitCtx` per engine instead of a 3.7 KB struct copy per dispatcher entry — invariant, ABI rules, measurement |
 | [JIT code memory on Darwin](code-memory-on-darwin.md) | What the OS allows for code memory (no huge pages, no superpages, `MAP_JIT` vs entitlements), the measured per-block cost of the `mmap`/`mprotect`/`ic ivau` path, the `JITMemoryKind` non-re-export blocker, the measured code working set, and the L1I aliasing defect of page-aligned block starts |
 | [Dispatcher entry, attributed](dispatcher-entry-attribution.md) | What a dispatcher entry still costs, piece by piece, after L1 — and which pieces can and cannot be removed |
+| [Tier 0: a single-pass emitter](tier0-emitter.md) | The plan for the entry-arm emitter: what the census says it must cover (58 % ceiling without call terminators, memory operands first), the correctness plan, and the open questions — no codegen yet |
 
 ## Design Overview
 

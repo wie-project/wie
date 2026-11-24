@@ -209,7 +209,37 @@ paths.
   class is tracked and should carry the evidence first.
 - **Tier 0 (no-regalloc emitter)** — the top unbuilt lever (ceiling ≥1.4×,
   plausibly ~2× on `7za x`/`h`), and the prerequisite for doing decision 3
-  correctly. Constraints recorded in `performance-ceiling.md` §11.5.
+  correctly. Constraints recorded in `performance-ceiling.md` §11.5. It is also
+  where the *critical-path* compile time is: see §5.1 for the measurement that
+  makes it the next slice rather than a nice-to-have.
+- **Ahead-of-time region compilation at PE load** — modelled and refuted before
+  any code was written; the four numbers are in §5.1. Do not re-propose it
+  without a filter that predicts the executed loop set to within ~2×.
+
+  The honest counterweight, and the strongest number anyone has for the region
+  path: **`WIE_JIT_REGION=1` cuts `compile_us` 5–8× on a bounded DOOM Retro run
+  — 64.4 s and 95.2 s with regions off against 11.5 s and 12.1 s with them on**
+  (two 120 s reps per arm, `--max-api 400000000`, `WIE_RUNTIME_PROFILE=1`; 79
+  regions formed without `WIE_JIT_REGION_SELF_LOOP`, 244 with it). **Provenance:
+  a shared host at loadavg 18–27, so quote the ratio rather than the seconds, and
+  read it as a *compile-time* claim — not a frame claim.** The frame effect of
+  the region knob is still unestablished; this is what regions are *for* until a
+  quiet-host frame A/B says otherwise.
+
+  Census of the same entry arm, taken while scoping the tier-0 emitter, because
+  it bounds that work too (4 225 blocks reaching the synchronous compile, one
+  7.6 s run): the dominant blockers are **terminator shapes** — `term:call`
+  1 013, `term:ret` 556, `term:calldyn` 195, i.e. **42 %** of the entry arm — then
+  `Lea` 222, `Push` 158, `Movzx`/`Movsxd`/`Movsx` 121, `Shr` 44, `Movups` 20. **A
+  single-pass emitter therefore cannot cover more than ~58 % of the entry arm
+  unless it takes call terminators**, which is the fact that decides its shape.
+  The first version of that census reported `alu_only` = 8 of 4 225 and was
+  wrong: the classifier scanned the terminator as if it were a body instruction,
+  so **1 748 blocks (41 %) were rejected by their own `jcc`**. Corrected on the
+  same sample: **`alu_only` 1 083 (25.6 %), `with_mem` 690 (16.3 %)** — 42 % of the
+  entry arm already expressible, and the memory subset is the same order of
+  magnitude as the ALU one. The bug is recorded in
+  [`tier0-emitter.md`](tier0-emitter.md) §2.1 so nobody quotes the 0.2 %.
 - **OSR (on-stack replacement)** — a loop entered once runs forever without
   touching a visit counter, which is exactly the load-heavy shape this
   emulator must serve. The `is_loop` threshold fakes the *promotion* half but
@@ -221,6 +251,63 @@ paths.
   queue is FIFO within a lane and applies backpressure to the *newcomer*
   (defer promotion, doubling its threshold). An ordering by predicted payoff
   would be better and is a self-contained change to `BgPool`.
+
+### 5.1 AOT region compilation at PE load: modelled, then dropped
+
+The idea is attractive and wrong, so it is recorded rather than rediscovered: at
+PE load every byte of the image is known, so loop regions could be formed and
+compiled before the first hop instead of waiting for a latch to reveal them.
+Four numbers kill it, and only one of them is a timing.
+
+**1. The static loop set is ~30x the executed set.** DOOM Retro's images hold
+2.79 MB of `.text` (`doomretro.exe` 1 396 224 B, `SDL2.dll` 1 071 616 B,
+`SDL2_mixer.dll` 317 952 B, from their PE section headers). At ~65 B per decoded
+block that is ~43 000 static blocks; loops are roughly one block in five, so
+**L ≈ 8 000 candidates against E = 244 regions actually formed** in a 100 s run.
+
+**2. It costs ~10 s before the first guest instruction to buy ~0.38 s.** AOT is
+paid with the guest *not running*, so `L · c / w` is pure added latency rather
+than the overlapped work compile normally is: 8 000 x ~5 ms / 4 workers ≈ 10 s,
+against a benefit of `(E/L) · T` = (244/8 000) x 12.6 s ≈ 0.38 s. **~26x
+against.** Break-even needs `L` within ~2x of `E`, i.e. a predictor of "which
+loops run" that does not exist — the only oracle is running the guest, which is
+what the latch fold already uses and why it works.
+
+**3. "AOT got there first" has a 1.5-1.7 % ceiling.** Of a 120 s DOOM run, the
+guest-visible share of *all* background compilation is `bg_stalls` 1 242-1 426
+totalling **1.83-2.07 s**. That is the entire prize for arriving earlier.
+
+**4. There are no repersist cycles to save.** `WIE_JIT_CODE_CACHE` is **off by
+default for a correctness reason** (restoring persisted code replays host
+instructions captured by a previous process, so a bug in it executes the wrong
+thing rather than running slowly). In the shipping configuration the
+invalidation/repersist axis is zero by construction.
+
+The decomposition that reframes this is in §5.1's neighbours above: **64 % of
+compiles are already off the critical path** (9-10 k background compiles, 64-95 s
+of CPU, fully overlapped). The compile time that is *on* it is the eager arm —
+**4 854-4 930 blocks compiled synchronously on the guest thread**, which is a
+tier-0 question (§5), not an AOT one. Its cost depends on what else is on the
+host and that spread is large: **1.23 ms per compile** measured on a short run
+(`compile_us` 9.69 s over 7 854 compiles, guest exited after 7.6 s), against
+**4.6-6.8 ms** in the 120 s runs above where four workers compete with a guest
+retiring 18 G instructions. So the same 4 930 blocks are **6-25 s** of
+guest-thread serial time, not one number — an earlier draft of this section
+quoted 12.6 s from a 2.6 ms/block assumption and that was too narrow. AOT's
+formation-only variant is not free either: `region.rs` requires formation to run
+with the guest thread's `HookWindow` in hand so a region never covers an address
+the guest asked to stop at, and at PE load the hook set is not yet known, so a
+static region needs a hook-set generation in its key and invalidation when a hook
+lands inside its span — new correctness surface on the one path where a mistake
+is silent wrong code, for 0.3-0.6 s.
+
+**Host caveat, because the seconds are soft:** these runs were taken on a shared
+host at loadavg 18 (a game at 158 %, `XprotectService` at 147 %), where
+per-compile CPU measured 4.6-6.8 ms against the 2-4 ms recorded from quiet hosts.
+**The counts are the load-bearing part; the seconds are inflated ~2x and the
+ratios are what should be quoted.** The 12.6 s figure is the quiet-host
+derivation (4 854 x 2.6 ms), not a wall-clock observation, and is labelled as
+such wherever it is used.
 
 ## 6. How to change this policy safely
 
