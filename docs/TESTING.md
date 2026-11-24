@@ -16,6 +16,36 @@ it is.
 the whole workspace suite minus two slow groups (see below). If it is green,
 `scripts/check.sh` is what you actually need to pass.
 
+## Prerequisites — the guest fixtures must exist
+
+Both fixture trees are gitignored, so on a fresh clone **both steps are
+required** before `cargo nextest run` is meaningful:
+
+```sh
+make -C micro-exes            # micro guests → micro-exes/out/*.exe  (needs mingw-w64)
+./scripts/fetch.sh notepad    # real guest  → real_exes/notepad.exe  (RNotepad)
+```
+
+A missing guest PE is a **test failure, not a skip**
+(`crates/wie-runtime/tests/common/mod.rs`), for both trees. That is deliberate:
+a test that quietly returns `()` is recorded as a *pass*, and nextest only
+prints a failing test's captured stderr — so a skip notice is invisible in
+exactly the case it exists to report. 39 notepad-backed GUI tests once passed in
+0.02–0.08 s each having executed nothing; see
+[docs/testing-model.md](testing-model.md#real-guests-a-skip-that-reported-pass).
+
+```sh
+./scripts/fetch.sh --list     # 7za, 2048, notepad, doomretro
+```
+
+The one documented escape hatch is `WIE_ALLOW_MISSING_GUESTS=1`, which restores
+the old skip **for `micro-exes/out/` only** (for a developer without the
+mingw-w64 toolchain). It deliberately does not apply to `real_exes/`, and it must
+never be set in CI. CI does both fixture steps itself
+(`.github/workflows/ci.yml`: "Build guest fixtures", then "Fetch real guest
+fixtures"), so a red `missing guest fixture` message in CI means the toolchain
+or the fetch step, not the emulator.
+
 ## Lanes
 
 ### Fast lane (inner dev loop)
@@ -158,12 +188,13 @@ excludes exactly the binaries they match.
 
 ## The GUI suite runs one test at a time
 
-`crates/wie-runtime/tests/micro_gui_window` is 52 tests, of which **13
-actually execute** (the other 39 drive RNotepad from `real_exes/`, which is
-gitignored and absent on a clean CI runner, so they announce a skip and pass
-— see [docs/testing-model.md](testing-model.md)).
+`crates/wie-runtime/tests/micro_gui_window` is 52 tests, and **all 52
+execute** — 39 of them drive RNotepad from `real_exes/notepad.exe`, which
+`./scripts/fetch.sh notepad` produces and CI now fetches (before that, those 39
+skipped while reporting `PASS`; see
+[docs/testing-model.md](testing-model.md#real-guests-a-skip-that-reported-pass)).
 
-Those 13 are serialized by nextest, not by the test code:
+All 52 are serialized by nextest, not by the test code:
 
 ```toml
 [[profile.default.overrides]]

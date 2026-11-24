@@ -32,6 +32,9 @@ One-page playbook for regressions after the foundational work and the **great cl
 | Hang on Wait / CS under MT | See [`docs/architecture/runtime.md`](architecture/runtime.md) (threading model); `ExitProcess` wakes waiters; check peer never signals |
 | `CreateThread` fails | Unset `WIE_MT=0`; raise `WIE_MT_MAX_THREADS` (default 64) |
 | Interlocked wrong | Expect host atomics via soft-translate; try `WIE_CPU=iced` |
+| Tests fail with `missing guest fixture: …/micro-exes/out/*.exe` | Not an emulator bug — the untracked fixture is absent. `make -C micro-exes` (needs `brew install mingw-w64`) |
+| Tests fail with `missing real guest fixture: …/real_exes/notepad.exe` | Not an emulator bug — the untracked RNotepad build is absent. `./scripts/fetch.sh notepad` (`--list` for 7za / 2048 / doomretro) |
+| A test "passes" suspiciously fast (<0.1 s) in `micro_gui_window` | Vacuous-pass smell. It means the guest fixture was missing and the test returned early. Both fixture trees are gitignored; see [docs/TESTING.md](TESTING.md#prerequisites--the-guest-fixtures-must-exist) |
 
 ## Regression matrix
 
@@ -255,6 +258,7 @@ unmappable and passes through.
 
 | Topic | Doc |
 | ----- | --- |
+| Guest fixtures (`micro-exes/out/`, `real_exes/`) and the "missing guest = failure" rule | [`docs/TESTING.md`](TESTING.md#prerequisites--the-guest-fixtures-must-exist) |
 | Multithreading | [`docs/architecture/runtime.md`](architecture/runtime.md) (threading model) |
 | Live progress log | [`../.slim/deepwork/gui-implementation.md`](../.slim/deepwork/gui-implementation.md) |
 
