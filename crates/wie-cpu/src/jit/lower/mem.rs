@@ -471,6 +471,393 @@ pub(super) fn refill_tlb_probe(
     (prot_ok, host)
 }
 
+// ── The hoisted guard: publish once per block, validate per access ──────
+//
+// The two probes above re-derive, on **every** memory operand, facts that only
+// change when the guest maps or protects memory: which stage answers the
+// operand, that stage's guest bounds, its host bias, and its R/W bits. Measured
+// from the emitted aarch64, that validation is 15–16 host instructions per
+// operand per iteration and it is the *same* 15–16 in every hot block measured
+// (`docs/architecture/scaled-blit-block-attribution.md` §8.3, §9.4).
+//
+// The functions below publish those facts once, in the prologue, as a
+// [`HomeSpan`] — a guest interval plus a host bias — and validate an access
+// against it with two compares. The bias costs nothing per access either: the
+// backend folds `addr + bias` into the access's own addressing mode, which is what
+// makes the published form 4 host instructions per operand where today's probe is
+// 15–16 (measured on the scratch functions in `mem_hoist_tests.rs`; see the
+// report accompanying this change). Nothing here weakens the probe: on
+// any failed predicate the caller jumps into the **unchanged** chain
+// (`hoisted_pin_probe` → `refill_tlb_probe` → `wie_jit_load`/`wie_jit_store`),
+// which re-derives everything from scratch and reports faults exactly as it does
+// today.
+//
+// # What the hoist is allowed to assume, and why it is not new
+//
+// Today's probe already uses descriptors loaded **once per block** — `live`,
+// `guest_base`, `guest_end`, `allow` and the refill `tag`/`base`/`prot` all come
+// from `hoist_pin_slot` / `hoist_refill` at block entry, never from a reload
+// inside the body. For a self-loop block the block *is* the loop, so the current
+// code already relies on "the generation does not move while the loop iterates".
+// [`generation_recheck`] turns that argument into a check; it does not add an
+// assumption. See `scaled-blit-block-attribution.md` §7.1 for the invalidation
+// paths that make it true (`JitCpu::virtual_alloc` / `virtual_free` /
+// `virtual_protect` / `mem_map_image`, all of which bump `mem_gen` and
+// `invalidate_tlb`).
+//
+// A failed generation check is *not* a fallback: it goes to the block's exit
+// path (state writeback, dispatcher re-entry), because "the mapping moved" means
+// the pins and refill slots the prologue read are all suspect, not just one
+// operand's.
+
+/// A published stage translation: every guest address in the closed interval
+/// `[lo, hi]` maps to the host address `guest + bias`.
+///
+/// `hi` is **already clamped by the access size** — `hi = stage_end - size`, so
+/// `addr <= hi` is exactly today's `addr + size <= stage_end` — which also
+/// subsumes today's `no_wrap` term: `addr + size` cannot overflow when it is
+/// `<= stage_end <= u64::MAX`.
+///
+/// An **empty** span ([`SPAN_EMPTY_LO`], [`SPAN_EMPTY_HI`]) encodes "this stage
+/// may not answer this operand at all" — a dead pin, a denied permission bit, or
+/// a stage shorter than the access. No address satisfies `1 <= addr <= 0`, so
+/// every access takes the fallback chain. That is what keeps the loop body
+/// single-copy: the *decision* is taken once, in the prologue, and the body
+/// carries the answer.
+///
+/// `bias` is `host_base - stage_lo`, computed for the non-empty case; on an empty
+/// span it is meaningless, and unreachable, because the interval cannot match.
+#[cfg_attr(not(test), expect(dead_code))]
+#[derive(Clone, Copy)]
+pub(super) struct HomeSpan {
+    /// Inclusive lower bound — the stage's guest base.
+    pub(super) lo: Value,
+    /// Inclusive upper bound — `stage_end - size`, or `0` for an empty span.
+    pub(super) hi: Value,
+    /// `host_base - stage_lo`: `guest + bias` is the host address of `guest`.
+    pub(super) bias: Value,
+}
+
+/// `lo` of a span that cannot match any address (see [`HomeSpan`]).
+///
+/// Paired with [`SPAN_EMPTY_HI`] it is unreachable by construction: the access
+/// test is `addr >= lo && addr <= hi`, i.e. `addr >= 1 && addr <= 0`.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(super) const SPAN_EMPTY_LO: i64 = 1;
+/// `hi` of a span that cannot match any address (see [`HomeSpan`]).
+#[cfg_attr(not(test), expect(dead_code))]
+pub(super) const SPAN_EMPTY_HI: i64 = 0;
+
+/// Publish one pin descriptor as a [`HomeSpan`] — the prologue half of the hoist
+/// for a stack or data pin operand.
+///
+/// Folds every term of [`hoisted_pin_probe`] that does not depend on the address
+/// into the span, so the per-access form is two compares (the `bias` add folds
+/// into the access's addressing mode):
+///
+/// | [`hoisted_pin_probe`] term | here |
+/// | --- | --- |
+/// | `live` (`host_base != 0 && pin_gen == mem_gen`) | entry-time `select` |
+/// | `allow & need != 0` (the R/W bit) | entry-time `select` |
+/// | `no_wrap` (`addr + size` did not overflow) | subsumed by `hi` |
+/// | `lo_ok` / `hi_ok` | retained: the two compares in [`home_span_probe`] |
+///
+/// Folding `live` and the R/W bit is exact, not an approximation: both are
+/// functions of values the current probe reads once per block anyway, and a
+/// change to either one is a mapping or protection change, which bumps
+/// `mem_gen` and takes the block out through [`generation_recheck`].
+///
+/// `size` is the *operand's* access width, so one block publishes one span per
+/// operand; `write` selects the permission bit the operand needs. The span is
+/// loop-invariant (it is built entirely from the hoisted descriptor), so it needs
+/// no block parameter on the back edge.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(super) fn span_of_pin(
+    bcx: &mut FunctionBuilder<'_>,
+    pin: &HoistedPin,
+    size: u32,
+    write: bool,
+) -> HomeSpan {
+    let size_v = iconst_u64(bcx, u64::from(size));
+    let lo = pin.guest_base;
+    let end = pin.guest_end;
+    // `end >= lo + size` ⇔ `hi = end - size >= lo`, i.e. the stage can hold the
+    // whole access. Without it a degenerate stage (`end < size`) would compute
+    // `hi` by wrapping, and a wrapped `hi` is a *huge* upper bound — the one
+    // direction that must never be wrong.
+    let span = bcx.ins().isub(end, lo);
+    let long_enough = bcx
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, span, size_v);
+    let need = if write { TLB_PROT_W } else { TLB_PROT_R };
+    let bits = bcx.ins().band_imm(pin.allow, need.cast_signed());
+    let prot_ok = bcx.ins().icmp_imm(IntCC::NotEqual, bits, 0);
+    let ok = bcx.ins().band(pin.live, long_enough);
+    let ok = bcx.ins().band(ok, prot_ok);
+    let hi = bcx.ins().isub(end, size_v);
+    HomeSpan {
+        lo: select_or_empty(bcx, ok, lo, SPAN_EMPTY_LO),
+        hi: select_or_empty(bcx, ok, hi, SPAN_EMPTY_HI),
+        bias: bcx.ins().isub(pin.host_base, lo),
+    }
+}
+
+/// One refill slot, loaded and validated once: the prologue half of the hoist
+/// for an operand the direct-mapped table answers.
+///
+/// Exactly [`refill_tlb_probe`]'s first half — index, three slot loads, the
+/// folded tag compare, the R/W bit — with the guards replaced by an `ok` value
+/// that [`span_of_slot`] turns into a [`HomeSpan`]. The page-crossing term stays
+/// where it was: it is the `hi` clamp of the *span*, so an access that would run
+/// past the end of the page fails the interval test and takes the chain, just as
+/// `page_off + size <= PAGE_SIZE` refuses it today.
+///
+/// Unlike a pin's, this descriptor is **not** loop-invariant: it is resolved for
+/// one page (`page_base`), so a caller that publishes it at entry must republish
+/// it — `page_base`, `base` — from the chain's hit block when an access leaves
+/// that page. Eviction of the slot is *not* a republish event: the home holds the
+/// page's host base, which a conflict cannot move.
+///
+/// # Contract
+///
+/// A slot-derived span is only as fresh as the slot tag, and the tag is compared
+/// against `refill.mem_gen`, the frame's generation as stamped at `run_compiled`
+/// entry. Inside one frame nothing rewrites `JitCtx::mem_gen` (the only writer is
+/// the dispatcher), so the published span is exactly as strong as today's
+/// per-access tag compare. Hoisting it is therefore sound under the *same*
+/// invalidation contract the current probe already documents; it is **not**
+/// sound if a helper call inside the block could map or protect guest memory
+/// without returning through the dispatcher. None can today (the reachable host
+/// code is `wie_jit_*` and `wie_ucrt_*`, and the UCRT helpers only move bytes
+/// inside an already-reserved arena), but that is the assumption to re-check if
+/// one is ever added.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(super) fn hoist_refill_slot(
+    bcx: &mut FunctionBuilder<'_>,
+    refill: &RefillProbe,
+    flags: MemFlagsData,
+    addr: Value,
+    write: bool,
+) -> HoistedSlot {
+    let page_base = bcx.ins().band_imm(addr, -PAGE_SIZE.cast_signed());
+    let page_key = bcx.ins().ushr_imm(addr, 12);
+    let h = bcx.ins().imul_imm(page_key, GOLDEN_RATIO_64.cast_signed());
+    let shifted = bcx
+        .ins()
+        .ushr_imm(h, i64::from(REFILL_SHIFT - REFILL_STRIDE_SHIFT));
+    let slot_off = bcx.ins().band_imm(shifted, REFILL_OFFSET_MASK);
+    let slot = bcx.ins().iadd(refill.table, slot_off);
+    let tag = bcx.ins().load(types::I64, flags, slot, 0);
+    let base = bcx.ins().load(types::I64, flags, slot, 8);
+    let prot = bcx.ins().load(types::I64, flags, slot, 16);
+    // One compare covers page identity *and* mapping generation (see `RefillSlot`).
+    let want = bcx.ins().bxor(page_key, refill.mem_gen);
+    let tag_ok = bcx.ins().icmp(IntCC::Equal, tag, want);
+    let need = if write { TLB_PROT_W } else { TLB_PROT_R };
+    let bits = bcx.ins().band_imm(prot, need.cast_signed());
+    let prot_ok = bcx.ins().icmp_imm(IntCC::NotEqual, bits, 0);
+    HoistedSlot {
+        page_base,
+        base,
+        ok: bcx.ins().band(tag_ok, prot_ok),
+    }
+}
+
+/// One refill slot's translation as loaded by [`hoist_refill_slot`].
+#[cfg_attr(not(test), expect(dead_code))]
+#[derive(Clone, Copy)]
+pub(super) struct HoistedSlot {
+    /// `addr & !0xFFF` at publish time — the guest page the slot answers.
+    pub(super) page_base: Value,
+    /// `slot.base`: host base of that page.
+    pub(super) base: Value,
+    /// `tag == page_key ^ mem_gen && (prot & need) != 0` at publish time.
+    pub(super) ok: Value,
+}
+
+/// Turn a [`HoistedSlot`] into a [`HomeSpan`] for an access of `size` bytes.
+///
+/// `hi = page_base + PAGE_SIZE - size`, so the interval is exactly "inside this
+/// page with room for the access" — today's `in_page` term — and `bias` is the
+/// page's host base minus its guest base.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(super) fn span_of_slot(
+    bcx: &mut FunctionBuilder<'_>,
+    slot: &HoistedSlot,
+    size: u32,
+) -> HomeSpan {
+    let room = i64::try_from(PAGE_SIZE.saturating_sub(u64::from(size))).unwrap_or(0);
+    let hi = bcx.ins().iadd_imm(slot.page_base, room);
+    HomeSpan {
+        lo: select_or_empty(bcx, slot.ok, slot.page_base, SPAN_EMPTY_LO),
+        hi: select_or_empty(bcx, slot.ok, hi, SPAN_EMPTY_HI),
+        bias: bcx.ins().isub(slot.base, slot.page_base),
+    }
+}
+
+/// `select(ok, v, empty)` — the empty arm is an immediate, so the backend folds
+/// it into the `csel`.
+#[cfg_attr(not(test), expect(dead_code))]
+fn select_or_empty(bcx: &mut FunctionBuilder<'_>, ok: Value, v: Value, empty: i64) -> Value {
+    let e = bcx.ins().iconst(types::I64, empty);
+    bcx.ins().select(ok, v, e)
+}
+
+/// Validate one access against a published [`HomeSpan`]; returns the host address.
+///
+/// Two compares and an add, as guarded exits to `fail` — the *unchanged* probe
+/// chain for this operand, which re-derives the translation from scratch:
+///
+/// ```text
+/// ok1 = addr >= lo            ; guest below the stage
+/// ok2 = addr <= hi            ; `addr + size` past the stage, or a page crossing
+/// host = addr + bias          ; only meaningful on the true edge
+/// ```
+///
+/// Both compares are unsigned and the interval is closed, so this accepts exactly
+/// the addresses [`hoisted_pin_probe`] accepts (`addr >= guest_base &&
+/// addr + size <= guest_end`, with `end` folded into `hi`) and exactly the
+/// addresses [`refill_tlb_probe`] accepts (`page_off + size <= PAGE_SIZE` with
+/// `page_off` folded out). The earlier conditions — `live` and the R/W bit — are
+/// in the span; see [`span_of_pin`].
+///
+/// `host` is defined in the block the guards return in, so it dominates the
+/// caller's hit block, the same contract as [`hoisted_pin_probe`].
+#[cfg_attr(not(test), expect(dead_code))]
+pub(super) fn home_span_probe(
+    bcx: &mut FunctionBuilder<'_>,
+    span: &HomeSpan,
+    addr: Value,
+    fail: Block,
+) -> Value {
+    let lo_ok = bcx
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, addr, span.lo);
+    let hi_ok = bcx
+        .ins()
+        .icmp(IntCC::UnsignedLessThanOrEqual, addr, span.hi);
+    let host = bcx.ins().iadd(addr, span.bias);
+    guard_exit(bcx, lo_ok, fail);
+    guard_exit(bcx, hi_ok, fail);
+    host
+}
+
+/// The mapping generation the spans were published under is still current.
+///
+/// Returns a boolean that is **true while the home is valid**. Emitted once per
+/// iteration and shared by every operand of the block (the generation is global;
+/// a per-operand compare would be one per operand for the same answer), and its
+/// failure edge is the block's exit path, not an operand's fallback: when the
+/// mapping moved, every descriptor the prologue read is suspect.
+///
+/// # What this check does and does not observe
+///
+/// It compares `JitCtx::mem_gen` as it stands at the access against the value the
+/// prologue loaded. The dispatcher is the only writer of that field
+/// (`pipeline.rs`, `run_compiled`), so within one `run_compiled` frame the two
+/// agree by construction and the *only* thing that can make them differ is a host
+/// helper that re-stamps the field mid-frame. The check is therefore two things
+/// at once, and both are worth stating plainly:
+///
+/// * a **checked assumption** — it costs three instructions per iteration and it
+///   fails loudly (through the exit path) if `mem_gen` is ever made to move
+///   inside a frame;
+/// * **not** a live observation of `GuestMemory::generation`. A guest
+///   map/protect issued mid-frame bumps the *shared* atomic, not the frame's
+///   copy, and is caught (as today) by the block exiting through the dispatcher.
+///   Closing that window for real needs a pointer to the shared atomic in
+///   `JitCtx`; see the report that accompanies this change.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(super) fn generation_recheck(
+    bcx: &mut FunctionBuilder<'_>,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    gen_at_entry: Value,
+) -> Value {
+    let p = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_MEM_GEN));
+    let now = bcx.ins().load(types::I64, flags, p, 0);
+    bcx.ins().icmp(IntCC::Equal, now, gen_at_entry)
+}
+
+/// One operand's per-access validation, generation check included: the composed
+/// form of [`generation_recheck`] + [`home_span_probe`].
+///
+/// `stale` (the generation moved) is a separate edge from `fail` (this operand is
+/// not in the stage): the first is the block's exit path, the second is this
+/// operand's own probe chain. Returns the host address, defined in the block both
+/// guard chains return in.
+#[cfg_attr(not(test), expect(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hoisted_access_probe(
+    bcx: &mut FunctionBuilder<'_>,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    span: &HomeSpan,
+    gen_at_entry: Value,
+    addr: Value,
+    stale: Block,
+    fail: Block,
+) -> Value {
+    let current = generation_recheck(bcx, ctx_ptr, flags, gen_at_entry);
+    guard_exit(bcx, current, stale);
+    home_span_probe(bcx, span, addr, fail)
+}
+
+/// Emit one operand's hoisted access: the fast path, its hit block, and control
+/// continuing in the **fallback block**, where the caller emits the operand's
+/// unchanged chain and jumps to the same `merge`.
+///
+/// This is [`home_span_probe`]/[`hoisted_access_probe`] plus the CFG plumbing
+/// [`emit_probe_stage`] already does for a probe, so the call-site change inside
+/// `call_load`/`call_store` is one inserted call rather than a new chain:
+///
+/// ```text
+/// let merge = bcx.create_block();            // exists already
+/// if let Some(span) = mem.home {             // per operand, published at entry
+///     hoisted_stage(bcx, span, gen, ctx_ptr, flags, addr, merge, |bcx| exit(bcx), hit);
+/// }
+/// // … then today's `emit_probe_stage` chain for this operand, unchanged, which
+/// // now emits in the block this function left the builder on …
+/// ```
+///
+/// `on_stale` must **terminate** the block it is given (flush state, return to the
+/// dispatcher) — the same contract `emit_inv_gen_check` gives its own handler. The
+/// `hit_effect` closure is [`emit_probe_stage`]'s: it performs the access in the
+/// hit block and returns the value to thread to `merge`, if any.
+///
+/// # `WIE_JIT_MEM=slow`
+///
+/// A caller must pass `None` (and therefore skip this stage entirely) whenever
+/// `MemEnv::refill` is `None`, which is what that knob sets: no span is ever
+/// published, so the emitted code is byte-for-byte today's.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), expect(dead_code))]
+pub(super) fn hoisted_stage(
+    bcx: &mut FunctionBuilder<'_>,
+    span: &HomeSpan,
+    gen_at_entry: Value,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    addr: Value,
+    merge: Block,
+    on_stale: impl FnOnce(&mut FunctionBuilder<'_>),
+    hit_effect: impl FnOnce(&mut FunctionBuilder<'_>, Value) -> Option<Value>,
+) {
+    let stale = bcx.create_block();
+    let fail = bcx.create_block();
+    let host = hoisted_access_probe(bcx, ctx_ptr, flags, span, gen_at_entry, addr, stale, fail);
+    // Positioned in the guard's continuation: this is the hit block.
+    match hit_effect(bcx, host) {
+        Some(v) => bcx.ins().jump(merge, &[BlockArg::Value(v)]),
+        None => bcx.ins().jump(merge, &[]),
+    };
+    bcx.switch_to_block(stale);
+    bcx.seal_block(stale);
+    on_stale(bcx);
+    bcx.switch_to_block(fail);
+    bcx.seal_block(fail);
+}
+
 /// Zero-extend a loaded integer of `size` bytes to i64.
 ///
 /// `flags` should be the caller's guest-data alias-tagged flags (`mem.guest_flags`)
@@ -1144,3 +1531,8 @@ mod guard_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::indexing_slicing)]
+#[path = "mem_hoist_tests.rs"]
+mod hoist_tests;
