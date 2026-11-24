@@ -8,9 +8,10 @@ use super::insn::{PendingFlags, flush_pending, lower_insn};
 use super::mem::call_load;
 use super::string::lower_string;
 use super::{
-    EDGE_IC_SLOTS, MAX_CHAIN_DEPTH, OFF_CHAIN_DEPTH, OFF_EDGE_IC_FN, OFF_EDGE_IC_VA, OFF_FAULT,
-    OFF_INSN_ACC, OFF_INV_GEN_PTR, OFF_RIP, OFF_SHADOW_RET, OFF_SHADOW_SP, SHADOW_DEPTH,
-    TLB_PROT_R, TLB_PROT_W, flag_cond, flag_cond_fs, lower_term,
+    EDGE_IC_SLOTS, MAX_CHAIN_DEPTH, OFF_CHAIN_DEPTH, OFF_CHAIN_HOPS, OFF_CHAIN_STORE_OPS,
+    OFF_EDGE_IC_FN, OFF_EDGE_IC_VA, OFF_FAULT, OFF_INSN_ACC, OFF_INV_GEN_PTR, OFF_RIP,
+    OFF_SHADOW_RET, OFF_SHADOW_SP, SHADOW_DEPTH, TLB_PROT_R, TLB_PROT_W, flag_cond, flag_cond_fs,
+    lower_term,
 };
 
 use super::super::block::{BlockStackPinPlan, BlockTerm, DecodedInsn, is_string_op};
@@ -95,6 +96,62 @@ impl TripCounter {
     }
 }
 
+/// The single source of truth for *which* GPRs `writeback_gprs` stores.
+///
+/// `gpr_dirty = Some(d)` stores every body-written reg (`d[i]`) **and** every
+/// reg that was loaded at entry (`gpr_loaded[i]`, which covers read-only
+/// live-ins and string-op counter/pointer writes not tracked in the dirty set);
+/// `None` (trampoline-style full flush) stores every loaded reg. Every caller
+/// of the predicate — [`writeback_gprs`] and [`chain_store_count`] — must go
+/// through this function so the emitted counter can never drift from the code.
+#[inline]
+fn gpr_store_predicate(i: usize, gpr_loaded: &[bool; 16], gpr_dirty: Option<&[bool; 16]>) -> bool {
+    match gpr_dirty {
+        Some(d) => d[i] || gpr_loaded[i],
+        None => gpr_loaded[i],
+    }
+}
+
+/// Number of GPR slots [`writeback_gprs`] stores for this edge — i.e. the
+/// `chain_store_ops` charge added by [`emit_chain_hop_accounting`].
+///
+/// Computed with the same predicate the emitter uses (see
+/// [`gpr_store_predicate`]), so the counter is exact rather than estimated.
+/// Excludes the `rflags` slot, which is not a GPR.
+pub(super) fn chain_store_count(gpr_loaded: &[bool; 16], gpr_dirty: Option<&[bool; 16]>) -> u64 {
+    (0..16).fold(0_u64, |n, i| {
+        if gpr_store_predicate(i, gpr_loaded, gpr_dirty) {
+            n.saturating_add(1)
+        } else {
+            n
+        }
+    })
+}
+
+/// Charge one taken chain edge to the run-wide chain counters.
+///
+/// Emitted on each of `emit_chain_or_exit`'s three successor-call sites (direct
+/// `FuncRef`, edge-IC hit, chain-table hit) — never on the depth-cap exit or
+/// the table-miss exit, so `chain_hops` counts native transfers and not block
+/// terminations. `store_ops` is the compile-time GPR-store count of *this*
+/// block's edge ([`chain_store_count`]), so this is two load-add-stores, not a
+/// runtime loop.
+fn emit_chain_hop_accounting(
+    bcx: &mut FunctionBuilder<'_>,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+    store_ops: u64,
+) {
+    let hops_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_CHAIN_HOPS));
+    let hops = bcx.ins().load(types::I64, flags, hops_ptr, 0);
+    let hops1 = bcx.ins().iadd_imm(hops, 1);
+    bcx.ins().store(flags, hops1, hops_ptr, 0);
+    let ops_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_CHAIN_STORE_OPS));
+    let ops = bcx.ins().load(types::I64, flags, ops_ptr, 0);
+    let ops_n = bcx.ins().iadd_imm(ops, store_ops.cast_signed());
+    bcx.ins().store(flags, ops_n, ops_ptr, 0);
+}
+
 /// Write SSA GPRs back into `JitCtx`.
 ///
 /// When `gpr_dirty` is `Some`, every body-written (dirty) reg is stored —
@@ -118,15 +175,11 @@ pub(super) fn writeback_gprs(
     rflags_ptr: Value,
     store_flags: bool,
 ) {
-    for i in 0..16 {
-        let do_store = match gpr_dirty {
-            Some(d) => d[i] || gpr_loaded[i],
-            None => gpr_loaded[i],
-        };
-        if do_store {
+    for (i, value) in gpr.iter().enumerate() {
+        if gpr_store_predicate(i, gpr_loaded, gpr_dirty) {
             let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
             let p = bcx.ins().iadd_imm(ctx_ptr, off);
-            bcx.ins().store(flags, gpr[i], p, 0);
+            bcx.ins().store(flags, *value, p, 0);
         }
     }
     if store_flags {
@@ -327,7 +380,12 @@ pub(super) fn emit_chain_or_exit(
     let depth1 = bcx.ins().iadd_imm(depth, 1);
     bcx.ins().store(flags, depth1, depth_ptr, 0);
 
+    // Past the depth cap, so every branch below really does transfer control to
+    // a compiled successor: charge the hop + this edge's GPR stores.
+    let store_ops = chain_store_count(gpr_loaded, gpr_dirty);
+
     if let Some(f) = href {
+        emit_chain_hop_accounting(bcx, ctx_ptr, flags, store_ops);
         bcx.ins().call(f, &[ctx_ptr]);
         bcx.ins().store(flags, depth, depth_ptr, 0);
         bcx.ins().return_(&[]);
@@ -360,6 +418,7 @@ pub(super) fn emit_chain_or_exit(
 
     bcx.switch_to_block(ic_hit_blk);
     bcx.seal_block(ic_hit_blk);
+    emit_chain_hop_accounting(bcx, ctx_ptr, flags, store_ops);
     bcx.ins().call_indirect(block_sig_ref, ic_fn, &[ctx_ptr]);
     bcx.ins().store(flags, depth, depth_ptr, 0);
     bcx.ins().return_(&[]);
@@ -375,6 +434,7 @@ pub(super) fn emit_chain_or_exit(
     bcx.ins().brif(hit, hit_blk, &[], miss_blk, &[]);
     bcx.switch_to_block(hit_blk);
     bcx.seal_block(hit_blk);
+    emit_chain_hop_accounting(bcx, ctx_ptr, flags, store_ops);
     bcx.ins().call_indirect(block_sig_ref, fn_ptr, &[ctx_ptr]);
     bcx.ins().store(flags, depth, depth_ptr, 0);
     bcx.ins().return_(&[]);
@@ -1119,4 +1179,54 @@ pub(super) fn emit_block_wide_stack_guard(
     let ok2 = bcx.ins().band(ok1, lo_ok);
     let ok3 = bcx.ins().band(ok2, hi_ok);
     bcx.ins().band(ok3, prot_ok)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::{chain_store_count, gpr_store_predicate};
+
+    const NONE_LOADED: [bool; 16] = [false; 16];
+    const ALL_LOADED: [bool; 16] = [true; 16];
+
+    /// The counter must agree with the emitter's store predicate on every
+    /// register, in both the masked (`Some`) and full-flush (`None`) modes —
+    /// this is the invariant that keeps `chain_store_ops` honest, since it is
+    /// the number the chain-edge cost is later divided by.
+    #[test]
+    fn store_count_matches_predicate_slot_by_slot() {
+        let loaded = [
+            true, false, true, false, true, false, false, true, true, false, true, false, false,
+            true, false, false,
+        ];
+        let dirty = [
+            false, true, false, false, true, false, false, false, true, false, false, true, false,
+            false, true, false,
+        ];
+        let n = chain_store_count(&loaded, Some(&dirty));
+        let counted = (0..16)
+            .filter(|&i| gpr_store_predicate(i, &loaded, Some(&dirty)))
+            .count();
+        assert_eq!(usize::try_from(n).unwrap_or(usize::MAX), counted);
+        // Every dirty register is stored even when it was never loaded: a
+        // `mov rcx,r12` call argument is not a live-in, and dropping it from
+        // the writeback silently hands a stale register to the callee.
+        assert_eq!(
+            chain_store_count(&NONE_LOADED, Some(&dirty)),
+            u64::try_from(dirty.iter().filter(|&&d| d).count()).unwrap_or(u64::MAX)
+        );
+        // Read-only live-ins count (they are re-stored under the current
+        // predicate — the whole point of the counter).
+        assert_eq!(chain_store_count(&loaded, None), 7);
+    }
+
+    /// Bounds the counter against the register file: 0 when nothing is live,
+    /// 16 when everything is. A value outside this range means the predicate
+    /// and the counter have diverged.
+    #[test]
+    fn store_count_is_bounded_by_the_register_file() {
+        assert_eq!(chain_store_count(&NONE_LOADED, Some(&NONE_LOADED)), 0);
+        assert_eq!(chain_store_count(&ALL_LOADED, None), 16);
+        assert_eq!(chain_store_count(&ALL_LOADED, Some(&ALL_LOADED)), 16);
+    }
 }

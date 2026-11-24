@@ -84,12 +84,17 @@ pub fn jit_profile_report_lines(s: &JitStats) -> Vec<String> {
     out
 }
 
-/// Direct-chaining health as one report line (G5): epoch-advance rate and
-/// resync width are the levers for install-time incremental linking.
+/// Direct-chaining health as one report line (G5): epoch-advance rate,
+/// resync width, and the chain-edge volume (`hops` / `store_ops`).
+///
+/// The first three describe the chain TABLE (how often it is refreshed, how
+/// wide it is); `hops` is the hit rate — edges actually taken in native code —
+/// and `store_ops` the GPR writes those edges performed. Keep them on one line
+/// so `hops` is never read next to `avg_width` alone and mistaken for it.
 ///
 /// `None` while nothing was recorded.
 fn chain_stats_line(s: &JitStats) -> Option<String> {
-    if s.chain.epoch_bumps == 0 && s.chain.resyncs == 0 {
+    if s.chain.epoch_bumps == 0 && s.chain.resyncs == 0 && s.chain.hops == 0 {
         return None;
     }
     let width = s
@@ -97,9 +102,17 @@ fn chain_stats_line(s: &JitStats) -> Option<String> {
         .resync_entries
         .checked_div(s.chain.resyncs)
         .unwrap_or(0);
+    // Same derived-ratio shape as `avg_width`: two decimal-free integer means,
+    // 0 when the denominator is 0.
+    let stores_per_hop = s.chain.store_ops.checked_div(s.chain.hops).unwrap_or(0);
     Some(format!(
-        "[wie] jit_chain: epoch_bumps={} resyncs={} avg_width={width} inline_inserts={} code_invs={}",
-        s.chain.epoch_bumps, s.chain.resyncs, s.chain.inline_inserts, s.exec.code_invs
+        "[wie] jit_chain: epoch_bumps={} resyncs={} avg_width={width} inline_inserts={} code_invs={} hops={} hop_store_ops={} stores_per_hop={stores_per_hop}",
+        s.chain.epoch_bumps,
+        s.chain.resyncs,
+        s.chain.inline_inserts,
+        s.exec.code_invs,
+        s.chain.hops,
+        s.chain.store_ops
     ))
 }
 

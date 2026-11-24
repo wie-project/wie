@@ -4,8 +4,10 @@
 mod atomic_tests;
 mod bg_pool_tests;
 mod btx_tests;
+mod chain_hop_tests;
 mod chain_tests;
 mod cmpxchg_tests;
+mod code_cache_tests;
 mod heap_isolation_tests;
 mod implicit_lock_tests;
 mod implicit_operands;
