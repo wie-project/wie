@@ -72,3 +72,27 @@ Check in this order, and stop at the first one that does not move:
   `VirtualFree` and remaps invalidate the inline path.
 - The diagnostic counters stay, but behind one branch: they exist for
   `WIE_JIT_MEM_TRACE` and nothing else reads them.
+
+## Shipped
+
+Done, in the shape above: 256 slots × 32 B in `JitCtx::refill`, tag folded with
+`mem_gen`, address `page_key ^ mem_gen`, index from the top bits of a
+golden-ratio multiply of the page key, populated from every resolution point
+(bucket hit, pin hit, walk hit, sticky-victim hit) and cleared on a generation
+change next to the pin rebuild.
+
+Counted from `WIE_JIT_DUMP_IR` at `opt_level = none`, per memory operand:
+
+| | CLIF instructions | slot loads | `icmp` | `band` | branches | `iconst` |
+|---|---|---|---|---|---|---|
+| 2-way sticky cascade | 71 | 9 | 9 | 11 | 7 | 22 |
+| direct-mapped refill | **29** | 3 | 3 | 5 | 2 | 9 |
+
+and `ctx+OFF_REFILL` / `ctx+OFF_MEM_GEN` are hoisted once per block instead of
+being re-derived per access. `tlb_page_ptr` was split so `classify_addr_vs_pins`
+and `classify_sticky_miss` (diagnostics) run only when `mem_path_on` is set.
+
+The 4-way bucket, `pin_resolve`, the fault paths and the host-side sticky ways
+are unchanged: the sticky set is now the MRU victim list the helper consults
+*after* an inline miss, and `WIE_JIT_MEM=slow` still bypasses the whole thing
+for bisection.

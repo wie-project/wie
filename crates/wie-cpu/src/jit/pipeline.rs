@@ -20,7 +20,7 @@ use super::fast_api::{FastApiKind, JitFastPathConfig};
 use super::gen_tlb::GenTlb;
 use super::lower::{
     self, CompiledBlock, JitCtx, MemPathSlice, MemPin, PIN_SLOTS, STICKY_WAYS, TLB_EMPTY, XmmSlot,
-    chain_table_clear, chain_table_insert,
+    chain_table_clear, chain_table_insert, refill_clear,
 };
 use super::shared::{BgEnqueueOutcome, BgWaitCell, BgWaitState, JitShared, PerThreadJitState};
 use super::{CacheEntry, JitCpu};
@@ -1233,6 +1233,13 @@ impl JitCpu {
                 self.thread.ctx.pins = std::array::from_fn(|i| MemPin::from_info(infos[i]));
             }
             self.thread.pins_gen = mem_gen;
+            // The inline refill table caches `(page_key ^ mem_gen, host base,
+            // prot)` per slot. Clearing it on the generation change means no
+            // slot outlives the mapping it was resolved under, which is what
+            // makes the emitted probe's folded tag compare *exact* rather than
+            // merely improbable (see `RefillSlot`). Same event and the same
+            // cost class as the pin rebuild above — a full table is 8 KiB.
+            refill_clear(&mut self.thread.ctx);
             // The pin *shape* stats are a pure function of `ctx.pins`, which
             // only changes on the line above (`invalidate_tlb` forces the same
             // rebuild by setting `pins_gen = u64::MAX`). They are read by the
@@ -1506,6 +1513,10 @@ impl JitCpu {
         ctx.sticky_gen = [0; STICKY_WAYS];
         ctx.sticky_rr = 0;
         ctx.pins = [MemPin::EMPTY; PIN_SLOTS];
+        // The inline fast path is a frame-side cache of the same translations;
+        // a thread switch (or a protect/free that routed here) must not leave a
+        // page resolvable through the refill table that the TLB no longer has.
+        refill_clear(ctx);
         self.thread.pins_gen = u64::MAX;
     }
 

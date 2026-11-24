@@ -805,6 +805,20 @@ pub(super) struct SuperStack {
     pub(super) bias: Value,
 }
 
+/// Block-invariant inputs of the direct-mapped refill probe, hoisted at entry.
+///
+/// Exactly [`HoistedPin`]'s trade: two `iadd_imm`s and one load at block entry
+/// instead of on every memory operand. `mem_gen` is invariant for the block for
+/// the same reason [`HoistedPin::live`] is — the generation only moves on a
+/// guest map/protect, which returns through the dispatcher.
+#[derive(Clone, Copy)]
+pub(super) struct RefillProbe {
+    /// `ctx_ptr + OFF_REFILL` — base of the [`RefillSlot`](super::RefillSlot) array.
+    pub(super) table: Value,
+    /// `ctx.mem_gen`, the generation half of the slot tag.
+    pub(super) mem_gen: Value,
+}
+
 pub(super) struct MemEnv {
     pub(super) ctx_ptr: Value,
     pub(super) load_ref: Option<cranelift::codegen::ir::FuncRef>,
@@ -837,8 +851,16 @@ pub(super) struct MemEnv {
     pub(super) div64_ref: Option<FuncRef>,
     /// Stack region pin (slot 0), hoisted at block entry when inline mem is on.
     pub(super) stack_pin: Option<HoistedPin>,
-    /// Data pins (slots 1..): process heap + VirtualAlloc spans, after sticky.
+    /// Data pins (slots 1..): process heap + VirtualAlloc spans, after the refill
+    /// probe (only with `WIE_JIT_MEM=pin`).
     pub(super) data_pins: Vec<HoistedPin>,
+    /// Direct-mapped refill table + generation, hoisted at block entry.
+    ///
+    /// `None` means "no inline probe in this block": either inline mem is off
+    /// (`WIE_JIT_MEM=slow`, helper-only by construction) or the block takes the
+    /// stack super path, which never probes. A `None` here is therefore a
+    /// fallthrough to the helper, never a hole.
+    pub(super) refill: Option<RefillProbe>,
     /// When set, load/store use `bias + addr` with **no** per-access bounds checks.
     pub(super) super_stack: Option<SuperStack>,
 }

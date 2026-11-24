@@ -1,18 +1,19 @@
 //! Guest-memory access: host-callable `wie_jit_*` helpers (registered as JIT
 //! symbols) and the IR-emitting load/store/pin helpers used by block emission.
 
-use super::emit::{HoistedPin, MemEnv, check_fault_after_ucrt};
+use super::emit::{HoistedPin, MemEnv, RefillProbe, check_fault_after_ucrt};
 use super::err::LowerError;
 use super::flags::iconst_u64;
-use super::gpr::sticky_tlb_probe;
 use super::tlb::{set_fault, tlb_page_ptr};
 use super::{
-    CHAIN_SLOTS, EDGE_IC_SLOTS, JitCtx, OFF_MEM_GEN, OFF_PINS, PIN_STRIDE, TLB_PROT_R, TLB_PROT_W,
+    CHAIN_SLOTS, EDGE_IC_SLOTS, GOLDEN_RATIO_64, JitCtx, OFF_MEM_GEN, OFF_PINS, OFF_REFILL,
+    PIN_STRIDE, REFILL_OFFSET_MASK, REFILL_SHIFT, REFILL_STRIDE_SHIFT, TLB_PROT_R, TLB_PROT_W,
     chain_hash,
 };
 
 use crate::exec::{self, StringOpKind};
 use crate::jit::config::JitConfig;
+use crate::mem::PAGE_SIZE;
 use crate::regs::{RegFile, Rflags};
 use cranelift::codegen::ir::{BlockArg, FuncRef};
 use cranelift::prelude::*;
@@ -322,6 +323,102 @@ pub(super) fn hoisted_pin_probe(
     (ok, host)
 }
 
+/// Hoist the two block-invariant inputs of the refill probe: the table base
+/// pointer and the frame's memory generation.
+///
+/// Same argument as [`hoist_pin_slot`]: `mem_gen` and `refill` are invariant for
+/// the whole block (a block is straight-line, and the only thing that moves the
+/// generation is a guest-initiated map/protect, which returns through the
+/// dispatcher before the next block), so loading them once at block entry beats
+/// paying `iadd_imm` + `load` on every memory operand — and with
+/// `opt_level = none` nothing downstream removes the redundancy.
+pub(super) fn hoist_refill(
+    bcx: &mut FunctionBuilder<'_>,
+    ctx_ptr: Value,
+    flags: MemFlagsData,
+) -> RefillProbe {
+    let table = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_REFILL));
+    let mem_gen_p = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_MEM_GEN));
+    let mem_gen = bcx.ins().load(types::I64, flags, mem_gen_p, 0);
+    RefillProbe { table, mem_gen }
+}
+
+/// Probe the direct-mapped refill table — the inline fast path for **every**
+/// memory operand the emitter lowers.
+///
+/// Returns `(ok_i1, host_ptr)`; `host_ptr` is only meaningful when `ok` is true.
+/// One slot, one compare, no cascade:
+///
+/// ```text
+/// slot_off = ((page_key * GOLDEN) >> 51) & 0x1FE0     // 256 slots × 32 B
+/// slot     = refill + slot_off
+/// ok       = slot.tag == page_key ^ mem_gen           // key *and* generation
+///          & (slot.prot & need) != 0                  // R/W bit for this access
+///          & page_off + size <= PAGE_SIZE             // does not cross a page
+/// host     = slot.base + page_off
+/// ```
+///
+/// Measured from `WIE_JIT_DUMP_IR` at `opt_level = none` (the default, where the
+/// emitter is the optimiser): **28 CLIF instructions** for this probe — 9
+/// `iconst`s (folded into `and` / `cmp` immediates and load offsets by the
+/// aarch64 backend), 3 slot loads, 15 arithmetic/compare ops and one `brif`.
+/// The two-way sticky cascade this replaces measured **71** in the same block,
+/// and it hit 0.016 % of accesses (see
+/// `docs/architecture/tlb-probe-redesign.md`).
+///
+/// On `!ok` the caller falls through to the existing probe stages and finally
+/// the `wie_jit_load` / `wie_jit_store` helper, which re-resolves through the
+/// 4-way bucket / pins / page walk and re-installs this slot. Fault semantics
+/// are therefore untouched: a cross-page, denied or unmapped access never
+/// takes this path, it takes the helper that reports it through `set_fault`.
+///
+/// # Why the low bits of the VA are not the index
+///
+/// See [`refill_slot`](super::refill_slot): a page key's low bits are the page
+/// number inside a small address window, so they partition a working set by
+/// address layout instead of scattering it, and a modular multiply leaves them
+/// untouched — the entropy that separates two nearby pages lives in the top
+/// bits of the product, which is what the shift harvests.
+pub(super) fn refill_tlb_probe(
+    bcx: &mut FunctionBuilder<'_>,
+    refill: &RefillProbe,
+    flags: MemFlagsData,
+    addr: Value,
+    size: u32,
+    write: bool,
+) -> (Value, Value) {
+    // The two halves of the VA the probe needs: page offset and page key.
+    let page_off = bcx.ins().band_imm(addr, (PAGE_SIZE - 1).cast_signed());
+    let page_key = bcx.ins().ushr_imm(addr, 12);
+    // `page_off + size <= PAGE_SIZE` ⇒ the access cannot cross a page, which is
+    // the precondition for `slot.base + page_off` to be the whole access.
+    let end = bcx.ins().iadd_imm(page_off, i64::from(size));
+    let in_page = bcx
+        .ins()
+        .icmp_imm(IntCC::UnsignedLessThanOrEqual, end, PAGE_SIZE.cast_signed());
+    // Golden-ratio scatter, scaled to the slot stride by folding the multiply
+    // into the shift: `((k * G) >> 56) * 32 == ((k * G) >> 51) & 0x1FE0`.
+    let h = bcx.ins().imul_imm(page_key, GOLDEN_RATIO_64.cast_signed());
+    let shifted = bcx
+        .ins()
+        .ushr_imm(h, i64::from(REFILL_SHIFT - REFILL_STRIDE_SHIFT));
+    let slot_off = bcx.ins().band_imm(shifted, REFILL_OFFSET_MASK);
+    let slot = bcx.ins().iadd(refill.table, slot_off);
+    let tag = bcx.ins().load(types::I64, flags, slot, 0);
+    let base = bcx.ins().load(types::I64, flags, slot, 8);
+    let prot = bcx.ins().load(types::I64, flags, slot, 16);
+    // One compare covers page identity *and* mapping generation (see `RefillSlot`).
+    let want = bcx.ins().bxor(page_key, refill.mem_gen);
+    let key_ok = bcx.ins().icmp(IntCC::Equal, tag, want);
+    let need = if write { TLB_PROT_W } else { TLB_PROT_R };
+    let prot_bits = bcx.ins().band_imm(prot, need.cast_signed());
+    let prot_ok = bcx.ins().icmp_imm(IntCC::NotEqual, prot_bits, 0);
+    let ok1 = bcx.ins().band(key_ok, prot_ok);
+    let ok = bcx.ins().band(ok1, in_page);
+    let host = bcx.ins().iadd(base, page_off);
+    (ok, host)
+}
+
 /// Zero-extend a loaded integer of `size` bytes to i64.
 ///
 /// `flags` should be the caller's guest-data alias-tagged flags (`mem.guest_flags`)
@@ -402,9 +499,10 @@ pub(super) fn call_load(
     }
 
     // CFG-ordered probes (not `select`).
-    // Order: stack → sticky → largest data pin → helper.
-    // Sticky first keeps single-page streams free of pin-bounds IR; the data
-    // pin catches multi-page thrash inside VirtualAlloc / heap after sticky miss.
+    // Order: stack → refill table → largest data pin → helper.
+    // The refill probe first keeps single-page streams free of pin-bounds IR;
+    // the data pin catches multi-page thrash inside VirtualAlloc / heap after
+    // the refill slot was replaced by a conflicting page.
     let merge = bcx.create_block();
     bcx.append_block_param(merge, types::I64);
 
@@ -415,8 +513,8 @@ pub(super) fn call_load(
         });
     }
 
-    {
-        let (ok, host) = sticky_tlb_probe(bcx, mem, addr, size, false);
+    if let Some(refill) = mem.refill {
+        let (ok, host) = refill_tlb_probe(bcx, &refill, mem.flags, addr, size, false);
         emit_probe_stage(bcx, ok, host, merge, |bcx, host| {
             Some(load_guest_bytes(bcx, mem.guest_flags, host, size))
         });
@@ -512,7 +610,7 @@ pub(super) fn call_store(
         return Ok(());
     }
 
-    // Same CFG order as `call_load`: stack → sticky → data pin → helper.
+    // Same CFG order as `call_load`: stack → refill table → data pin → helper.
     let merge = bcx.create_block();
 
     if let Some(ref pin) = mem.stack_pin {
@@ -523,8 +621,8 @@ pub(super) fn call_store(
         });
     }
 
-    {
-        let (ok, host) = sticky_tlb_probe(bcx, mem, addr, size, true);
+    if let Some(refill) = mem.refill {
+        let (ok, host) = refill_tlb_probe(bcx, &refill, mem.flags, addr, size, true);
         emit_probe_stage(bcx, ok, host, merge, |bcx, host| {
             store_guest_bytes(bcx, mem.guest_flags, host, size, value);
             None

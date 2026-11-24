@@ -1,6 +1,10 @@
-//! GPR operand helpers (read/write, effective-address, sticky-TLB probe) and the
+//! GPR operand helpers (read/write, effective-address) and the
 //! mov/ALU/shift/push/pop/imul/div/cmpxchg lowering family.
+//!
+//! The inline mem fast path (the direct-mapped refill probe) lives in
+//! [`super::mem`], next to the load/store stages that emit it.
 
+use super::OFF_GS_BASE;
 use super::emit::MemEnv;
 use super::flags::{
     FlagState, clear_flags, flag_bit, flags_add, flags_logic, flags_sub, iconst_u64, mask_width,
@@ -8,17 +12,11 @@ use super::flags::{
 };
 use super::insn::PendingFlags;
 use super::mem::{call_load, call_store};
-use super::{
-    OFF_GS_BASE, OFF_MEM_GEN, OFF_STICKY_GEN, OFF_STICKY_PAGE, OFF_STICKY_PROT, OFF_STICKY_PTR,
-    STICKY_WAYS, TLB_PROT_R, TLB_PROT_W,
-};
 
 use super::super::block::mem_width_bytes;
 use super::err::LowerError;
 
-use crate::mem::PAGE_SIZE;
 use crate::regs::Rflags;
-use cranelift::codegen::ir::BlockArg;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
@@ -373,91 +371,6 @@ pub(super) fn read_op_mem(
         | OpKind::Immediate32to64 => Ok(read_imm(bcx, instr, op)),
         _ => Err(LowerError::form("operand_kind")),
     }
-}
-
-/// Probe multi sticky TLB (last [`STICKY_WAYS`] pages): key, in-page, gen, R|W.
-///
-/// Returns `(ok_i1, host_ptr)` where `host_ptr` is only valid when `ok` is true.
-/// Cascades ways with CFG (first hit wins) so a 2–4 page working set stays in IR.
-pub(super) fn sticky_tlb_probe(
-    bcx: &mut FunctionBuilder<'_>,
-    mem: &MemEnv,
-    addr: Value,
-    size: u32,
-    write: bool,
-) -> (Value, Value) {
-    let page_mask = iconst_u64(bcx, PAGE_SIZE - 1);
-    let page_off = bcx.ins().band(addr, page_mask);
-    let sh = iconst_u64(bcx, 12);
-    let page_key = bcx.ins().ushr(addr, sh);
-    let size_v = iconst_u64(bcx, u64::from(size));
-    let end = bcx.ins().iadd(page_off, size_v);
-    // end <= PAGE_SIZE  ⇒  no cross-page
-    let page_sz = iconst_u64(bcx, PAGE_SIZE);
-    let in_page = bcx.ins().icmp(IntCC::UnsignedLessThanOrEqual, end, page_sz);
-
-    let mem_gen_p = bcx.ins().iadd_imm(mem.ctx_ptr, i64::from(OFF_MEM_GEN));
-    let mem_gen = bcx.ins().load(types::I64, mem.flags, mem_gen_p, 0);
-    let need = if write { TLB_PROT_W } else { TLB_PROT_R };
-    let need_v = iconst_u64(bcx, need);
-
-    // Merge block: (ok_i8_as_i64? use i1 as i64 via select — Cranelift brif uses i8/i1)
-    let merge = bcx.create_block();
-    bcx.append_block_param(merge, types::I8); // ok
-    bcx.append_block_param(merge, types::I64); // host
-
-    let zero = iconst_u64(bcx, 0);
-    let zero_i8 = bcx.ins().iconst(types::I8, 0);
-
-    // Probe way 0..N-1; on miss fall through to next / final miss.
-    for way in 0..STICKY_WAYS {
-        let off = i64::try_from(way.saturating_mul(8)).unwrap_or(0);
-        let key_p = bcx
-            .ins()
-            .iadd_imm(mem.ctx_ptr, i64::from(OFF_STICKY_PAGE) + off);
-        let ptr_p = bcx
-            .ins()
-            .iadd_imm(mem.ctx_ptr, i64::from(OFF_STICKY_PTR) + off);
-        let prot_p = bcx
-            .ins()
-            .iadd_imm(mem.ctx_ptr, i64::from(OFF_STICKY_PROT) + off);
-        let gen_p = bcx
-            .ins()
-            .iadd_imm(mem.ctx_ptr, i64::from(OFF_STICKY_GEN) + off);
-        let hot_key = bcx.ins().load(types::I64, mem.flags, key_p, 0);
-        let hot_base = bcx.ins().load(types::I64, mem.flags, ptr_p, 0);
-        let hot_prot = bcx.ins().load(types::I64, mem.flags, prot_p, 0);
-        let hot_gen = bcx.ins().load(types::I64, mem.flags, gen_p, 0);
-        let key_ok = bcx.ins().icmp(IntCC::Equal, hot_key, page_key);
-        let base_nz = bcx.ins().icmp_imm(IntCC::NotEqual, hot_base, 0);
-        let gen_ok = bcx.ins().icmp(IntCC::Equal, hot_gen, mem_gen);
-        let prot_bits = bcx.ins().band(hot_prot, need_v);
-        let prot_ok = bcx.ins().icmp_imm(IntCC::NotEqual, prot_bits, 0);
-        let ok1 = bcx.ins().band(key_ok, base_nz);
-        let ok2 = bcx.ins().band(ok1, gen_ok);
-        let ok3 = bcx.ins().band(ok2, prot_ok);
-        let ok = bcx.ins().band(ok3, in_page);
-        let host = bcx.ins().iadd(hot_base, page_off);
-
-        let hit = bcx.create_block();
-        let miss = bcx.create_block();
-        bcx.ins().brif(ok, hit, &[], miss, &[]);
-        bcx.switch_to_block(hit);
-        bcx.seal_block(hit);
-        let one_i8 = bcx.ins().iconst(types::I8, 1);
-        bcx.ins()
-            .jump(merge, &[BlockArg::Value(one_i8), BlockArg::Value(host)]);
-        bcx.switch_to_block(miss);
-        bcx.seal_block(miss);
-    }
-
-    // All ways missed.
-    bcx.ins()
-        .jump(merge, &[BlockArg::Value(zero_i8), BlockArg::Value(zero)]);
-    bcx.switch_to_block(merge);
-    bcx.seal_block(merge);
-    let params = bcx.block_params(merge);
-    (params[0], params[1])
 }
 
 pub(super) fn lower_mov(

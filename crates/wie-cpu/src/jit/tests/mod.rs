@@ -21,6 +21,7 @@ mod interp_edge_tests;
 mod inv_gen_tests;
 mod locked_alu_tests;
 mod pause_tests;
+mod refill_tlb_tests;
 mod simd_parity_tests;
 mod strlen_repro;
 mod testb_high_byte;

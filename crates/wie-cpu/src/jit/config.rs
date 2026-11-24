@@ -44,10 +44,16 @@ pub(super) const COOLDOWN_THRESHOLD_CAP: u32 = WORK_THRESHOLD_CEILING * 4;
 
 /// JIT memory lower mode (`WIE_JIT_MEM`).
 ///
-/// - unset / `sticky` (**default**) — sticky-TLB IR + stack pin (4.1b); helpers
-///   use all pin slots (stack / heaps / VirtualAlloc) via `pin_resolve`
+/// - unset / `sticky` (**default**) — direct-mapped refill-table IR + stack pin;
+///   helpers use all pin slots (stack / heaps / VirtualAlloc) via `pin_resolve`
 /// - `slow` — helper-only loads/stores (oracle / bisect; no host ptr in IR)
-/// - `pin` — sticky + stack + **top-2 data pin IR** (heaps/VA); helpers same
+/// - `pin` — refill table + stack + **top-2 data pin IR** (heaps/VA); helpers same
+///
+/// "Sticky" is the historical name of the mode and of its host-side victim ways
+/// (`JitCtx::sticky_*`); the inline structure the emitted probe consults is now
+/// the 256-slot direct-mapped `JitCtx::refill` table, which replaced the emitted
+/// two-way sticky cascade (`docs/architecture/tlb-probe-redesign.md`). The mode
+/// name is kept because it is a user-facing env value.
 ///
 /// **Why `sticky` is the default and `pin` is the opt-in.** The data-pin stage
 /// adds a third probe ahead of the helper on *every* memory op, and that IR
@@ -377,7 +383,11 @@ impl JitConfig {
     /// blob is only valid against the layout it was compiled with.
     ///
     /// 2 — the shadow return stack (`shadow_sp`, `shadow_ret`) was removed.
-    pub(super) const FRAME_LAYOUT_VERSION: u64 = 2;
+    /// 3 — the direct-mapped refill table (`refill: [RefillSlot; 256]`) and
+    ///     `mem_path_on` were appended; the emitted mem probe now indexes
+    ///     `OFF_REFILL` with a 32-byte slot stride instead of walking
+    ///     `sticky_page` / `sticky_ptr` / `sticky_prot` / `sticky_gen`.
+    pub(super) const FRAME_LAYOUT_VERSION: u64 = 3;
 
     /// Where to append CLIF dumps, if `WIE_JIT_DUMP_IR` names a file.
     #[must_use]

@@ -297,6 +297,7 @@ mod tests {
             div64_ref: None,
             stack_pin: None,
             data_pins: Vec::new(),
+            refill: None,
             super_stack: None,
         };
         f(&mut bcx, &mut env)

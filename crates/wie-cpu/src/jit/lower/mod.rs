@@ -68,6 +68,85 @@ impl ChainSlot {
     }
 }
 
+/// One **direct-mapped** refill slot: the inline mem probe's whole fast path.
+///
+/// Replaces the emitted two-way sticky cascade ([`STICKY_WAYS`]), which hit
+/// 0.016 % of accesses on DOOM Retro: a guest whose working set is wider than
+/// two pages replaced both ways on every access, so the cascade paid ~20 CLIF
+/// ops to fail and then called a helper. One slot per scattered page key has no
+/// replacement policy to thrash — a conflict costs one access, not the table.
+///
+/// # Why the tag folds the generation
+///
+/// `tag == page_key ^ mem_gen` is one `icmp` that answers **both** "is this the
+/// page the guest means" *and* "is it still the mapping this frame resolved".
+/// When the two generations agree the xor cancels and the compare *is* the key
+/// check; when they disagree the slot is rejected without a second load, which
+/// is what makes `VirtualProtect` / `VirtualFree` / a remap invalidate the
+/// inline path. Keeping the generation in the tag is also the only thing that
+/// catches a bump the dispatcher has not seen yet — a protect issued by a host
+/// helper inside a chained frame (the frame's `mem_gen` is only re-stamped on
+/// the next dispatcher entry).
+///
+/// # Layout
+///
+/// ABI: emitted code bakes [`REFILL_STRIDE`] and the three field offsets as
+/// immediates, so reordering fields here is a code-cache-invalidating layout
+/// change (bump `JitConfig::FRAME_LAYOUT_VERSION`). The stride is padded to a
+/// power of two on purpose — see [`REFILL_STRIDE`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct RefillSlot {
+    /// `page_key ^ generation` at install (see the type doc).
+    pub tag: u64,
+    /// Host base of the page (page-aligned; `base + (addr & 0xFFF)` is the host
+    /// address of the guest byte).
+    pub base: *mut u8,
+    /// Software R/W bits (`TLB_PROT_R` / `TLB_PROT_W`), masked with the access
+    /// mode by the emitted probe.
+    pub prot: u64,
+    /// Padding to [`REFILL_STRIDE`] so the emitted index arithmetic is a shift
+    /// and a mask instead of a multiply.
+    _pad: u64,
+}
+
+impl RefillSlot {
+    /// A slot that can never be honoured: tag `TLB_EMPTY` (a page key that
+    /// cannot exist, since `TLB_EMPTY ^ mem_gen` would need every high page-key
+    /// bit of the guest VA set), null host base, no permissions.
+    pub(super) const EMPTY: Self = Self {
+        tag: TLB_EMPTY,
+        base: std::ptr::null_mut(),
+        prot: 0,
+        _pad: 0,
+    };
+
+    /// A resolved page: `tag` folds the page key with the generation the page
+    /// entry was resolved under.
+    pub(super) const fn new(tag: u64, base: *mut u8, prot: u64) -> Self {
+        Self {
+            tag,
+            base,
+            prot,
+            _pad: 0,
+        }
+    }
+
+    /// Host mirror of the emitted validity test (`tag == page_key ^ mem_gen`
+    /// and the R/W bits allow `need`).
+    ///
+    /// Emitted code cannot call this — it is the same predicate spelled out in
+    /// CLIF by [`refill_tlb_probe`](super::mem::refill_tlb_probe). It exists so
+    /// the test suite can assert the *table* semantics (a bumped generation
+    /// rejects an otherwise matching slot) without depending on the CFG the
+    /// probe compiles to.
+    #[cfg(test)]
+    #[must_use]
+    pub(super) fn hits(&self, page_key: u64, mem_gen: u64, need: u64) -> bool {
+        self.tag == page_key ^ mem_gen && !self.base.is_null() && self.prot & need != 0
+    }
+}
+
 /// One XMM slot as lo/hi u64 with 16-byte alignment (Neon-friendly bank).
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Default)]
@@ -102,7 +181,42 @@ pub(super) const PIN_SLOTS: usize = crate::mem::JIT_REGION_PIN_SLOTS;
 ///
 /// 2 balances 7za (large WS full-miss tax vs small-WS hit rate). 4 helps more
 /// on tiny working sets but pays 4 probes on every thrash miss.
+///
+/// Since the inline probe became the direct-mapped [`RefillSlot`] table these
+/// ways are no longer emitted into IR: they are a host-side victim set that
+/// `tlb_page_ptr` scans after an inline miss (`sticky_hit` in the mem-path
+/// histogram), and `tlb_set_hot` still maintains them.
 pub(super) const STICKY_WAYS: usize = 2;
+/// Direct-mapped refill slots for the inline mem probe (power of two).
+///
+/// 256 slots holds every working set the emulator has measured — DOOM Retro's
+/// renderer (frame buffer + colormap + texture columns + stack + heap) is ~30
+/// pages; 7-Zip's archive scans are wider but each page is streamed. 256 × 32 B
+/// is 8 KiB of frame, which stays resident in L1 next to the code that probes
+/// it.
+pub(super) const REFILL_SLOTS: usize = 256;
+/// Bytes per [`RefillSlot`] — **power of two on purpose**.
+///
+/// The emitted index is `((page_key * GOLDEN) >> REFILL_SHIFT) * STRIDE`, so a
+/// power-of-two stride folds the multiply into the shift: two immediate ops
+/// (`ushr_imm` + `band_imm`) instead of shift-add-shift. The trailing 8 bytes
+/// are padding, and buying the cheaper index with them is the right trade on a
+/// path the guest hits per memory operand. It also means a 32-byte slot is
+/// half a cache line: with a 32-byte-aligned table base (it happens to be,
+/// see `OFF_REFILL`) the probe's three loads of one slot never span two lines.
+pub(super) const REFILL_STRIDE: usize = 32;
+/// log2([`REFILL_STRIDE`]) — the shift the emitted index arithmetic folds in.
+pub(super) const REFILL_STRIDE_SHIFT: u32 = 5;
+/// Bits dropped from the golden-ratio product to select a slot: `64 - log2(256)`.
+pub(super) const REFILL_SHIFT: u32 = 56;
+/// Byte-offset mask the emitted probe applies to `page_key * GOLDEN`.
+///
+/// `((page_key * GOLDEN) >> (REFILL_SHIFT - REFILL_STRIDE_SHIFT)) & MASK`
+/// equals `refill_slot(page_key) * REFILL_STRIDE`, i.e. the byte offset of the
+/// slot inside [`JitCtx::refill`]. [`refill_slot`] is the host-side spelling of
+/// the same arithmetic, and `refill_slot_matches_emitted_index` pins them
+/// together — the constant below is only ever allowed to change with it.
+pub(super) const REFILL_OFFSET_MASK: i64 = ((REFILL_SLOTS as i64) - 1) << REFILL_STRIDE_SHIFT;
 /// Bytes per [`MemPin`] (`repr(C)`: 5×u64).
 pub(super) const PIN_STRIDE: i32 = 40;
 /// Monomorphic edge inline-cache slots (data-plane chaining).
@@ -292,7 +406,7 @@ impl MemPin {
 /// * **Per-run fields must be reset by the dispatcher** (`fault`, `mem_path`,
 ///   the dirty masks, `chain_depth`, `insn_acc`, `chain_hops`,
 ///   `chain_store_ops`, `load_calls`, `store_calls`) because the frame now
-///   outlives a run. Everything else (`tlb`, `pins`, `sticky_*`, `edge_ic_*`,
+///   outlives a run. Everything else (`tlb`, `refill`, `pins`, `sticky_*`, `edge_ic_*`,
 ///   `tlb_hot_*`) is *meant* to persist and already did — it used
 ///   to be copied back into the thread after each run.
 #[repr(C)]
@@ -317,9 +431,9 @@ pub(super) struct JitCtx {
     pub fault_access: u64,
     /// Generation-validated set-associative page TLB.
     ///
-    /// Host-helper-side only: emitted IR never reads it (the sticky and
-    /// hot-slot fields carry the inline IR fast path), so it is free to live
-    /// inside a generic cache type. `offset_of!` constants auto-derive.
+    /// Host-helper-side only: emitted IR never reads it (the direct-mapped
+    /// [`JitCtx::refill`] table carries the inline fast path), so it is free to
+    /// live inside a generic cache type. `offset_of!` constants auto-derive.
     pub tlb: GenTlb<u64, TlbValue, TLB_SETS, TLB_WAYS_PER_SET>,
     /// XMM0..XMM15 as 16-byte aligned slots (lo/hi layout for IR offsets).
     pub xmm: [XmmSlot; 16],
@@ -361,7 +475,20 @@ pub(super) struct JitCtx {
     pub xmm_dirty_bits: u64,
     /// Helper mem-path breakdown for this `run_compiled` (not used from Cranelift IR).
     pub mem_path: MemPathSlice,
-    /// Multi sticky page keys (`TLB_EMPTY` = cold). Appended after IR-stable fields.
+    /// Whether [`Self::mem_path`] is being recorded at all (`WIE_JIT_MEM_TRACE`).
+    ///
+    /// Process-constant, stamped once at [`Self::new_persistent`] rather than per
+    /// entry: it is the single branch every diagnostic counter on the helper
+    /// path is behind, so it must be a plain load, not a `OnceLock` deref per
+    /// resolution. Nothing else reads it.
+    pub mem_path_on: u64,
+    /// Multi sticky page keys (`TLB_EMPTY` = cold); a host-side **victim set**,
+    /// MRU-ordered, scanned by `tlb_page_ptr` after an inline refill miss.
+    ///
+    /// Emitted code no longer reads these ways (the inline probe is
+    /// [`Self::refill`]); `STICKY_WAYS` stays because a page whose refill slot
+    /// was taken by a conflicting page must still resolve without a page walk,
+    /// and because `sticky_miss_*` attributes the inline miss.
     pub sticky_page: [u64; STICKY_WAYS],
     /// Host page bases parallel to [`Self::sticky_page`].
     pub sticky_ptr: [*mut u8; STICKY_WAYS],
@@ -459,6 +586,19 @@ pub(super) struct JitCtx {
     /// the helper's access to one `&mut` with no `Drop` glue in the
     /// `#[repr(C)]` C-ABI context. Same idiom as [`Self::chain_slots`].
     pub large_free: *mut LargeFreeList,
+    /// **The inline mem fast path**: [`REFILL_SLOTS`] direct-mapped page slots,
+    /// scattered by [`refill_slot`] and probed by emitted code (see
+    /// [`RefillSlot`] and [`OFF_REFILL`]).
+    ///
+    /// Persistent across entries, like `tlb` and the sticky ways, and populated
+    /// by `tlb_set_hot` at every resolution point of `tlb_page_ptr` (bucket hit,
+    /// pin hit, walk hit) so an inline miss installs the page the helper just
+    /// resolved. It is cleared whenever the guest memory generation moves
+    /// (`run_compiled`'s pin refresh, `invalidate_tlb`) — that makes the folded
+    /// tag compare *exact*: no installed slot can outlive the generation it was
+    /// resolved under, so `tag == page_key ^ mem_gen` reduces to `tag ==
+    /// page_key` plus a generation every entry shares.
+    pub refill: [RefillSlot; REFILL_SLOTS],
 }
 
 impl JitCtx {
@@ -501,6 +641,7 @@ impl JitCtx {
             edge_ic_rr: 0,
             xmm_dirty_bits: 0,
             mem_path: MemPathSlice::default(),
+            mem_path_on: u64::from(JitConfig::get().mem_path_trace_enabled()),
             sticky_page: [TLB_EMPTY; STICKY_WAYS],
             sticky_ptr: [std::ptr::null_mut(); STICKY_WAYS],
             sticky_prot: [0; STICKY_WAYS],
@@ -516,18 +657,19 @@ impl JitCtx {
             heap_base: 0,
             heap_end: 0,
             large_free: std::ptr::null_mut(),
+            refill: [RefillSlot::EMPTY; REFILL_SLOTS],
         }
     }
 }
 
 /// Per-`run_compiled` mem helper resolution counters (appended after IR-stable layout).
 ///
-/// Classifies why the sticky IR path missed and how the helper resolved the access.
+/// Classifies why the inline probe missed and how the helper resolved the access.
 /// Cheap saturating adds; accumulate into [`super::JitStats`] after each block.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct MemPathSlice {
-    /// Helper sticky hit (IR already missed — rare unless race/gen refresh).
+    /// Helper resolved through a sticky victim way (the inline probe missed).
     pub sticky_hit: u64,
     /// Multi-way set-assoc TLB hit after sticky miss.
     pub multi_hit: u64,
@@ -585,6 +727,10 @@ pub(super) const OFF_INSN_ACC: i32 = std::mem::offset_of!(JitCtx, insn_acc) as i
 pub(super) const OFF_CHAIN_HOPS: i32 = std::mem::offset_of!(JitCtx, chain_hops) as i32;
 /// GPR stores performed by chain edges (see [`JitCtx::chain_store_ops`]).
 pub(super) const OFF_CHAIN_STORE_OPS: i32 = std::mem::offset_of!(JitCtx, chain_store_ops) as i32;
+/// Direct-mapped refill table base (see [`JitCtx::refill`]): the emitted probe
+/// adds [`REFILL_OFFSET_MASK`]'s scatter result to this, then loads the
+/// [`RefillSlot`] fields at +0 / +8 / +16.
+pub(super) const OFF_REFILL: i32 = std::mem::offset_of!(JitCtx, refill) as i32;
 
 /// Max nested host frames for JIT block chaining.
 ///
@@ -620,6 +766,7 @@ const _: () = {
     assert!(std::mem::offset_of!(JitCtx, insn_acc) as i32 == OFF_INSN_ACC);
     assert!(std::mem::offset_of!(JitCtx, chain_hops) as i32 == OFF_CHAIN_HOPS);
     assert!(std::mem::offset_of!(JitCtx, chain_store_ops) as i32 == OFF_CHAIN_STORE_OPS);
+    assert!(std::mem::offset_of!(JitCtx, refill) as i32 == OFF_REFILL);
     // The two chain counters must be adjacent 8-byte slots: both are read and
     // written by the same emitted load-add-store pair on every chain edge, so
     // they must land in one cache line together.
@@ -628,6 +775,24 @@ const _: () = {
     assert!(std::mem::size_of::<MemPin>() == PIN_STRIDE as usize);
     assert!(std::mem::size_of::<XmmSlot>() == 16);
     assert!(std::mem::align_of::<XmmSlot>() >= 16);
+    // Refill table ABI. The probe's addressing folds the slot stride into a
+    // shift (`REFILL_STRIDE_SHIFT`), so the stride must be exactly a power of
+    // two matching that shift, the slot's field offsets must be 0/8/16, and
+    // `REFILL_SLOTS` must be the power of two `REFILL_SHIFT` drops bits for.
+    assert!(std::mem::size_of::<RefillSlot>() == REFILL_STRIDE);
+    // The emitted probe bakes these three displacements.
+    assert!(std::mem::offset_of!(RefillSlot, tag) == 0);
+    assert!(std::mem::offset_of!(RefillSlot, base) == 8);
+    assert!(std::mem::offset_of!(RefillSlot, prot) == 16);
+    assert!(REFILL_STRIDE.is_power_of_two());
+    assert!(REFILL_STRIDE.trailing_zeros() == REFILL_STRIDE_SHIFT);
+    assert!(REFILL_SLOTS.is_power_of_two());
+    assert!(REFILL_SHIFT == 64 - REFILL_SLOTS.trailing_zeros());
+    assert!(REFILL_SHIFT > REFILL_STRIDE_SHIFT);
+    assert!(REFILL_OFFSET_MASK == ((REFILL_SLOTS as i64 - 1) << REFILL_STRIDE_SHIFT));
+    // The probe loads tag/base/prot at `OFF_REFILL + slot_off + {0,8,16}`; every
+    // one of those must be 8-byte aligned for the I64 loads to be well-formed.
+    assert!((OFF_REFILL as usize).is_multiple_of(8));
     assert!(std::mem::align_of::<GenTlb<u64, TlbValue, TLB_SETS, TLB_WAYS_PER_SET>>() >= 16);
     assert!(TLB_SETS.is_power_of_two());
     assert!(CHAIN_SLOTS.is_power_of_two());
@@ -661,13 +826,51 @@ pub(super) struct CompiledBlock {
 ///
 /// Well-mixed multiplicative scatter for hashing guest VAs into chain-table
 /// slots; the odd, evenly-distributed bits avoid low-bit clustering.
-const GOLDEN_RATIO_64: u64 = 0x9E37_79B9_7F4A_7C15;
+pub(super) const GOLDEN_RATIO_64: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Hash a guest VA into a chain-table slot.
 #[inline]
 pub(super) fn chain_hash(va: u64) -> usize {
     let h = va.wrapping_mul(GOLDEN_RATIO_64);
     (h as usize) & (CHAIN_SLOTS - 1)
+}
+
+/// Host-side index of `page_key`'s [`RefillSlot`] — the arithmetic the emitted
+/// probe computes as `band_imm(ushr_imm(key * GOLDEN, 51), REFILL_OFFSET_MASK)`.
+///
+/// Same multiply-shift idiom as [`chain_hash`]: take the *top* bits of the
+/// golden-ratio product.
+///
+/// # Why the low bits of a VA cannot be the index
+///
+/// Two independent reasons, and either one alone is disqualifying:
+///
+/// 1. **The low 12 bits of a VA are structurally zero for a page key.** A page
+///    key is `addr >> 12`, so indexing with `page_key & 255` would be indexing
+///    with bits 12..20 of the address — the *page number within a 1 MiB
+///    window*. Guest working sets are exactly the case where those bits repeat:
+///    a stack, a heap block and a frame buffer allocated in the same 1 MiB
+///    would take turns on the same 256-slot region only if their *alignment*
+///    agreed, but consecutive pages of one buffer would map to consecutive
+///    slots — so a 64 KiB buffer walked page by page (16 pages) would evict the
+///    other 240 slots' worth of nothing and hit every time, while a real
+///    collision (two buffers whose 1 MiB offsets agree mod 256 pages) is
+///    systematic rather than accidental. Low-bit indexing does not scatter; it
+///    partitions by address, which is the opposite of what a cache wants.
+/// 2. **Multiplicative hashing needs the high bits anyway.** The low bits of
+///    `k * GOLDEN` carry no information about the *page identity* beyond the
+///    low bits of `k` (modular multiplication is a permutation of the low
+///    bits: `(k * G) mod 2^n` depends only on `k mod 2^n`). The avalanche that
+///    makes two nearby pages land in different slots is in the top bits; that
+///    is what running the product through a 56-bit shift harvests.
+///
+/// The scatter is evaluated per memory operand by emitted code, so there is no
+/// memoisation: `refill_slot` is the host mirror used by the install side and
+/// is tested to agree with the emitted immediate arithmetic.
+#[inline]
+pub(super) fn refill_slot(page_key: u64) -> usize {
+    let h = page_key.wrapping_mul(GOLDEN_RATIO_64);
+    usize::try_from(h >> REFILL_SHIFT).unwrap_or(0)
 }
 
 /// Insert or update a compiled block in the open-addressing chain table.
@@ -742,7 +945,7 @@ use gpr::{
     read_op_mem, reg_index, sext_to_i64, write_gpr, write_op_mem,
 };
 use insn::{PendingFlags, ShiftKind, flush_pending};
-use mem::{call_load, call_store, hoist_pin_slot};
+use mem::{call_load, call_store, hoist_pin_slot, hoist_refill};
 
 pub(super) use gpr::wie_div64;
 pub(super) use mem::{
@@ -752,6 +955,7 @@ pub(super) use sse::{wie_sse_int_binop, wie_sse_pshufb_hi, wie_sse_pshufb_lo, wi
 pub(super) use sse_fp::{
     wie_f32_binop, wie_f64_binop, wie_sse_cvt, wie_sse_fp_binop, wie_sse_fp_unop,
 };
+pub(crate) use tlb::refill_clear;
 
 /// Process-wide empty chain table, so blocks with no chainable successor avoid
 /// building a `HashMap` (RandomState init) on every compile.
@@ -1113,17 +1317,20 @@ pub(super) fn compile_block(
         // Hoist pin descriptors on the **entry** block (once per run_compiled).
         // Slot 0 = stack. Slots 1.. = size-ranked data (heap + VirtualAlloc).
         // Data-pin IR is opt-in via `WIE_JIT_MEM=pin` (see hoist below). The
-        // default, sticky, keeps stack + sticky only; helpers still
+        // default, sticky, keeps stack + refill only; helpers still
         // `pin_resolve` all 8 slots (VA/heaps) so walks collapse — without the
         // IR cascade tax that measured 22–25 % on `7za h`/`x` (see
         // `JitMemMode`). Set `WIE_JIT_MEM=pin` to probe top-2 data pins too.
         // Gate on `has_mem`: a block with no memory operand and no call/ret has
         // nothing to translate, and `opt_level = none` means nothing downstream
-        // removes the six pin/generation loads this would emit at its entry.
-        let (stack_pin, mut data_pins) = if has_mem && JitConfig::get().mem_inline_enabled() {
+        // removes the pin/generation loads this would emit at its entry.
+        let (stack_pin, mut data_pins, refill) = if has_mem && JitConfig::get().mem_inline_enabled()
+        {
             let stack = Some(hoist_pin_slot(&mut bcx, ctx_ptr, flags, 0));
+            // Inline refill table: the memory fast path for every operand below.
+            let refill = Some(hoist_refill(&mut bcx, ctx_ptr, flags));
             // Default sticky: no data-pin IR (helpers cover VA via pin_resolve).
-            // `WIE_JIT_MEM=pin`: top-2 size-ranked data pins after sticky.
+            // `WIE_JIT_MEM=pin`: top-2 size-ranked data pins after refill.
             let mut data = Vec::new();
             if JitConfig::get().mem_pin_enabled() {
                 const IR_DATA_PIN_SLOTS: usize = 2;
@@ -1133,9 +1340,9 @@ pub(super) fn compile_block(
                     data.push(hoist_pin_slot(&mut bcx, ctx_ptr, flags, slot));
                 }
             }
-            (stack, data)
+            (stack, data, refill)
         } else {
-            (None, Vec::new())
+            (None, Vec::new(), None)
         };
 
         // Pre-compile scan: displacement range for block-wide stack pin guard.
@@ -1275,6 +1482,9 @@ pub(super) fn compile_block(
                     } else {
                         std::mem::take(&mut data_pins)
                     },
+                    // The super path never probes: it is one entry guard plus
+                    // bare host memops, so an inline probe would be dead IR.
+                    refill: if is_super { None } else { refill },
                     super_stack: if is_super {
                         Some(SuperStack { bias })
                     } else {
@@ -1401,6 +1611,7 @@ pub(super) fn compile_block(
                 ucrt_refs,
                 stack_pin,
                 data_pins,
+                refill,
                 super_stack: None,
             };
 

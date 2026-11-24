@@ -1,11 +1,13 @@
 //! TLB hot-path lookup helpers: software-permission checks, pin resolution,
-//! multi-way set-associative lookups, and the single-page host-pointer resolver (`tlb_page_ptr`).
+//! multi-way set-associative lookups, installation into the direct-mapped
+//! inline refill table, and the single-page host-pointer resolver
+//! (`tlb_page_ptr`).
 
 use super::super::config::JitConfig;
 use super::super::gen_tlb::GenTlb;
 use super::{
-    GuestVa, JitCtx, MemPin, STICKY_WAYS, TLB_EMPTY, TLB_PROT_R, TLB_PROT_W, TLB_SETS,
-    TLB_WAYS_PER_SET, TlbValue,
+    GuestVa, JitCtx, MemPin, REFILL_SLOTS, RefillSlot, STICKY_WAYS, TLB_EMPTY, TLB_PROT_R,
+    TLB_PROT_W, TLB_SETS, TLB_WAYS_PER_SET, TlbValue, refill_slot,
 };
 
 use crate::mem::PAGE_SIZE;
@@ -18,10 +20,45 @@ pub(super) fn set_fault(ctx: &mut JitCtx, insn_ip: u64, addr: u64, size: u64, ac
     ctx.fault_access = access;
 }
 
-/// Promote a mapped page into multi sticky (IR) + last-hit mirror + multi-way cache warm.
+/// Install a resolved page into the **direct-mapped inline refill table** — the
+/// table emitted code probes before it calls a helper.
 ///
-/// Sticky ways are **MRU-ordered**: way 0 is always the last hit so sequential
-/// streams take one IR probe; thrash of ≤[`STICKY_WAYS`] pages stays in IR.
+/// Called from [`tlb_set_hot`], i.e. from all three resolution points of
+/// [`tlb_page_ptr`] (bucket hit, pin hit, walk hit): whatever the helper just
+/// resolved is what the next inline access hits. Populating only on a "clean"
+/// hit would leave the slot cold after exactly the accesses that paid a helper.
+///
+/// `generation` is the generation the *page entry* was resolved under (not
+/// necessarily the frame's `ctx.mem_gen`): a page resolved by a helper after a
+/// mid-frame protect carries the newer generation and therefore misses the
+/// inline probe until the dispatcher re-stamps `mem_gen`, which is the
+/// conservative direction (helper, not a stale host pointer).
+fn refill_install(ctx: &mut JitCtx, page_key: u64, page_base: *mut u8, prot: u8, generation: u64) {
+    let slot = refill_slot(page_key);
+    if let Some(s) = ctx.refill.get_mut(slot) {
+        *s = RefillSlot::new(page_key ^ generation, page_base, u64::from(prot));
+    }
+}
+
+/// Clear every refill slot (generation bump / thread switch / TLB invalidate).
+///
+/// The emitted probe's tag folds `mem_gen`, so a stale slot would already be
+/// rejected; clearing makes the folded compare *exact* rather than merely
+/// improbable — no installed slot can outlive the generation it was resolved
+/// under, so `tag == page_key ^ mem_gen` reduces to `tag == page_key`. Costs one
+/// 8 KiB memset on a map/protect event, next to the pin rebuild that event
+/// already pays for.
+pub(crate) fn refill_clear(ctx: &mut JitCtx) {
+    ctx.refill = [RefillSlot::EMPTY; REFILL_SLOTS];
+}
+
+/// Promote a mapped page into multi sticky (host victim set) + last-hit mirror +
+/// the inline refill slot.
+///
+/// Sticky ways are **MRU-ordered** host-side: way 0 is always the last hit.
+/// Emitted IR no longer reads them (the inline probe is the refill table); they
+/// are a victim set that [`tlb_page_ptr`] scans after an inline miss, which is
+/// what keeps a thrashing page reachable without rebuilding the bucket.
 pub(super) fn tlb_set_hot(
     ctx: &mut JitCtx,
     page_key: u64,
@@ -29,7 +66,11 @@ pub(super) fn tlb_set_hot(
     prot: u8,
     generation: u64,
 ) {
-    if ctx.tlb_hot_page != page_key && ctx.tlb_hot_page != TLB_EMPTY && !ctx.tlb_hot_ptr.is_null() {
+    if ctx.mem_path_on != 0
+        && ctx.tlb_hot_page != page_key
+        && ctx.tlb_hot_page != TLB_EMPTY
+        && !ctx.tlb_hot_ptr.is_null()
+    {
         ctx.mem_path.sticky_swaps = ctx.mem_path.sticky_swaps.saturating_add(1);
     }
     // Last-hit mirror (helper + diagnostics).
@@ -37,6 +78,8 @@ pub(super) fn tlb_set_hot(
     ctx.tlb_hot_ptr = page_base;
     ctx.tlb_hot_prot = u64::from(prot);
     ctx.tlb_hot_gen = generation;
+    // Inline fast path: the page the helper just resolved.
+    refill_install(ctx, page_key, page_base, prot, generation);
 
     // Find existing way (if any).
     let mut found = None;
@@ -171,9 +214,9 @@ pub(super) fn classify_sticky_miss(ctx: &mut JitCtx, page_key: u64, write: bool)
 /// Callers fold the `write` branch into `need` once per helper invocation,
 /// hoisting it out of the per-way TLB scans below; each way check then stays
 /// a single arithmetic bit test. Mirrors the IR-side fold in
-/// [`sticky_tlb_probe`](crate::jit::lower::gpr::sticky_tlb_probe), which
+/// [`refill_tlb_probe`](crate::jit::lower::mem::refill_tlb_probe), which
 /// computes `need = if write { TLB_PROT_W } else { TLB_PROT_R }` so the
-/// emitted probes share one permission vocabulary.
+/// emitted probe and the helper share one permission vocabulary.
 #[inline]
 pub(super) fn tlb_prot_allows(prot: u8, need: u64) -> bool {
     (u64::from(prot) & need) != 0
@@ -192,7 +235,9 @@ pub(super) fn pack_tlb_prot(allow_r: bool, allow_w: bool) -> u8 {
 
 /// Soft-translate via region pin when gen / bounds / R|W match.
 ///
-/// On hit, also warms sticky + multi-way TLB so subsequent sticky IR can fire.
+/// On hit, also warms sticky + multi-way TLB **and the inline refill slot**, so
+/// the next access to this page never reaches a helper (a miss is what installs
+/// the page it just resolved).
 pub(super) fn pin_resolve(
     ctx: &mut JitCtx,
     addr: u64,
@@ -341,37 +386,68 @@ pub(super) fn lane_eq_bit(v: std::arch::aarch64::uint64x2_t, lane: usize) -> u32
     u32::from(arr.get(lane).copied().unwrap_or(0) != 0)
 }
 
-/// Resolve host page pointer via multi-way TLB (single-page accesses only).
+/// How a helper-side access was resolved — the `WIE_JIT_MEM_TRACE` histogram axis.
 ///
-/// Enforces software R/W bits and memory generation on every hit. Misses that
-/// lack the required permission return `None` so the slow path can set a fault
-/// via [`GuestMemory::read`] / [`GuestMemory::write`] (SPC oracle).
+/// Produced by [`resolve_page`] on every helper call and read **only** by
+/// [`record_resolution`], which is behind one `mem_path_on` branch: the
+/// resolution itself never counts, classifies or branches for diagnostics.
+#[derive(Clone, Copy)]
+enum Resolve {
+    /// Host-side sticky victim way.
+    Sticky,
+    /// 4-way set-associative bucket.
+    Multi,
+    /// Region-direct pin (stack / heap / VirtualAlloc span).
+    Pin,
+    /// Page-table walk (first touch of a page under this generation).
+    Walk,
+    /// The access straddles a page boundary.
+    CrossPage,
+    /// Resolved, but the current access is not permitted (write to an R page).
+    Denied,
+    /// Nothing mapped this page.
+    Unmapped,
+}
+
+/// Everything [`resolve_page`] hands back: the host pointer (if any), how it got
+/// there, and whether the host-side sticky scan missed (so the trace can
+/// attribute the miss to key / generation / permission).
+struct Resolution {
+    host: Option<*mut u8>,
+    path: Resolve,
+    sticky_missed: bool,
+}
+
+/// Resolve a single-page guest access to a host pointer (helper side).
 ///
-/// Updates [`JitCtx::mem_path`] counters: sticky IR already missed (caller is
-/// the host helper), so each call is one helper invocation to classify.
-pub(super) unsafe fn tlb_page_ptr(
+/// Order: sticky victim ways → 4-way bucket → region pin → page walk. Every
+/// resolving branch installs the page into the bucket *and* the inline refill
+/// slot (`tlb_set_hot`), so the access that paid this call is the last one.
+fn resolve_page(
     ctx: &mut JitCtx,
     addr: u64,
+    page_off: usize,
+    page_key: u64,
     size: usize,
     write: bool,
-) -> Option<*mut u8> {
-    classify_addr_vs_pins(ctx, addr, size);
-    let page_off = usize::try_from(addr & (PAGE_SIZE - 1)).unwrap_or(0);
+) -> Resolution {
     let page_cap = usize::try_from(PAGE_SIZE).unwrap_or(0x1000);
     if page_off.saturating_add(size) > page_cap {
-        ctx.mem_path.cross_page = ctx.mem_path.cross_page.saturating_add(1);
-        return None; // cross-page → slow path
+        return Resolution {
+            host: None,
+            path: Resolve::CrossPage,
+            sticky_missed: false,
+        };
     }
-    let page_key = addr >> 12; // PAGE_SIZE = 0x1000
     let cur_gen = ctx.mem_gen;
-    // Multi sticky hit first (matches inline IR fast path).
+    // Sticky victim ways first (the inline refill slot already missed — the
+    // caller is a host helper — but a conflict may only have replaced the
+    // slot, not the ways).
     //
-    // Branchless way select (same predicate folding as the inline
-    // `sticky_tlb_probe` IR): each way folds key / gen / prot / non-null into
-    // one bit, and `pick` becomes `winning_way + 1` (0 = miss). The scan is
+    // Branchless way select: each way folds key / gen / prot / non-null into one
+    // bit, and `pick` becomes `winning_way + 1` (0 = miss). The scan is
     // straight-line arithmetic with a single exit branch instead of up to 4
-    // mispredictable `continue`s per way — sticky probes fire on the TLB-miss
-    // helper path, where the way index varies with the access stream.
+    // mispredictable `continue`s per way.
     let need = if write { TLB_PROT_W } else { TLB_PROT_R };
     let mut pick = 0_usize; // 0 = miss; else (winning way + 1)
     for w in 0..STICKY_WAYS {
@@ -386,9 +462,7 @@ pub(super) unsafe fn tlb_page_ptr(
         let m = usize::from(key_ok & gen_ok & !host.is_null() & tlb_prot_allows(prot, need));
         pick |= m * (w + 1);
     }
-    if pick == 0 {
-        classify_sticky_miss(ctx, page_key, write);
-    } else {
+    if pick != 0 {
         let w = pick - 1;
         // Re-fetch the winning way by index — no per-way select branch.
         let host = ctx
@@ -397,26 +471,42 @@ pub(super) unsafe fn tlb_page_ptr(
             .copied()
             .unwrap_or(std::ptr::null_mut());
         let prot = u8::try_from(ctx.sticky_prot.get(w).copied().unwrap_or(0)).unwrap_or(0);
-        ctx.mem_path.sticky_hit = ctx.mem_path.sticky_hit.saturating_add(1);
         // Keep last-hit mirror coherent with the way that hit.
         ctx.tlb_hot_page = page_key;
         ctx.tlb_hot_ptr = host;
         ctx.tlb_hot_prot = u64::from(prot);
         ctx.tlb_hot_gen = cur_gen;
-        // SAFETY: sticky ptr is a mapped page base; access stays in-page; SPC bits match.
-        return Some(unsafe { host.add(page_off) });
+        // A sticky hit must re-install the inline slot too, or a page whose slot
+        // was taken by a conflicting page would resolve through the victim way
+        // for ever and never become inline again — measured: a thrashing pair
+        // stayed at helpers=1 per access indefinitely, which is exactly the
+        // regression this table exists to remove.
+        refill_install(ctx, page_key, host, prot, cur_gen);
+        return Resolution {
+            // SAFETY: sticky ptr is a mapped page base; access stays in-page;
+            // SPC bits match.
+            host: Some(unsafe { host.add(page_off) }),
+            path: Resolve::Sticky,
+            sticky_missed: false,
+        };
     }
     let hit = tlb_bucket_lookup(&ctx.tlb, page_key, write, cur_gen);
     if let Some((page_base, prot)) = hit {
-        ctx.mem_path.multi_hit = ctx.mem_path.multi_hit.saturating_add(1);
         tlb_set_hot(ctx, page_key, page_base, prot, cur_gen);
-        // SAFETY: page mapped; access stays within the page.
-        return Some(unsafe { page_base.add(page_off) });
+        return Resolution {
+            // SAFETY: page mapped; access stays within the page.
+            host: Some(unsafe { page_base.add(page_off) }),
+            path: Resolve::Multi,
+            sticky_missed: true,
+        };
     }
     // Region-direct pin (stack/heap arenas) before radix/page walk.
     if let Some(p) = pin_resolve(ctx, addr, size, write) {
-        ctx.mem_path.pin_hit = ctx.mem_path.pin_hit.saturating_add(1);
-        return Some(p);
+        return Resolution {
+            host: Some(p),
+            path: Resolve::Pin,
+            sticky_missed: true,
+        };
     }
     // Miss: resolve via GuestMemory (committed + protect meta + host ptr).
     // SAFETY: `mem` set by `run_compiled` to the live guest map.
@@ -425,8 +515,11 @@ pub(super) unsafe fn tlb_page_ptr(
     // `or_else` fallback here could never fire — it only cost a second walk,
     // with its own `fast_tlb` read, on every miss.
     let Some(entry) = mem.page_tlb_entry_walk(page_key) else {
-        ctx.mem_path.slow = ctx.mem_path.slow.saturating_add(1);
-        return None;
+        return Resolution {
+            host: None,
+            path: Resolve::Unmapped,
+            sticky_missed: true,
+        };
     };
     // Install even if this access is denied so a later opposite access can hit;
     // but only return a pointer when the *current* access is allowed.
@@ -434,10 +527,69 @@ pub(super) unsafe fn tlb_page_ptr(
     tlb_install(ctx, page_key, entry.host, prot, entry.generation);
     tlb_set_hot(ctx, page_key, entry.host, prot, entry.generation);
     if !tlb_prot_allows(prot, need) {
-        ctx.mem_path.slow = ctx.mem_path.slow.saturating_add(1);
-        return None;
+        return Resolution {
+            host: None,
+            path: Resolve::Denied,
+            sticky_missed: true,
+        };
     }
-    ctx.mem_path.walk_hit = ctx.mem_path.walk_hit.saturating_add(1);
-    // SAFETY: page mapped; access stays within the page; permission checked.
-    Some(unsafe { entry.host.add(page_off) })
+    Resolution {
+        // SAFETY: page mapped; access stays within the page; permission checked.
+        host: Some(unsafe { entry.host.add(page_off) }),
+        path: Resolve::Walk,
+        sticky_missed: true,
+    }
+}
+
+/// Charge one helper call to the `WIE_JIT_MEM_TRACE` histogram.
+///
+/// **The only place on the helper path that branches for diagnostics.** Called
+/// under `mem_path_on`, and when that flag is clear neither this nor
+/// [`classify_addr_vs_pins`] (a loop over every pin) nor [`classify_sticky_miss`]
+/// (a second way scan) runs at all — the counters exist for one trace knob and
+/// nothing else reads them.
+fn record_resolution(
+    ctx: &mut JitCtx,
+    addr: u64,
+    size: usize,
+    page_key: u64,
+    write: bool,
+    r: &Resolution,
+) {
+    classify_addr_vs_pins(ctx, addr, size);
+    let n = |v: u64| v.saturating_add(1);
+    match r.path {
+        Resolve::Sticky => ctx.mem_path.sticky_hit = n(ctx.mem_path.sticky_hit),
+        Resolve::Multi => ctx.mem_path.multi_hit = n(ctx.mem_path.multi_hit),
+        Resolve::Pin => ctx.mem_path.pin_hit = n(ctx.mem_path.pin_hit),
+        Resolve::Walk => ctx.mem_path.walk_hit = n(ctx.mem_path.walk_hit),
+        Resolve::CrossPage => ctx.mem_path.cross_page = n(ctx.mem_path.cross_page),
+        Resolve::Denied | Resolve::Unmapped => ctx.mem_path.slow = n(ctx.mem_path.slow),
+    }
+    if r.sticky_missed {
+        classify_sticky_miss(ctx, page_key, write);
+    }
+}
+
+/// Resolve host page pointer for a helper load/store (single-page accesses only).
+///
+/// Enforces software R/W bits and memory generation on every hit. Misses that
+/// lack the required permission return `None` so the slow path can set a fault
+/// via [`GuestMemory::read`] / [`GuestMemory::write`] (SPC oracle).
+///
+/// Every resolution installs into the inline refill table, so the next access
+/// to that page never reaches this function.
+pub(super) unsafe fn tlb_page_ptr(
+    ctx: &mut JitCtx,
+    addr: u64,
+    size: usize,
+    write: bool,
+) -> Option<*mut u8> {
+    let page_off = usize::try_from(addr & (PAGE_SIZE - 1)).unwrap_or(0);
+    let page_key = addr >> 12; // PAGE_SIZE = 0x1000
+    let r = resolve_page(ctx, addr, page_off, page_key, size, write);
+    if ctx.mem_path_on != 0 {
+        record_resolution(ctx, addr, size, page_key, write, &r);
+    }
+    r.host
 }
