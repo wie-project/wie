@@ -1064,22 +1064,44 @@ fn exec_ret(
     Ok(())
 }
 
+/// `XCHG r, r/m` — swap. The memory form is **implicitly locked** on x86-64 even
+/// without a `LOCK` prefix, so the memory side must be a single
+/// read-modify-write: a plain load followed by a separate store gives a guest
+/// spinlock (`pthread_spin_lock` and friends) no mutual exclusion at all, and
+/// the lock word ends up `0` ("held") with no holder.
 fn exec_xchg(
     mem: &GuestMemory,
     regs: &mut RegFile,
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
-    let a = read_op(mem, regs, instr, 0)?;
-    let b = read_op(mem, regs, instr, 1)?;
-    write_op(mem, regs, instr, 0, b)?;
-    write_op(mem, regs, instr, 1, a)?;
+    let k0 = instr.op0_kind();
+    let k1 = instr.op1_kind();
+    if k0 != OpKind::Memory && k1 != OpKind::Memory {
+        let a = read_op(mem, regs, instr, 0)?;
+        let b = read_op(mem, regs, instr, 1)?;
+        write_op(mem, regs, instr, 0, b)?;
+        write_op(mem, regs, instr, 1, a)?;
+        return Ok(());
+    }
+
+    // mem,reg / reg,mem — one atomic exchange against the memory operand.
+    let (mem_op, reg_op) = if k0 == OpKind::Memory { (0, 1) } else { (1, 0) };
+    let size = op_size_bytes(instr, mem_op)?;
+    let addr = effective_address(regs, instr)?;
+    let mask = regs::size_mask(size);
+    let reg_val = read_op(mem, regs, instr, reg_op)? & mask;
+    let old = atomic_rmw(mem, addr, size, |_cur| reg_val)?;
+    // The register side gets the old memory value; the memory side is done.
+    write_op(mem, regs, instr, reg_op, old)?;
     Ok(())
 }
 
 /// `XADD r/m, r` — temp = dest; dest = dest + src; src = temp. Flags as ADD.
 ///
-/// With `LOCK` and a memory destination, uses host atomics via soft-translate when
-/// the span is aligned and mappable (needed for 7za LZMA2 worker counters).
+/// `LOCK XADD` with a memory destination is a genuine atomic RMW (this is what
+/// `InterlockedIncrement`-style guest code compiles to), so it goes through
+/// [`atomic_rmw`] — which, unlike a load/store pair, keeps mutual exclusion for
+/// sub-word and unaligned operands too.
 fn exec_xadd(
     mem: &GuestMemory,
     regs: &mut RegFile,
@@ -1089,17 +1111,14 @@ fn exec_xadd(
     let mask = regs::size_mask(size);
     let src = read_op(mem, regs, instr, 1)? & mask;
 
-    // Atomic path: LOCK + memory dest (InterlockedIncrement-style RMW).
     if instr.has_lock_prefix() && instr.op0_kind() == OpKind::Memory {
         let addr = effective_address(regs, instr)?;
-        if let Some(old) = atomic_fetch_add(mem, addr, size, src) {
-            let old_m = old & mask;
-            let sum = old_m.wrapping_add(src) & mask;
-            // Operand 1 is always a register — write original dest value.
-            write_op(mem, regs, instr, 1, old_m)?;
-            regs::set_add_flags(regs, old_m, src, sum, size);
-            return Ok(());
-        }
+        let old = atomic_rmw(mem, addr, size, |cur| cur.wrapping_add(src) & mask)? & mask;
+        let sum = old.wrapping_add(src) & mask;
+        // Operand 1 is always a register — write original dest value.
+        write_op(mem, regs, instr, 1, old)?;
+        regs::set_add_flags(regs, old, src, sum, size);
+        return Ok(());
     }
 
     let dest = read_op(mem, regs, instr, 0)? & mask;
@@ -1110,36 +1129,210 @@ fn exec_xadd(
     Ok(())
 }
 
-/// Host-atomic `fetch_add` for guest memory when soft-translate allows.
-/// Returns the previous value, or `None` to fall back to non-atomic RMW.
-fn atomic_fetch_add(mem: &GuestMemory, addr: u64, size: usize, addend: u64) -> Option<u64> {
+/// Bit-preserving `u32 -> i32` (and back) for the atomic boundary.
+///
+/// Same `from_le_bytes`/`to_le_bytes` round trip `atomic_rmw`'s 64-bit arms use;
+/// endianness cancels, and it keeps the `as_conversions` lint out.
+fn bits_i32(v: u64) -> i32 {
+    i32::from_le_bytes(u32::try_from(v & 0xffff_ffff).unwrap_or(0).to_le_bytes())
+}
+
+fn bits_u32(v: i32) -> u64 {
+    u64::from(u32::from_le_bytes(v.to_le_bytes()))
+}
+
+fn bits_i64(v: u64) -> i64 {
+    i64::from_le_bytes(v.to_le_bytes())
+}
+
+fn bits_u64(v: i64) -> u64 {
+    u64::from_le_bytes(v.to_le_bytes())
+}
+
+/// Host-side locks backing the RMW fallback path (see [`rmw_fallback_lock`]).
+///
+/// Deliberately a fixed-size striped table rather than a per-address map: the
+/// RMW is a handful of instructions wide, so a wrong-but-narrow stripe only
+/// costs a little serialisation, whereas a growable map would be a new
+/// process-global data structure on the guest's hottest spin path.
+const RMW_STRIPES: usize = 256;
+static RMW_FALLBACK_LOCKS: [Mutex<()>; RMW_STRIPES] = [const { Mutex::new(()) }; RMW_STRIPES];
+/// Serialisation point for a stripe the table cannot supply. Unreachable while
+/// `RMW_STRIPES` is a power of two and the index is masked, but present so the
+/// fallback can never degrade into an unsynchronised RMW.
+static RMW_FALLBACK_OVERFLOW: Mutex<()> = Mutex::new(());
+
+fn lock_unpoisoned(cell: &'static Mutex<()>) -> MutexGuard<'static, ()> {
+    match cell.lock() {
+        Ok(guard) => guard,
+        // A panicked RMW leaves no invariant to protect: the memory word is
+        // still a valid x86 word, so keep going rather than cascade-poison.
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The host lock that serialises the non-`host_span` RMW path for `addr`.
+///
+/// `host_span` only yields a pointer for a naturally aligned 4/8-byte operand,
+/// but x86 permits an atomic RMW at *any* alignment. Those cases (plus RX code
+/// pages, which `host_span` refuses to write so SMC goes through `write`) take
+/// this lock instead — mutual exclusion is exactly what a guest spinlock needs,
+/// and it is strictly stronger than the load-then-store it replaces.
+fn rmw_fallback_lock(addr: u64) -> MutexGuard<'static, ()> {
+    // Mix the low byte with the page offset so both a single hot lock word and a
+    // dense array of small words spread across stripes.
+    let mask = u64::try_from(RMW_STRIPES - 1).unwrap_or(u64::MAX);
+    let stripe = usize::try_from((addr ^ (addr >> 12)) & mask).unwrap_or(0);
+    match RMW_FALLBACK_LOCKS.get(stripe) {
+        Some(cell) => lock_unpoisoned(cell),
+        None => lock_unpoisoned(&RMW_FALLBACK_OVERFLOW),
+    }
+}
+
+/// Atomic read-modify-write of the `size`-byte guest word at `addr`.
+///
+/// Returns the value the word held before the update. `f` computes the new
+/// value from the old one and must be pure (it may run more than once under
+/// contention).
+///
+/// **Permission oracle.** The fast path calls `mem.host_span(addr, size, true)`,
+/// which runs the software page-permission check (SPC) and arena walk before
+/// returning a host pointer, exactly as the previous `atomic_fetch_add` did —
+/// the RMW never writes guest memory through a path that skips it. The fallback
+/// path takes the host lock and then goes through the ordinary checked
+/// `mem.read` / `mem.write`, so a read-only or unmapped word still faults with
+/// the access-type-tagged `InvalidMemory` the guest expects.
+fn atomic_rmw<F>(mem: &GuestMemory, addr: u64, size: usize, f: F) -> Result<u64, StepExecError>
+where
+    F: Fn(u64) -> u64,
+{
+    if let Some(old) = host_atomic_rmw(mem, addr, size, &f) {
+        return Ok(old);
+    }
+    let _guard = rmw_fallback_lock(addr);
+    let old = read_mem_value(mem, addr, size)?;
+    let new = f(old);
+    write_mem_value(mem, addr, new, size)?;
+    Ok(old)
+}
+
+/// Host-atomic arm of [`atomic_rmw`]: a naturally aligned 4/8-byte word inside a
+/// writable `host_span` becomes a real SeqCst RMW. `None` means "not host
+/// atomic" (sub-word, unaligned, unmapped, or permission/exec denied) and the
+/// caller must take the locked fallback.
+fn host_atomic_rmw<F>(mem: &GuestMemory, addr: u64, size: usize, f: &F) -> Option<u64>
+where
+    F: Fn(u64) -> u64,
+{
     use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
     match size {
         4 if addr.is_multiple_of(4) => {
             let host = mem.host_span(addr, 4, true)?;
-            // SAFETY: host_span checked SPC+arena; alignment preserved by soft-translate.
+            // SAFETY: host_span checked SPC+arena and write permission; the
+            // 4-byte alignment the atomic type needs is checked above, and
+            // soft-translate preserves it.
             #[expect(unsafe_code)]
             let atom = unsafe { &*(host.cast::<AtomicI32>()) };
-            let add = i32::from_le_bytes((addend as u32).to_le_bytes());
-            let old = atom.fetch_add(add, Ordering::SeqCst);
-            Some(u64::from(old as u32))
+            let mut cur = atom.load(Ordering::SeqCst);
+            loop {
+                let new = bits_i32(f(bits_u32(cur)));
+                match atom.compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => return Some(bits_u32(cur)),
+                    // Another guest engine won the race: retry on its value.
+                    Err(actual) => cur = actual,
+                }
+            }
         }
         8 if addr.is_multiple_of(8) => {
             let host = mem.host_span(addr, 8, true)?;
+            // SAFETY: as the 4-byte arm — 8-byte alignment checked above.
             #[expect(unsafe_code)]
             let atom = unsafe { &*(host.cast::<AtomicI64>()) };
-            let add = i64::from_le_bytes(addend.to_le_bytes());
-            let old = atom.fetch_add(add, Ordering::SeqCst);
-            Some(u64::from_le_bytes(old.to_le_bytes()))
+            let mut cur = atom.load(Ordering::SeqCst);
+            loop {
+                let new = bits_i64(f(bits_u64(cur)));
+                match atom.compare_exchange(cur, new, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => return Some(bits_u64(cur)),
+                    Err(actual) => cur = actual,
+                }
+            }
         }
-        // 8/16-bit lock xadd: rare; fall back to non-atomic.
+        // 8/16-bit and unaligned lock RMW: rare, and taken under the host lock.
         _ => None,
     }
 }
 
+/// Atomic compare-and-exchange of the `size`-byte guest word at `addr`:
+/// store `new` iff the word currently equals `expected`.
+///
+/// Returns the value the word actually held (equal to `expected` on success),
+/// never a torn or stale read. `expected` and `new` must already be masked to
+/// `size` bytes — only the low `size` bytes are compared and stored, matching
+/// x86. Used by `CMPXCHG r/m, r`, which is implicitly locked on x86-64 just
+/// like `XCHG`.
+fn atomic_cas(
+    mem: &GuestMemory,
+    addr: u64,
+    size: usize,
+    expected: u64,
+    new: u64,
+) -> Result<u64, StepExecError> {
+    use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+    // Host-atomic arm: aligned 4/8-byte word, permissions checked by host_span.
+    let host = match size {
+        4 if addr.is_multiple_of(4) => mem.host_span(addr, 4, true).map(|h| {
+            // SAFETY: host_span checked SPC+arena and write permission; the
+            // 4-byte alignment the atomic type needs is checked above.
+            #[expect(unsafe_code)]
+            let atom = unsafe { &*(h.cast::<AtomicI32>()) };
+            match atom.compare_exchange(
+                bits_i32(expected),
+                bits_i32(new),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                // CAS success: the word held `expected`.
+                Ok(_) => Ok(expected),
+                Err(actual) => Ok(bits_u32(actual)),
+            }
+        }),
+        8 if addr.is_multiple_of(8) => mem.host_span(addr, 8, true).map(|h| {
+            // SAFETY: as the 4-byte arm — 8-byte alignment checked above.
+            #[expect(unsafe_code)]
+            let atom = unsafe { &*(h.cast::<AtomicI64>()) };
+            match atom.compare_exchange(
+                bits_i64(expected),
+                bits_i64(new),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                // CAS success: the word held `expected`.
+                Ok(_) => Ok(expected),
+                Err(actual) => Ok(bits_u64(actual)),
+            }
+        }),
+        // Sub-word, unaligned, unmapped or exec-page: locked fallback.
+        _ => None,
+    };
+    if let Some(outcome) = host {
+        return outcome;
+    }
+
+    // Locked fallback: still mutually exclusive, still permission-checked.
+    let _guard = rmw_fallback_lock(addr);
+    let old = read_mem_value(mem, addr, size)?;
+    if old == expected {
+        write_mem_value(mem, addr, new, size)?;
+    }
+    Ok(old)
+}
+
 /// `CMPXCHG r/m, r` — compare ACC with dest; if equal write src→dest and ZF=1, else dest→ACC and ZF=0.
 ///
-/// Flags follow a CMP of ACC vs dest (same width). `LOCK` is ignored (single-threaded guest).
+/// Flags follow a CMP of ACC vs dest (same width). The memory form is a true
+/// read-modify-write on x86-64 (implicitly locked, like `XCHG`), so it goes
+/// through [`atomic_cas`] rather than a load/store pair — the guest is 1:1 on
+/// host threads now, so a non-atomic CAS has no mutual exclusion either.
 fn exec_cmpxchg(
     mem: &GuestMemory,
     regs: &mut RegFile,
@@ -1147,16 +1340,29 @@ fn exec_cmpxchg(
 ) -> Result<(), StepExecError> {
     let size = op_size_bytes(instr, 0)?;
     let mask = regs::size_mask(size);
-    let dest = read_op(mem, regs, instr, 0)? & mask;
-    let src = read_op(mem, regs, instr, 1)? & mask;
     let acc = accumulator_value(regs, size)? & mask;
+    let src = read_op(mem, regs, instr, 1)? & mask;
+    let mem_dest = instr.op0_kind() == OpKind::Memory;
+
+    // Perform the RMW first, then derive the flags from it: a speculative
+    // compare before the exchange would race with the other engines.
+    let dest = (if mem_dest {
+        let addr = effective_address(regs, instr)?;
+        atomic_cas(mem, addr, size, acc, src)?
+    } else {
+        read_op(mem, regs, instr, 0)?
+    }) & mask;
 
     // Flags as if CMP ACC, dest.
     let result = acc.wrapping_sub(dest);
     regs::set_sub_flags(regs, acc, dest, result, size);
 
     if regs.flag(Rflags::ZF) {
-        write_op(mem, regs, instr, 0, src)?;
+        // The memory form already stored `src` inside `atomic_cas`; a register
+        // destination still needs it written (ACC takes the source, not itself).
+        if !mem_dest {
+            write_op(mem, regs, instr, 0, src)?;
+        }
     } else {
         write_accumulator(regs, size, dest)?;
     }

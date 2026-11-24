@@ -1,6 +1,7 @@
 // JIT parity / invalidation / background-worker integration tests.
 // Moved out of jit/mod.rs (file-size policy, ADR-002); wired via
 // `#[cfg(test)] #[allow(clippy::expect_used)] mod tests;`.
+mod atomic_tests;
 mod bg_pool_tests;
 mod chain_tests;
 mod inv_gen_tests;

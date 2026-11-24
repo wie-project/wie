@@ -1244,6 +1244,18 @@ pub(super) fn lower_xadd(
 /// Lower CmpXchg (compare and exchange):
 /// Compare dst with accumulator (AL/AX/EAX/RAX). If equal, dst = src, else accumulator = dst.
 /// Sets ZF based on the comparison. Flushes pending flags before operation.
+///
+/// **Known wrong for the register-destination form** (`cmpxchg r32, r32`; no
+/// memory, so nothing to do with atomicity). `lower/mod.rs` builds `entry_gpr`
+/// as a literal `iconst 0` and only *loads* the registers its liveness set
+/// marks live; reading `gpr[0]` directly here bypasses `read_gpr`, which is
+/// what records the read. When RAX is not otherwise live the comparison is
+/// therefore against `0`: with EAX=7/ECX=0/EDX=7 the block exchanges (ECX
+/// becomes 7) when it must not, and with EAX=0/ECX=7 it must set ZF and does
+/// not (the RFLAGS carrier is likewise never loaded or stored back). The
+/// interpreter gets both cases right. Reading the accumulator through
+/// `read_gpr_logical` is the first half of the fix; the RFLAGS liveness
+/// contract needs its own look.
 pub(super) fn lower_cmpxchg(
     bcx: &mut FunctionBuilder<'_>,
     instr: &Instruction,

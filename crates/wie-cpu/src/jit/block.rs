@@ -269,10 +269,12 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Or
         | Mnemonic::Cmp
         | Mnemonic::Test
-        | Mnemonic::Bt
-        | Mnemonic::Bts
-        | Mnemonic::Btr
-        | Mnemonic::Btc => alu_is_lowerable(instr),
+        | Mnemonic::Bt => alu_is_lowerable(instr),
+        // BTS/BTR/BTC are read-modify-write against memory, so `LOCK` needs a
+        // native atomic lowering (see `lock_rmw_mem_is_lowerable`).
+        Mnemonic::Bts | Mnemonic::Btr | Mnemonic::Btc => {
+            alu_is_lowerable(instr) && lock_rmw_mem_is_lowerable(instr)
+        }
         Mnemonic::Inc | Mnemonic::Dec | Mnemonic::Not | Mnemonic::Neg => unary_is_lowerable(instr),
         Mnemonic::Imul => imul_is_lowerable(instr),
         // Integer div/idiv: 32-bit register or simple-mem divisor (v1).
@@ -287,10 +289,13 @@ fn is_lowerable(instr: &Instruction) -> bool {
         | Mnemonic::Ror
         | Mnemonic::Rcl
         | Mnemonic::Rcr => shift_is_lowerable(instr),
-        // Xadd/Cmpxchg: same operand forms (dst reg/mem, src register).
+        // Xadd/Cmpxchg: same operand forms (dst reg/mem, src register), except
+        // that a `LOCK` memory destination needs a native atomic lowering.
         Mnemonic::Xadd | Mnemonic::Cmpxchg => match (instr.op0_kind(), instr.op1_kind()) {
             (OpKind::Register, OpKind::Register) => true,
-            (OpKind::Memory, OpKind::Register) => mem_ea_ok(instr) && mem_size_ok(instr),
+            (OpKind::Memory, OpKind::Register) => {
+                mem_ea_ok(instr) && mem_size_ok(instr) && lock_rmw_mem_is_lowerable(instr)
+            }
             _ => false,
         },
         // Bsr/Lzcnt: bit scan — dst reg, src reg/mem.
@@ -820,17 +825,28 @@ fn div_is_lowerable(instr: &Instruction) -> bool {
     }
 }
 
-/// `xchg` reg,reg or reg,mem (simple EA).
+/// `xchg` reg,reg only.
+///
+/// The memory form is **implicitly locked** on x86-64 even without a `LOCK`
+/// prefix, so it must be a single atomic read-modify-write. Cranelift
+/// `atomic_rmw` is not emitted for it here, so those blocks fall back to the
+/// interpreter, whose [`crate::exec`] `XCHG` is a real host atomic. Do not
+/// re-admit the memory form here without a native atomic lowering — the old
+/// `call_load` + `call_store` pair silently compiled a guest spinlock down to
+/// an unsynchronised load/store pair.
 fn xchg_is_lowerable(instr: &Instruction) -> bool {
-    let k0 = instr.op0_kind();
-    let k1 = instr.op1_kind();
-    match (k0, k1) {
-        (OpKind::Register, OpKind::Register) => true,
-        (OpKind::Register, OpKind::Memory) | (OpKind::Memory, OpKind::Register) => {
-            mem_ea_ok(instr) && mem_size_ok(instr)
-        }
-        _ => false,
-    }
+    matches!(
+        (instr.op0_kind(), instr.op1_kind()),
+        (OpKind::Register, OpKind::Register)
+    )
+}
+
+/// `LOCK` on a memory RMW requires an atomic lowering, which the JIT does not
+/// emit: `LOCK XADD` / `LOCK CMPXCHG` / `LOCK BTX` against memory would be
+/// compiled as a plain load plus a store. Only the non-`LOCK` forms (and the
+/// register-only forms, which need no memory ordering) stay compiled.
+fn lock_rmw_mem_is_lowerable(instr: &Instruction) -> bool {
+    !(instr.has_lock_prefix() && instr.op0_kind() == OpKind::Memory)
 }
 
 /// `push` r64 / imm / simple mem (64-bit stack ops only; 16-bit override → iced).
