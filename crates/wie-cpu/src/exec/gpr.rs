@@ -85,25 +85,29 @@ pub(super) fn exec_arith(
     op: ArithOp,
 ) -> Result<(), StepExecError> {
     let size = op_size_bytes(instr, 0)?;
-    let dst = read_op(mem, regs, instr, 0)?;
     let src = read_op(mem, regs, instr, 1)?;
     let mask = regs::size_mask(size);
-    let d = dst & mask;
     let s = src & mask;
     let cf = u64::from(regs.flag(Rflags::CF));
-    let result = match op {
-        ArithOp::Add => d.wrapping_add(s),
-        ArithOp::Adc => d.wrapping_add(s).wrapping_add(cf),
-        ArithOp::Sub | ArithOp::Cmp => d.wrapping_sub(s),
-        ArithOp::Sbb => d.wrapping_sub(s).wrapping_sub(cf),
-        ArithOp::Xor => d ^ s,
-        ArithOp::Or => d | s,
-        ArithOp::And => d & s,
+    // A `LOCK`ed memory destination is ONE atomic update, and the flags below are
+    // a function of the value that update replaced — so `d` has to be the RMW's
+    // own old value. Reading the destination first and storing afterwards is the
+    // load-then-store pair `LOCK` exists to forbid.
+    let locked = super::is_locked_mem_rmw(instr);
+    let d = if locked {
+        super::locked_mem_rmw(mem, regs, instr, size, |cur| {
+            super::arith_result(op, cur, s, cf)
+        })?
+    } else {
+        read_op(mem, regs, instr, 0)? & mask
     };
+    let result = super::arith_result(op, d, s, cf);
     match op {
         ArithOp::Add => {
             regs::set_add_flags(regs, d, s, result, size);
-            write_op(mem, regs, instr, 0, result & mask)?;
+            if !locked {
+                write_op(mem, regs, instr, 0, result & mask)?;
+            }
         }
         ArithOp::Adc => {
             // Flags from full add with carry-in.
@@ -112,11 +116,15 @@ pub(super) fn exec_arith(
                 .wrapping_add(u128::from(cf));
             regs::set_add_flags(regs, d, s.wrapping_add(cf), result, size);
             regs.set_flag(Rflags::CF, wide > u128::from(mask));
-            write_op(mem, regs, instr, 0, result & mask)?;
+            if !locked {
+                write_op(mem, regs, instr, 0, result & mask)?;
+            }
         }
         ArithOp::Sub => {
             regs::set_sub_flags(regs, d, s, result, size);
-            write_op(mem, regs, instr, 0, result & mask)?;
+            if !locked {
+                write_op(mem, regs, instr, 0, result & mask)?;
+            }
         }
         ArithOp::Sbb => {
             // CF/OF must use full-width borrow: when `s + CF` overflows the
@@ -131,14 +139,18 @@ pub(super) fn exec_arith(
             let expected = d_s.wrapping_sub(s_s).wrapping_sub(i128::from(cf != 0));
             let got = i128::from(sign_extend(r, size));
             regs.set_flag(Rflags::OF, expected != got);
-            write_op(mem, regs, instr, 0, r)?;
+            if !locked {
+                write_op(mem, regs, instr, 0, r)?;
+            }
         }
         ArithOp::Cmp => {
             regs::set_sub_flags(regs, d, s, result, size);
         }
         ArithOp::Xor | ArithOp::Or | ArithOp::And => {
             regs::set_logic_flags(regs, result, size);
-            write_op(mem, regs, instr, 0, result & mask)?;
+            if !locked {
+                write_op(mem, regs, instr, 0, result & mask)?;
+            }
         }
     }
     Ok(())

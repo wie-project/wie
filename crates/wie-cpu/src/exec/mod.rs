@@ -802,8 +802,21 @@ fn exec_inc_dec(
     inc: bool,
 ) -> Result<(), StepExecError> {
     let size = op_size_bytes(instr, 0)?;
-    let dst = read_op(mem, regs, instr, 0)? & regs::size_mask(size);
+    let mask = regs::size_mask(size);
     let src = 1_u64;
+    // `LOCK INC` / `LOCK DEC` against memory is a real atomic RMW.
+    let locked = is_locked_mem_rmw(instr);
+    let dst = if locked {
+        locked_mem_rmw(mem, regs, instr, size, |cur| {
+            if inc {
+                cur.wrapping_add(src)
+            } else {
+                cur.wrapping_sub(src)
+            }
+        })?
+    } else {
+        read_op(mem, regs, instr, 0)? & mask
+    };
     let result = if inc {
         dst.wrapping_add(src)
     } else {
@@ -816,7 +829,9 @@ fn exec_inc_dec(
         regs::set_sub_flags(regs, dst, src, result, size);
     }
     regs.set_flag(Rflags::CF, cf);
-    write_op(mem, regs, instr, 0, result & regs::size_mask(size))?;
+    if !locked {
+        write_op(mem, regs, instr, 0, result & mask)?;
+    }
     Ok(())
 }
 
@@ -826,12 +841,20 @@ fn exec_neg(
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
     let size = op_size_bytes(instr, 0)?;
-    let dst = read_op(mem, regs, instr, 0)? & regs::size_mask(size);
+    let mask = regs::size_mask(size);
+    let locked = is_locked_mem_rmw(instr);
+    let dst = if locked {
+        locked_mem_rmw(mem, regs, instr, size, |cur| 0_u64.wrapping_sub(cur))?
+    } else {
+        read_op(mem, regs, instr, 0)? & mask
+    };
     let result = 0_u64.wrapping_sub(dst);
     regs::set_sub_flags(regs, 0, dst, result, size);
     // NEG sets CF if operand was non-zero.
     regs.set_flag(Rflags::CF, dst != 0);
-    write_op(mem, regs, instr, 0, result & regs::size_mask(size))?;
+    if !locked {
+        write_op(mem, regs, instr, 0, result & mask)?;
+    }
     Ok(())
 }
 
@@ -841,9 +864,17 @@ fn exec_not(
     instr: &Instruction,
 ) -> Result<(), StepExecError> {
     let size = op_size_bytes(instr, 0)?;
-    let dst = read_op(mem, regs, instr, 0)? & regs::size_mask(size);
-    let result = !dst;
-    write_op(mem, regs, instr, 0, result & regs::size_mask(size))?;
+    let mask = regs::size_mask(size);
+    // NOT writes no flags, so the old value is needed only as the RMW input.
+    let locked = is_locked_mem_rmw(instr);
+    let dst = if locked {
+        locked_mem_rmw(mem, regs, instr, size, |cur| !cur)?
+    } else {
+        read_op(mem, regs, instr, 0)? & mask
+    };
+    if !locked {
+        write_op(mem, regs, instr, 0, !dst & mask)?;
+    }
     Ok(())
 }
 
@@ -901,6 +932,88 @@ fn exec_bit_scan(
     Ok(())
 }
 
+/// Everything a shift/rotate needs besides the operand value, so the whole
+/// computation can be a pure `eval(old) -> (new, carry_out)`.
+///
+/// That purity is what lets one definition serve both the `LOCK`ed memory path —
+/// where it runs inside an `atomic_rmw` closure that may be re-invoked on another
+/// engine's value — and the ordinary load/store path. Bundled into a struct rather
+/// than passed as eight arguments, so "the operand is the only variable" is
+/// structural rather than a convention.
+struct ShiftCtx {
+    kind: ShiftKind,
+    count_mod: u32,
+    count_usize: usize,
+    bits: usize,
+    mask: u64,
+    rot_width: u32,
+    cf_in: bool,
+}
+
+impl ShiftCtx {
+    /// `(new value, carry out)` for an operand value. Pure.
+    fn eval(&self, dst: u64) -> (u64, bool) {
+        let Self {
+            kind,
+            count_mod,
+            count_usize,
+            bits,
+            mask,
+            rot_width,
+            cf_in,
+        } = *self;
+        match kind {
+            ShiftKind::Shl => {
+                let cf_bit = if count_usize <= bits {
+                    ((dst << (count_usize.saturating_sub(1))) >> bits.saturating_sub(1)) & 1
+                } else {
+                    0
+                };
+                ((dst << count_mod) & mask, cf_bit != 0)
+            }
+            ShiftKind::Shr => {
+                let cf_bit = (dst >> count_mod.saturating_sub(1)) & 1;
+                ((dst >> count_mod) & mask, cf_bit != 0)
+            }
+            ShiftKind::Sar => {
+                let sign_bits = 64_u32.saturating_sub(u32::try_from(bits).unwrap_or(64));
+                let signed = ((dst as i64) << sign_bits) >> sign_bits;
+                let cf_bit = ((signed as u64) >> count_mod.saturating_sub(1)) & 1;
+                let r = ((signed >> count_mod) as u64) & mask;
+                (r, cf_bit != 0)
+            }
+            ShiftKind::Rol => {
+                let r = ((dst << count_mod) | (dst >> bits.saturating_sub(count_usize))) & mask;
+                let cf_bit = r & 1;
+                (r, cf_bit != 0)
+            }
+            ShiftKind::Ror => {
+                let r = ((dst >> count_mod) | (dst << bits.saturating_sub(count_usize))) & mask;
+                let cf_bit = (r >> bits.saturating_sub(1)) & 1;
+                (r, cf_bit != 0)
+            }
+            ShiftKind::Rcl => {
+                // {CF, dst} as a (width+1)-bit value with CF at bit `width`, rotated left.
+                let total = rot_width;
+                let t = (u128::from(dst) << 1) | u128::from(cf_in);
+                let total_mask = (u128::from(1_u64) << total).wrapping_sub(1);
+                let t = ((t << count_mod) | (t >> (total - count_mod))) & total_mask;
+                let cf_bit = (t >> u32::try_from(bits).unwrap_or(64)) & 1;
+                ((t as u64) & mask, cf_bit != 0)
+            }
+            ShiftKind::Rcr => {
+                // {CF, dst} rotated right.
+                let total = rot_width;
+                let t = (u128::from(dst) << 1) | u128::from(cf_in);
+                let total_mask = (u128::from(1_u64) << total).wrapping_sub(1);
+                let t = ((t >> count_mod) | (t << (total - count_mod))) & total_mask;
+                let cf_bit = t & 1;
+                ((t as u64) & mask, cf_bit != 0)
+            }
+        }
+    }
+}
+
 fn exec_shift(
     mem: &GuestMemory,
     regs: &mut RegFile,
@@ -910,8 +1023,8 @@ fn exec_shift(
     let size = op_size_bytes(instr, 0)?;
     let bits = size.saturating_mul(8);
     let mask = regs::size_mask(size);
-    let dst = read_op(mem, regs, instr, 0)? & mask;
-    let count_raw = read_op(mem, regs, instr, 1)? as u32;
+    let count_raw = read_op(mem, regs, instr, 1)?;
+    let count_raw = u32::try_from(count_raw).unwrap_or(0);
     // 64-bit operands mask the count with 0x3F; narrower operands with 0x1F.
     let count_masked = count_raw
         & if u32::try_from(bits).unwrap_or(u32::MAX) >= QWORD_BITS {
@@ -935,57 +1048,39 @@ fn exec_shift(
     if count_mod == 0 {
         return Ok(());
     }
-    let count_usize = count_mod as usize;
-    let cf_in = regs.flag(Rflags::CF);
-    let (result, cf) = match kind {
-        ShiftKind::Shl => {
-            let cf_bit = if count_usize <= bits {
-                ((dst << (count_usize.saturating_sub(1))) >> bits.saturating_sub(1)) & 1
-            } else {
-                0
-            };
-            ((dst << count_mod) & mask, cf_bit != 0)
-        }
-        ShiftKind::Shr => {
-            let cf_bit = (dst >> count_mod.saturating_sub(1)) & 1;
-            ((dst >> count_mod) & mask, cf_bit != 0)
-        }
-        ShiftKind::Sar => {
-            let sign_bits = 64_u32.saturating_sub(u32::try_from(bits).unwrap_or(64));
-            let signed = ((dst as i64) << sign_bits) >> sign_bits;
-            let cf_bit = ((signed as u64) >> count_mod.saturating_sub(1)) & 1;
-            let r = ((signed >> count_mod) as u64) & mask;
-            (r, cf_bit != 0)
-        }
-        ShiftKind::Rol => {
-            let r = ((dst << count_mod) | (dst >> bits.saturating_sub(count_usize))) & mask;
-            let cf_bit = r & 1;
-            (r, cf_bit != 0)
-        }
-        ShiftKind::Ror => {
-            let r = ((dst >> count_mod) | (dst << bits.saturating_sub(count_usize))) & mask;
-            let cf_bit = (r >> bits.saturating_sub(1)) & 1;
-            (r, cf_bit != 0)
-        }
-        ShiftKind::Rcl => {
-            // {CF, dst} as a (width+1)-bit value with CF at bit `width`, rotated left.
-            let total = rot_width;
-            let t = (u128::from(dst) << 1) | u128::from(cf_in);
-            let total_mask = (u128::from(1_u64) << total).wrapping_sub(1);
-            let t = ((t << count_mod) | (t >> (total - count_mod))) & total_mask;
-            let cf_bit = (t >> u32::try_from(bits).unwrap_or(64)) & 1;
-            ((t as u64) & mask, cf_bit != 0)
-        }
-        ShiftKind::Rcr => {
-            // {CF, dst} rotated right.
-            let total = rot_width;
-            let t = (u128::from(dst) << 1) | u128::from(cf_in);
-            let total_mask = (u128::from(1_u64) << total).wrapping_sub(1);
-            let t = ((t >> count_mod) | (t << (total - count_mod))) & total_mask;
-            let cf_bit = t & 1;
-            ((t as u64) & mask, cf_bit != 0)
-        }
+    let ctx = ShiftCtx {
+        kind,
+        count_mod,
+        count_usize: usize::try_from(count_mod).unwrap_or(0),
+        bits,
+        mask,
+        rot_width,
+        cf_in: regs.flag(Rflags::CF),
     };
+    // The old value has to be the RMW's own, not a pre-load: OF compares old
+    // against new, so a separate read could compare two different words.
+    //
+    // **This branch is currently unreachable**, and that is deliberate, not
+    // speculative: no member of the shift/rotate group is `LOCK`-able
+    // (`Intel SDM` Vol. 2D lists the LOCK-able set and the shifts are not in it),
+    // so iced decodes `F0` before every one of `D0`/`D1`/`D2`/`D3`/`C0`/`C1` as
+    // `Code::INVALID` and `exec_shift` is never handed a locked shift. It is kept
+    // because the alternative is a *silent* hole: should a decoder relaxation ever
+    // let one through, the ordinary path below would turn it into a load-then-store
+    // pair with no fault and no diagnostic, which is precisely the defect this
+    // whole change is about. The guard is two field reads on the interpreter's
+    // shift path; the bug it forecloses is a guest spinlock that does not lock.
+    let locked = is_locked_mem_rmw(instr);
+    let (dst, result) = if locked {
+        let old = locked_mem_rmw(mem, regs, instr, size, |cur| ctx.eval(cur).0)?;
+        let new = ctx.eval(old).0;
+        (old, new)
+    } else {
+        let d = read_op(mem, regs, instr, 0)? & mask;
+        let new = ctx.eval(d).0;
+        (d, new)
+    };
+    let (_, cf) = ctx.eval(dst);
     regs.set_flag(Rflags::CF, cf);
     // ROL/ROR do not update ZF/SF/PF; SHL/SHR/SAR do.
     if matches!(kind, ShiftKind::Shl | ShiftKind::Shr | ShiftKind::Sar) {
@@ -996,26 +1091,29 @@ fn exec_shift(
     }
     if count_mod == 1 {
         let sign = regs::size_sign_bit(size);
+        let width = ctx.bits;
         let of = match kind {
             ShiftKind::Shl => ((result ^ dst) & sign) != 0,
             ShiftKind::Shr => (dst & sign) != 0,
             ShiftKind::Sar => false,
-            ShiftKind::Rol => ((result >> bits.saturating_sub(1)) ^ (result & 1)) != 0,
+            ShiftKind::Rol => ((result >> width.saturating_sub(1)) ^ (result & 1)) != 0,
             ShiftKind::Ror => {
-                let b1 = (result >> bits.saturating_sub(1)) & 1;
-                let b2 = (result >> bits.saturating_sub(2)) & 1;
+                let b1 = (result >> width.saturating_sub(1)) & 1;
+                let b2 = (result >> width.saturating_sub(2)) & 1;
                 b1 != b2
             }
-            ShiftKind::Rcl => (cf as u64 ^ ((result >> bits.saturating_sub(1)) & 1)) != 0,
+            ShiftKind::Rcl => (u64::from(cf) ^ ((result >> width.saturating_sub(1)) & 1)) != 0,
             ShiftKind::Rcr => {
-                let b1 = (result >> bits.saturating_sub(1)) & 1;
-                let b2 = (result >> bits.saturating_sub(2)) & 1;
+                let b1 = (result >> width.saturating_sub(1)) & 1;
+                let b2 = (result >> width.saturating_sub(2)) & 1;
                 b1 != b2
             }
         };
         regs.set_flag(Rflags::OF, of);
     }
-    write_op(mem, regs, instr, 0, result)?;
+    if !locked {
+        write_op(mem, regs, instr, 0, result)?;
+    }
     Ok(())
 }
 
@@ -1127,6 +1225,63 @@ fn exec_xadd(
     write_op(mem, regs, instr, 1, dest)?;
     regs::set_add_flags(regs, dest, src, sum, size);
     Ok(())
+}
+
+/// Whether `instr` is a memory read-modify-write carrying an explicit `LOCK`
+/// prefix, and therefore owes the guest a single atomic update.
+///
+/// This is the interpreter's half of the contract `jit/block.rs`'s
+/// `mem_rmw_is_lowerable` enforces on the JIT: a `LOCK`ed memory form is refused
+/// there and executed here, so it must actually be atomic here. Note this tests
+/// the **prefix**, not the architectural implicit lock — only `XCHG` and
+/// `CMPXCHG` have an implicitly locked memory form, and each of those is
+/// unconditional in its own handler. The ALU / unary / shift group is lockable
+/// but *not* implicitly locked, so a bare `add [rbx], eax` stays an ordinary load
+/// plus store and only `lock add [rbx], eax` takes the path below.
+fn is_locked_mem_rmw(instr: &Instruction) -> bool {
+    instr.has_lock_prefix() && instr.op0_kind() == OpKind::Memory
+}
+
+/// Atomic read-modify-write of the memory destination of `instr`.
+///
+/// Returns the value the word held **before** `f` updated it. Every caller needs
+/// that old value for its flags, and taking it from the RMW rather than from a
+/// separate pre-load is the whole point: a pre-load would reintroduce exactly the
+/// race this removes. The new value is stored inside `atomic_rmw`, so the caller
+/// must not write the destination back.
+///
+/// `f` may run more than once under contention, so it must be pure. It closes
+/// over already-decoded register operands and the carry flag, which are per-engine
+/// and cannot change while the lock is held.
+fn locked_mem_rmw<F>(
+    mem: &GuestMemory,
+    regs: &RegFile,
+    instr: &Instruction,
+    size: usize,
+    f: F,
+) -> Result<u64, StepExecError>
+where
+    F: Fn(u64) -> u64,
+{
+    let addr = effective_address(regs, instr)?;
+    let mask = regs::size_mask(size);
+    let old = atomic_rmw(mem, addr, size, |cur| f(cur & mask) & mask)?;
+    Ok(old & mask)
+}
+
+/// The `ADD`/`ADC`/`SUB`/`SBB`/`XOR`/`OR`/`AND` result, as a pure function of the
+/// masked operands — so the locked memory path can hand it to [`locked_mem_rmw`]
+/// and the unlocked path can call it directly. One definition, two callers.
+fn arith_result(op: ArithOp, d: u64, s: u64, cf: u64) -> u64 {
+    match op {
+        ArithOp::Add => d.wrapping_add(s),
+        ArithOp::Adc => d.wrapping_add(s).wrapping_add(cf),
+        ArithOp::Sub | ArithOp::Cmp => d.wrapping_sub(s),
+        ArithOp::Sbb => d.wrapping_sub(s).wrapping_sub(cf),
+        ArithOp::Xor => d ^ s,
+        ArithOp::Or => d | s,
+        ArithOp::And => d & s,
+    }
 }
 
 /// Bit-preserving `u32 -> i32` (and back) for the atomic boundary.
