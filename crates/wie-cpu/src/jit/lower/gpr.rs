@@ -38,10 +38,15 @@ pub(super) fn sext_to_i64(bcx: &mut FunctionBuilder<'_>, v: Value, bits: u32) ->
     }
 }
 
+/// Widened 0/1 lane for an i1.
+///
+/// `uextend` is the whole conversion: a Cranelift `i1` is an `I8` holding exactly
+/// 0 or 1, so the value is already the answer and the aarch64 backend emits one
+/// `uxtb`. `select(b, 1, 0)` — what this used to be — costs `mov`,`mov`,`csel`
+/// for the same number, and every `adc`/`sbb` link and every carry-in widening
+/// pays it.
 pub(super) fn bool_to_i64(bcx: &mut FunctionBuilder<'_>, b: Value) -> Value {
-    let one = iconst_u64(bcx, 1);
-    let zero = iconst_u64(bcx, 0);
-    bcx.ins().select(b, one, zero)
+    bcx.ins().uextend(types::I64, b)
 }
 
 pub(super) fn flag_set(bcx: &mut FunctionBuilder<'_>, rflags: Value, bit: Rflags) -> Value {

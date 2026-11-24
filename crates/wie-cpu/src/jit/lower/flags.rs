@@ -4,7 +4,7 @@
 use super::emit::MemEnv;
 use super::err::LowerError;
 use super::gpr::{bool_to_i64, flag_set, op_width_bits, read_op_mem, sext_to_i64, write_op_mem};
-use super::insn::{PendingFlags, ShiftKind};
+use super::insn::{PendingFlags, ShiftKind, flush_pending};
 
 use crate::regs::Rflags;
 use cranelift::prelude::*;
@@ -21,9 +21,22 @@ pub(super) fn lower_inc_dec_lazy(
     dirty: &mut [bool; 16],
     rflags: &mut Value,
     pending: &mut PendingFlags,
+    flag_state: &mut Option<FlagState>,
     mem: &mut MemEnv,
     inc: bool,
 ) -> Result<(), LowerError> {
+    // INC/DEC define five flags and **preserve the sixth**, so they *read* what
+    // the previous writer produced: "last writer wins" (what the lazy path does
+    // for every writer that defines all six) drops a `cmp`/`sub`/`add`'s CF that
+    // an INC two instructions later must hand to a `jc`/`setc`/`pushfq` — and to
+    // the block's own exit word. A pending INC/DEC needs no flush: it preserved
+    // the same CF the incoming state already holds.
+    if !matches!(
+        *pending,
+        PendingFlags::Inc { .. } | PendingFlags::Dec { .. }
+    ) {
+        flush_pending(bcx, rflags, pending, flag_state);
+    }
     let bits = op_width_bits(instr, 0)?;
     let a_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
     let a = mask_width(bcx, a_raw, bits);
@@ -161,10 +174,20 @@ pub(super) fn replace_flag(
     bcx.ins().bor(base, on)
 }
 
+/// `cond` as its architectural bit: `0` or `bit`.
+///
+/// `uextend(cond) << log2(bit)` is `cset` + `lsl` on aarch64 (and just `cset`
+/// for CF, the only bit at position 0). The `select(cond, iconst(bit),
+/// iconst(0))` this replaces costs `mov`,`mov`,`csel`: two constant
+/// materialisations per flag, six per packed word. Same value — a Cranelift `i1`
+/// is an `I8` holding exactly 0 or 1.
 pub(super) fn select_flag(bcx: &mut FunctionBuilder<'_>, cond: Value, bit: Rflags) -> Value {
-    let bit_v = iconst_u64(bcx, u64::from(bit));
-    let zero = iconst_u64(bcx, 0);
-    bcx.ins().select(cond, bit_v, zero)
+    let widened = bcx.ins().uextend(types::I64, cond);
+    let pos = u64::from(bit).trailing_zeros();
+    if pos == 0 {
+        return widened;
+    }
+    bcx.ins().ishl_imm(widened, i64::from(pos))
 }
 
 #[derive(Clone)]
@@ -176,6 +199,16 @@ pub(super) struct FlagState {
     pub pf: Value,
     pub af: Value,
     pub old: Value,
+    /// The packed word these fields were last written as, if it is still exact.
+    ///
+    /// A block can ask for the architectural word several times (a fault check
+    /// after each memory operand, then the terminator) with no flag write in
+    /// between; each ask used to rebuild the same 20-instruction word. `None`
+    /// means "the fields have moved since", which every mutator sets. This is a
+    /// memo, not a second source of truth: it is only ever the result of
+    /// [`FlagState::pack`] over exactly these fields, or a word those fields were
+    /// decomposed from (in which case re-packing reproduces it bit for bit).
+    pub packed: Option<Value>,
 }
 
 pub(super) fn decompose_packed(bcx: &mut FunctionBuilder<'_>, rflags: Value) -> FlagState {
@@ -187,6 +220,9 @@ pub(super) fn decompose_packed(bcx: &mut FunctionBuilder<'_>, rflags: Value) -> 
         pf: flag_set(bcx, rflags, Rflags::PF),
         af: flag_set(bcx, rflags, Rflags::AF),
         old: rflags,
+        // These six fields came out of exactly this word, so it is a valid memo:
+        // `pack` clears those bits and ORs back the values they were read from.
+        packed: Some(rflags),
     }
 }
 
@@ -202,6 +238,7 @@ impl FlagState {
         self.pf = flag_set(bcx, packed, Rflags::PF);
         self.af = flag_set(bcx, packed, Rflags::AF);
         self.old = packed;
+        self.packed = Some(packed);
     }
 
     /// Compute ADD/SUB-family flags once (predicate-direct) from operands.
@@ -217,7 +254,16 @@ impl FlagState {
         sub: bool,
         keep_cf: bool,
     ) {
-        let (cf_c, of_c, af_c) = add_sub_preds(bcx, dst, src, result, bits, sub);
+        let (cf_c, of_c, af_c) = add_sub_preds(
+            bcx,
+            dst,
+            src,
+            result,
+            bits,
+            sub,
+            PredSource::Plain,
+            !keep_cf,
+        );
         let (zf, sf, pf) = zs_pf_preds(bcx, result, bits);
         self.zf = zf;
         self.sf = sf;
@@ -227,6 +273,7 @@ impl FlagState {
         if !keep_cf {
             self.cf = cf_c;
         }
+        self.packed = None;
     }
 
     /// AND/OR/XOR/TEST flags: CF=OF=0, ZS/PF from result.
@@ -235,9 +282,13 @@ impl FlagState {
         self.zf = zf;
         self.sf = sf;
         self.pf = pf;
-        let zero = iconst_u64(bcx, 0);
-        self.cf = bcx.ins().icmp_imm(IntCC::Equal, zero, 1); // false
-        self.of = bcx.ins().icmp_imm(IntCC::Equal, zero, 1); // false
+        // CF = OF = 0. `iconst(i1 0)` *is* the false predicate — the
+        // `icmp_imm(Equal, iconst 0, 1)` this used to be materialised a zero, a
+        // `cmp` and a `cset` for a constant, on every AND/OR/XOR/TEST.
+        let f = bcx.ins().iconst(types::I8, 0);
+        self.cf = f;
+        self.of = f;
+        self.packed = None;
     }
 
     /// MUL/IMUL flags: CF = OF = "the full product is not the sign extension of
@@ -255,6 +306,7 @@ impl FlagState {
         self.cf = overflow;
         self.of = overflow;
         self.old = packed;
+        self.packed = None;
     }
 
     /// SBB flags, predicate-direct mirror of `flags_sbb`: full-width borrow CF.
@@ -270,7 +322,8 @@ impl FlagState {
     ) {
         // Base ZF/SF/PF/AF/OF from (d - s) via add_sub_preds(sub=true); the CF
         // from the base sub is replaced by the wide borrow below.
-        let (_, of_c, af_c) = add_sub_preds(bcx, d, s, result, bits, true);
+        let (_, of_c, af_c) =
+            add_sub_preds(bcx, d, s, result, bits, true, PredSource::CarryIn, false);
         let (zf, sf, pf) = zs_pf_preds(bcx, result, bits);
         self.zf = zf;
         self.sf = sf;
@@ -293,6 +346,7 @@ impl FlagState {
             bcx.ins().icmp(IntCC::UnsignedLessThan, d, s_plus_cf)
         };
         self.cf = cf_b;
+        self.packed = None;
     }
 
     /// ADC flags, predicate-direct mirror of `flags_adc`: iced
@@ -311,7 +365,16 @@ impl FlagState {
         let s_eff_m = mask_width(bcx, s_eff, bits);
         // Base flags from add(d, s_eff, result) via add_sub_preds(sub=false);
         // the CF from the base add is replaced by the wide-add CF below.
-        let (_, of_c, af_c) = add_sub_preds(bcx, d, s_eff_m, result, bits, false);
+        let (_, of_c, af_c) = add_sub_preds(
+            bcx,
+            d,
+            s_eff_m,
+            result,
+            bits,
+            false,
+            PredSource::CarryIn,
+            false,
+        );
         let (zf, sf, pf) = zs_pf_preds(bcx, result, bits);
         self.zf = zf;
         self.sf = sf;
@@ -338,6 +401,7 @@ impl FlagState {
             bcx.ins().icmp(IntCC::NotEqual, shifted, zero)
         };
         self.cf = cf_b;
+        self.packed = None;
     }
 
     /// Shift/rotate flags, mirroring `materialize_shift_flags` semantics but
@@ -448,6 +512,7 @@ impl FlagState {
             self.sf = bcx.ins().select(is_zero, old_sf, sf);
             self.pf = bcx.ins().select(is_zero, old_pf, pf);
         }
+        self.packed = None;
     }
 
     /// Pack the SSA flags into the packed rflags carrier, keeping the previous
@@ -474,10 +539,14 @@ impl FlagState {
 }
 
 pub(super) fn pack_state(bcx: &mut FunctionBuilder<'_>, fs: &mut FlagState) -> Value {
+    if let Some(packed) = fs.packed {
+        return packed;
+    }
     let packed = fs.pack(bcx);
     // Keep the carrier in sync so later packs preserve only the untracked bits
     // (DF, IF, reserved) from the current architectural state, never a stale one.
     fs.old = packed;
+    fs.packed = Some(packed);
     packed
 }
 
@@ -555,6 +624,79 @@ pub(super) fn flags_logic(
     flags_zs_pf(bcx, f, result, bits)
 }
 
+/// Carry and overflow straight from the host's own flags.
+///
+/// `uadd_overflow`/`usub_overflow` lower to `adds`+`cset hs` / `subs`+`cset lo`
+/// on aarch64, and the signed forms to `adds`/`subs`+`cset vs` (rule 2 for
+/// `ty_32_or_64` in `cranelift-codegen-0.133.1/src/isa/aarch64/lower.isle`).
+/// That is **one instruction per predicate, and it produces it** — the point of
+/// the exercise. What it replaces re-derives both from the operands, because a
+/// plain `iadd`/`isub` does not publish its flags: `cmp`+`cset` for CF, and
+/// `bxor`,`bxor`,`band`,`iconst`,`band`,`icmp_imm` for OF.
+///
+/// Full width only. The ops are width-typed, so a 32-bit guest add held in an
+/// `I64` register would need an `ireduce` first, and the 8/16-bit forms lower
+/// to `uxt`+`add`+`cmp`+`cset` (`overflow_op_small`), which is *worse* than the
+/// arithmetic predicates. Narrow widths keep those below; a disassembly of the
+/// 32-bit path is what decided this, not the operand size.
+fn overflow_preds(
+    bcx: &mut FunctionBuilder<'_>,
+    d: Value,
+    s: Value,
+    bits: u32,
+    sub: bool,
+    cf_wanted: bool,
+) -> Option<(Value, Value)> {
+    // 32-bit operands are already masked into an I64, and `ireduce` to I32 is a
+    // pass-through on aarch64 ("values are always stored with high bits
+    // undefined", `lower.isle` rules for `ireduce`), so the typed ops are free
+    // to feed. 8/16-bit forms lower to `uxt`+`add`+`cmp`+`cset`
+    // (`overflow_op_small`) — worse than the arithmetic they would replace.
+    let (d, s) = match bits {
+        64 => (d, s),
+        32 => (
+            bcx.ins().ireduce(types::I32, d),
+            bcx.ins().ireduce(types::I32, s),
+        ),
+        _ => return None,
+    };
+    let of = if sub {
+        bcx.ins().ssub_overflow(d, s).1
+    } else {
+        bcx.ins().sadd_overflow(d, s).1
+    };
+    if !cf_wanted {
+        // INC/DEC preserve CF: the carry is computed and thrown away otherwise.
+        let f = bcx.ins().iconst(types::I8, 0);
+        return Some((f, of));
+    }
+    let cf = if sub {
+        bcx.ins().usub_overflow(d, s).1
+    } else {
+        bcx.ins().uadd_overflow(d, s).1
+    };
+    Some((cf, of))
+}
+
+/// Where a flag burst's CF/OF come from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PredSource {
+    /// `result` is exactly `dst ± src` (mod 2^bits), so the host's own
+    /// carry/overflow flags answer both — one instruction per predicate, from
+    /// the instruction that made the result's width.
+    Plain,
+    /// `src` already carries a carry-in lane (`adc`), or is the raw source of a
+    /// borrow (`sbb`) while `result` also subtracts the borrow. `result` is then
+    /// *not* `dst ± src`, and the host flags of `dst ± src` are a different
+    /// predicate from the one this lowering has always produced — so these keep
+    /// the operand arithmetic, bit for bit.
+    CarryIn,
+}
+
+// `source`/`cf_wanted` are the two things a caller knows and this function
+// cannot: whether `result` is exactly `dst ± src`, and whether CF is consumed.
+// Bundling them into a struct would not make the call sites read any better.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn add_sub_preds(
     bcx: &mut FunctionBuilder<'_>,
     dst: Value,
@@ -562,27 +704,38 @@ pub(super) fn add_sub_preds(
     result: Value,
     bits: u32,
     sub: bool,
+    source: PredSource,
+    cf_wanted: bool,
 ) -> (Value, Value, Value) {
     let d = mask_width(bcx, dst, bits);
     let s = mask_width(bcx, src, bits);
     let r = mask_width(bcx, result, bits);
-    let cf_cond = if sub {
-        bcx.ins().icmp(IntCC::UnsignedLessThan, d, s)
-    } else {
-        bcx.ins().icmp(IntCC::UnsignedLessThan, r, d)
+    let produced = match source {
+        PredSource::Plain => overflow_preds(bcx, d, s, bits, sub, cf_wanted),
+        PredSource::CarryIn => None,
     };
-    let sb = iconst_u64(bcx, sign_bit(bits));
-    let both = if sub {
-        let ds = bcx.ins().bxor(d, s);
-        let dr = bcx.ins().bxor(d, r);
-        bcx.ins().band(ds, dr)
-    } else {
-        let dr = bcx.ins().bxor(d, r);
-        let sr = bcx.ins().bxor(s, r);
-        bcx.ins().band(dr, sr)
+    let (cf_cond, of_cond) = match produced {
+        Some((cf, of)) => (cf, of),
+        None => {
+            let cf = if sub {
+                bcx.ins().icmp(IntCC::UnsignedLessThan, d, s)
+            } else {
+                bcx.ins().icmp(IntCC::UnsignedLessThan, r, d)
+            };
+            let sb = iconst_u64(bcx, sign_bit(bits));
+            let both = if sub {
+                let ds = bcx.ins().bxor(d, s);
+                let dr = bcx.ins().bxor(d, r);
+                bcx.ins().band(ds, dr)
+            } else {
+                let dr = bcx.ins().bxor(d, r);
+                let sr = bcx.ins().bxor(s, r);
+                bcx.ins().band(dr, sr)
+            };
+            let of_bits = bcx.ins().band(both, sb);
+            (cf, bcx.ins().icmp_imm(IntCC::NotEqual, of_bits, 0))
+        }
     };
-    let of_bits = bcx.ins().band(both, sb);
-    let of_cond = bcx.ins().icmp_imm(IntCC::NotEqual, of_bits, 0);
     let x = bcx.ins().bxor(d, s);
     let y = bcx.ins().bxor(x, r);
     let ten = iconst_u64(bcx, 0x10);
@@ -622,7 +775,8 @@ pub(super) fn flags_add(
     result: Value,
     bits: u32,
 ) -> Value {
-    let (cf_cond, of_cond, af_cond) = add_sub_preds(bcx, dst, src, result, bits, false);
+    let (cf_cond, of_cond, af_cond) =
+        add_sub_preds(bcx, dst, src, result, bits, false, PredSource::Plain, true);
     pack_add_sub(bcx, old, cf_cond, of_cond, af_cond, result, bits)
 }
 
@@ -634,7 +788,8 @@ pub(super) fn flags_sub(
     result: Value,
     bits: u32,
 ) -> Value {
-    let (cf_cond, of_cond, af_cond) = add_sub_preds(bcx, dst, src, result, bits, true);
+    let (cf_cond, of_cond, af_cond) =
+        add_sub_preds(bcx, dst, src, result, bits, true, PredSource::Plain, true);
     pack_add_sub(bcx, old, cf_cond, of_cond, af_cond, result, bits)
 }
 

@@ -183,6 +183,28 @@ fn adc_and_sbb_read_the_pending_carry() {
     }
 }
 
+/// The 64-bit `adc`/`sbb` link: `cmp rax,rbx` then `adc rcx,rcx` / `sbb rcx,rcx`.
+///
+/// The 64-bit carry-out is computed from the two half-adds (`bool_to_i64` over
+/// the two wrap compares), which is a different path from the 32-bit `ushr`
+/// form — so it needs its own rows. `ARITH_CASES` again, because CF must be
+/// separated from OF for the borrow direction to be visible.
+#[test]
+fn adc64_and_sbb64_read_the_pending_carry() {
+    for (case, eax, ebx) in ARITH_CASES {
+        for (name, op) in [
+            ("adc64", [0x48_u8, 0x11, 0xC9]),
+            ("sbb64", [0x48, 0x19, 0xC9]),
+        ] {
+            let mut code = vec![0x48, 0x39, 0xD8]; // cmp rax, rbx
+            code.extend_from_slice(&op);
+            code.extend_from_slice(&setcc_cl(2)); // setb cl: the link's carry out
+            let (iced, jit) = simd_dual(&code, &[], setup(eax, ebx));
+            assert_same_regs(&iced, &jit, &format!("{name} after cmp, {case}"));
+        }
+    }
+}
+
 /// `imul` is an *eager* writer that defines only CF/OF. Its SSA state is now
 /// updated from the overflow predicate directly, so these cases pin the two
 /// flags it does define reaching a consumer in the same block, in both the
@@ -224,5 +246,159 @@ fn jcc_after_an_imul_reads_the_earlier_cmp() {
             let (iced, jit) = chain_dual(&code, stop, setup(eax, ebx), |_| {});
             assert_same_regs(&iced, &jit, &format!("j{name} after cmp+imul, {case}"));
         }
+    }
+}
+
+// ── The arithmetic half: produced predicates and the packed word ────────
+//
+// The cases above pin the *consumers*. The tests below pin what feeds them,
+// after the lowering started taking CF/OF from the host's own carry/overflow
+// flags (`overflow_preds`) instead of re-deriving them from the operands, and
+// started reusing a packed word while the SSA flag state has not moved
+// (`FlagState::packed`). Both are invisible unless a flag is actually read, so
+// every case is a full register-file differential against the interpreter.
+
+/// Flag-writing instructions whose flags a following `setcc` reads. Each is
+/// `dst ← dst op src` with dst=EAX, src=EBX, so the same operands feed every
+/// row: `(name, bytes, operand width)`.
+const ARITH_WRITERS: [(&str, [u8; 2], u32); 6] = [
+    ("add32", [0x01, 0xD8], 32),
+    ("sub32", [0x29, 0xD8], 32),
+    ("add64", [0x48, 0x01], 64),
+    ("sub64", [0x48, 0x29], 64),
+    // `inc`/`dec` are the `keep_cf` path: they define every flag *except* CF.
+    ("inc32", [0xFF, 0xC0], 32),
+    ("dec32", [0xFF, 0xC8], 32),
+];
+
+/// Operand pairs for the *arithmetic* writers, chosen so that CF and OF are
+/// **separated**: a table where every case has CF = OF = 0 cannot tell the two
+/// predicates apart, and a mutation that swaps them passes. Measured — that is
+/// exactly how the first version of this table missed one.
+///
+/// `(name, dst, src)`; comments give `add` CF/OF and `sub` CF/OF.
+const ARITH_CASES: [(&str, u64, u64); 6] = [
+    ("equal", 5, 5),                         // add 0/0   sub 0/0
+    ("carry-not-overflow", 0xffff_ffff, 1),  // add 1/0 sub 0/0
+    ("overflow-not-carry", 0x7fff_ffff, 1),  // add 0/1 sub 0/0
+    ("borrow", 0, 1),                        // add 0/0   sub 1/0
+    ("sign-both", 0x8000_0000, 0x8000_0000), // add 1/1 sub 0/1
+    ("wide", 1, 0xffff_ffff),                // add 1/0   sub 1/0
+];
+
+/// `pushfq`/`pop` need a stack. The harness's data page is mapped and unused by
+/// these fixtures, so half of it is the stack; every push is balanced by a pop.
+const TEST_STACK: u64 = super::SIMD_DATA + 0x800;
+
+/// [`setup`], plus a valid RSP for the `pushfq` cases.
+fn setup_with_stack(eax: u64, ebx: u64) -> impl Fn(&mut RegFile) + Copy {
+    move |r: &mut RegFile| {
+        setup(eax, ebx)(r);
+        r.set_gpr_public(4, TEST_STACK);
+    }
+}
+
+/// `setcc cl` for all 16 conditions after each arithmetic writer shape.
+///
+/// This is the table that pins the *produced* predicates: CF comes from
+/// `uadd_overflow`/`usub_overflow` (`adds`/`subs` + `cset`) and OF from the
+/// signed forms, for 32- and 64-bit operands; CF on `inc`/`dec` must survive
+/// untouched. A predicate that disagrees with the interpreter on any operand
+/// pair changes CL.
+#[test]
+fn arithmetic_writers_feed_every_condition() {
+    for (writer, bytes, width) in ARITH_WRITERS {
+        for (case, eax, ebx) in ARITH_CASES {
+            // Carry-in makes CF/borrow direction observable for inc/dec too.
+            // Set it with admitted instructions only (`stc`/`clc` are not
+            // JIT-lowered — they force the interpreter fallback): `xor` clears
+            // CF, and `sub ecx,1` from zero borrows.
+            for carry_in in [0_u8, 1] {
+                let mut code = if carry_in == 1 {
+                    vec![0x31, 0xC9, 0x83, 0xE9, 0x01] // xor ecx,ecx; sub ecx,1
+                } else {
+                    vec![0x31, 0xC9] // xor ecx,ecx
+                };
+                code.extend_from_slice(&bytes);
+                if width == 64 {
+                    // `48 01 /r` is `add r/m64, r64`: the ModRM byte is the second
+                    // half of the two-byte entry above.
+                    code.push(0xD8);
+                }
+                for (cc, name) in COND_NAMES.iter().enumerate() {
+                    let cc = u8::try_from(cc).expect("0..16");
+                    let mut case_code = code.clone();
+                    case_code.extend_from_slice(&setcc_cl(cc));
+                    let (iced, jit) = simd_dual(&case_code, &[], setup(eax, ebx));
+                    assert_same_regs(
+                        &iced,
+                        &jit,
+                        &format!("set{name} after {writer}, {case}, carry_in={carry_in}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `jcc` on the carry and overflow of the same writers — the branch form, which
+/// reads the same i1s through a different consumer.
+#[test]
+fn arithmetic_writers_drive_every_branch() {
+    for (writer, bytes, width) in ARITH_WRITERS {
+        for (case, eax, ebx) in ARITH_CASES {
+            for (cc, name) in COND_NAMES.iter().enumerate() {
+                let cc = u8::try_from(cc).expect("0..16");
+                let mut code = Vec::from(bytes);
+                if width == 64 {
+                    code.push(0xD8);
+                }
+                code.extend_from_slice(&[0x70 | cc, 0x01, 0x90, 0x0F, 0x0B]);
+                let stop = super::SIMD_BASE + u64::try_from(code.len()).expect("len");
+                let (iced, jit) = chain_dual(&code, stop, setup(eax, ebx), |_| {});
+                assert_same_regs(&iced, &jit, &format!("j{name} after {writer}, {case}"));
+            }
+        }
+    }
+}
+
+/// `pushfq` is the boundary that hands the **whole word** to the guest: it is
+/// the consumer that forces a pack, so a flag bit that is computed right but
+/// never inserted into the carrier shows up here and nowhere else.
+///
+/// `pushfq`/`pop rcx` keeps the stack balanced, so RCX *is* the architectural
+/// word the block produced.
+#[test]
+fn pushfq_hands_out_the_packed_word() {
+    for (writer, bytes, width) in ARITH_WRITERS {
+        for (case, eax, ebx) in ARITH_CASES {
+            let mut code = Vec::from(bytes);
+            if width == 64 {
+                code.push(0xD8);
+            }
+            code.extend_from_slice(&[0x9C, 0x59]); // pushfq; pop rcx
+            let (iced, jit) = simd_dual(&code, &[], setup_with_stack(eax, ebx));
+            assert_same_regs(
+                &iced,
+                &jit,
+                &format!("pushfq after {writer}, {case}: the packed word differs"),
+            );
+        }
+    }
+}
+
+/// Two writers, two packs, one block: `add` → `pushfq` → `sub` → `pushfq`.
+///
+/// `FlagState::packed` memoises the word "until the fields move", so a mutator
+/// that forgets to invalidate it hands the *first* word to the second `pushfq`.
+/// The two words must differ exactly as the interpreter's do — RCX and RDX are
+/// compared, so a stale memo cannot pass.
+#[test]
+fn the_packed_word_is_rebuilt_after_a_second_writer() {
+    for (case, eax, ebx) in CMP_CASES {
+        // add eax,ebx · pushfq · pop rcx · sub eax,ebx · pushfq · pop rdx
+        let code = [0x01, 0xD8, 0x9C, 0x59, 0x29, 0xD8, 0x9C, 0x5A];
+        let (iced, jit) = simd_dual(&code, &[], setup_with_stack(eax, ebx));
+        assert_same_regs(&iced, &jit, &format!("two packs, one block, {case}"));
     }
 }

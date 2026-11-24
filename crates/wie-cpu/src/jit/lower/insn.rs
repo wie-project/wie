@@ -441,8 +441,12 @@ pub(super) fn lower_insn(
             Ok(())
         }
         // Inc/dec: lazy with CF preserved on flush (Intel: INC/DEC do not touch CF).
-        Mnemonic::Inc => lower_inc_dec_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, true),
-        Mnemonic::Dec => lower_inc_dec_lazy(bcx, instr, gpr, dirty, rflags, pending, mem, false),
+        Mnemonic::Inc => lower_inc_dec_lazy(
+            bcx, instr, gpr, dirty, rflags, pending, flag_state, mem, true,
+        ),
+        Mnemonic::Dec => lower_inc_dec_lazy(
+            bcx, instr, gpr, dirty, rflags, pending, flag_state, mem, false,
+        ),
         Mnemonic::Neg => {
             // Neg is 0-sub; can lazy as Sub{0,a,res}.
             lower_neg_lazy(bcx, instr, gpr, dirty, rflags, pending, mem)
