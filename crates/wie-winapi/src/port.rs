@@ -62,6 +62,14 @@
 //! | `state.kernel.threads.current_tid()` | [`WinApiState::current_tid`] |
 //! | `user32::handle_get_dc` (direct handler call) | [`dispatch_winapi_id`] with [`WinApiId::User32Getdc`] |
 //! | `gdi32::handle_*` (direct handler calls) | [`dispatch_winapi_id`] with the matching [`WinApiId`] |
+//! | `state.kernel.sync.<field>` (14 fields) | [`WinApiState::scheduler`] → [`Scheduler`] |
+//! | `state.kernel.sync.process_dying` (read, `&self` callers) | [`WinApiState::is_process_dying`] |
+//! | `state.kernel.sync.multi_wait` (read only) | [`WinApiState::wait_targets`] |
+//! | `state.kernel.sync.thread_cpu` | [`WinApiState::saved_thread_context`] |
+//! | `state.kernel.sync.wake_hub` (clone) | [`WinApiState::wake_hub`] |
+//! | `state.kernel.sync.objects`→thread object | [`WinApiState::finish_thread_object`] |
+//! | `WinApiState { …44 fields… }` | [`WinApiState::for_session`] with [`SessionInit`] |
+//! | `WinApiState { …all zero… }` (test fixtures) | [`WinApiState::empty`] |
 //!
 //! Deliberately **not** in the table, because the ADR rejects the trade:
 //! `WindowState`'s 31 public fields and `PresentState`'s fields still reach
@@ -70,8 +78,27 @@
 //! sites for no DLL-boundary win (both sides are in-crate) — ADR-0006
 //! "Alternatives considered". Their *types* are re-exported below, so a rename
 //! inside them is still a cross-crate change; that is recorded debt, not an
-//! oversight. `state.kernel.sync` is the third such case and the largest: see
-//! [`SyncState`] below.
+//! oversight.
+//!
+//! # Why a scheduler handle and not a builder
+//!
+//! Two shapes were considered for `SyncState` and for session construction,
+//! and the same test applied to both: does it narrow the surface, or rename it?
+//!
+//! For `SyncState` the answer is narrowing. It is driven, not read: the 34
+//! field-poke sites performed 15 distinct operations. [`Scheduler`] exposes
+//! those 15 — no `Deref`, no `as_mut`, no field returned by reference — so
+//! `SyncState` has no way out of this crate. A handle that handed the struct
+//! back would be the old reach with a new name.
+//!
+//! For construction a **builder would not have narrowed anything**: one setter
+//! per field is the 44-field literal in method syntax, which is worth saying
+//! plainly rather than shipping. So the constructor takes [`SessionInit`]
+//! instead — the 11 *inputs* a session actually varies (heap range, exe bytes,
+//! module identity, two guest VAs, environment, two bottle roots). The other
+//! 33 fields are constants or derivatives and are filled here, where they
+//! belong. [`WinApiState::empty`] is the same idea for the all-zero fixture
+//! state a handler-level test needs.
 
 // ── §1 Dispatch identity and fake-VA encoding ──────────────────────────────
 //
@@ -112,22 +139,24 @@ pub use crate::state::{
 pub use crate::state::{
     DEFAULT_ENVIRONMENT, DisplayMetrics, DllStateMap, FileHandle, FileIoState, FindFileHandle,
     GuestIoRuntimeConfig, GuestStdinMode, HeapState, HostFileMount, ImportResolver, KernelState,
-    ModuleHandle, ModuleState, ProcessState, RegistryKeyHandle, ResourceHandle,
+    ModuleHandle, ModuleState, ProcessState, RegistryKeyHandle, ResourceHandle, SessionInit,
 };
 
 // ── §4 Kernel objects, threads, waits, and parking ─────────────────────────
 //
-// The runtime's scheduler and its park loops need to name kernel objects and
-// the wake/park vocabulary. Types only: the *fields* of `SyncState` are the
-// largest remaining wide surface in this crate (the scheduler drives
-// `state.kernel.sync.{objects,cs_waiters,multi_wait,process_dying,…}`
-// directly, ~45 sites). Narrowing that needs one opaque scheduler handle, i.e.
-// its own change — ADR-0006 records it as debt rather than pretending a
-// re-export fixed it.
+// The runtime's scheduler and its park loops name kernel objects and the
+// wake/park vocabulary. `SyncState` itself is *not* here: it is the one struct
+// in this crate with a scheduler-shaped hole, and the whole point of
+// [`Scheduler`] below is that nobody reaches it. `ProcessObject` and
+// `ThreadObject` are named because [`Scheduler::register_process`] /
+// [`Scheduler::register_detached_thread`] hand them to the host thread that
+// finishes a child process — the `Arc` outlives the lock, so it is data, not
+// state.
 pub use crate::state::pthread_return_trampoline_va;
 pub use crate::sync_obj::{
-    INFINITE, KernelHandle, KernelObject, MultiWaitRequest, PendingSpawn, SyncState, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT, WaitTarget, wait_multiple, wait_multiple_step,
+    INFINITE, KernelHandle, KernelObject, MultiWaitRequest, PendingSpawn, ProcessObject,
+    ThreadObject, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT, WaitTarget, wait_multiple,
+    wait_multiple_step,
 };
 pub use crate::thread::{GuestThread, PRIMARY_THREAD_ID, ThreadState, bind_current_tid};
 pub use crate::wake::{ThreadInbox, Wake, WakeHub};
@@ -166,7 +195,7 @@ pub use crate::user32::{Dimension, MenuEntry, MenuRecord};
 // `wie_winapi::<module>::` path that the winapi-port gate now forbids.
 pub use crate::bottle::{bottle_root_from_env, drive_d_from_env};
 pub use crate::console::take_ctrlc_for_profile_stop;
-pub use crate::exception::parse_pdata;
+pub use crate::exception::{RuntimeFunction, parse_pdata};
 pub use crate::gdi32::enumerate::advance_enumeration;
 pub use crate::kernel32::clock::{clock_is_fixed, clock_table_values, tick_count_32};
 pub use crate::kernel32::{
@@ -194,6 +223,113 @@ pub use crate::dll_loader::{
     DLL_PROCESS_ATTACH, REAL_MODULE_HANDLE_BASE, StaticDllMain, apply_pe_section_protects,
     prepare_dll_main_call, resolve_static_guest_import,
 };
+
+// ── §9 The scheduler handle ────────────────────────────────────────────────
+//
+// `SyncState` is 14 public fields and the only thing in the crate that is
+// genuinely *driven* rather than read: the session pump, the worker loop and
+// the teardown path orchestrate thread activation, parks, spawns, child
+// processes and death.
+//
+// This is the "one explicit opaque handle" ADR-0006 asks for in place of a
+// struct that broad mutable access could be reached through. Obtain it with
+// `WinApiState::scheduler()`; every method below is one of the 15 operations
+// the ~34 former field-poke sites actually performed. There is deliberately no
+// `as_mut()`, no `Deref`, and no field returned by reference: a handle that
+// hands the struct back would be the old reach with a new name, which is the
+// failure mode this exists to avoid.
+//
+// The four *queries* the scheduler needs live on `WinApiState` instead
+// (`is_process_dying`, `wait_targets`, `saved_thread_context`, `wake_hub`),
+// because several park loops only hold `&WinApiState` — a `&mut`-only handle
+// could not serve them, and duplicating the verbs across two receiver types
+// would be worse than splitting them by receiver.
+pub struct Scheduler<'a> {
+    inner: &'a mut crate::sync_obj::SyncState,
+}
+
+impl<'a> Scheduler<'a> {
+    /// Wrapped by [`WinApiState::scheduler`]; not constructed directly.
+    pub(crate) fn new(inner: &'a mut crate::sync_obj::SyncState) -> Self {
+        Self { inner }
+    }
+
+    /// `ExitProcess` has been requested; workers must stop.
+    pub fn mark_process_dying(&mut self) {
+        self.inner.mark_process_dying();
+    }
+
+    /// Wake every blocked waiter — CS queues and every waitable kernel object.
+    pub fn wake_all_waiters(&mut self) {
+        self.inner.wake_all_waiters();
+    }
+
+    /// Deliver a shutdown token to every inbox-parked thread.
+    pub fn broadcast_shutdown(&self) {
+        self.inner.broadcast_shutdown();
+    }
+
+    /// Take the pending `WaitForMultipleObjects` request for `tid`.
+    pub fn take_multi_wait(&mut self, tid: u32) -> Option<MultiWaitRequest> {
+        self.inner.take_multi_wait(tid)
+    }
+
+    /// Signal the event object at `handle`, if that handle is an event.
+    pub fn signal_event(&self, handle: u64) -> bool {
+        self.inner.signal_event(handle)
+    }
+
+    /// Drop the kernel object at `handle` without signalling it.
+    pub fn remove_object(&mut self, handle: u64) -> bool {
+        self.inner.remove_object(handle)
+    }
+
+    /// Take the spawns queued by `CreateThread` since the last call.
+    pub fn take_pending_spawns(&mut self) -> Vec<PendingSpawn> {
+        self.inner.take_pending_spawns()
+    }
+
+    /// Queue one `CreateThread` spawn for the session to start.
+    pub fn queue_spawn(&mut self, spawn: PendingSpawn) {
+        self.inner.queue_spawn(spawn);
+    }
+
+    /// Register a guest thread's kernel object and its saved context.
+    ///
+    /// Discards the handle/object pair the underlying allocator returns: no
+    /// caller uses them (they re-resolve by TID or go through
+    /// [`Self::finish_thread_object`]), so returning them would put
+    /// `Arc<ThreadObject>` in the surface for nothing.
+    pub fn register_thread(&mut self, tid: u32, context: wie_cpu::ThreadContext) {
+        drop(self.inner.register_thread(tid, context));
+    }
+
+    /// Allocate the guest pid for a child process.
+    pub fn alloc_child_pid(&mut self) -> u32 {
+        self.inner.alloc_child_pid()
+    }
+
+    /// Register a child process's kernel object, returning its handle and the
+    /// object the child's host thread finishes on exit.
+    pub fn register_process(&mut self, pid: u32) -> (u64, std::sync::Arc<ProcessObject>) {
+        self.inner.register_process(pid)
+    }
+
+    /// Register the kernel thread object for a child process's main thread.
+    pub fn register_detached_thread(&mut self, tid: u32) -> (u64, std::sync::Arc<ThreadObject>) {
+        self.inner.register_detached_thread(tid)
+    }
+
+    /// Forget a child process's pid → handle entry.
+    pub fn forget_process(&mut self, pid: u32) -> Option<u64> {
+        self.inner.forget_process(pid)
+    }
+
+    /// Register the unwind tables of one mapped image.
+    pub fn install_function_table(&mut self, image_base: u64, entries: Vec<RuntimeFunction>) {
+        self.inner.install_function_table(image_base, entries);
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,16 +1,54 @@
 # Maintainability Plan
 
-Status: **Waves 0–4 implemented · Wave 5 recorded as ADRs · four gaps open**
-Evidence gathered 2026-10-01 against `main`; implementation status 2026-10-03.
+Status: **Waves 0–4 implemented · Wave 5 landed (ADRs 0004–0007, 0009) · open:
+T3.3 · partial: T2.9, T3.5, T4.5**
+Evidence gathered 2026-10-01 against `main`; first implementation pass
+2026-10-03; every item status re-verified 2026-11-23 against `a4ba020`.
 
-Scope: whole workspace — 5 crates, 241,606 lines across 431 `.rs` files.
+Scope: whole workspace — 5 crates, 254,445 lines across 467 `.rs` files
+(`find crates -name '*.rs' | wc -l`; `find crates -name '*.rs' -exec cat {} + | wc -l`).
 
 ## Implementation status
 
-Waves 0–4 are implemented and `./scripts/check.sh` is green end to end
-(1,929 tests, 213 guest fixtures, `long_loop` budget). Wave 5's six decisions are
-recorded as ADRs rather than applied blind — each is a multi-site refactor, and
-`doc/adr/0004`–`0009` carry the reasoning.
+**Pre-PR gate, measured 2026-11-23.** `./scripts/check.sh --list` prints nine
+steps in canonical order — `file-sizes dep-direction winapi-port fmt clippy
+micro-exes nextest micro-suite perf`. `cargo clippy --workspace --all-targets`
+is silent: **zero warnings, exit 0**, on a full rebuild of a pristine `a4ba020`
+extraction. `./scripts/check.sh --only file-sizes`, `--only dep-direction` and
+`--only winapi-port` all pass on that tree, and `cargo nextest list --workspace`
+enumerates **2,018** tests.
+
+**This document had its own state wrong in both directions.** Until 2026-11-23
+the header read "Waves 0–4 implemented · Wave 5 recorded as ADRs · four gaps
+open". Two things were false about that:
+
+- **Wave 5 was recorded, not applied.** ADRs 0004–0009 (and the still-blocked
+  0010) existed and were reasoned, but three items the plan counted as done work — T3.4, T3.5, T3.6 —
+  were still pre-refactor in the tree: `state/` had no capability traits,
+  `lib.rs` re-exported ~60 names flat, and `names/mod.rs` hand-kept all 650 soft
+  export names. The ADRs landed on 2026-11-23 (`a4ba020`, `42a1008`); until then
+  the plan described code that did not exist.
+- **Wave 6 had partly landed** while the plan still called it future work. T4.1,
+  T4.2, T4.3, T4.4, T4.6, T4.7 and T1.1–T1.4 are all done and were then listed as
+  "to do once the codebase can absorb it".
+
+Item-by-item, with the check that shows it:
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| T0.1–T0.7 | **DONE** | `CLAUDE.md` lint + unsafe + dense-API sections rewritten; `CONTRIBUTING.md` rule 5 states cap 2000/target 1000; `DATA_TABLES` is empty; RUNBOOK table is now test-enforced (T1.3); `notepad-support-plan.md` carries a superseded banner |
+| T0.2 unsafe table | **DONE, re-drifted, re-fixed** | the table was corrected to 46/17 in the first pass; at `a4ba020` the count is 145 `wie-cpu` / 43 `wie-cli` / 17 `wie-winapi`. Corrected in `CLAUDE.md` again on 2026-11-23 |
+| T1.1 | **DONE** | `[lints] workspace = true` in all five crates (`grep -c '\[lints\]' crates/*/Cargo.toml`) |
+| T1.2 | **DECIDED — option A** | no `[workspace.lints.clippy]` anywhere; clippy runs without `-D warnings` in both `check.sh:554` and `ci.yml:97`. The workspace is nevertheless 0-warning, so option B is now a *scope* decision, not a cleanup |
+| T1.3 | **DONE** | `crates/wie-runtime/tests/runbook_knobs.rs` asserts bidirectional equality (`live ⊆ documented`, `documented ⊆ live ∪ {RUST_LOG}`) |
+| T1.4 | **DONE** | `check_deps()` in `scripts/check.sh` compares `cargo metadata`'s internal edges against `EXPECTED_EDGES` (8 normal, 0 dev) |
+| T2.1–T2.8, T2.10 | **DONE** | see each item |
+| T2.9 | **OPEN** | `winapi_state_default()` still defined 4× (`state/tests/mod.rs:109`, `version.rs:994`, `kernel32/file_io/path.rs:782`, `ole_clipboard.rs:409`) |
+| T3.1, T3.2, T3.4, T3.6 | **DONE** | ADRs 0007, 0004, 0005, 0009 — accepted 2026-11-23 |
+| T3.3 | **OPEN** | ADR-0008 (`Control` trait) is still `Proposed`; no `trait` exists under `user32/controls/` |
+| T3.5 | **PARTIAL** | `port` + the `winapi-port` gate landed; ADR-0006 decision 3 (`wie-cli` off its direct `wie-winapi` dependency) did not |
+| T4.1, T4.2, T4.3, T4.4, T4.6, T4.7 | **DONE** | see each item |
+| T4.5 | **PARTIAL** | CI gained the non-macOS compile job; `winapi-port` is still not a CI step |
 
 **Two real bugs were found by implementing this plan, neither visible from
 reading the code:**
@@ -32,17 +70,66 @@ duplication: every check was declared twice, once in `check.sh` and once in
 measurement — most consequentially the soft-path census (650 names in
 `names/mod.rs`, not 729, which is the wider cross-module set) and the
 `encode_export` location (`fake_va.rs`, not `hooks.rs`). Where a claim would not
-reproduce at all it was replaced with something measured.
+reproduce at all it was replaced with something measured. The 2026-11-23 pass
+found **eleven more**; they are listed under [Figures corrected on
+2026-11-23](#figures-corrected-on-2026-11-23).
 
 ### Open
 
 | Item | Status |
 | --- | --- |
+| T3.3 — `Control` trait (ADR-[0008](../adr/0008-control-trait.md)) | recorded, not applied |
+| T2.9 — `winapi_state_default()` dedup | 4 copies remain |
+| T3.5 decision 3 — drop `wie-cli`'s direct `wie-winapi` dependency | `gui/` still reaches `wie_winapi::user32::`/`::gdi32::`/`::present::` |
+| T4.5 — `winapi-port` as a CI step | runs locally via `check.sh`; `ci.yml` runs only `file-sizes` and `dep-direction` of the policy steps |
 | `lock`-shift/rotate test rows | 8 unencodable rows dropped; SDM, `mingw-as` and iced all agree they do not exist (`objdump` disagrees) |
 | `exec_shift` locked branch | unreachable by the same argument; kept as a documented guard on the interpreter's fallback path |
 | Paint-path visual coverage | pressed-button face, partial repaint, listbox banding, combo — in progress |
 | Multi-threaded real guest for the large free list | not covered; proven only in-crate |
-| Wave 5 ADRs | recorded, not applied — each needs its own change |
+
+### Figures corrected on 2026-11-23
+
+The nine that the first pass caught are recorded above. Measured again against
+`a4ba020` and `a4ba020^`, eleven more did not survive. Each row names the command
+that decides it; commands for a *parent-state* claim are meant to be run against
+`git archive a4ba020^` (or with a `git show` prefix), because the file has since
+changed.
+
+| Claim as written | What the tree says | How to check |
+| --- | --- | --- |
+| ADR-0005: "**1,768** non-test `state.*` references", plus a directory table led by `user32` 269 | Not reproducible. Three readings of the ADR's own method at `a4ba020^` give 1,879 (`state.<ident>`), 1,059 (`state.<ident>(`) and 197 (`ctx.state.<ident>`). Under the first, `kernel32` (651) outranks `user32` (307) — the ranking, not just the total, is wrong | `git archive a4ba020^ crates/wie-winapi \| tar -x -C /tmp/x`, then count with line comments stripped, non-test files only |
+| ADR-0005: "`comdlg32` → `window_state` (**154**)" and "`kernel32` → `console` (**65** of kernel32's **76**)" | Method-dependent, not wrong: counting `window_state()` call sites gives exactly 154 and `state.console` exactly 65. A different count gives the **146** and **70** the tree now cites (`capability.rs`, on `WindowDialogAccess` and `ConsoleAccess`). The **76** reproduces under no reading tried — 89 in call form, 644 in all forms | `grep -o 'window_state()' crates/wie-winapi/src/comdlg32/*.rs \| wc -l`; `grep -rhoE 'state\\.console' crates/wie-winapi/src/kernel32 \| wc -l` |
+| ADR-0006 / T3.5: "**405** `wie_winapi` references in `wie-runtime`" (the T3.5 body says 402) | 400 in `src` at the parent commit, 503 including `tests/`; 408 in `src` at `a4ba020` | `grep -rn wie_winapi crates/wie-runtime/src \| wc -l` |
+| ADR-0006: "`wie-cli` depends on **four crates instead of three**" (Consequences) | Decision 3 never landed. `crates/wie-cli/Cargo.toml:35` still declares `wie-winapi`, and `gui/` still calls `wie_winapi::user32::`/`::gdi32::`/`::present::` | `grep -n wie-winapi crates/wie-cli/Cargo.toml` |
+| ADR-0006: "re-exports **~60** names flat from `state`" | 63 | `git show a4ba020^:crates/wie-winapi/src/lib.rs` and count the `pub use state::{…}` block |
+| ADR-0007: `block.rs` "1442 → **601** lines", and Consequences' "the `Cqo` dead arm is removed as a side effect" | `block.rs` is **602** lines at both `42a1008` and HEAD. `Mnemonic::Cqo` is still lowered, at `jit/lower/insn.rs:317` | `git show 42a1008:crates/wie-cpu/src/jit/block.rs \| wc -l`; `grep -n 'Mnemonic::Cqo' crates/wie-cpu/src/jit/lower/insn.rs` |
+| ADR-0007 / T3.1: the admission gate is **270** mnemonics and the lowering dispatch **230** | One table, **266** admitted (247 body + 19 term). The 270/230 were two files counted separately, and the 41-vs-1 asymmetry they supported no longer exists | `sed -n '299,601p' crates/wie-cpu/src/jit/lower/opclass.rs \| grep -o 'Mnemonic::[A-Za-z0-9_]*' \| sort -u \| wc -l` |
+| T4.4 / ADR-0005: the lock order is "**prose in ~10 doc comments across 4 files**" | There was **one statement of the order** — a "Lock ordering:" paragraph on `PresentChannel` (`present/mod.rs:197-199` at the parent commit). The other 9 sites are `deadlock` warnings in the 4 files the ADR names (`state/window.rs` 5, `comdlg32/print.rs` 2, `comdlg32/file.rs` 1, `console/host_term.rs` 1): a hazard repeated, not an order specified. It is now a type (`lock_order.rs`, 355 lines) | `git show a4ba020^:crates/wie-winapi/src/present/mod.rs \| sed -n '197,199p'`; `git grep -c deadlock a4ba020^ -- crates/wie-winapi/src` |
+| T4.1: `jit/tests/mod.rs` is "**2,360** lines" and the split was "**2,190 → 66**" (`42a1008`'s message) | **2,364 → 95** at the commit; 95 today | `git show 42a1008^:crates/wie-cpu/src/jit/tests/mod.rs \| wc -l`; `wc -l < crates/wie-cpu/src/jit/tests/mod.rs` |
+| T4.1: the 2000-line cap is what constrains `jit/tests/mod.rs` | `check_file_sizes()` skips `*/tests.rs` and `*/tests/*`, so the cap **never** applied to it. The binding budget was ADR-002's 1000-line *target*, enforced by review alone | `sed -n '/case "\$rel" in/,+3p' scripts/check.sh` |
+| T4.6 / `42a1008`'s message: "~90 lock `unwrap()`s" at the start, "**19** remaining in `jit/tests/**`" at the end | 75 call sites use the new helpers; **14** bare lock `unwrap`/`expect` sites remain, all under `jit/tests/**` | `grep -rE '\.(lock\|read\|write)\(\)\.(unwrap\(\)\|expect\()' crates/wie-cpu/src` |
+
+Two more, corrected in place rather than tabled. The scope line said 241,606
+lines across 431 `.rs` files; it reads 254,445 / 467 now. And the status block
+quoted "1,929 tests, 213 guest fixtures": the test count at `a4ba020` is **2,018**
+(`cargo nextest list --workspace | wc -l`), while 213 is not reproducible — there
+are 86 fixture sources under `micro-exes/` (`find micro-exes -name '*.c' -o -name
+'*.cpp' | wc -l`), and how many executables they produce is not pinned anywhere.
+
+**The chain-relocation claim, which was wrong twice.** The brief for the
+code-cache work said chained blocks are refused because their relocations are
+`FunctionOffset`. They are not: a direct chain call is `Reloc::Arm64Call` to
+`ModuleRelocTarget::User { namespace: 0, index }` with `index >= import_count`,
+and `PersistedCode::all_targets_are_imports()`
+(`crates/wie-cpu/src/jit/engine/code_cache.rs:451`) only ever tested
+`namespace == 0`, which every block reference satisfies. So chained blobs were
+being **written** and then refused at **restore** (`UnrelocatableTarget`, from
+`resolved_relocs`), and the loss showed up in the `target` bucket as if they had
+never been cached. The defect was on the restore side, not the capture side, and
+the fix follows from that: persist the guest VA the edge transfers to
+(`PersistedCode::chain_relocs`) and re-resolve it through `chain_func_for` at
+restore, because a `FuncId` is an index into this process's declaration order and
+cannot cross a process boundary. `CODE_FORMAT_VERSION` went 2 → 3.
 
 ---
 
@@ -77,7 +164,11 @@ Recorded so a future change does not "fix" working code:
 
 Highest value per byte in this document. Each of these was verified against the tree.
 
-### T0.1 — `CLAUDE.md:46` lists six lints that exist in no `Cargo.toml`
+### T0.1 — the six lints `CLAUDE.md` listed exist in no `Cargo.toml`
+
+**Status: DONE.** The lint section of `CLAUDE.md` now separates what the machine
+checks from what is convention, and names the one table that binds
+(`[workspace.lints.rust]`, opted into by all five crates).
 
 `unwrap_used`, `expect_used`, `panic`, `indexing_slicing`, `as_conversions`, `clippy::pedantic`. There is no `[workspace.lints.clippy]` section at all. **0 of 6 are enforced.** The paragraph reads as "this is what you must write to"; it is unbacked.
 
@@ -87,7 +178,23 @@ The per-site `#[allow(clippy::expect_used)]` markers scattered through test code
 **Trade-off.** none. Documentation only.
 **Reversibility.** total.
 
-### T0.2 — `CLAUDE.md:51` understates the `unsafe` surface
+### T0.2 — the `unsafe` inventory understated the surface
+
+**Status: DONE, then re-drifted, then fixed again (2026-11-23).** The table was
+corrected in the first pass; the 2026-11-23 refactor moved `kernel32/console*` to
+`src/console/` and changed both counts again. Re-measured at `a4ba020`, same
+method, over `crates/*/src`:
+
+| Crate | 2026-10-03 | 2026-11-23 | Files (2026-11-23) |
+| --- | --- | --- | --- |
+| `wie-cpu` | 137 | **145** | 23 |
+| `wie-cli` | 46 | **43** | 3 — `gui/print.rs` 36, `gui/app/native_dialog.rs` 5, `commands/run.rs` 2 |
+| `wie-winapi` | 17 | **17** | 4 — `console/host_term.rs` 9, `kernel32/sync.rs` 6, `ucrt/stdio.rs` 1, `dispatch_table/mod.rs` 1 |
+| `wie-pe`, `wie-runtime` | 0 | 0 | 0 |
+
+`wie-cli` is down 3 because `gui/app.rs`'s 2 sites (the `env::set_var` pair T2.7
+deleted) are gone and `gui/print.rs` reads 36, not 37. The table below is the
+2026-10-03 measurement, kept because it is the item's record:
 
 Counted as **code sites only** (doc-comment lines and `#[…]` attribute lines excluded):
 
@@ -103,7 +210,12 @@ This is wrong in the direction that *understates* risk, which is the wrong direc
 
 **Change.** Correct the numbers, and point at T1.1 (which closes the enforcement gap, not just the doc gap).
 
-### T0.3 — `CLAUDE.md:77` misroutes every future API addition
+### T0.3 — `CLAUDE.md` misrouted every future API addition
+
+**Status: DONE.** `CLAUDE.md` now carries the one-row recipe and points at
+`dispatch_table/decl.rs`; `docs/architecture/winapi-handling.md` was fixed with
+it. The soft-path exception it warned about is real and is now stated as such
+(T3.6 → ADR-0009).
 
 The claim: `dispatch_table.rs` "claims it is auto-generated by `scripts/gen_winapi_dispatch.py`, but that script no longer exists — the file is maintained by hand. Adding an API means: a `WinApiId` variant, a dispatch arm, the handler in the right DLL module, and **registration in the fake-VA table**."
 
@@ -118,7 +230,10 @@ All three parts are false:
 **Change.** Replace with: *"adding an API = one row in `winapi_ids!` (`dispatch_table/decl.rs`) + the handler; fake-VA encoding is derived."* Note the **soft**-path exception (see T3.6) — the dense path is DRY, the string-dispatch path is not.
 **Note.** `docs/architecture/winapi-handling.md:55` carries the same stale claim (507 variants, maintained by hand) — actual is 510, macro-generated. Fix together.
 
-### T0.4 — `CONTRIBUTING.md:15` states a 1500-line cap; the script enforces 2000
+### T0.4 — `CONTRIBUTING.md` stated a 1500-line cap; the script enforces 2000
+
+**Status: DONE.** Rule 5 now reads "hard cap 2000, target 1000" and names the
+`check_file_sizes()` step as the enforcement.
 
 `scripts/check-file-sizes.sh:12` → `HARD_CAP=2000` (now `check_file_sizes()` in `scripts/check.sh`). The prose said "under 1500 lines (target: 1000)".
 
@@ -130,9 +245,13 @@ All three parts are false:
 
 **Change.** Update the path or delete the entry.
 
-### T0.6 — `docs/RUNBOOK.md` knob table has drifted in both directions
+### T0.6 — `docs/RUNBOOK.md` knob table had drifted in both directions
 
-39 rows. Measured against `grep` of `WIE_*` reads across `crates/`:
+**Status: DONE.** The table is now test-enforced in both directions by
+`crates/wie-runtime/tests/runbook_knobs.rs` (T1.3), and holds 55 `WIE_*` rows
+(`grep -c '^| `WIE_' docs/RUNBOOK.md`).
+
+Measured at the time: 39 rows, against `grep` of `WIE_*` reads across `crates/`:
 
 - **5 rows name knobs that no code reads**: `WIE_COMPACT_STRING`, `WIE_D3D9_INPLACE` (never existed / removed silently); `WIE_JIT_DIRECT_REGS`, `WIE_JIT_TAILCHAIN`, `WIE_JIT_VERIFY` (genuinely removed — `RUNBOOK.md:114` *says so in prose*, so the table rows are residue, not drift).
 - **10 live knobs have no row**: `WIE_ALLOW_MISSING_GUESTS`, `WIE_DEGRADE`, `WIE_GUEST_ENV`, `WIE_JIT_BG`, `WIE_JIT_EAGER_BLOCK_INSNS`, `WIE_JIT_SSA_FLAGS`, `WIE_JIT_TARGET_WORK`, `WIE_MT_DEBUG`, `WIE_NO_HOOK_SLICES`, `WIE_PRESENT_PACING_HZ`.
@@ -164,6 +283,10 @@ Opted in: `crates/wie-cpu/Cargo.toml:41`, `crates/wie-winapi/Cargo.toml:28` — 
 
 ### T1.1 — Add `[lints] workspace = true` to the three crates that lack it
 
+**Status: DONE.** All five crates opt in (`grep -n '\[lints\]' crates/*/Cargo.toml`
+→ 5 hits, each followed by `workspace = true`). The measurement below is the
+pre-change state.
+
 **Options.**
 
 | Option | Effect | Cost |
@@ -184,6 +307,16 @@ The existing 11 `#[expect(unsafe_code)]` attributes in `wie-cli` become *fulfill
 
 ### T1.2 — Decide whether to add `[workspace.lints.clippy]`
 
+**Status: DECIDED — option A, and the gap it left is now smaller.** No
+`[lints.clippy]` table exists in any manifest, `scripts/check.sh:554` and
+`.github/workflows/ci.yml:97` both run clippy without `-D warnings`, and clippy
+is therefore still advisory. Two things changed since: the workspace is
+**clippy-clean with zero warnings** (so option B would no longer start with
+thousands of lines of churn), and `wie-cpu` grew the lock convention T4.6 asked
+for — `crates/wie-cpu/src/lock.rs` — which makes `clippy::unwrap_used` affordable
+*there* first. Option B scoped to `wie-cpu` is now the cheap experiment; it was
+not before.
+
 This is the one item in this document that is a genuine policy choice, not a mechanical fix. CLAUDE.md and CONTRIBUTING rule 4 currently say clippy is advisory and that natural Rust beats lint-silencing — a defensible position.
 
 **Options.**
@@ -200,6 +333,11 @@ Note that `unwrap` counts are *not* automatically violations: `crates/wie-cpu` s
 
 ### T1.3 — Make the RUNBOOK knob table self-checking
 
+**Status: DONE.** `crates/wie-runtime/tests/runbook_knobs.rs` asserts both
+directions (`live ⊆ documented`, `documented ⊆ live ∪ {RUST_LOG}`), with the live
+set extracted from read/write call sites only, which is what the precondition
+below was for.
+
 **Precondition:** T2.8 (`knobs.rs`) so the read set is greppable in one file.
 
 Add a test that parses the RUNBOOK table's knob column and asserts equality with the union of knob names the code reads.
@@ -208,7 +346,13 @@ Add a test that parses the RUNBOOK table's knob column and asserts equality with
 
 ### T1.4 — Add a dependency-direction test
 
-**Zero architecture-boundary tests exist.** 1,884 tests, of which 104 (5.5%) live in `tests/`. `wie-cli` has **0** integration tests. Nothing asserts the crate flow, so the one invariant CLAUDE.md calls load-bearing is unverified by construction.
+**Status: DONE.** `check_deps()` in `scripts/check.sh` (step 2 of 9) compares
+`cargo metadata`'s internal edges against `EXPECTED_EDGES` and prints
+`crate dependency direction ok (8 internal normal edges, 8 expected, 0 internal
+dev edges)`. It is a gate step, not a `cargo test`. The `wie-cli → wie-winapi`
+deviation recorded below is still in `EXPECTED_EDGES` as a known edge — see T3.5.
+
+**Zero architecture-boundary tests exist.** 1,884 tests, of which 104 (5.5%) live in `tests/`. `wie-cli` has **0** integration tests. (Pre-change figures; `wie-cli` now has `tests/run_entry.rs` — 7 tests — because T2.2 landed, and the workspace total is 2,018.) Nothing asserts the crate flow, so the one invariant CLAUDE.md calls load-bearing is unverified by construction.
 
 Actual edges (verified from all five `Cargo.toml`s):
 
@@ -232,6 +376,13 @@ No cycles, no internal dev-deps, no feature-gated internal deps. One deviation: 
 
 ### T2.1 — Extract `prepare_run` in `wie-cli` (lowest risk, highest value in T2)
 
+**Status: DONE.** `pub fn prepare_run(path: &Path, setup: RunSetup<'_>) -> Result<PreparedRun>`
+at `crates/wie-cli/src/commands/run.rs:271`. `crates/wie-cli/tests/run_entry.rs`
+(7 tests) covers it, including
+`prepare_run_stages_the_exe_and_threads_the_bottle_root`,
+`…_parent_folder_mode_copies_the_whole_app_folder` and
+`…_app_dir_mode_preserves_nested_relative_paths`.
+
 The 4-line pattern `resolve_volume_config` → `stage_run_source` → `new_with_options` with `bottle_root`/`current_directory` is **copy-pasted 5 times** (`commands/run.rs:312,461,550`, `gui/headless.rs:33`, `gui/app.rs:877`) and **already diverged**:
 
 - `app.rs` also mutates the process environment
@@ -243,6 +394,11 @@ The 4-line pattern `resolve_volume_config` → `stage_run_source` → `new_with_
 **Trade-off.** none — pure DRY, no behaviour change. **Do this one first.**
 
 ### T2.2 — `wie-cli` has no `[lib]` target — the highest-leverage structural change in the crate
+
+**Status: DONE.** `crates/wie-cli/Cargo.toml:17-19` declares
+`[lib] name = "wie_cli"`, and `crates/wie-cli/tests/` now holds integration
+tests that import it (e.g. `tests/run_entry.rs`), which is exactly what the item
+asked for.
 
 `crates/wie-cli/Cargo.toml:9-11` declares `[[bin]]` only. 9,421 lines in `src/`, **108 tests all inline**, no `tests/` directory, so **no external test can import anything from `wie-cli`**.
 
@@ -257,17 +413,30 @@ Consequences, measured:
 
 ### T2.3 — Delete the two dead permission fields
 
+**Status: DONE.** Both fields are gone; the constructors now take `_perms` and
+say so — `mem/region.rs:56` "`_perms` is accepted and ignored: region
+permissions were never read by…" and `mem/arena.rs:439` the same for arenas.
+
 `GuestRegion::perms` (`mem/region.rs:45`) and `MmapArena::perms` (`mem/arena.rs:29`) are **written, never read for any decision**. Verified: no `.perms` read exists outside `region.rs`/`arena.rs`, and the only read in `arena.rs` is `arena.rs:717`, a test asserting the value is stored.
 
 **Why it matters beyond two fields.** `wie-cpu/src/mem/` carries **8 encodings of page permission** — 6 live (`RwxPerms`, `PageProtect`, `PageState`, `PageProtectMeta{allow_r,allow_w}`, the 2-bit `TLB_PROT_R/W` carried in three separate fields, the host `mprotect` frame table) and these 2 dead ones. `region.rs` and `vad.rs` *look like* permission sources by name and are not. Deleting the dead two removes a quarter of the mental model for a two-field diff.
 
 ### T2.4 — Name the W-on-X rule once
 
+**Status: DONE.** `PageProtect::allow_write_for()` (`mem/protect.rs:149-150`,
+`allows_write() && !self.allows_execute()`) is the one definition, called from
+`mem/rw.rs:288` and `mem/map.rs:91`, with `allow_write_for_denies_writes_on_executable_pages`
+(`protect.rs:324`) as the test.
+
 The load-bearing subtlety — `allow_w = allows_write() && !allow_x`, so stores cannot silently SMC through the TLB/pins — is documented only at `mem/rw.rs:286-288`, and **re-implemented independently** at `mem/map.rs:90` for pins. Two copies of a non-obvious correctness rule, no shared constant.
 
 **Change.** one `const ALLOW_W: fn(PageProtect) -> bool` in `protect.rs`, called from both. 3-line change, called on TLB fill only so no perf cost. Add a test asserting the two paths agree.
 
 ### T2.5 — One `JitCtx::from_raw` for 27 `unsafe` sites
+
+**Status: DONE, under a different name.** `pub(super) unsafe fn ctx_mut<'a>(raw:
+*mut JitCtx) -> &'a mut JitCtx` at `jit/trampolines.rs:38` is the single
+deref-with-one-SAFETY-comment site the item asked for.
 
 `jit/trampolines.rs` has **20 unsafe blocks with 5 SAFETY comments**. Twelve are the identical 4-line shape — `unsafe extern "C" fn tramp_X(ctx: *mut JitCtx) { let ctx = unsafe { &mut *ctx }; … }` at `:185,193,201,209,217,225,233,241,249,257,266,280,295`. The *invariant* is identical and stated 13 times or not at all. `jit/fast_api.rs` repeats it 7 more times with 2 SAFETY comments. `iced_cpu.rs` has 2 blocks, 0 comments.
 
@@ -279,6 +448,12 @@ The load-bearing subtlety — `allow_w = allows_write() && !allow_x`, so stores 
 
 ### T2.6 — One `unpack_rgba`/`pack_rgba`
 
+**Status: DONE.** `crates/wie-winapi/src/color.rs` holds `pack_rgba` /
+`unpack_rgba`, consumed by five `d3d9_render` files (`vertex`, `blend`, `ps`,
+`sample`, `vs`) and by `opengl32_render/mod.rs`. It landed in `wie-winapi`
+rather than `d3d9_render` as proposed — which is what lets the GL sibling use
+it, the point of the item.
+
 `0xAARRGGBB` is documented **25 times** across `d3d9_render/*` and `opengl32_render/*`, and each site re-implements the unpack: `d3d9_render/blend.rs:288` (three `(x >> 16) & 0xFF` in one function), `ps.rs:116`, `sample.rs` ×6, `opengl32_render/mod.rs:396/406`, `gdi32/text/mod.rs:179`, `gdi32/dib.rs:258`.
 
 **Change.** one `color.rs` in `d3d9_render`, consumed by all three subsystems. Pure refactor of shifts — provably behaviour-preserving.
@@ -287,6 +462,11 @@ The load-bearing subtlety — `allow_w = allows_write() && !allow_x`, so stores 
 
 ### T2.7 — Delete the two `set_var` calls in `gui/app.rs:877-886`
 
+**Status: DONE.** `grep -rn set_var crates/wie-cli/src` now finds only the
+`WIE_IDLE` pair in `commands/run.rs` (`:557`, `:644`), which the item said to
+leave because it is genuinely cross-crate. `WIE_ROOT`/`WIE_DRIVE_D` go through
+`SessionOptions`.
+
 The GUI path mutates `WIE_ROOT`/`WIE_DRIVE_D` into the process environment, because the session is constructed on a spawned thread. But `SessionOptions` is `Send` (all fields are) and already carries `bottle_root`/`drive_d_root` (`session/mod.rs:41-44`) — which console, persistent and headless all use. The typed route was available.
 
 **Change.** pass the values through `SessionOptions`. This removes 2 of `wie-cli`'s 47 unsafe sites (T1.1) *and* one env side-channel into the core, and makes the runbook-knob set smaller.
@@ -294,6 +474,9 @@ The GUI path mutates `WIE_ROOT`/`WIE_DRIVE_D` into the process environment, beca
 **Trade-off.** one env channel remains: `WIE_IDLE` is written at `commands/run.rs:472,559` and read by `wie-cpu`. Leave it; it is genuinely cross-crate.
 
 ### T2.8 — `knobs.rs`: one place the `WIE_*` read set is visible
+
+**Status: DONE.** `crates/wie-runtime/src/knobs.rs`, 231 lines, `OnceLock`-cached
+getters — option A. It is what made T1.3's test possible.
 
 16 distinct knobs at 17 sites across `wie-runtime` + `wie-cli`, read by bare `env::var` at point of use. Two partial centralisations exist (`RuntimeMemoryLayout::with_env_overrides` handles 2; two `OnceLock` getters). No `Config` struct exists.
 
@@ -306,9 +489,17 @@ The GUI path mutates `WIE_ROOT`/`WIE_DRIVE_D` into the process environment, beca
 
 ### T2.9 — Deduplicate `winapi_state_default()`
 
+**Status: OPEN.** Still four definitions:
+`state/tests/mod.rs:109`, `version.rs:994`, `kernel32/file_io/path.rs:782`,
+`ole_clipboard.rs:409` (`grep -rn 'fn winapi_state_default' crates/wie-winapi/src`).
+
 Copied in 5 files: `state/tests/mod.rs:85`, `version.rs:991`, `kernel32/file_io/path.rs:786`, `advapi32/tests.rs`, `ole_clipboard.rs:417`. Move to `state/tests/mod.rs` and import.
 
 ### T2.10 — Split `user32/controls/button.rs` (pure `git mv`)
+
+**Status: DONE.** `user32/controls/` is now `button/`, `edit/`, `listbox.rs`,
+`paint.rs`, `paint_tests/`, `static.rs`, `statusbar/` — the all-control-kind
+entry point is in `paint.rs`, where a reader will look for it.
 
 The file is **misnamed**: it holds `paint_control`, the *all-control-kind* entry point (`:24`), plus the status-bar strip/separator/parts painters (`:340-563`), plus BUTTON face/border/mnemonics. Two unrelated controls in one file. A developer looking for status-bar paint will not open `button.rs`.
 
@@ -321,6 +512,13 @@ Also: split the ~25 `pub(crate) const` message/style values out of `controls/mod
 ## T3 — Architectural (each needs its own ADR)
 
 ### T3.1 — `wie-cpu`: three mnemonic tables where one would do (ADR-[0007](../adr/0007-opclass-table.md))
+
+**Status: DONE** (`42a1008`). `jit/lower/opclass.rs` (1,107 lines) is the one
+table — 266 admitted mnemonics, 247 body + 19 term — and `jit/block.rs` went
+**1,442 → 602 lines**. The three-table counts below are the pre-change
+measurement. Two predictions did not hold: `Cqo`'s dead arm is still at
+`lower/insn.rs:317`, and `Enter`/`Pushf`/`Popf` are *absent* from the table
+rather than modelled as `Term`.
 
 | Table | file:line | distinct `Mnemonic::` |
 | --- | --- | --- |
@@ -354,6 +552,11 @@ The tables are near-identical in shape and ordering, and operand *forms* are re-
 
 ### T3.2 — `fast_api.rs`: a guest heap allocator in the CPU crate, backed by process-global `static`s (ADR-[0004](../adr/0004-per-engine-guest-heap-layout.md))
 
+**Status: DONE** (ADR-0004, 2026-10-03). The statics described below no longer
+exist: the layout lives on `JitCtx` (`jit/lower/mod.rs:425-440`) and the atomics
+on `JitShared` (`jit/shared.rs:348`), with `heap_isolation_tests.rs` (3 tests) as
+the fail-before evidence.
+
 `jit/fast_api.rs` is a UCRT reimplementation living in `wie-cpu`: `FastApiKind::{Malloc,Free,Memcpy,Strlen,AcrtIobFunc,Fwrite,Fflush}` (`:19-27`) matched by export name, and `wie_ucrt_malloc` (`:210`) implementing 24 size classes, bump allocation, large-list fitting and block headers against `guest_layout` constants.
 
 Verified: `static HEAP_CTRL / HEAP_BASE / HEAP_END: AtomicU64` at `fast_api.rs:90-92`, set by `install_heap_layout` (`pipeline.rs:159`) — **`static`, not per-`JitCpu`**. `guest_layout.rs:1-13` justifies sharing *constants* across crates; it does not justify sharing *mutable heap state*.
@@ -372,6 +575,10 @@ Verified: `static HEAP_CTRL / HEAP_BASE / HEAP_END: AtomicU64` at `fast_api.rs:9
 Adjacent, low value, do only if already in the area: merge `diag.rs` (208) + `profile.rs` (251) — one consumer, overlapping `WIE_*` gates.
 
 ### T3.3 — `user32/controls`: no trait, six kinds, five concerns each (ADR-[0008](../adr/0008-control-trait.md))
+
+**Status: OPEN.** ADR-0008 is still `Proposed` and no `trait` exists under
+`crates/wie-winapi/src/user32/controls/`. T2.10 has landed, which the ADR's plan
+wanted first; the `Control` trait itself has not been attempted.
 
 **Measured:** `grep -rn "trait " src/user32/ src/gdi32/` returns **1 hit**. There is no control abstraction.
 
@@ -403,6 +610,20 @@ Adjacent, low value, do only if already in the area: merge `diag.rs` (208) + `pr
 
 ### T3.4 — `state/window.rs`: the real god object is not `state/` (ADR-[0005](../adr/0005-capability-traits.md))
 
+**Status: DONE, with the deferral the ADR states.** `crates/wie-winapi/src/capability.rs`
+holds `ConsoleAccess` (7 verbs), `WindowDialogAccess` (22 verbs) and
+`PresentAccess` (18 verbs); `kernel32/console*` moved to `src/console/`.
+`WindowState`'s 31 fields are still `pub` — ADR-0005 defers that explicitly, so
+It is not drift. Caveat worth carrying: **`PresentAccess` narrows nothing** — it
+is implemented for `WinApiState` and imported by 15 files for its method names,
+with no `dyn PresentAccess` parameter anywhere. `ConsoleAccess` does narrow: 54
+`ctx.console()` call sites, each producing a `ConsoleCall` whose `state` field is
+`&mut dyn ConsoleAccess`. `WindowDialogAccess` narrows helper parameters only —
+one helper takes it — and 476 sites in the crate still bind
+`let state = &mut *ctx.state`, wide handle and all. The numbers below (154 / 65 /
+1,768) are the ADR's, and they did not all reproduce — see
+[Figures corrected on 2026-11-23](#figures-corrected-on-2026-11-23).
+
 The premise to discard: `state/` is **not** a god module. `WinApiState` (`state/mod.rs:398-427`) has **8 fields**, and 16 of the 24 state types live in their own DLL module. `state/` correctly owns only what is cross-DLL: `KernelState`, `HeapState`, `FileIoState`, `ModuleState`, `ProcessState`, `DisplayMetrics`, `ClipboardState`, `WinApiEnvironment`.
 
 The god object is **`WindowState`** (`state/window.rs:475`, **31 `pub` fields**) plus 33 free-floating request/pick/session types in the same file (18 dialog/messagebox bridge structs are defined at `:20-475`, *before* `WindowState` itself).
@@ -427,13 +648,13 @@ The god object is **`WindowState`** (`state/window.rs:475`, **31 `pub` fields**)
 
 Two clusters dominate and both are boundary errors:
 - **`comdlg32` → `window_state` (146).** `comdlg32/font.rs:85,202-207,467` reads *and writes* `WindowState` fields (`font_dialog`, `font_dialog_policy`, `file_dialog_loop_va`).
-- **`kernel32` → `console` (65).** `ConsoleState` is a `DllId` slot owned by `src/console/`, but its 65 call sites live in kernel32 (`kernel32/console.rs:27`, `console_cells.rs:31`, `console_input.rs:7`).
+- **`kernel32` → `console` (65).** `ConsoleState` is a `DllId` slot owned by `src/console/`, but its 65 call sites lived in kernel32 — in `kernel32/console.rs`, `console_cells.rs` and `console_input.rs`, which are now `src/console/{api,cells,input}.rs` (ADR-0005 stage 1).
 
 **`HandlerContext` is a real port and the strongest asset in the crate** — 4 fields, one of which is `&mut dyn CpuEngine` (`state/mod.rs:879-888`). Its only weakness is that `&mut WinApiState` transitively exposes all 8 sub-states.
 
 **Two further hazards:**
 - Per-DLL state is `[Option<Box<dyn Any + Send>>; 16]` (`state/mod.rs:178`, `DllStateMap`), type-erased with lazy `get_or_init::<T>(DllId)`. **Passing `GdiState` where `PresentState` is expected is a runtime downcast failure, not a compile error.**
-- The lock order `WinApiState → MessageQueue` (18 `state.lock_message_queue()` sites) and `WinApiState → PresentChannel` (`present/mod.rs:197-199`) is **prose in doc comments, not a type**. A violation deadlocks the macOS UI thread — the failure mode warned about at `state/window.rs:81,104,137,170,338`, `comdlg32/print.rs:422,751`, `comdlg32/file.rs:804`, `console/host_term.rs:85`. `sync_obj.rs:1012` notes holding `engine`/`winapi` mutexes while waiting deadlocks workers.
+- The lock order `WinApiState → MessageQueue` (18 `state.lock_message_queue()` sites) and `WinApiState → PresentChannel` (`present/mod.rs:197-199`) is **prose in doc comments, not a type** — that was the finding; T4.4 has since made it a type (`lock_order.rs`), so read this bullet as the pre-change state. A violation deadlocks the macOS UI thread — the failure mode warned about at `state/window.rs:81,104,137,170,338`, `comdlg32/print.rs:422,751`, `comdlg32/file.rs:804`, `console/host_term.rs:85`. `sync_obj.rs:1012` notes holding `engine`/`winapi` mutexes while waiting deadlocks workers.
 
 **Options.**
 
@@ -447,6 +668,14 @@ Two clusters dominate and both are boundary errors:
 **Recommend A, then B for the console cluster only.** D is a genuine trade of a documented design property for type safety — pick it only if a downcast bug has actually occurred. A is the item that makes the boundary real.
 
 ### T3.5 — `wie-winapi`'s public surface does not insulate its internals (ADR-[0006](../adr/0006-winapi-port-module.md))
+
+**Status: PARTIAL — both changes below landed; the ADR's third decision did
+not.** `wie_winapi::port` publishes 139 names in eight sections, the crate root
+re-exports 13 `state` names (down from 63), and `./scripts/check.sh --only
+winapi-port` enforces it over `wie-runtime`'s `src` **and** `tests` with an empty
+allow-list. Still open: point 3 of the ADR — `wie-cli` keeps
+`wie-winapi = { path = "../wie-winapi" }` and reaches `wie_winapi::user32::`,
+`::gdi32::` and `::present::` from `gui/`. The counts below are pre-change.
 
 `lib.rs` (106 lines) re-exports ~60 names flat from `state` (`:86-100`) and 6 from `dispatch_table` (`:103-106`). `mod state` and `mod dispatch_table` are **private modules with wide `pub use`** — the module tree is hidden but the contents are not. `WinApiState`, `WindowState` (31 pub fields), `HandlerContext` and `DllStateMap` are public structs with public fields.
 
@@ -466,9 +695,18 @@ Two clusters dominate and both are boundary errors:
 
 ### T3.6 — The API-registration spine: dense path is DRY, soft path is not (ADR-[0009](../adr/0009-census-derivation.md))
 
+**Status: DONE for 11 of 19 modules; the other 8 are the intended residue.**
+`dispatch_table/names/mod.rs` went 1,088 → 368 lines; each module owns
+`pub(crate) const EXPORTS`, and for 11 of them (135 names) `soft_exports!` expands
+one row list into both the dispatch table and the census, so a missing row is a
+compile error. The 8 that stay hand-kept (515 names) have dispatch sets strictly
+wider than the census and say why at the list. The registry table below is the
+pre-change inventory — in particular, the census lists are no longer "in
+`names/mod.rs`", and `names/mod.rs` is 368 lines, not 1,054.
+
 This corrects CLAUDE.md's framing in the *opposite* direction — the dense path was refactored and the doc still describes the old world.
 
-**Dense path (510 APIs), genuinely DRY:** one row in `winapi_ids!` (`decl.rs:35`) emits the `WinApiId` variant, the hot-path `dispatch_winapi_id` match arm, and the name rows, with a compile-time count assert (`:78-88`). Fake-VA encoding is derived (`encode_export(id)`, `fake_va.rs:1249`). Adding a dense API = 1 row + the handler. CLAUDE.md's "4th place" does not exist.
+**Dense path (510 APIs), genuinely DRY:** one row in `winapi_ids!` (`decl.rs:35`) emits the `WinApiId` variant, the hot-path `dispatch_winapi_id` match arm, and the name rows, with a compile-time count assert (`decl.rs:82-88`). Fake-VA encoding is derived (`encode_export(id)`, `fake_va.rs:1249`). Adding a dense API = 1 row + the handler. CLAUDE.md's "4th place" does not exist.
 
 **Soft / string-dispatch path, the opposite:** **~1,050 hand-kept names across 4 parallel registries.**
 
@@ -483,8 +721,15 @@ This corrects CLAUDE.md's framing in the *opposite* direction — the dense path
 | per-DLL `*_EXPORTS` | `urlmon.rs:70`, `ntdll.rs:54`, `opengl32.rs:212`, wininet | 4 more copies |
 | `CLASSIFY_TABLE` (stub rewiring) | `wie-runtime/src/guest_stubs/classify.rs:42` | ~99 rows |
 
+Where those rows are now: the census lists are per-module `pub(crate) const
+EXPORTS` (11 of them declared through `soft_exports!`), `names/mod.rs` is 368
+lines, and `is_winapi_library` / `is_winapi_implemented` sit at `names/mod.rs:49`
+and `:91` rather than `:768-808` / `:810-855`. `PREPLANTED_SOFT_APIS`,
+`DYNAMIC_FAKE_APIS`, `CLASSIFY_TABLE` and `encode_export` (`fake_va.rs:1249`) are
+unchanged.
+
 **Failure modes, measured:**
-- Forget a `*_DLL_EXPORTS` census row → **no runtime failure**. `is_winapi_implemented` is used in production only via `is_winapi_library` at `session/init.rs:508`, which has its own separate list. The oracle itself is used only by `commands/inspect.rs:132` and `tests/api_sets.rs`. Drift = wrong `inspect` output, invisible in `run`. **No test ties any census list to a dispatch match arm.**
+- Forget a `*_DLL_EXPORTS` census row → **no runtime failure**. `is_winapi_implemented` is used in production only via `is_winapi_library` at `session/init.rs:508`, which has its own separate list. The oracle itself is used only by `commands/inspect.rs:132` and `tests/api_sets.rs`. Drift = wrong `inspect` output, invisible in `run`. **No test ties any census list to a dispatch match arm** — true when this was written, and the hole `dispatch_table/census_tests.rs` was added to close (ADR-0009's guard, which is why the rows above moved beside their dispatch).
 - Miss a dispatch arm → `bail!("unsupported WinAPI call: {library}!{name}")` (`dispatch_table/mod.rs:205`) → runtime error string, worker exits 1. Not a panic, but a hard guest failure.
 - Miss a `DllId` slot → compile error (array length derives from `DllId::COUNT`). Good.
 - New DLL missing from `is_winapi_library` → its imports are treated as loadable guest modules → silent static-load attempt.
@@ -513,6 +758,13 @@ Also: `tests/api_sets.rs:47` duplicates `NTDL_EXPORTS` from `src/ntdll.rs:54` wi
 
 ### T4.1 — `wie-cpu` test harness (converts a silent failure into a compile error)
 
+**Status: DONE** (`42a1008`). `jit/tests/harness.rs` (179 lines) holds
+`Backend`/`open`/`open_worker`/`alloc_code`, and `jit/tests/mod.rs` went
+**2,364 → 95 lines** with 23 sibling test files. One correction to how this item
+was budgeted: `tests/**` is exempt from `check_file_sizes`, so the 2000-line cap
+never constrained `mod.rs` — the binding budget was ADR-002's 1000-line *target*,
+enforced by review. The 2,360 in the text below should read 2,364.
+
 277 tests, all in-crate. `jit/tests/` holds 119 across 14 files. The stated policy is "file-size policy, ADR-002" (`tests/mod.rs:1-2`) — but `mod.rs` is **2,360 lines / 52 tests / 60 helpers**, 2.6× the next largest, while `chain_tests.rs` (227 lines) holds **1 test**.
 
 **There is no harness.** Four independent dual-backend harnesses exist: `atomic_tests.rs:66/108/128/133` (the most complete, and the only one with `open_worker`), `cmpxchg_tests.rs:144/158`, `mod.rs:802 simd_dual` + `mod.rs:1824 gs_teb_dual`, `chain_tests.rs:16`. `Backend`/`BACKENDS` are declared in `atomic_tests.rs` but consumed by `btx_tests.rs:479`, `implicit_lock_tests.rs:280`, `implicit_operands.rs:298` — already a de-facto shared fixture reached via `use super::*`.
@@ -522,6 +774,14 @@ Also: `tests/api_sets.rs:47` duplicates `NTDL_EXPORTS` from `src/ntdll.rs:54` wi
 **Change.** `jit/tests/harness.rs` with `Backend`/`BACKENDS`/`Engine`/`open`/`open_worker` plus `alloc_code(cpu, bytes) -> u64` that returns a *fresh* VA per call. Removes ~24 copies of a 6-line `virtual_alloc(...).expect("alloc")` prologue and makes the aliasing hazard enforced. Then split `mod.rs` (the harness extraction shrinks it first).
 
 ### T4.2 — `wie-cpu`: three mechanisms for "cannot execute this", and they disagree
+
+**Status: DONE** (`42a1008`). `jit/lower/err.rs` defines
+`LowerError::{Unsupported, Form(&'static str), Verifier(String)}`; 97 signatures
+now return it (`grep -rc 'Result<[^>]*, LowerError>' crates/wie-cpu/src`) instead
+of `Result<_, String>`, and refusals reach the report as
+`[wie] jit_lower_refusals: unsupported=… form=… verifier=…`
+(`jit/diag.rs:277`). The "38 distinct ad-hoc literals" below is the count this
+item started from; the change replaced 57 distinct literals at 72 sites.
 
 | Class | Mechanism |
 | --- | --- |
@@ -538,6 +798,13 @@ Secondary: replace `Result<(), String>` in `jit/lower/` with `Result<(), LowerEr
 
 ### T4.3 — Gate or delete the untested dual raster path
 
+**Status: DONE** (`a4ba020`). `spawn_render_thread` (`present/mod.rs:73`) is now
+the only thread-creation site under `present/` (the two files the text below sizes
+at 953 and 337 lines are 977 and 355 now), and
+`default_present_path_spawns_no_render_thread` (`present/tests.rs:692`) fails if a
+thread appears on the default path — a claim about *absence*, which is what this
+item said did not exist.
+
 `d3d9/capture.rs` (953) records ops on the emu thread; `present/stream.rs` (337) replays them on a render thread into its *own* backbuffer, with textures/shaders **snapshotted by clone** at record time (`capture.rs:20-25`, v1; `Arc` deferred). So there are two rasterisation paths for the same draw, gated by a flag `stream.rs:18-19` states the headless runs and micro-suite never set: *"headless runs and the micro-suite never spawn it"*.
 
 `docs/status.md:46` already concedes the GUI half is untested — the 39 notepad tests "run headless through `RuntimeSession`, where the capture path never runs", and the sole render-thread claim "rests on the 2026-09-25 commit-path removal plus acceptance runs over one micro fixture — not on any test asserting the *absence* of a second render thread."
@@ -546,11 +813,31 @@ Secondary: replace `Result<(), String>` in `jit/lower/` with `Result<(), LowerEr
 
 ### T4.4 — Lock-order assertion (converts a UI-thread hang into a test failure)
 
+**Status: DONE** (`a4ba020`). `crates/wie-winapi/src/lock_order.rs` (355 lines)
+ranks `Lock::{State, Queue, Channel}` by declaration order, records acquisitions
+in a `#[cfg(debug_assertions)]` thread-local, and returns an `Ordered` guard so the
+record cannot precede or outlive the lock. `channel_then_state_panics` (`:264`)
+and `holding_the_channel_makes_the_real_queue_accessor_panic` (`:341`) both fire.
+
+**"Prose in ~10 doc comments across 4 files" overstated what existed: the order
+was stated once**, in a "Lock ordering:" paragraph on `PresentChannel`
+(`present/mod.rs:197-199` at the parent commit). The ~9 other sites are `deadlock`
+warnings — a hazard repeated, not an order specified, and not something a reader
+could implement from. That is an argument for making it a type, not against; see
+the figures list.
+
 The order `WinApiState → MessageQueue → PresentChannel` is prose in ~10 doc comments across 4 files. A debug-only thread-local lock-set that panics on `channel → state` turns an unreproducible macOS UI deadlock into a failing test.
 
 **Trade-off.** KISS, but adds a thread-local to the dispatch path — scope it to `#[cfg(debug_assertions)]`.
 
 ### T4.5 — CI gaps
+
+**Status: PARTIAL.** `.github/workflows/ci.yml` now has two jobs: `Checks`
+(fmt, `--only file-sizes`, `--only dep-direction`, clippy, fixtures, nextest,
+release build, micro-suite) and `Non-macOS compile check`
+(`./scripts/check-non-macos.sh`, not `continue-on-error`). Still absent from CI:
+the `winapi-port` policy step (it runs only through `./scripts/check.sh`) and the
+`long_loop` budget, which the section below argues should stay local.
 
 Running on push and PR: fmt, file-sizes, clippy (advisory), `make micro-exes`, `fetch.sh notepad`, nextest, release build, **4 micro-suite categories** (~14 of ~70 exes).
 
@@ -564,6 +851,12 @@ Local-only (`./scripts/check.sh` runs the full sweep): `--matrix` (`WIE_JIT_MEM=
 Also worth noting: **there are zero cargo features.** `grep -rn 'cfg(feature' crates/` → 0. Every variant is a runtime env var. That is defensible (documented at `RUNBOOK.md:118`, and features would multiply a matrix nobody runs — YAGNI), but it means no variant can be *proven* to build differently. **Do not** re-plumb this.
 
 ### T4.7 — FOUND BY IMPLEMENTATION (T4.5): `winit` is not platform-gated, and the workspace cannot build for non-macOS
+
+**Status: DONE.** `winit` now sits in
+`[target.'cfg(target_os = "macos")'.dependencies]` (`crates/wie-cli/Cargo.toml`),
+the GUI module subtree is cfg-gated, and the CI job named above runs
+`./scripts/check-non-macos.sh`. The 136-error finding below is the record of what
+the fix cost.
 
 This was not visible from reading the `Cargo.toml` and is the single most
 useful thing the T4.5 work produced.
@@ -613,6 +906,13 @@ unbacked until T4.5: it was wrong, and nothing would have said so.
 
 ### T4.6 — Lock-poisoning convention, before T1.2 option B
 
+**Status: DONE** (`42a1008`). `crates/wie-cpu/src/lock.rs` defines
+`lock_unpoisoned` / `read_unpoisoned` / `write_unpoisoned`; 75 call sites use
+them, and the `exec/mod.rs` and `iced_cpu.rs` local helpers delegate. What is
+left is deliberate: **14** bare `.lock()/read()/write().unwrap()/.expect()` sites,
+all under `jit/tests/**` (`grep -rE '\.(lock|read|write)\(\)\.(unwrap\(\)|expect\()'`).
+The change's own count was 19; 14 is what the tree holds.
+
 ~90 lock `unwrap()`s across `wie-cpu` (`shared.rs` 28, `cpu_engine.rs` 25, `pipeline.rs` 21) where the crate already demonstrates a poison-tolerant idiom (`unwrap_or_else(|e| e.into_inner())`, `shared.rs:928`; `degrade_locked_seen`, `exec/mod.rs:139-144`). Pick one convention — one `lock_unpoisoned(&Mutex<T>)` helper is the mechanical option — *then* decide whether `clippy::unwrap_used` can ever be a gate. Doing T1.2-B first means either fighting hundreds of sites or adding a clippy config that excludes lock unwraps, which is worse than having no lint.
 
 ---
@@ -628,6 +928,18 @@ unbacked until T4.5: it was wrong, and nothing would have said so.
 | **4** | T3.1 (A then C) | The largest single-DRY win; needs a benchmark before/after because it touches the JIT. |
 | **5** | T3.4, T3.5, T3.3, T3.6 (A) | The real architectural work. **One ADR each.** T3.3 lands after T2.10. T3.4 and T3.5 should be sequenced together (T3.5's CI gate is what holds T3.4's refactor). |
 | **6** | T1.2-B, T1.3, T4.2-LowerError, T4.3, T4.4, T4.5 | Policy tightening, once the codebase can absorb it. |
+
+**How it actually went, as of 2026-11-23.** Waves 0–4 landed as planned in the
+first pass. Wave 5 arrived in one commit (`a4ba020`), not one ADR per change,
+because T3.4/T3.5/T3.6 share `lib.rs`, `state/mod.rs` and `present/mod.rs` and
+`wie-runtime` compiles only against all of them together; T3.3 is still open. Wave
+6 largely landed *before* Wave 5 (`42a1008` carries T4.1, T4.2, T4.6 and the code
+cache; `a4ba020` carries T4.3, T4.4 and ADRs 0005/0006/0009), and T1.3/T4.7 landed
+out of order as well. The wave numbering was a reading order, not a dependency
+graph: what is still open is T3.3 (its ADR recorded, not applied), T3.5's third
+decision, T2.9 and the CI half of T4.5 — none of which anything else waits on.
+T3.6's eight hand-kept modules are not open work: ADR-0009 records them as the
+distinguished subset they have to be.
 
 Explicitly **not** in this plan: unifying `glsl.rs` with `d3d9_shader.rs`; a `win_struct!` macro for `guest_layout`; collapsing `FastTlb` into `GenTlb` (the interpreter path is measurably slower set-associative — T2.3 deletes the dead fields instead); cargo features for JIT/iced/GUI; splitting `raw_input.rs`; introducing cargo features or a `win_struct!` macro; turning `WinApiControlSignal` into an enum return (a cross-crate protocol change, not a refactor — defer behind T3.4).
 

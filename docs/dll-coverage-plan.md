@@ -117,4 +117,6 @@ AddFontResource).
 1. Zero-coverage table has only explicitly-deferred entries (WININET/URLMON).
 2. Every Tier-1/2 DLL has a passing micro-exe under both CPU backends.
 3. Qt-class smoke: a minimal Qt app links and reaches its message loop.
-4. Full gate green: `./scripts/check.sh`, clippy `-D warnings`, fmt, sizes.
+4. Full gate green: `./scripts/check.sh` (all nine steps — `--list` prints them),
+   and clippy with `-D warnings` as an extra check, which is stricter than the
+   gate runs (clippy is advisory there).

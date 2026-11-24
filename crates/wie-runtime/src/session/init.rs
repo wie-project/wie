@@ -301,7 +301,7 @@ impl super::RuntimeSession {
         // loop can park on the primary inbox without the state lock.
         let wake_hub = process.with_mut(|_, st| {
             st.wire_wake_hub();
-            st.kernel.sync.wake_hub.clone()
+            st.wake_hub()
         });
         let heap = Arc::clone(&process.shared_heap);
         Ok(Self {
@@ -1034,12 +1034,9 @@ impl super::RuntimeSession {
         // can resolve GetCurrentThread/GetCurrentProcess pseudohandles.
         {
             let ctx = wie_cpu::ThreadContext::default();
-            drop(
-                winapi_state
-                    .kernel
-                    .sync
-                    .register_thread(wie_winapi::port::PRIMARY_THREAD_ID, ctx),
-            );
+            winapi_state
+                .scheduler()
+                .register_thread(wie_winapi::port::PRIMARY_THREAD_ID, ctx);
         }
 
         // Register .pdata function table for C++ exception handling.
@@ -1058,10 +1055,8 @@ impl super::RuntimeSession {
                 let entries = wie_winapi::port::parse_pdata(raw);
                 if !entries.is_empty() {
                     winapi_state
-                        .kernel
-                        .sync
-                        .function_tables
-                        .insert(image_summary.image_base, entries);
+                        .scheduler()
+                        .install_function_table(image_summary.image_base, entries);
                 }
             }
         }

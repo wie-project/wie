@@ -463,8 +463,7 @@ impl ProcessResources {
 
     /// Spawn a host thread for each pending `CreateThread` spawn.
     pub(crate) fn drain_spawns(&mut self) -> Result<()> {
-        let spawns: Vec<PendingSpawn> =
-            self.with_mut(|_, st| std::mem::take(&mut st.kernel.sync.pending_spawns));
+        let spawns: Vec<PendingSpawn> = self.with_mut(|_, st| st.scheduler().take_pending_spawns());
         if spawns.is_empty() {
             return Ok(());
         }
@@ -584,33 +583,12 @@ fn join_workers_impl(
 ) {
     {
         let mut st = lock_wait(winapi, stats);
-        st.kernel.sync.process_dying = true;
-        for q in st.kernel.sync.cs_waiters.values() {
-            q.notify_all();
-        }
-        for obj in st.kernel.sync.objects.values() {
-            match obj {
-                wie_winapi::port::KernelObject::Event(e) => e.set(),
-                wie_winapi::port::KernelObject::Semaphore(s) => s.notify_all(),
-                wie_winapi::port::KernelObject::Thread(t) => {
-                    if !t.is_finished() {
-                        t.finish(1);
-                    }
-                }
-                // File mappings hold no waiters; nothing to wake at teardown.
-                wie_winapi::port::KernelObject::FileMapping(_) => {}
-                // Directory watches: waking the parked waiter unblocks the
-                // join; the watcher itself stops when the object drops.
-                wie_winapi::port::KernelObject::DirectoryWatch(d) => d.deactivate(),
-                // Child-process objects: wake waiters so a parked
-                // WaitForSingleObject never blocks the teardown join.
-                wie_winapi::port::KernelObject::Process(p) => {
-                    if !p.is_finished() {
-                        p.finish(1);
-                    }
-                }
-            }
-        }
+        // Mark dying, then release every waiter: CS queues, and every waitable
+        // kernel object (events signalled, semaphores notified, threads and
+        // child processes finished, directory watches deactivated). The arms
+        // live in `SyncState::wake_all_waiters` now, next to the enum.
+        st.scheduler().mark_process_dying();
+        st.scheduler().wake_all_waiters();
     }
     for j in joins.drain(..) {
         drop(j.join());
@@ -792,7 +770,7 @@ fn run_worker(
     // Load initial thread context set by CreateThread.
     {
         let st = lock_wait(&shared_winapi, &lock_wait_stats);
-        if let Some(ctx) = st.kernel.sync.thread_cpu.get(&tid).cloned() {
+        if let Some(ctx) = st.saved_thread_context(tid) {
             drop(st);
             engine.restore_thread_context(&ctx);
             engine.on_thread_switch();
@@ -858,7 +836,7 @@ fn run_worker(
                 });
                 if let Some(result) = api_result {
                     let st = lock_wait(&shared_winapi, &lock_wait_stats);
-                    if st.kernel.sync.process_dying {
+                    if st.is_process_dying() {
                         finish_tid(&st, tid, 1);
                         return engine;
                     }
@@ -1041,11 +1019,9 @@ mod tests {
         let worker_a = {
             let tid = 0x5679_u32;
             resources.with_mut(|_, st| {
-                st.kernel.sync.register_thread(tid, ThreadContext::new());
-                st.kernel
-                    .sync
-                    .pending_spawns
-                    .push(spawn(tid, 0x8000_0001, stack_a, stack_size));
+                st.scheduler().register_thread(tid, ThreadContext::new());
+                st.scheduler()
+                    .queue_spawn(spawn(tid, 0x8000_0001, stack_a, stack_size));
             });
             tid
         };
@@ -1081,8 +1057,8 @@ mod tests {
         let worker_b = {
             let tid = 0x567A_u32;
             resources.with_mut(|_, st| {
-                st.kernel.sync.register_thread(tid, ThreadContext::new());
-                st.kernel.sync.pending_spawns.push(spawn(
+                st.scheduler().register_thread(tid, ThreadContext::new());
+                st.scheduler().queue_spawn(spawn(
                     tid,
                     0x8000_0002,
                     stack_a + 0x20_0000,

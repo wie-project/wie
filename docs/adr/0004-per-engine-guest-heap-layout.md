@@ -1,6 +1,41 @@
 # ADR 0004 — Per-engine guest heap layout for the UCRT fast path
 
-Status: Proposed · 2026-10-01 — maintainability plan T3.2
+Status: **Accepted** · 2026-11-23 — implemented 2026-10-03; status line corrected
+2026-11-23. Proposed 2026-10-01 · maintainability plan T3.2
+
+## Implementation note (2026-11-23)
+
+Verified against `a4ba020`. The four edits are in the tree as decided:
+
+| Decision clause | What the code does |
+| --- | --- |
+| no process-global heap state | `HEAP_CTRL`/`HEAP_BASE`/`HEAP_END` and `LARGE_FREE` are gone from `jit/fast_api.rs`; no `install_heap_layout` remains anywhere |
+| layout is per `JitCtx` | `heap_ctrl_va`/`heap_base`/`heap_end` (`jit/lower/mod.rs:425-430`) and `large_free: *mut LargeFreeList` (`:440`) |
+| the atomics live in `JitShared` | `JitShared::heap: [AtomicU64; 3]` (`jit/shared.rs:348`); `PerThreadJitState::large_free` (`:1576`) owns the `Vec` |
+| ctx-shaped readers | `heap_layout(ctx)` (`fast_api.rs:118`) and `large_free_mut(ptr)` (`:142`) |
+
+`jit/tests/heap_isolation_tests.rs` holds the three tests the Validation section
+lists, under the same names.
+
+**Where the ADR's premise did not match the tree**, as implementation found it
+(the Decision section already records the first; both are listed here so the
+reasoning is not read as still-current):
+
+1. `LARGE_FREE` was scheduled as a follow-up because "a `Vec` inside a
+   `#[repr(C)]` C-ABI struct deserved its own decision". `#[repr(C)]` was never
+   the problem. The blocker is lifetime: `JitCtx` is built per block dispatch, so
+   an owned `Vec` there would be emptied at every block boundary — a silent
+   performance regression rather than a build error. It shipped in the same
+   change, as a pointer to a `PerThreadJitState`-owned list.
+2. The Consequences section says the change "is currently blocked on
+   `jit/lower/mod.rs` being unfenced". No unfencing happened: `jit/lower/` is
+   still inside `jit`, whose module doc carries
+   `#![allow(unsafe_code, private_interfaces)]` (`jit/mod.rs:15-18`), and its 5
+   `unsafe` sites carry no individual attributes. The clause described a transient
+   obstacle, not a lasting condition, and the change landed with the fence intact.
+
+One figure in Validation is stale: it reports "clippy shows 4 warnings before and
+after". `cargo clippy --workspace --all-targets` is silent at `a4ba020`.
 
 ## Context
 

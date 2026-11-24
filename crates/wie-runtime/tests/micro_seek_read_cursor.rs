@@ -13,14 +13,10 @@
 //! and asserts that after a seek the bytes read are exactly the bytes at the
 //! offset the `FILE_CURRENT` query returned.
 
-use ahash::{HashMap, HashMapExt};
 use wie_cpu::{CpuEngine, IcedCpu, RwxPerms};
 use wie_winapi::port::{
-    DEFAULT_ENVIRONMENT, DllStateMap, FileHandle, FileIoState, FindFileHandle, GuestHeap,
-    GuestIoRuntimeConfig, GuestStdinMode, HandlerContext, HeapState, KernelState, MessageQueue,
-    ModuleHandle, ModuleState, ProcessState, REAL_MODULE_HANDLE_BASE, RegistryKeyHandle,
-    ResourceHandle, SyncState, ThreadState, VolumeConfig, WinApiEnvironment, WinApiHandlerResult,
-    WinApiId, WinApiState, dispatch_winapi_id, mount_host_file,
+    GuestIoRuntimeConfig, HandlerContext, WinApiEnvironment, WinApiHandlerResult, WinApiId,
+    WinApiState, dispatch_winapi_id, mount_host_file,
 };
 
 const STACK_VA: u64 = 0x100_0000;
@@ -68,74 +64,16 @@ fn default_env() -> WinApiEnvironment {
 }
 
 fn default_winapi_state() -> WinApiState {
-    let heap = std::sync::Arc::new(std::sync::Mutex::new(GuestHeap::new(0x2000, 0x10000)));
-    heap.lock()
+    // The bare fixture state comes from the port (ADR-0006): a 44-field
+    // literal here is exactly what kept the state structs un-opaque. `empty`
+    // is the zero-valued state, not a session's — see `for_session`.
+    let state = WinApiState::empty(0x2000, 0x10000);
+    state
+        .heap_arc()
+        .lock()
         .unwrap_or_else(|e| e.into_inner())
         .attach_guest_control(0x2000);
-    WinApiState {
-        display: wie_winapi::port::DisplayMetrics::default(),
-        heap_state: HeapState {
-            heap,
-            next_fls_index: 0,
-            fls_slots: Vec::new(),
-            guest_fls_table_va: 0,
-        },
-        file_io: FileIoState {
-            executable_file_size: 0,
-            executable_file_bytes: std::sync::Arc::new(Vec::new()),
-            executable_file_cursor: 0,
-            next_find_handle: FindFileHandle::from(0),
-            find_handles: Vec::new(),
-            host_file_mounts: Vec::new(),
-            virtual_files: Vec::new(),
-            open_files: HashMap::new(),
-            next_file_handle: FileHandle::from(0),
-            next_resource_handle: ResourceHandle::from(0),
-            resources: Vec::new(),
-            current_directory_wide: Vec::new(),
-            bottle_root: None,
-            volumes: VolumeConfig::default(),
-            guest_file_data_next: 0,
-            guest_io: None,
-            stdin_bytes: Vec::new(),
-            stdin_cursor: 0,
-            stdin_mode: GuestStdinMode::InjectOnly,
-            ucrt_files: HashMap::new(),
-            ucrt_next_file_va: 0x0000_0000_6900_0000,
-            cached_streams: HashMap::new(),
-        },
-        process: ProcessState {
-            last_error: 0,
-            next_registry_key_handle: RegistryKeyHandle::from(0),
-            registry_keys: Vec::new(),
-            main_module_file_name: String::new(),
-            main_module_path: String::new(),
-            main_module_host_dir: None,
-            error_mode: 0,
-            suspended_threads: HashMap::new(),
-            environment: DEFAULT_ENVIRONMENT
-                .iter()
-                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-                .collect(),
-            main_module_dialogs: Vec::new(),
-            main_module_menus: Vec::new(),
-            main_module_strings: Vec::new(),
-            main_module_accelerators: Vec::new(),
-        },
-        kernel: KernelState {
-            threads: ThreadState::primary(),
-            sync: SyncState::new(),
-            seh_pending: HashMap::new(),
-        },
-        dll_states: DllStateMap::new(),
-        message_queue: std::sync::Arc::new(std::sync::Mutex::new(MessageQueue::default())),
-        module_state: ModuleState {
-            loaded_modules: HashMap::new(),
-            import_resolver: None,
-            get_proc_address_cache: HashMap::new(),
-            next_module_handle: ModuleHandle::from(REAL_MODULE_HANDLE_BASE),
-        },
-    }
+    state
 }
 
 /// Run one KERNEL32 handler with a fresh context and return its return value.

@@ -21,10 +21,16 @@ use crate::mt_runtime::OrderedState;
 use std::time::Instant;
 use wie_cpu::CpuError;
 use wie_winapi::port::{
-    DLL_PROCESS_ATTACH, DueTimer, DueTimerKind, GuestCallbackRequest, HostParkReason, KernelHandle,
-    KernelObject, StaticDllMain, WOM_DONE, WaveOutCallbackKind, WinApiControlSignal, WinApiState,
+    DLL_PROCESS_ATTACH, DueTimer, DueTimerKind, GuestCallbackRequest, HostParkReason,
+    StaticDllMain, WOM_DONE, WaveOutCallbackKind, WinApiControlSignal, WinApiState,
     prepare_dll_main_call,
 };
+
+/// `process_dying` read through the port, as a plain fn so the three park loops
+/// can hand it to `with_winapi_ref` without restating the closure.
+fn winapi_is_dying(state: &WinApiState) -> bool {
+    state.is_process_dying()
+}
 
 /// Primary-thread hook state for one `run_until_stop` segment.
 ///
@@ -118,11 +124,7 @@ impl<'a> SessionPumpHooks<'a> {
                         Ok(None)
                     }
                     WaveOutCallbackKind::Event => {
-                        if let Some(KernelObject::Event(event)) =
-                            guard.kernel.sync.object(due.callback_va)
-                        {
-                            event.set();
-                        }
+                        guard.scheduler().signal_event(due.callback_va);
                         Ok(None)
                     }
                     WaveOutCallbackKind::Null => Ok(None),
@@ -768,14 +770,10 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                 self.profile
                     .record_handler(t0.elapsed().as_nanos(), false, export_key.as_deref());
             }
-            guard.kernel.sync.process_dying = true;
+            guard.scheduler().mark_process_dying();
             // Wake every inbox-parked thread (Painpoint 1): teardown is
             // explicit — no park loop may outlive the process decision.
-            guard
-                .kernel
-                .sync
-                .wake_hub
-                .broadcast(wie_winapi::port::Wake::Shutdown);
+            guard.scheduler().broadcast_shutdown();
             // Flush buffered CRT console output (printf/puts buffer in the
             // guest stream; fwrite bypasses it). Windows flushes stdout at
             // process exit — without this, trailing printf output is silently
@@ -1173,11 +1171,11 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                         let spawn_outcome: Option<(u64, u64, u32, u32)> = match build {
                             Ok(mut child) => {
                                 let pid =
-                                    core.with_locked(|_, st| st.kernel.sync.alloc_child_pid());
+                                    core.with_locked(|_, st| st.scheduler().alloc_child_pid());
                                 let (h_process, proc_obj) =
-                                    core.with_locked(|_, st| st.kernel.sync.register_process(pid));
+                                    core.with_locked(|_, st| st.scheduler().register_process(pid));
                                 let (h_thread, thread_obj) = core.with_locked(|_, st| {
-                                    st.kernel.sync.register_detached_thread(pid)
+                                    st.scheduler().register_detached_thread(pid)
                                 });
                                 let spawned = std::thread::Builder::new()
                                     .name(format!("wie-child-{pid}"))
@@ -1223,15 +1221,9 @@ impl QuantumHooks for SessionPumpHooks<'_> {
                                             "failed to spawn child host thread"
                                         );
                                         core.with_locked(|_, st| {
-                                            st.kernel
-                                                .sync
-                                                .objects
-                                                .remove(&KernelHandle::from(h_process));
-                                            st.kernel
-                                                .sync
-                                                .objects
-                                                .remove(&KernelHandle::from(h_thread));
-                                            st.kernel.sync.process_by_pid.remove(&pid);
+                                            st.scheduler().remove_object(h_process);
+                                            st.scheduler().remove_object(h_thread);
+                                            st.scheduler().forget_process(pid);
                                         });
                                         None
                                     }
@@ -1506,9 +1498,8 @@ impl super::RuntimeSession {
                                                 break;
                                             }
                                             drop(self.process.drain_spawns());
-                                            let dying = self
-                                                .process
-                                                .with_winapi_ref(|st| st.kernel.sync.process_dying);
+                                            let dying =
+                                                self.process.with_winapi_ref(winapi_is_dying);
                                             if dying {
                                                 break;
                                             }
@@ -1608,9 +1599,7 @@ impl super::RuntimeSession {
                                         if Instant::now() >= deadline {
                                             break;
                                         }
-                                        let dying = self
-                                            .process
-                                            .with_winapi_ref(|st| st.kernel.sync.process_dying);
+                                        let dying = self.process.with_winapi_ref(winapi_is_dying);
                                         if dying {
                                             break;
                                         }
@@ -1636,13 +1625,13 @@ impl super::RuntimeSession {
                             drop(self.process.drain_spawns());
                             let req = self
                                 .process
-                                .with_mut(|_, st| st.kernel.sync.multi_wait.remove(&primary_tid));
+                                .with_mut(|_, st| st.scheduler().take_multi_wait(primary_tid));
                             let t0 = Instant::now();
                             let result = match req {
                                 Some(req) => {
-                                    let targets = self.process.with_mut(|_, st| {
-                                        st.kernel.sync.wait_targets(&req.handles)
-                                    });
+                                    let targets = self
+                                        .process
+                                        .with_mut(|_, st| st.wait_targets(&req.handles));
                                     match targets {
                                         Some(targets) => {
                                             if req.timeout_ms == wie_winapi::port::INFINITE {
@@ -1665,10 +1654,9 @@ impl super::RuntimeSession {
                                                         break;
                                                     }
                                                     drop(self.process.drain_spawns());
-                                                    let dying =
-                                                        self.process.with_winapi_ref(|st| {
-                                                            st.kernel.sync.process_dying
-                                                        });
+                                                    let dying = self
+                                                        .process
+                                                        .with_winapi_ref(winapi_is_dying);
                                                     if dying {
                                                         break;
                                                     }

@@ -182,11 +182,11 @@ pub(crate) trait QuantumHooks {
         _api_index: usize,
     ) -> Result<Step> {
         let st = &mut *guard;
-        if st.kernel.sync.process_dying {
+        if st.is_process_dying() {
             return Ok(Step::ExitThread(1));
         }
         if resolved.traits.exit_process() {
-            st.kernel.sync.process_dying = true;
+            st.scheduler().mark_process_dying();
             // Flush buffered CRT console output (printf/puts buffer in the
             // guest stream; fwrite bypasses it). Windows flushes stdout at
             // process exit — without this, trailing printf output is lost.
@@ -736,7 +736,7 @@ impl<'a> QuantumCore<'a> {
     /// self-deadlock if invoked while a guard were still held.
     fn process_dying(winapi: &Arc<Mutex<WinApiState>>, stats: &LockWaitStats) -> bool {
         let st = lock_wait(winapi, stats);
-        st.kernel.sync.process_dying
+        st.is_process_dying()
     }
 
     /// Block on a host wait reason outside the WinAPI lock, observing
@@ -797,7 +797,7 @@ impl<'a> QuantumCore<'a> {
                 drain();
                 let req = {
                     let mut st = lock_wait(self.winapi, self.lock_wait_stats);
-                    st.kernel.sync.multi_wait.remove(&self.tid)
+                    st.scheduler().take_multi_wait(self.tid)
                 };
                 let result = Self::wait_multiple_with_dying(
                     req,
@@ -854,7 +854,7 @@ impl<'a> QuantumCore<'a> {
         };
         let targets = {
             let st = lock_wait(winapi, stats);
-            st.kernel.sync.wait_targets(&req.handles)
+            st.wait_targets(&req.handles)
         };
         let Some(ts) = targets else {
             return wie_winapi::port::WAIT_FAILED;
@@ -883,15 +883,7 @@ impl<'a> QuantumCore<'a> {
 /// waking joiners (`GetExitCodeProcess` / `WaitForSingleObject` / pthread
 /// joins). Idempotent — the worker and the teardown path may both call it.
 pub(crate) fn finish_tid(st: &WinApiState, tid: u32, code: u32) {
-    let thread = st
-        .kernel
-        .sync
-        .objects
-        .values()
-        .find(|obj| matches!(obj, wie_winapi::port::KernelObject::Thread(t) if t.tid == tid));
-    if let Some(wie_winapi::port::KernelObject::Thread(t)) = thread {
-        t.finish(code);
-    }
+    st.finish_thread_object(tid, code);
 }
 
 #[cfg(test)]
@@ -1535,7 +1527,7 @@ mod tests {
         let step = core.step(&mut hooks).expect("step");
         assert!(matches!(step, Step::ExitThread(42)));
         let st = lock(&winapi);
-        assert!(st.kernel.sync.process_dying);
+        assert!(st.is_process_dying());
     }
 
     /// `claim_hook_locked` runs before the callback trampoline / SEH / resolve

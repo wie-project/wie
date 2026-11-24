@@ -4,10 +4,11 @@
 //! Per-domain submodules below hold the definitions; `lib.rs` re-exports
 //! every name at the crate root so the public surface is unchanged.
 
+use ahash::HashMapExt as _;
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use strum::IntoEnumIterator;
 use wie_cpu::CpuEngine;
 use wie_cpu::guest_layout::TEB_LAST_ERROR_OFFSET;
@@ -1104,6 +1105,260 @@ impl WinApiState {
     #[must_use]
     pub fn current_directory_wide(&self) -> &[u16] {
         &self.file_io.current_directory_wide
+    }
+
+    /// The opaque scheduler handle (ADR-0006).
+    ///
+    /// `SyncState` is the one struct in this crate that a consumer drives
+    /// rather than reads, and handing out `&mut SyncState` is what made its 14
+    /// fields published surface. [`crate::port::Scheduler`] exposes the 15
+    /// operations the session's scheduler and park loops actually perform;
+    /// there is no way to get the struct back out of it.
+    pub fn scheduler(&mut self) -> crate::port::Scheduler<'_> {
+        crate::port::Scheduler::new(&mut self.kernel.sync)
+    }
+
+    /// Whether `ExitProcess` has been requested.
+    ///
+    /// On `WinApiState` rather than on the [`Self::scheduler`] handle because
+    /// several park loops hold only `&WinApiState`.
+    #[must_use]
+    pub fn is_process_dying(&self) -> bool {
+        self.kernel.sync.process_dying
+    }
+
+    /// Resolve `handles` to live wait targets, or `None` if any is unknown.
+    #[must_use]
+    pub fn wait_targets(&self, handles: &[u64]) -> Option<Vec<crate::sync_obj::WaitTarget>> {
+        self.kernel.sync.wait_targets(handles)
+    }
+
+    /// The saved CPU context for `tid`, while it is not running on the engine.
+    #[must_use]
+    pub fn saved_thread_context(&self, tid: u32) -> Option<wie_cpu::ThreadContext> {
+        self.kernel.sync.saved_thread_context(tid)
+    }
+
+    /// Finish the guest thread object whose TID is `tid`, waking joiners.
+    ///
+    /// `&self`: the exit code lives in an `Arc`'d atomic on the object, so this
+    /// reads the table and signals, it does not restructure it.
+    pub fn finish_thread_object(&self, tid: u32, code: u32) {
+        self.kernel.sync.finish_thread_object(tid, code);
+    }
+
+    /// The session's wake hub (clone of the `Arc`-backed registry).
+    #[must_use]
+    pub fn wake_hub(&self) -> crate::wake::WakeHub {
+        self.kernel.sync.wake_hub.clone()
+    }
+}
+
+// ── Session construction (ADR-0006) ────────────────────────────────────────
+//
+// `wie-runtime` used to build a `WinApiState` with a 44-field struct literal.
+// That literal is why these five state structs could not be opaque: a literal
+// names every field, so every field was published surface whether or not
+// anybody meant it.
+//
+// The replacement is not a builder. A builder with one setter per field would
+// be the same surface in method syntax — the honest objection, and it is
+// correct. What the runtime actually has is *session inputs*: a heap range, the
+// mapped exe, the module identity, two guest VAs, an environment, and two
+// bottle roots. [`SessionInit`] is that list (11 values), and every remaining
+// field of the state is a constant or a derivative that belongs here rather
+// than in the caller. [`WinApiState::empty`] is the same idea for the bare
+// fixture state a handler-level test needs.
+
+/// The session inputs [`WinApiState::for_session`] needs.
+///
+/// Everything here is a value the session genuinely varies; everything else in
+/// the state is a fixed default or derived from one of these.
+#[derive(Debug, Clone)]
+pub struct SessionInit {
+    /// Guest VA the process heap starts at.
+    pub heap_base: u64,
+    /// Size of the process heap in bytes.
+    pub heap_size: u64,
+    /// Raw main-module file bytes, shared (`Arc`) — readers only slice them.
+    pub executable_file_bytes: Arc<Vec<u8>>,
+    /// Main module's base file name (`GetModuleFileName` short form).
+    pub module_file_name: String,
+    /// Main module's full guest path.
+    pub module_path: String,
+    /// Guest current directory (Windows form, not yet UTF-16).
+    pub current_directory: String,
+    /// Guest VA of the FLS value table.
+    pub guest_fls_table_va: u64,
+    /// Guest VA of the file-content mirror arena.
+    pub guest_file_data_va: u64,
+    /// Win32 process environment, `(name, value)` in insertion order.
+    pub environment: Vec<(String, String)>,
+    /// Legacy single C: bottle root.
+    pub bottle_root: Option<std::path::PathBuf>,
+    /// Host bridge root for guest `D:`.
+    pub drive_d_root: Option<std::path::PathBuf>,
+}
+
+impl WinApiState {
+    /// Build the state for one session.
+    ///
+    /// Seeds the C: folder skeleton as a side effect (idempotent mkdirs), exactly
+    /// where the old literal did, so the on-disk result of a session start is
+    /// unchanged.
+    pub fn for_session(init: SessionInit) -> Result<Self> {
+        let heap_end = init
+            .heap_base
+            .checked_add(init.heap_size)
+            .context("heap end overflow")?;
+        let executable_file_size = u64::try_from(init.executable_file_bytes.len())
+            .context("executable file size does not fit u64")?;
+        let volumes = {
+            let drive_d = init.drive_d_root.clone();
+            if let Some(ref root) = init.bottle_root {
+                drop(crate::vfs::seed_default_skeleton(root));
+            }
+            crate::vfs::VolumeConfig::from_parts(init.bottle_root.clone(), drive_d)
+        };
+        Ok(Self {
+            display: DisplayMetrics::default(),
+            heap_state: HeapState {
+                heap: Arc::new(Mutex::new(crate::guest_heap::GuestHeap::new(
+                    init.heap_base,
+                    heap_end,
+                ))),
+                next_fls_index: 1,
+                fls_slots: Vec::new(),
+                guest_fls_table_va: init.guest_fls_table_va,
+            },
+            process: ProcessState {
+                last_error: 0,
+                next_registry_key_handle: RegistryKeyHandle::from(0x0000_0000_7000_0000),
+                registry_keys: Vec::new(),
+                main_module_file_name: init.module_file_name,
+                main_module_path: init.module_path,
+                main_module_host_dir: None,
+                error_mode: 0,
+                suspended_threads: ahash::HashMap::new(),
+                environment: init.environment,
+                main_module_dialogs: Vec::new(),
+                main_module_menus: Vec::new(),
+                main_module_strings: Vec::new(),
+                main_module_accelerators: Vec::new(),
+            },
+            kernel: KernelState {
+                threads: ThreadState::primary(),
+                sync: SyncState::new(),
+                seh_pending: ahash::HashMap::new(),
+            },
+            file_io: FileIoState {
+                executable_file_size,
+                executable_file_bytes: init.executable_file_bytes,
+                executable_file_cursor: 0,
+                next_find_handle: FindFileHandle::from(0x0000_0000_6200_0000),
+                find_handles: Vec::new(),
+                host_file_mounts: Vec::new(),
+                virtual_files: Vec::new(),
+                open_files: ahash::HashMap::new(),
+                next_file_handle: FileHandle::from(0x0000_0000_6700_0001),
+                next_resource_handle: ResourceHandle::from(0x0000_0000_6300_0000),
+                resources: Vec::new(),
+                current_directory_wide: init.current_directory.encode_utf16().collect(),
+                bottle_root: init.bottle_root,
+                volumes,
+                guest_file_data_next: init.guest_file_data_va,
+                guest_io: None,
+                stdin_bytes: Vec::new(),
+                stdin_cursor: 0,
+                stdin_mode: GuestStdinMode::InjectOnly,
+                ucrt_files: ahash::HashMap::new(),
+                ucrt_next_file_va: 0x0000_0000_6900_0000,
+                cached_streams: ahash::HashMap::new(),
+            },
+            dll_states: DllStateMap::new(),
+            message_queue: Arc::new(Mutex::new(present::MessageQueue::default())),
+            module_state: ModuleState {
+                loaded_modules: ahash::HashMap::new(),
+                import_resolver: None,
+                get_proc_address_cache: ahash::HashMap::with_capacity(64),
+                next_module_handle: ModuleHandle::from(crate::dll_loader::REAL_MODULE_HANDLE_BASE),
+            },
+        })
+    }
+
+    /// The bare state a handler-level test starts from.
+    ///
+    /// Every counter and every collection is at its zero value: no volumes, no
+    /// environment, no volume skeleton on disk, and handle bases of `0`. That is
+    /// deliberately *not* what a session gets — [`Self::for_session`] is — so a
+    /// test that needs the production seeding should call that instead. Provided
+    /// because the alternative was a 44-field literal in an integration test,
+    /// which is what kept these structs un-opaque.
+    #[must_use]
+    pub fn empty(heap_base: u64, heap_end: u64) -> Self {
+        Self {
+            display: DisplayMetrics::default(),
+            heap_state: HeapState {
+                heap: Arc::new(Mutex::new(crate::guest_heap::GuestHeap::new(
+                    heap_base, heap_end,
+                ))),
+                next_fls_index: 0,
+                fls_slots: Vec::new(),
+                guest_fls_table_va: 0,
+            },
+            process: ProcessState {
+                last_error: 0,
+                next_registry_key_handle: RegistryKeyHandle::from(0),
+                registry_keys: Vec::new(),
+                main_module_file_name: String::new(),
+                main_module_path: String::new(),
+                main_module_host_dir: None,
+                error_mode: 0,
+                suspended_threads: ahash::HashMap::new(),
+                environment: Vec::new(),
+                main_module_dialogs: Vec::new(),
+                main_module_menus: Vec::new(),
+                main_module_strings: Vec::new(),
+                main_module_accelerators: Vec::new(),
+            },
+            kernel: KernelState {
+                threads: ThreadState::primary(),
+                sync: SyncState::new(),
+                seh_pending: ahash::HashMap::new(),
+            },
+            file_io: FileIoState {
+                executable_file_size: 0,
+                executable_file_bytes: Arc::new(Vec::new()),
+                executable_file_cursor: 0,
+                next_find_handle: FindFileHandle::from(0),
+                find_handles: Vec::new(),
+                host_file_mounts: Vec::new(),
+                virtual_files: Vec::new(),
+                open_files: ahash::HashMap::new(),
+                next_file_handle: FileHandle::from(0),
+                next_resource_handle: ResourceHandle::from(0),
+                resources: Vec::new(),
+                current_directory_wide: Vec::new(),
+                bottle_root: None,
+                volumes: crate::vfs::VolumeConfig::default(),
+                guest_file_data_next: 0,
+                guest_io: None,
+                stdin_bytes: Vec::new(),
+                stdin_cursor: 0,
+                stdin_mode: GuestStdinMode::InjectOnly,
+                ucrt_files: ahash::HashMap::new(),
+                ucrt_next_file_va: 0x0000_0000_6900_0000,
+                cached_streams: ahash::HashMap::new(),
+            },
+            dll_states: DllStateMap::new(),
+            message_queue: Arc::new(Mutex::new(present::MessageQueue::default())),
+            module_state: ModuleState {
+                loaded_modules: ahash::HashMap::new(),
+                import_resolver: None,
+                get_proc_address_cache: ahash::HashMap::new(),
+                next_module_handle: ModuleHandle::from(crate::dll_loader::REAL_MODULE_HANDLE_BASE),
+            },
+        }
     }
 }
 

@@ -68,7 +68,7 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
-      # The two policy checks below live in scripts/check.sh as functions (that
+      # The policy checks below live in scripts/check.sh as functions (that
       # file is the single source of truth for the gate). They are invoked here
       # one step at a time with --only, NOT as a bare `./scripts/check.sh`:
       # CI runs each check as its own named step, with the cache and toolchain
@@ -89,6 +89,15 @@ jobs:
       # before anything expensive starts.
       - name: Crate dependency direction
         run: ./scripts/check.sh --only dep-direction
+
+      # ADR-0006's decision 2: `wie-winapi` publishes 139 names through `port`
+      # and `mod state` is private at its wide surface. Without this step that
+      # boundary is a convention — a single `state.kernel.sync` reach or a
+      # `WinApiState { … }` literal in `wie-runtime` re-opens it, compiles, and
+      # every test still passes. check_winapi_port() scans `src` and `tests`,
+      # keeps an empty allow-list, and costs ~1s (grep, no compile).
+      - name: wie-winapi port boundary
+        run: ./scripts/check.sh --only winapi-port
 
       # No -D warnings: scripts/check.sh (the authoritative local gate) runs
       # clippy advisory, and the workspace lint table denies no clippy lints

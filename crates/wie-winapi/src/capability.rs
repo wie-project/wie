@@ -346,8 +346,13 @@ impl WindowDialogAccess for WinApiState {
 /// Outside `state/` and `present/` the crate reached `PresentState` 55 times
 /// (user32 20, gdi32 16, d3d9 10, opengl32_wgl 8, shell32 1). Every one is a
 /// verb — publish this window, mark this region dirty, hand me the surface to
-/// paint into — so the capability is a verb list rather than a struct, which is
-/// what keeps `PresentState`'s 18 fields out of reach.
+/// paint into — so the capability is a verb list rather than a struct.
+///
+/// What this does **not** yet do: `WinApiState::present()` remains `pub` and
+/// still hands back `&mut PresentState`, so the fields are reachable from any
+/// handler that asks for the whole state. The trait narrows the handlers that
+/// take it as a `dyn` parameter; it is not a closure of the surface. See
+/// ADR-0005's implementation note for the measured split.
 ///
 /// Every method takes `&mut self` even where it only reads: the presenter slot
 /// is lazily allocated, so `PresentState::windows_rev()` through a `&self`

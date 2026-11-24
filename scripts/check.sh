@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Pre-PR checklist and the single source of truth for what the gate runs:
-# the two policy checks, fmt, clippy, the unit/integration tests and the
-# end-to-end micro-suite. Exits non-zero on first failure.
+# the three policy checks (file sizes, crate layering, the wie-winapi port
+# boundary), fmt, clippy, the tests and the end-to-end micro-suite. Exits
+# non-zero on first failure.
 #
 # Callers:
 #   README.md / CONTRIBUTING.md      ./scripts/check.sh
@@ -272,10 +273,21 @@ check_winapi_port() {
   local ALLOWED_DEEP=()
 
   # Modules the port re-exports from; `wie_winapi::<mod>::` is no longer theirs.
-  local GATED_MODULES="user32|gdi32|present|winmm|kernel32|dll_loader|pthread|seh"
+  # `sync_obj` is here because `SyncState` is reached through
+  # `WinApiState::scheduler()` — the module path is not a way in any more.
+  local GATED_MODULES="user32|gdi32|present|winmm|kernel32|dll_loader|pthread|seh|sync_obj"
 
-  # `WinApiState` field classes the port has accessors for.
-  local GATED_FIELDS="heap_state|file_io|module_state|dll_states|message_queue"
+  # `WinApiState` field classes the port has accessors for. `kernel` covers both
+  # `kernel.threads` and `kernel.sync`; the latter is the scheduler handle's
+  # subject and the reason that handle exists at all.
+  local GATED_FIELDS="heap_state|file_io|module_state|dll_states|message_queue|kernel"
+
+  # State structs that have a port constructor. A literal names every field,
+  # which is what kept these un-opaque — `WinApiState` has `for_session` and
+  # `empty`, the rest are only ever built inside `wie-winapi`. `VolumeConfig`
+  # and `DisplayMetrics` are deliberately absent: they are small value types the
+  # runtime legitimately constructs.
+  local GATED_STRUCTS="WinApiState|HeapState|ProcessState|FileIoState|KernelState|ModuleState|SyncState"
 
   # Both halves of the crate. An integration test that calls a WinAPI handler
   # by name is the documented deadlock class and is the pattern a reader copies
@@ -366,7 +378,7 @@ check_winapi_port() {
   # --- R2: direct field pokes ----------------------------------------------
   hits=$(
     {
-      grep -rnE "\.($GATED_FIELDS)\b|\.kernel\.threads\b|\.display[[:space:]]*=[^=]" \
+      grep -rnE "\.($GATED_FIELDS)\b|\.display[[:space:]]*=[^=]" \
         "${srcs[@]}" || true
     } | sort -u | strip_and_subtract R2
   )
@@ -374,6 +386,25 @@ check_winapi_port() {
     echo "wie-runtime pokes a WinApiState field directly (use the port accessor instead):"
     printf '%s\n' "$hits" | sed 's/^/  /'
     echo "  accessor table: docs/adr/0006-winapi-port-module.md / crates/wie-winapi/src/port.rs"
+    fail=1
+  fi
+
+  # --- R3: state struct literals -------------------------------------------
+  # A literal names every field, so one literal publishes the whole struct —
+  # that is why `WinApiState` and the five structs inside it could not be
+  # opaque. `WinApiState::for_session` / `::empty` are the way in. `struct`,
+  # `impl`, `for` and `dyn` headers are declarations, not literals.
+  hits=$(
+    {
+      grep -rnE "\b($GATED_STRUCTS)[[:space:]]*\{" "${srcs[@]}" \
+        | grep -vE "(struct|impl|for|dyn)[[:space:]]+($GATED_STRUCTS)" \
+        | grep -vE -- "->[[:space:]]*([A-Za-z_0-9]+::)*($GATED_STRUCTS)" || true
+    } | sort -u | strip_and_subtract R3
+  )
+  if [[ -n "$hits" ]]; then
+    echo "wie-runtime builds a state struct by literal (use the port constructor):"
+    printf '%s\n' "$hits" | sed 's/^/  /'
+    echo "  constructors: WinApiState::for_session(SessionInit) / WinApiState::empty(heap_base, heap_end)"
     fail=1
   fi
 

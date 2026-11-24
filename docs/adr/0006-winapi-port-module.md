@@ -1,6 +1,69 @@
 # ADR 0006 — A `port` module as `wie-winapi`'s published surface
 
-Status: Proposed · 2026-10-01 — maintainability plan T3.5
+Status: **Accepted** · 2026-11-23 — decisions 1 and 2 implemented (`a4ba020`);
+decision 3 **not implemented**. Proposed 2026-10-01 · maintainability plan T3.5
+
+## Implementation note (2026-11-23)
+
+`crates/wie-winapi/src/port.rs` publishes **139 names in eight sections**, each
+stating why the boundary crosses there. The crate root went from 63 flat `state`
+names to **13** (`pub use state::{…}` in `lib.rs`), the other `state` *types* are
+nameable only crate-internally, and `mod state` carries
+`#[expect(unreachable_pub)]` — scoped, not `allow`, so if an edit makes one of
+those names reachable again the crate stops compiling.
+
+What did **not** become opaque: the structs are still `pub` types with `pub`
+fields. `WinApiState` has 8 public fields and `WindowState` 31, so a field poke
+compiles; the gate is what stops seven of those classes (`heap_state`, `file_io`,
+`module_state`, `dll_states`, `message_queue`, `kernel.threads`, `display`) from
+appearing in `wie-runtime`. Two are listed in `check_winapi_port` as known
+ungated debt rather than pretend-fixed: `state.kernel.sync` (the scheduler drives
+`SyncState`'s fields directly; 27 lines in `wie-runtime/src` mention it, and
+`check_winapi_port`'s comment records ~45 call sites) and the `WinApiState` struct
+literal at `crates/wie-runtime/src/memory.rs:555`.
+
+`wie-runtime` was migrated onto it: `grep -rn wie_winapi crates/wie-runtime/src |
+wc -l` reads 408 at `a4ba020` (400 at its parent), and
+`./scripts/check.sh --only winapi-port` reports 0 gated-module paths and 0 field
+pokes with an **empty** allow-list. That gate covers `crates/wie-runtime/src`
+*and* `crates/wie-runtime/tests`, in two rules (module-qualified reach, including
+the brace-group import form; and `WinApiState` field pokes). It is wired into
+`scripts/check.sh` as step 3 of 9 — **not** into `.github/workflows/ci.yml`,
+which runs only the `file-sizes` and `dep-direction` policy steps.
+
+**Where the premise did not match the tree:**
+
+1. **"The legitimate port surface is roughly twelve names" was never
+   achievable.** The runtime legitimately constructs ~35 state types, names the
+   kernel-object vocabulary, and drives the window/presenter seam. The delivered
+   surface is 139 names, and the honest description of the win is narrower: 26
+   `WinApiState` accessors replaced the field pokes (impl `WinApiState` grew 41 →
+   67 `pub fn`), handler calls the runtime makes itself now go through
+   `dispatch_winapi_id` (6 call sites, against 1 at the parent commit), and the
+   *rename* cost is what went away — the surface itself did not collapse to
+   twelve.
+2. **The reference count is not 405.** At `a4ba020^`, `grep -rn wie_winapi
+   crates/wie-runtime/src | wc -l` = 400; including `tests/` it is 503. The 405
+   in Context reproduces under neither reading.
+3. **Decision 3 did not land.** `wie-cli` still declares
+   `wie-winapi = { path = "../wie-winapi" }` (`crates/wie-cli/Cargo.toml:35`) and
+   still reaches `wie_winapi::user32::`, `::gdi32::`, `::present::` directly from
+   `gui/`. `scripts/check.sh` lists that edge in `EXPECTED_EDGES` as a known
+   deviation, so the gate does not cover the CLI. Re-exporting
+   `console::profile_sigint_armed` / `ensure_hooks_installed` from `wie-runtime`
+   and dropping the dependency is still open work.
+4. **One item of Context is now stale in the other direction:** the ADR records
+   `user32::handle_get_dc` as a direct handler call at `session/mod.rs:930`. It
+   is gone — the gate forbids that shape, and the runtime reaches the same
+   behaviour through `dispatch_winapi_id`.
+
+Two dead types were found only because the surface stopped publishing them and
+the compiler then had nothing to say about them. `HeapAllocation` had two lines
+in the whole repo — its definition in `state/process.rs` and its re-export in
+`lib.rs` (`git grep -c HeapAllocation a4ba020^`) — and is deleted.
+`WindowsHookRecord` stored four fields that nothing read, because nothing
+dispatches through a hook; it is now `struct WindowsHookRecord { handle: u64 }`,
+which is all any caller ever asked for.
 
 ## Context
 

@@ -1,6 +1,5 @@
 //! Guest memory layout and WinAPI environment bootstrap helpers.
 
-use ahash::HashMapExt;
 use anyhow::{Context, Result, bail};
 use wie_cpu::{RegionKind, RwxPerms};
 
@@ -539,106 +538,34 @@ pub(crate) fn default_winapi_state(
     executable_file_bytes: std::sync::Arc<Vec<u8>>,
     process: &wie_pe::ProcessIdentity,
 ) -> Result<wie_winapi::port::WinApiState> {
-    let heap_size_u64 =
+    let heap_size =
         u64::try_from(layout.process_heap.size).context("heap size does not fit u64")?;
-    let heap_end = layout
-        .process_heap
-        .base
-        .checked_add(heap_size_u64)
-        .context("heap end overflow")?;
-
-    let executable_file_size = u64::try_from(executable_file_bytes.len())
-        .context("executable file size does not fit u64")?;
 
     let (directinput_var, directinput_value) = SDL_DIRECTINPUT_ENV_PAIR;
+    // SDL2 guests: disable the DirectInput joystick driver (see
+    // `SDL_DIRECTINPUT_ENV_PAIR`), then apply the host-side `WIE_GUEST_ENV`
+    // measurement overrides on top. Both stay here rather than moving into
+    // `wie-winapi`: `WIE_GUEST_ENV` is a runtime knob, and the environment is
+    // an input to the session, not a property of the state's shape.
+    let mut environment = vec![(directinput_var.to_string(), directinput_value.to_string())];
+    apply_host_guest_env_overrides(&mut environment);
 
-    Ok(wie_winapi::port::WinApiState {
-        display: wie_winapi::port::DisplayMetrics::default(),
-        heap_state: wie_winapi::port::HeapState {
-            heap: std::sync::Arc::new(std::sync::Mutex::new(wie_winapi::port::GuestHeap::new(
-                layout.process_heap.base,
-                heap_end,
-            ))),
-            next_fls_index: 1,
-            fls_slots: Vec::new(),
-            guest_fls_table_va: layout.guest_fls_table.base,
-        },
-        process: wie_winapi::port::ProcessState {
-            last_error: 0,
-            next_registry_key_handle: wie_winapi::port::RegistryKeyHandle::from(
-                0x0000_0000_7000_0000,
-            ),
-            registry_keys: Vec::new(),
-            main_module_file_name: process.module_file_name.clone(),
-            main_module_path: process.module_path.clone(),
-            main_module_host_dir: None,
-            error_mode: 0,
-            suspended_threads: ahash::HashMap::new(),
-            // SDL2 guests: disable the DirectInput joystick driver (see
-            // `SDL_DIRECTINPUT_ENV_PAIR`), then apply the host-side
-            // `WIE_GUEST_ENV` measurement overrides on top.
-            environment: {
-                let mut environment =
-                    vec![(directinput_var.to_string(), directinput_value.to_string())];
-                apply_host_guest_env_overrides(&mut environment);
-                environment
-            },
-            // The main module's RT_DIALOG/RT_MENU/RT_STRING/RT_ACCELERATOR
-            // resources are parsed in session init (the section map is not
-            // available here).
-            main_module_dialogs: Vec::new(),
-            main_module_menus: Vec::new(),
-            main_module_strings: Vec::new(),
-            main_module_accelerators: Vec::new(),
-        },
-        kernel: wie_winapi::port::KernelState {
-            threads: wie_winapi::port::ThreadState::primary(),
-            sync: wie_winapi::port::SyncState::new(),
-            seh_pending: ahash::HashMap::new(),
-        },
-        file_io: wie_winapi::port::FileIoState {
-            executable_file_size,
-            executable_file_bytes,
-            executable_file_cursor: 0,
-            next_find_handle: wie_winapi::port::FindFileHandle::from(0x0000_0000_6200_0000),
-            find_handles: Vec::new(),
-            host_file_mounts: Vec::new(),
-            virtual_files: Vec::new(),
-            open_files: ahash::HashMap::new(),
-            next_file_handle: wie_winapi::port::FileHandle::from(0x0000_0000_6700_0001),
-            next_resource_handle: wie_winapi::port::ResourceHandle::from(0x0000_0000_6300_0000),
-            resources: Vec::new(),
-            current_directory_wide: process.current_directory.encode_utf16().collect(),
-            bottle_root: crate::knobs::bottle_root_from_env(),
-            volumes: {
-                let bottle = crate::knobs::bottle_root_from_env();
-                let drive_d = crate::knobs::drive_d_root_from_env();
-                if let Some(ref root) = bottle {
-                    drop(wie_winapi::port::seed_default_skeleton(root));
-                }
-                wie_winapi::port::VolumeConfig::from_parts(bottle, drive_d)
-            },
-            guest_file_data_next: layout.guest_file_data.base,
-            guest_io: None,
-            stdin_bytes: Vec::new(),
-            stdin_cursor: 0,
-            stdin_mode: wie_winapi::port::GuestStdinMode::InjectOnly,
-            ucrt_files: ahash::HashMap::new(),
-            ucrt_next_file_va: 0x0000_0000_6900_0000,
-            cached_streams: ahash::HashMap::new(),
-        },
-        dll_states: wie_winapi::port::DllStateMap::new(),
-        message_queue: std::sync::Arc::new(std::sync::Mutex::new(
-            wie_winapi::port::MessageQueue::default(),
-        )),
-        module_state: wie_winapi::port::ModuleState {
-            loaded_modules: ahash::HashMap::new(),
-            import_resolver: None,
-            get_proc_address_cache: ahash::HashMap::with_capacity(64),
-            next_module_handle: wie_winapi::port::ModuleHandle::from(
-                wie_winapi::port::REAL_MODULE_HANDLE_BASE,
-            ),
-        },
+    // The remaining fields — the magic handle bases, the empty collections, the
+    // message-queue shard — are `for_session`'s business now: they are
+    // constants of the state, not things a session chooses. See ADR-0006 and
+    // `crates/wie-winapi/src/port.rs`.
+    wie_winapi::port::WinApiState::for_session(wie_winapi::port::SessionInit {
+        heap_base: layout.process_heap.base,
+        heap_size,
+        executable_file_bytes,
+        module_file_name: process.module_file_name.clone(),
+        module_path: process.module_path.clone(),
+        current_directory: process.current_directory.clone(),
+        guest_fls_table_va: layout.guest_fls_table.base,
+        guest_file_data_va: layout.guest_file_data.base,
+        environment,
+        bottle_root: crate::knobs::bottle_root_from_env(),
+        drive_d_root: crate::knobs::drive_d_root_from_env(),
     })
 }
 

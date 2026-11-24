@@ -12,7 +12,7 @@ contract, and where each tier runs.
 | Tier | Command | What it covers | Where it runs |
 | --- | --- | --- | --- |
 | **Fast lane** | `cargo nextest run --profile fast` | whole workspace suite minus the two slow groups (`gui`, `guest` — the `micro_*`, `clock_stub` and `idle_park_wake` test binaries) | inner dev loop, every save |
-| **Full gate** | `./scripts/check.sh` | file sizes, `cargo fmt --all --check`, advisory clippy, the FULL `cargo nextest run --workspace` (slow groups included), `make -C micro-exes`, `scripts/run-micro-suite.sh` | **authoritative pre-PR gate** — locally and as the CI `check` job |
+| **Full gate** | `./scripts/check.sh` | nine steps in order: file-size cap, crate-dependency direction, the `winapi-port` boundary, `cargo fmt --all --check`, advisory clippy, `make -C micro-exes`, the FULL `cargo nextest run --workspace` (slow groups included), `scripts/run-micro-suite.sh`, the `long_loop` perf budget | **authoritative pre-PR gate** — locally in full; CI runs the same functions split across named steps |
 | **Nightly axes** | `./scripts/run-micro-suite.sh all --matrix` (plus the slow groups by hand) | the same guests re-run under `WIE_JIT_MEM=slow`, `WIE_JIT_MEM=pin` and `WIE_CPU=iced`; the full ~70-exe data-driven sweep; the 40 s fixed-window GUI harnesses | not on the push path — run before touching memory lowering, JIT chaining or CPU dispatch, and the target for a future scheduled job |
 
 `scripts/check.sh` is the gate: nothing in the fast lane short-circuits any of
@@ -181,12 +181,19 @@ mechanism and the table.
 
 ## What CI runs
 
-`.github/workflows/ci.yml`, one job on `macos-latest`, in order: checkout →
-Rust → cargo cache → nextest → mingw-w64 (+ `--version` probes) →
-`cargo fmt --all --check` → `./scripts/check.sh --only file-sizes` → advisory clippy →
+`.github/workflows/ci.yml` has two jobs. `Checks` (on `macos-latest`), in
+order: checkout → Rust → cargo cache → nextest → mingw-w64 (+ `--version`
+probes) → `cargo fmt --all --check` → `./scripts/check.sh --only file-sizes` →
+`./scripts/check.sh --only dep-direction` → advisory clippy →
 `make -C micro-exes` → `cargo nextest run --workspace` →
 `cargo build -p wie-cli --release` → `scripts/run-micro-suite.sh` for
-`console_tests`, `pthread_tests`, `cpp_exes`, `dll_tests`.
+`console_tests`, `pthread_tests`, `cpp_exes`, `dll_tests`. `Non-macOS compile
+check` (on `ubuntu-latest`) runs `./scripts/check-non-macos.sh`, and is
+deliberately not `continue-on-error`.
+
+Two gate steps are **not** in CI: `winapi-port` (it needs only grep and runs in
+`./scripts/check.sh`) and `perf` (a wall-clock budget that is meaningless on a
+shared runner). Both are still pre-PR obligations.
 
 The fixture build must precede the test step: with the rule above, a runner
 without the fixtures fails dozens of tests instead of skipping them. The four
@@ -205,9 +212,13 @@ Clippy in CI is advisory, exactly as in `scripts/check.sh` — no `-D warnings`.
 The workspace lint table (`Cargo.toml` `[workspace.lints]`) denies rustc lints
 only; clippy runs at its defaults in both places, and the two invocations are
 kept identical on purpose. A newer clippy therefore cannot turn CI red on its
-own: the 14 `chunks_exact_to_as_chunks` warnings the 1.98 toolchain adds are
-warnings, and `cargo clippy --workspace --all-targets` exits 0 with them
-present. What *is* a real process risk is the pin itself —
+own.
+
+That posture used to hide real noise: this section recorded "the 14
+`chunks_exact_to_as_chunks` warnings the 1.98 toolchain adds". There are none
+now — on the pinned toolchain (`clippy 0.1.98`) `cargo clippy --workspace
+--all-targets` exits 0 with **zero** warnings across a full rebuild, so a new
+warning is a signal rather than business as usual. What *is* a real process risk is the pin itself —
 `rust-toolchain.toml` says `channel = "stable"`, a floating pin, so a gate's
 outcome depends on whatever Rust released last. Pin the toolchain (or pin the
 clippy invocation's expectations) if a build's green/red should be a function

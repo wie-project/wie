@@ -366,6 +366,122 @@ impl SyncState {
             })
             .clone()
     }
+
+    // ── Scheduler verbs (ADR-0006) ─────────────────────────────────────────
+    //
+    // The session's scheduler and its park loops are the only outside readers
+    // of this struct, and they need 15 operations — not 14 fields. Each verb
+    // below is one of those operations, so `crate::port::Scheduler` can expose
+    // them without handing out `&mut SyncState`. The table lives in
+    // `crate::port`'s docs; the implementations live here, next to the state
+    // they mutate.
+
+    /// `ExitProcess` has been requested; workers must stop.
+    pub fn mark_process_dying(&mut self) {
+        self.process_dying = true;
+    }
+
+    /// Wake every blocked waiter: CS wait queues, then every kernel object
+    /// that can hold one.
+    ///
+    /// File mappings hold no waiters; a directory watch is deactivated rather
+    /// than signalled; thread and process objects are finished so a parked
+    /// `WaitForSingleObject` returns instead of outliving the teardown.
+    pub fn wake_all_waiters(&mut self) {
+        for queue in self.cs_waiters.values() {
+            queue.notify_all();
+        }
+        for obj in self.objects.values() {
+            match obj {
+                KernelObject::Event(event) => event.set(),
+                KernelObject::Semaphore(semaphore) => semaphore.notify_all(),
+                KernelObject::Thread(thread) => {
+                    if !thread.is_finished() {
+                        thread.finish(1);
+                    }
+                }
+                KernelObject::FileMapping(_) => {}
+                KernelObject::DirectoryWatch(watch) => watch.deactivate(),
+                KernelObject::Process(process) => {
+                    if !process.is_finished() {
+                        process.finish(1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Deliver a shutdown token to every inbox-parked thread.
+    pub fn broadcast_shutdown(&self) {
+        self.wake_hub.broadcast(crate::wake::Wake::Shutdown);
+    }
+
+    /// Take the pending `WaitForMultipleObjects` request for `tid`.
+    pub fn take_multi_wait(&mut self, tid: u32) -> Option<MultiWaitRequest> {
+        self.multi_wait.remove(&tid)
+    }
+
+    /// Signal the event object at `handle`, if that handle is an event.
+    ///
+    /// Returns whether anything was signalled — `false` for an unknown handle
+    /// or a non-event object, which is the "not an event, nothing to do" case
+    /// the pump has always treated as a no-op.
+    pub fn signal_event(&self, handle: u64) -> bool {
+        match self.object(handle) {
+            Some(KernelObject::Event(event)) => {
+                event.set();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drop the kernel object at `handle` without signalling it.
+    pub fn remove_object(&mut self, handle: u64) -> bool {
+        self.objects.remove(&KernelHandle::from(handle)).is_some()
+    }
+
+    /// Finish the guest thread object whose TID is `tid` (if registered).
+    pub fn finish_thread_object(&self, tid: u32, code: u32) {
+        for obj in self.objects.values() {
+            if let KernelObject::Thread(thread) = obj
+                && thread.tid == tid
+            {
+                thread.finish(code);
+            }
+        }
+    }
+
+    /// Take the spawns queued by `CreateThread` since the last call.
+    pub fn take_pending_spawns(&mut self) -> Vec<PendingSpawn> {
+        std::mem::take(&mut self.pending_spawns)
+    }
+
+    /// Queue one `CreateThread` spawn for the session to start.
+    pub fn queue_spawn(&mut self, spawn: PendingSpawn) {
+        self.pending_spawns.push(spawn);
+    }
+
+    /// The saved CPU context for `tid`, while it is not running on the engine.
+    #[must_use]
+    pub fn saved_thread_context(&self, tid: u32) -> Option<ThreadContext> {
+        self.thread_cpu.get(&tid).cloned()
+    }
+
+    /// Forget the kernel handle of a child process that exited or failed to
+    /// spawn.
+    pub fn forget_process(&mut self, pid: u32) -> Option<u64> {
+        self.process_by_pid.remove(&pid)
+    }
+
+    /// Register the unwind tables of one mapped image.
+    pub fn install_function_table(
+        &mut self,
+        image_base: u64,
+        entries: Vec<crate::exception::RuntimeFunction>,
+    ) {
+        self.function_tables.insert(image_base, entries);
+    }
 }
 
 /// One pending `CreateThread` for the session to spawn as a host OS thread.

@@ -1,6 +1,72 @@
 # ADR 0005 — Capability traits on the Win32 dispatch port
 
-Status: Proposed · 2026-10-01 — maintainability plan T3.4
+Status: **Accepted** · 2026-11-23 — implemented (`a4ba020`). Proposed 2026-10-01 ·
+maintainability plan T3.4
+
+## Implementation note (2026-11-23)
+
+The three traits exist in a private `capability` module (the same
+`#[expect(unreachable_pub)]` shape as `state`, because `port` is the published
+surface): `ConsoleAccess` 7 verbs, `WindowDialogAccess` 22 verbs, `PresentAccess`
+18 verbs. How a handler obtains one:
+
+| Capability | Route from `HandlerContext` |
+| --- | --- |
+| console | `ctx.console()` → `ConsoleCall<'_> { engine, state: &mut dyn ConsoleAccess }` |
+| window dialogs | `ctx.dialogs()` → `&mut dyn WindowDialogAccess` (1 call site; the rest of `comdlg32` receives the capability as a helper parameter) |
+| present | **no accessor** — `PresentAccess` is implemented for `WinApiState`; handlers import the trait to call `publish`/`surface`/… on the state they already hold |
+
+Stage 1 landed with it: `kernel32/console.rs`, `console_cells.rs` and
+`console_input.rs` are now `src/console/{api,cells,input}.rs` (that directory also
+gained `records.rs` and `stdin.rs` in the same move), and `kernel32/` contains no
+console file. `DllId::Console`'s owner and its callers agree for the first time.
+
+**Where the premise did not match the tree.** The Context section's measurements
+were re-taken during implementation and three of them do not survive:
+
+1. **The 1,768 total and the directory table do not reproduce.** Re-measured at
+   `a4ba020^` (non-test sources, line comments stripped) the three plausible
+   readings of the stated method give 1,879 (`state.<ident>`), 1,059
+   (`state.<ident>(`) and 197 (`ctx.state.<ident>`). None is 1,768, and the first
+   reading ranks `kernel32` (651) above `user32` (307) — the table's ranking, not
+   just its totals, is unreproducible.
+2. **The two cluster figures are method-dependent, and the ADR does not state
+   the method.** Counting `window_state()` call sites in `comdlg32` gives exactly
+   the ADR's 154, and `state.console` in `kernel32` gives exactly its 65; a
+   different count gives 146 and 70, which is what the tree now cites
+   (`capability.rs` on `WindowDialogAccess` and `ConsoleAccess`, and
+   maintainability plan T3.4). The 76 that 65 is "of" reproduces under no reading
+   tried (89 call-form, 644 all-forms). Treat every number in Context as
+   unverified; take 146 and 70 from the code, not from here.
+3. **The 313 sites did not become compiler-checked; three seams acquired names.**
+   The ADR names "a capability that hands back `&mut WindowState` — the current
+   `&mut` with a new name" as the design failure mode, and the delivered shape sits
+   between the two:
+
+   | Capability | How it reaches a handler | Narrows? |
+   | --- | --- | --- |
+   | `ConsoleAccess` | `HandlerContext::console()` → `ConsoleCall { engine, state: &mut dyn ConsoleAccess }`, 54 call sites | yes |
+   | `WindowDialogAccess` | `HandlerContext::dialogs()` (1 call site) and helper parameters of type `&mut dyn WindowDialogAccess` (1) | at the helper only — the handler still binds `let state = &mut *ctx.state` and coerces at the call |
+   | `PresentAccess` | imported by 15 files for its method names; 0 `dyn` parameters | no |
+
+   And 476 sites in the crate still do `let state = &mut *ctx.state;`
+   (`grep -rn 'let state = &mut \*ctx.state;' crates/wie-winapi/src | wc -l`), so
+   the wide handle is still everywhere the handler body starts. That is a fair
+   description of stage 1: the two dominant clusters have named, checkable seams;
+   the crate does not have a capability-only dispatch path, and `PresentAccess` in
+   particular cannot fail a reach.
+
+The lock-order hazard this ADR's Context records as "prose in ~10 doc comments
+across 4 files" was one statement of the order, in a "Lock ordering:" paragraph on
+`PresentChannel` (`present/mod.rs:197-199` at the parent commit); the ~9 other
+sites were `deadlock` warnings in the four files named, i.e. the hazard repeated
+rather than the rule specified. It is now a type —
+`crates/wie-winapi/src/lock_order.rs`, recorded as T4.4 in the
+[maintainability plan](../architecture/maintainability-plan.md).
+
+`WindowState`'s 31 fields are still `pub`, which is the deferral this ADR states
+explicitly ("Explicitly not decided here"); nothing about that clause has
+changed.
 
 ## Context
 

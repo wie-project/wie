@@ -1,6 +1,48 @@
 # ADR 0009 — Derive the export census from dispatch instead of hand-keeping it
 
-Status: Proposed · 2026-10-01 — maintainability plan T3.6
+Status: **Accepted** · 2026-11-23 — implemented for 11 of 19 modules (`a4ba020`);
+the other 8 are the distinguished subset this ADR anticipated. Proposed
+2026-10-01 · maintainability plan T3.6
+
+## Implementation note (2026-11-23)
+
+`dispatch_table/names/mod.rs` went **1,088 → 368 lines**
+(`git show a4ba020^:crates/wie-winapi/src/dispatch_table/names/mod.rs | wc -l`)
+and now holds only what is genuinely name-table shaped: `resolve_winapi_id`,
+`winapi_id_export`, `is_winapi_library`, `is_winapi_implemented`, the test-only
+`SOFT_EXPORT_CENSUS` table (21 library rows over 19 module consts — `setupapi`
+serves `cfgmgr32` and `dbghelp` serves `imagehlp`), and its tests. Every one of
+the 650 export names moved verbatim into the module that dispatches it.
+
+Derivation strength, by measurement:
+
+| Kind | Modules | Names | Property |
+| --- | --- | --- | --- |
+| single-source | 11: `winmm` 36, `ws2_32` 26, `dbghelp` 14, `setupapi` 12, `shell32` 11, `imm32` 11, `winhttp` 9, `crypt32` 8, `uxtheme` 4, `msimg32` 3, `dinput8` 1 | 135 | `soft_exports!` (`soft_dispatch.rs`) expands one `(name, handler)` row list into both `DISPATCH` and `pub(crate) const EXPORTS`; there is no second list to forget |
+| distinguished subset | 8: `kernel32` 192, `ucrt` 154, `user32` 66, `oleaut32` 28, `gdi32` 25, `ole32` 22, `advapi32` 21, `comctl32` 7 | 515 | dispatch accepts names that must stay out of `wie inspect` output, with the reason stated at the list |
+
+**Where the premise did not match the tree:**
+
+1. **Option A's "~19 new consts" is the wrong shape for the majority.** In 11 of
+   19 modules the census is not a const that happens to sit next to the match —
+   it is a *macro expansion of the dispatch rows*. `dispatch ⊆ census` is
+   therefore a compile-time fact there rather than a review discipline, which is
+   stronger than the ADR asked for. In the other 8 the ADR's own prediction holds
+   exactly: `census ⊆ dispatch` is testable, `dispatch ⊆ census` is unstateable,
+   and that residue is review responsibility, not a gap to be closed later.
+2. **The `urlmon`/`opengl32` precedent did not extend as far as Context implies.**
+   Those two keep their census in-module, outside `names/mod.rs`, and they were
+   *not* converted to `soft_exports!` — they are among the four module-own lists
+   (`ntdll` 27, `urlmon` 4, `wininet` 17, `opengl32` 134) that this change leaves
+   alone. "The target shape already exists here" was true of the file layout, not
+   of the macro.
+3. **The 650 / 729 / 496 figures in Context describe three scopes, and two of
+   them no longer have a definition a reader can check.** The reproducible objects
+   after this change are 650 names in 19 module consts (135 macro-derived, 515
+   hand-kept) and the four module-own lists this change leaves alone (`ntdll` 27,
+   `urlmon` 4, `wininet` 17, and `opengl32`'s macro-generated list). Adding those
+   up does not produce 729 under any combination tried, and 496 only ever meant
+   "650 minus UCRT's 154". Quote 650-in-19-consts, or a per-module number.
 
 ## Context
 
