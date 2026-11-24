@@ -1,8 +1,9 @@
 # Compile-selection policy: what to compile, when, and at which tier
 
-Status: **analysis + instrumentation** — the compile-cost measurement is in the
-tree; the threshold correction it implies is specified and unshipped (§3). Decisions 1 and 3 are policy-shaped but blocked on machinery that
-does not exist yet; each says so rather than pretending to be scheduled.
+Status: **one win shipped, one candidate refuted.** Boot mode no longer lowers the
+promotion threshold (§3.1, 1.23x on `h` / 1.12x on `x`). The threshold *shape*
+correction was measured and refuted (§3.1). Decision 3 is still blocked on machinery
+that does not exist yet.
 
 Scope: how a decoded guest block becomes machine code. Not lowering quality, not
 dispatch cost — those are `performance-ceiling.md` levers L1/L3.
@@ -115,6 +116,63 @@ So the tree keeps: the measurement (`jit_compile_cost`), the analysis above, and
 the shipped policy unchanged. The experiment is specified in §5 and is the next
 thing to run.
 
+### 3.1 What the shape experiment led to
+
+The shape change was measured, refuted, and on the way it exposed the thing that was
+actually wrong. Two experiments, both on the calibrated corpus with interleaved pairs,
+alternate runs, one binary, median of per-pair ratios (arm/base, <1 is better), 5 pairs
+per class, load 2.1-2.2.
+
+**Experiment 1 — flat thresholds. Refuted.** Forcing a size-independent threshold at
+225, 1 000 and 3 000 visits (4x lower to 13x higher than the shipped threshold at
+typical block sizes):
+
+| class | flat 225 | flat 1000 | flat 3000 | compiles | iced share |
+|---|---|---|---|---|---|
+| `x` | 1.0003 | 1.0031 | 1.0020 | 668 -> 673 | 0.024 % -> 0.040 % |
+| `h` | 1.0025 | 1.0033 | 0.9992 | **identical** | unchanged |
+
+Nothing moves: every arm is inside a +-1.5 % noise band, and the compile count does not
+respond (668 -> 673). Two mechanisms explain it. On `x` the guest runs long enough that
+every block which matters becomes hot whatever the threshold, so raising it only
+*defers* compiles, it does not avoid them — visible in `iced`, which rises from 0.024 %
+to 0.040 % of instructions, i.e. 0.016 percentage points. On `h` the counters are
+identical across all four arms because boot mode forced `thr = 1` for the first 5 M
+guest instructions and `h` retires 5.79 M: the threshold was **never consulted**.
+
+That second observation is the useful one, and it is the whole of experiment 2.
+
+**Experiment 2 — boot mode stops forcing `thr = 1`. Shipped.**
+
+| class | arm/base | wall median | compiles | iced | guest insns |
+|---|---|---|---|---|---|
+| `h` | **0.811** | 1 197 -> 969 ms | 336 -> 183 | 9 114 -> 10 291 | 5.79 M both |
+| `x` | **0.897** | 3 583 -> 3 210 ms | 668 -> 472 | 28 424 -> 30 026 | 120.9 M both |
+
+**1.23x on `h`, 1.12x on `x`**, every pair favouring the change. The compile saving is
+genuine rather than a shift of work into the interpreter: retired instructions are
+identical, and the extra interpreted instructions are 0.02-0.03 % of the run.
+
+The mechanism matters, because a similar-looking change was refuted before
+(`performance-ceiling.md` §11.4 A1: deleting the inline baseline made every block fall
+into the promotion machinery, the queue saturated, and the engine compiled 1.9x as many
+blocks). Two separate paths pull blocks into the compiler during boot, and only one of
+them was earning its keep:
+
+- blocks of **<= 32 instructions** compile on first sight in `pipeline.rs`'s boot arm,
+  *before* the threshold is consulted (`baseline::is_baseline_eligible`). Untouched.
+- **every other** block reached the ordinary `Hot { visits, thr }` path, where boot mode
+  had set `thr = 1` — compile on second visit, regardless of size or history.
+
+Removing the override leaves those blocks to earn their compile. That is why the compile
+count falls by 45 % / 29 % while the baseline install path is untouched.
+
+Not changed, and deliberately: the two `thr = 1` sites in `cool_down` and
+`defer_promotion`. They are backoff paths (reached after a wait timeout or a full queue,
+once the inline token bucket is spent) and their intent is "do not apply backoff during
+warmup", not "compile everything immediately". They were unchanged in the measurement
+above, so the win does not depend on them; they are a separate candidate.
+
 ## 4. What is observable
 
 `WIE_RUNTIME_PROFILE=1` emits:
@@ -136,14 +194,11 @@ paths.
 
 ## 5. Deliberately not implemented
 
-- **Absolute break-even on nanoseconds** — see §3.2 and §3.3.
-- **The corrected threshold shape** — §3. The experiment that decides it: two
-  binaries (current `900/n` vs flat `thr = 200`), interleaved pairs on mx9s,
-  mx1s, `x`, `h` at load < 2.0, reporting wall *and* `compiles`/`bg_compiles`/
-  `iced` per class. A flat threshold should compile materially fewer mid-size
-  blocks while leaving self-loop promotion untouched (`is_loop` uses its own
-  hotness), so the risk is confined to forward blocks. Guest instruction count
-  must match between arms, else the arms are not comparable.
+- **Absolute break-even on nanoseconds** — see §3, items 2 and 3.
+- **The corrected threshold shape** — measured and refuted (§3.1, experiment 1):
+  flat at 225 / 1 000 / 3 000 is indistinguishable from `900/n` on `x`, and boots
+  identical on `h`. Do not re-propose it without a class where the compile count
+  actually responds to the threshold.
 - **Counter decay** — no evidence yet that any real guest changes phase in a
   way this would help. Implementing it without that measurement would be a
   plausible-looking non-fix; `performance-ceiling.md` §11 is where the compile

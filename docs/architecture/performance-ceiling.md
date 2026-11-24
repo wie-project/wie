@@ -1419,6 +1419,40 @@ is the number to use, the loaded one shows the win survives contention.
 instructions identical to 8e-6. The loaded window shows the same change compressed to
 -10/-13%: under heavy contention the host, not the emulator, sets the wall.
 
+**D3 — boot mode stops lowering the promotion threshold. Shipped.** Distinct from A1
+above: the inline baseline and its `Ready` install both **stay**. What went is the
+`thr = 1` override that boot mode applied for the first `BOOT_MODE_INSNS` (5 M) guest
+instructions. Two different things were pulling blocks into the compiler during boot
+and only one of them was earning its keep:
+
+* blocks **≤ 32 insns** (`baseline::is_baseline_eligible`) compile on first sight at
+  `pipeline.rs`'s boot arm, *before* the threshold is ever consulted — untouched by
+  this change, and load-bearing per A1;
+* every **other** block reached the ordinary `Hot { visits, thr }` path, where boot mode
+  had set `thr = 1`, i.e. compile on its second visit regardless of size or history.
+
+Removing the override leaves those blocks to earn the compile like any other. Measured
+with interleaved pairs (median of per-pair ratios, arm/base, 5/5 pairs, load 2.1-2.2),
+one binary, alternate runs:
+
+```
+class  arm/base   wall median        compiles     iced     guest insns
+h      0.811      1197 -> 969 ms     336 -> 183   9114 -> 10291   5.79 M both arms
+x      0.897      3583 -> 3210 ms    668 -> 472   28424 -> 30026  120.9 M both arms
+```
+
+**1.23x on `h` and 1.12x on `x`**, every pair favouring the change. The arithmetic that
+makes it a win rather than a trade: retired guest instructions are identical and `iced`
+rises by 1 177 / 1 602 instructions — **0.02 % / 0.03 % of the run**. The 153 / 196
+compiles that disappeared were being executed too rarely to pay for themselves; at
+~0.7-1.0 ms each (§11.3) that is 150-200 ms of pure waste on a 1.2 s class.
+
+Two `thr = 1` boot-mode sites remain in `cool_down` / `defer_promotion` (the backoff
+paths, reached only after a wait timeout or a full queue, and only once the inline token
+bucket is spent). They were unchanged during the measurement above, so the reported win
+does not depend on them; they are a separate candidate, and their intent — "do not apply
+backoff during warmup" — is not the same as "compile everything immediately".
+
 **Mechanism confirmed by re-sampling** (`r3_d2`, same windows as §11.2): the `x` guest
 thread is still 98% compile-path (72% compiling, 26% mutex wait) and `h` is 65% compile +
 14% wait — the *share* is unchanged because the *run* is now about 1.6x shorter. That is

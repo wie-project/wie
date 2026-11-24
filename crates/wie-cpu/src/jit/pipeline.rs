@@ -597,7 +597,7 @@ impl JitCpu {
                     BlockKind::Pure { insns, .. } => insns.len(),
                     BlockKind::NotPure => 0,
                 };
-                let (mut thr, eager) = select_hot_threshold(
+                let (thr, eager) = select_hot_threshold(
                     is_ucrt,
                     is_loop,
                     pure_insns,
@@ -605,11 +605,26 @@ impl JitCpu {
                     cfg!(test),
                     JitConfig::get().target_work(),
                 );
-                // Boot mode: first 5 M guest insns use threshold = 1 and bypass
-                // deferral doubling (inline token bucket handles thrash).
-                if self.shared.is_boot_mode() {
-                    thr = 1;
-                }
+                // Boot mode deliberately does NOT lower the threshold. It used
+                // to force `thr = 1` for the first `BOOT_MODE_INSNS` (5 M)
+                // guest instructions, i.e. compile every block on first sight,
+                // on the theory that a warm engine pays for its compiles later.
+                // Measured against simply leaving the threshold alone, on the
+                // calibrated corpus with interleaved pairs (median of per-pair
+                // ratios, 5/5 pairs, load 2.1-2.2):
+                //
+                //   `7za h` 0.811 (1 197 -> 969 ms), compiles 336 -> 183
+                //   `7za x` 0.897 (3 583 -> 3 210 ms), compiles 668 -> 472
+                //
+                // Retired guest instructions were unchanged (5.79 M / 120.9 M
+                // both arms) and `iced` rose by only 0.02-0.03 % of them, so
+                // the saving is almost entirely compile work that was never
+                // repaid. 45 % / 29 % of the compiles were buying nothing.
+                //
+                // What remains of boot mode is the part that measured neutral
+                // or better: the bounded inline-compile token bucket below
+                // (`try_acquire_boot_inline_token`) and the tier-0 attempt, both
+                // of which exist to keep a compile from blocking the guest.
                 // Tier-0 baseline: during boot, attempt a fast inline baseline
                 // compile (0.2 ms) and enqueue tier-1 Cranelift bg for same RIP.
                 // On next execution the Ready entry will be patched to tier-1.
