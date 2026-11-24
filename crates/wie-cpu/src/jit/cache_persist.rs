@@ -17,11 +17,24 @@
 //! The ledger therefore persists per-PE *metadata*: file key =
 //! `(pe_hash, opt_level)` (see [`jit_cache_key`]), in-file key =
 //! `(guest_va, fnv1a(guest bytes))`, value = `{guest_start, guest_end,
-//! insn_count, inv_gen, never}` (spec metadata minus machine-code bytes). On
-//! warm boot, [`JitShared::attach_pe_cache`] bulk-loads the file; every later
+//! insn_count, inv_gen, never, compiled_at_opt}` (spec metadata minus
+//! machine-code bytes). On warm boot, [`JitShared::attach_pe_cache`] bulk-loads
+//! the file; every later
 //! consumption re-validates the CURRENT guest bytes against the recorded hash
 //! before acting on it, so any stale/SMC-diverged entry simply probes as
 //! absent and falls back to the normal cold path.
+//!
+//! **The file key alone is not enough once opt level becomes per-block.** With
+//! hot-block tiering one process compiles the same guest VA at *both* levels,
+//! so a record must name the level that produced it (see [`OptTier`]). Two
+//! consequences, both enforced here:
+//!
+//! - a tier-level record is written to a **second ledger file**, keyed by the
+//!   tier's own `jit_cache_key`, so the base file only ever holds base-level
+//!   records and vice versa;
+//! - [`Self::load_file`] rejects any record whose `compiled_at_opt` does not
+//!   match the level the file declares, so a foreign record can never be served
+//!   to a compile expecting the other level (defence in depth behind the key).
 //!
 //! Warm-boot savings (honest accounting): known-good blocks skip the Hot
 //! visit-threshold warmup entirely (immediate background compile), and
@@ -31,6 +44,7 @@
 //! real tier-0 emitter (see docs/RUNBOOK.md knob table note).
 
 use super::config::JitConfig;
+use super::tier::{OptTier, TIER_OPT_LEVEL};
 use crate::mem::GuestMemory;
 use std::fs;
 use std::io::Write as _;
@@ -44,12 +58,18 @@ use std::time::{Duration, Instant};
 const MAGIC: [u8; 8] = *b"WIEJITC\x01";
 /// Current on-disk format version.
 ///
-/// v2 adds `opt_level` to [`FileBody`] and folds it into the file key. v1 files
-/// were keyed by PE hash alone, so a `WIE_JIT_OPT=none` run and a
+/// v3 adds a per-record `compiled_at_opt` (an [`OptTier`] code). The per-FILE
+/// `opt_level` of v2 is not sufficient: hot-block tiering compiles one guest VA
+/// at both levels inside a single process, so a file keyed on the base level
+/// can hold a record that only ever succeeded at the tier level, and a base
+/// run would happily serve it. v2 files are deleted rather than left readable
+/// under a record layout that no longer matches.
+///
+/// v2 added `opt_level` to [`FileBody`] and folded it into the file key. v1
+/// files were keyed by PE hash alone, so a `WIE_JIT_OPT=none` run and a
 /// `WIE_JIT_OPT=speed` run shared one ledger file and each consumed the other's
-/// entries. The bump deletes every such file rather than leaving it readable
-/// under a key that no longer matches.
-const FORMAT_VERSION: u32 = 2;
+/// entries.
+const FORMAT_VERSION: u32 = 3;
 
 /// Window hashed for `Never` (negative) entries: they lack an exact byte
 /// extent at record time, so both record and validate sides compare a fixed
@@ -154,6 +174,13 @@ pub(super) struct LedgerRec {
     pub inv_gen: u64,
     /// `true`: this block failed to compile last run (negative entry).
     pub never: bool,
+    /// Which opt level the recorded verdict belongs to.
+    ///
+    /// Load-bearing with per-block tiering: `Ready` means "these exact bytes
+    /// compiled successfully", which is a claim about the compiler settings
+    /// that produced it, and `Never` ("do not retry compiling these bytes") is
+    /// a *stronger* claim still. Neither transfers across opt levels.
+    pub compiled_at_opt: OptTier,
 }
 
 impl LedgerRec {
@@ -195,6 +222,21 @@ struct DiskEntry {
     insn_count: u32,
     inv_gen: u64,
     never: bool,
+    /// [`OptTier::code`]; `None` on decode is a rejected record, never a guess.
+    compiled_at_opt: u8,
+}
+
+/// Build one on-disk entry from a live record.
+fn disk_entry(r: &LedgerRec) -> DiskEntry {
+    DiskEntry {
+        va: r.va,
+        guest_end: r.guest_end,
+        bytes_hash: r.bytes_hash,
+        insn_count: r.insn_count,
+        inv_gen: r.inv_gen,
+        never: r.never,
+        compiled_at_opt: r.compiled_at_opt.code(),
+    }
 }
 
 fn load_body(path: &Path) -> Result<FileBody, String> {
@@ -262,11 +304,24 @@ type PeTables = RwLock<ahash::HashMap<u64, Arc<papaya::HashMap<u64, LedgerRec>>>
 pub(super) struct PersistentJitCache {
     enabled: bool,
     base_dir: PathBuf,
-    /// Cranelift `opt_level` this process compiles at. Part of every ledger
-    /// key — see [`jit_cache_key`].
+    /// Cranelift `opt_level` this process compiles at, for the BASE tier. Part
+    /// of every ledger key — see [`jit_cache_key`].
     opt_level: &'static str,
-    /// Active ledger key ([`jit_cache_key`], so `0` still means "none").
+    /// Active BASE-tier ledger key ([`jit_cache_key`], so `0` still means
+    /// "none"). This is the only key whose file is ever loaded.
     active_key: AtomicU64,
+    /// Ledger key for the TIER opt level ([`TIER_OPT_LEVEL`]) for the attached
+    /// PE, or `0` when there is no separate tier file (persistence off, not
+    /// attached, or the base level already IS the tier level).
+    ///
+    /// Tier-level records are written here and **never read by the process that
+    /// wrote them**: a `none` run must not consume `speed` verdicts. A later
+    /// `WIE_JIT_OPT=speed` run loads this very file as its own base file, which
+    /// is the whole point of persisting it.
+    tier_key: AtomicU64,
+    /// VAs compiled at the tier level this run, so [`Self::record_ready`] files
+    /// their record under the tier's key instead of the base key.
+    tiered: RwLock<ahash::HashSet<u64>>,
     /// Load-once latch per attached key.
     tables: PeTables,
     flush: Mutex<FlushState>,
@@ -294,6 +349,8 @@ impl PersistentJitCache {
             base_dir: dir,
             opt_level,
             active_key: AtomicU64::new(0),
+            tier_key: AtomicU64::new(0),
+            tiered: RwLock::new(ahash::HashSet::default()),
             tables: RwLock::new(ahash::HashMap::default()),
             flush: Mutex::new(FlushState::new()),
         }
@@ -305,6 +362,8 @@ impl PersistentJitCache {
             base_dir: PathBuf::new(),
             opt_level: JitConfig::get().opt_level(),
             active_key: AtomicU64::new(0),
+            tier_key: AtomicU64::new(0),
+            tiered: RwLock::new(ahash::HashSet::default()),
             tables: RwLock::new(ahash::HashMap::default()),
             flush: Mutex::new(FlushState::new()),
         }
@@ -337,15 +396,26 @@ impl PersistentJitCache {
     /// Attach + bulk-load the ledger for `pe_hash` at this process's opt
     /// level. Idempotent per `(pe_hash, opt_level)`; errors degrade to "no
     /// ledger" (warn-once), never propagate.
+    ///
+    /// Only the BASE-tier file is loaded. The TIER file (if the tiers differ) is
+    /// opened empty for writing: a base run must not consume tier-level
+    /// verdicts, and a tier run will load the very same file as its own base
+    /// file because its base level *is* the tier level.
     pub(super) fn attach(&self, pe_hash: u64) {
         if !self.enabled || pe_hash == 0 {
             return;
         }
         let key = jit_cache_key(pe_hash, self.opt_level);
+        let tier_key = if TIER_OPT_LEVEL == self.opt_level {
+            0 // tiers coincide: one file, no routing
+        } else {
+            jit_cache_key(pe_hash, TIER_OPT_LEVEL)
+        };
         {
             let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
             if tables.contains_key(&key) {
                 self.active_key.store(key, Ordering::Release);
+                self.tier_key.store(tier_key, Ordering::Release);
                 return; // already loaded
             }
         }
@@ -353,12 +423,20 @@ impl PersistentJitCache {
         {
             let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
             tables.entry(key).or_insert(Arc::new(map));
+            if tier_key != 0 {
+                // Deliberately NOT loaded — see the doc comment.
+                tables
+                    .entry(tier_key)
+                    .or_insert_with(|| Arc::new(papaya::HashMap::new()));
+            }
         }
         self.active_key.store(key, Ordering::Release);
+        self.tier_key.store(tier_key, Ordering::Release);
         tracing::debug!(
             pe = format_args!("{pe_hash:#x}"),
             opt = self.opt_level,
             key = format_args!("{key:#x}"),
+            tier_key = format_args!("{tier_key:#x}"),
             "jit disk cache attached"
         );
     }
@@ -389,10 +467,25 @@ impl PersistentJitCache {
             return empty;
         }
         let map = papaya::HashMap::with_capacity(body.entries.len());
+        let mut rejected = 0_u64;
         {
             let pin = map.pin();
             for e in body.entries {
                 if e.guest_end < e.va {
+                    continue;
+                }
+                // Per-RECORD opt-level gate. The file-level checks above already
+                // make this unreachable for a file this build wrote; it exists
+                // because `Ready`/`Never` are claims about compiler settings, so
+                // a record produced at the other level must not be served to a
+                // compile expecting this one — even if a key collision or a
+                // hand-edited file got it onto the right key.
+                let Some(compiled_at_opt) = OptTier::from_code(e.compiled_at_opt) else {
+                    rejected = rejected.saturating_add(1);
+                    continue;
+                };
+                if compiled_at_opt.opt_level() != body.opt_level {
+                    rejected = rejected.saturating_add(1);
                     continue;
                 }
                 pin.insert(
@@ -404,9 +497,20 @@ impl PersistentJitCache {
                         insn_count: e.insn_count,
                         inv_gen: e.inv_gen,
                         never: e.never,
+                        compiled_at_opt,
                     },
                 );
             }
+        }
+        if rejected > 0 {
+            // Not a file-level mismatch, so the file is NOT deleted: the bad
+            // records are dropped here and the next flush rewrites the file
+            // without them.
+            tracing::info!(
+                key = format_args!("{key:#x}"),
+                rejected,
+                "jit disk cache records rejected — opt level mismatch or unknown tier code"
+            );
         }
         map
     }
@@ -418,6 +522,43 @@ impl PersistentJitCache {
         }
         let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
         tables.get(&key).cloned()
+    }
+
+    /// Table holding TIER-level records for the attached PE (`None` when the
+    /// tiers coincide or nothing is attached). Write-only for this process.
+    fn tier_table(&self) -> Option<Arc<papaya::HashMap<u64, LedgerRec>>> {
+        let key = self.tier_key.load(Ordering::Acquire);
+        if key == 0 || key == self.active_key.load(Ordering::Acquire) {
+            return None;
+        }
+        let tables = self.tables.read().unwrap_or_else(|e| e.into_inner());
+        tables.get(&key).cloned()
+    }
+
+    /// Declare `va` as compiled at the tier opt level, so its next
+    /// [`Self::record_ready`] files the record under the tier key.
+    ///
+    /// Called only after a tier compile has SUCCEEDED: a tier compile that the
+    /// verifier rejects falls back to a base compile, and that base verdict
+    /// must not be filed as a tier one.
+    // The tier-up policy that calls this is the next change; until then the
+    // hook is unreachable outside the test build (where the routing test below
+    // does use it, which is why the expectation is `not(test)`-gated).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "tier-up policy (jit::tier) is the caller and lands next"
+        )
+    )]
+    pub(super) fn mark_tiered(&self, va: u64) {
+        if !self.enabled {
+            return;
+        }
+        self.tiered
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(va);
     }
 
     /// Byte-validated probe of the CURRENT guest bytes at `va`.
@@ -453,7 +594,17 @@ impl PersistentJitCache {
         self.active_table().map_or(0, |t| t.pin().len())
     }
 
+    #[cfg(test)]
+    pub(super) fn test_tier_entries_len(&self) -> usize {
+        self.tier_table().map_or(0, |t| t.pin().len())
+    }
+
     /// Record one successfully installed block (inline or worker install).
+    ///
+    /// The record is filed under the key for the tier that actually compiled
+    /// it: a VA marked by [`Self::mark_tiered`] goes to the tier ledger, every
+    /// other VA to the base ledger. That is what keeps a base run from ever
+    /// reading (or writing) a tier-level verdict under its own key.
     pub(super) fn record_ready(
         &self,
         mem: &GuestMemory,
@@ -468,17 +619,36 @@ impl PersistentJitCache {
         let Some(hash) = hash_guest_range(mem, va, guest_end) else {
             return;
         };
-        self.insert_rec(LedgerRec {
-            va,
-            guest_end,
-            bytes_hash: hash,
-            insn_count,
-            inv_gen,
-            never: false,
-        });
+        let tier = if self.is_tiered(va) {
+            OptTier::Speed
+        } else {
+            OptTier::Base
+        };
+        self.insert_rec(
+            LedgerRec {
+                va,
+                guest_end,
+                bytes_hash: hash,
+                insn_count,
+                inv_gen,
+                never: false,
+                compiled_at_opt: tier,
+            },
+            tier,
+        );
+    }
+
+    fn is_tiered(&self, va: u64) -> bool {
+        self.tiered
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&va)
     }
 
     /// Record a `Never` verdict for `va` (fixed-window hash validation).
+    ///
+    /// Always the BASE ledger: a `Never` is only ever reached after a base
+    /// compile failed, so a tier-level record would overstate the claim.
     pub(super) fn record_never(&self, mem: &GuestMemory, va: u64) {
         if !self.enabled {
             return;
@@ -493,18 +663,26 @@ impl PersistentJitCache {
         let Some(hash) = hash_guest_range(mem, va, va.saturating_add(win)) else {
             return;
         };
-        self.insert_rec(LedgerRec {
-            va,
-            guest_end: va.saturating_add(win),
-            bytes_hash: hash,
-            insn_count: 0,
-            inv_gen: 0,
-            never: true,
-        });
+        self.insert_rec(
+            LedgerRec {
+                va,
+                guest_end: va.saturating_add(win),
+                bytes_hash: hash,
+                insn_count: 0,
+                inv_gen: 0,
+                never: true,
+                compiled_at_opt: OptTier::Base,
+            },
+            OptTier::Base,
+        );
     }
 
-    fn insert_rec(&self, rec: LedgerRec) {
-        let Some(table) = self.active_table() else {
+    fn insert_rec(&self, rec: LedgerRec, tier: OptTier) {
+        let table = match tier {
+            OptTier::Base => self.active_table(),
+            OptTier::Speed => self.tier_table(),
+        };
+        let Some(table) = table else {
             return;
         };
         // Ready upserts overwrite older Never records for the same VA.
@@ -518,27 +696,17 @@ impl PersistentJitCache {
 
     /// Drop ledger records overlapping `[addr, addr+len)` (in-memory now, on
     /// disk at next flush via full rewrite) — SMC / X-loss invalidations.
+    ///
+    /// Both ledgers are purged: the tier ledger holds records for the same guest
+    /// bytes, and a stale entry there would be served to a later `speed` run.
     pub(super) fn invalidate_range(&self, addr: u64, len: usize) {
         if !self.enabled || len == 0 {
             return;
         }
         let end = addr.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
-        let Some(table) = self.active_table() else {
-            return;
-        };
-        let pin = table.pin();
-        let doomed: Vec<u64> = pin
-            .iter()
-            .filter(|(_, r)| r.overlaps(addr, end))
-            .map(|(&va, _)| va)
-            .collect();
-        if doomed.is_empty() {
+        if !self.drop_overlapping(addr, end) {
             return;
         }
-        for va in &doomed {
-            pin.remove(va);
-        }
-        drop(pin);
         {
             let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
             st.dirty_rewrite = true;
@@ -546,6 +714,29 @@ impl PersistentJitCache {
         }
         // Rewrite promptly (metadata files are small).
         self.flush_now(false);
+    }
+
+    /// Remove every record overlapping `[addr, end)` from the base and (when
+    /// present) tier ledgers. Returns whether anything was dropped.
+    fn drop_overlapping(&self, addr: u64, end: u64) -> bool {
+        let Some(base) = self.active_table() else {
+            return false;
+        };
+        let tier = self.tier_table();
+        let mut dropped = false;
+        for table in [Some(base), tier].into_iter().flatten() {
+            let pin = table.pin();
+            let doomed: Vec<u64> = pin
+                .iter()
+                .filter(|(_, r)| r.overlaps(addr, end))
+                .map(|(&va, _)| va)
+                .collect();
+            dropped |= !doomed.is_empty();
+            for va in &doomed {
+                pin.remove(va);
+            }
+        }
+        dropped
     }
 
     /// Full-clear handling.
@@ -571,10 +762,13 @@ impl PersistentJitCache {
             }
             st.dirty_rewrite = true;
         }
-        let Some(table) = self.active_table() else {
+        let Some(base) = self.active_table() else {
             return;
         };
-        table.pin().clear();
+        base.pin().clear();
+        if let Some(tier) = self.tier_table() {
+            tier.pin().clear();
+        }
         self.flush_now(true);
     }
 
@@ -592,8 +786,9 @@ impl PersistentJitCache {
         }
     }
 
-    /// Serialize the active PE's table (+ buffered appends) to
-    /// `<dir>/<ledger-key>.bin` via temp-file rename. `force_fsync` also calls
+    /// Serialize the attached PE's ledgers to `<dir>/<ledger-key>.bin` via
+    /// temp-file rename — the base ledger always, the tier ledger when the two
+    /// tiers differ and something was recorded there. `force_fsync` also calls
     /// `sync_all` (the lazy-fsync policy keeps ordinary flushes unsynced).
     fn flush_now(&self, force_fsync: bool) {
         if !self.enabled {
@@ -603,45 +798,71 @@ impl PersistentJitCache {
         if key == 0 {
             return;
         }
-        let Some(table) = self.active_table() else {
-            return;
-        };
-        let mut snapshot: Vec<DiskEntry> = {
-            let pin = table.pin();
-            pin.iter()
-                .map(|(_, r)| DiskEntry {
-                    va: r.va,
-                    guest_end: r.guest_end,
-                    bytes_hash: r.bytes_hash,
-                    insn_count: r.insn_count,
-                    inv_gen: r.inv_gen,
-                    never: r.never,
-                })
-                .collect()
-        };
-        {
+        // Drain the append buffer ONCE and split it: the routing is a pure
+        // function of `compiled_at_opt`, so one drain feeds both files. Draining
+        // per file would hand the first call everything and starve the second.
+        let (base_pending, tier_pending) = {
             let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
-            for r in st.pending.drain(..) {
-                // Pending additions may have raced the snapshot above; fold
-                // them back in so a very short-lived process still persists.
-                if !snapshot.iter().any(|e| e.va == r.va) {
-                    snapshot.push(DiskEntry {
-                        va: r.va,
-                        guest_end: r.guest_end,
-                        bytes_hash: r.bytes_hash,
-                        insn_count: r.insn_count,
-                        inv_gen: r.inv_gen,
-                        never: r.never,
-                    });
+            let pending = std::mem::take(&mut st.pending);
+            let mut base_pending = Vec::new();
+            let mut tier_pending = Vec::new();
+            for r in pending {
+                if r.compiled_at_opt == OptTier::Base {
+                    base_pending.push(r);
+                } else {
+                    tier_pending.push(r);
                 }
             }
             st.dirty_rewrite = false;
+            (base_pending, tier_pending)
+        };
+        if let Some(table) = self.active_table() {
+            self.flush_table(key, table, OptTier::Base, &base_pending, force_fsync);
+        }
+        let tier_key = self.tier_key.load(Ordering::Acquire);
+        // An all-empty tier ledger is not written at all: creating an empty file
+        // would materialise a second ledger for a level this process compiled
+        // nothing at, and a base run must leave the other level's ledger
+        // namespace alone. A non-empty one is rewritten, so an invalidation
+        // flush reaches it too.
+        if tier_key != 0
+            && tier_key != key
+            && let Some(table) = self.tier_table()
+            && !(table.pin().is_empty() && tier_pending.is_empty())
+        {
+            self.flush_table(tier_key, table, OptTier::Speed, &tier_pending, force_fsync);
+        }
+    }
+
+    /// Snapshot one ledger table (plus the matching buffered appends) and
+    /// write it under `key`.
+    fn flush_table(
+        &self,
+        key: u64,
+        table: Arc<papaya::HashMap<u64, LedgerRec>>,
+        tier: OptTier,
+        pending: &[LedgerRec],
+        force_fsync: bool,
+    ) {
+        let mut snapshot: Vec<DiskEntry> = {
+            let pin = table.pin();
+            pin.iter()
+                .filter(|(_, r)| r.compiled_at_opt == tier)
+                .map(|(_, r)| disk_entry(r))
+                .collect()
+        };
+        // Pending additions may have raced the snapshot above; fold them back in
+        // so a very short-lived process still persists.
+        for r in pending {
+            if !snapshot.iter().any(|e| e.va == r.va) {
+                snapshot.push(disk_entry(r));
+            }
         }
         let body = FileBody {
             wie_version: env!("CARGO_PKG_VERSION").to_string(),
             format_version: FORMAT_VERSION,
             key,
-            opt_level: self.opt_level.to_string(),
+            opt_level: tier.opt_level().to_string(),
             entries: snapshot,
         };
         let path = self.file_path_for(key);
@@ -800,6 +1021,19 @@ mod tests {
     const REGION: u64 = 0x0040_0000;
     const VA1: u64 = REGION + 0x100;
 
+    /// Hand-written on-disk record, for the paths this build never writes.
+    fn disk_rec(tier: OptTier, va: u64, end: u64) -> DiskEntry {
+        DiskEntry {
+            va,
+            guest_end: end,
+            bytes_hash: 42,
+            insn_count: 3,
+            inv_gen: 9,
+            never: false,
+            compiled_at_opt: tier.code(),
+        }
+    }
+
     #[test]
     fn round_trip_ready_and_never() {
         let dir = scratch_dir("round-trip");
@@ -872,14 +1106,7 @@ mod tests {
             format_version: FORMAT_VERSION,
             key: jit_cache_key(PE_A, opt),
             opt_level: opt.to_string(),
-            entries: vec![DiskEntry {
-                va: VA1,
-                guest_end: VA1 + 16,
-                bytes_hash: 42,
-                insn_count: 3,
-                inv_gen: 9,
-                never: false,
-            }],
+            entries: vec![disk_rec(OptTier::Base, VA1, VA1 + 16)],
         };
         write_body(&path, &stale_body).expect("seed stale file");
         assert!(path.exists());
@@ -983,14 +1210,7 @@ mod tests {
             format_version: FORMAT_VERSION,
             key,
             opt_level: "speed_and_size".to_string(),
-            entries: vec![DiskEntry {
-                va: VA1,
-                guest_end: VA1 + 16,
-                bytes_hash: 42,
-                insn_count: 3,
-                inv_gen: 0,
-                never: false,
-            }],
+            entries: vec![disk_rec(OptTier::Base, VA1, VA1 + 16)],
         };
         write_body(&path, &lying).expect("seed lying file");
 
@@ -1013,8 +1233,189 @@ mod tests {
         cache.invalidate_range(VA1, 8);
         cache.clear_all(true);
         assert_eq!(cache.test_entries_len(), 0);
+        assert_eq!(cache.test_tier_entries_len(), 0);
         assert!(cache.probe(&mem, VA1).is_none());
         assert!(cache.never_vas().is_empty());
+    }
+
+    // --- per-record `compiled_at_opt` (the tier-up prerequisite) ----------
+    //
+    // Task 1 keyed the cache on the RUN-level opt level, which is sound while
+    // one process compiles everything at one level. Per-block tiering breaks
+    // that: one process compiles the same guest VA at both levels, so the
+    // record has to name the level that produced it. These tests are the
+    // RECORD-level half; `artifact_from_one_opt_level_is_not_served_to_another`
+    // above is the file-level half.
+
+    #[test]
+    fn speed_compiled_record_is_not_served_to_a_none_compile() {
+        // A record that only ever succeeded at `speed`, sitting on the `none`
+        // ledger's own key (key collision or hand edit): it must be refused at
+        // the RECORD, not served.
+        let dir = scratch_dir("rec-speed-into-none");
+        let code = [0x90_u8; 64];
+        let opt = JitConfig::get().opt_level();
+        let key = jit_cache_key(PE_A, opt);
+        let path = dir.join(format!("{key:016x}.bin"));
+        write_body(
+            &path,
+            &FileBody {
+                wie_version: env!("CARGO_PKG_VERSION").to_string(),
+                format_version: FORMAT_VERSION,
+                key,
+                opt_level: opt.to_string(),
+                entries: vec![disk_rec(OptTier::Speed, VA1, VA1 + 64)],
+            },
+        )
+        .expect("seed file");
+
+        let cache = PersistentJitCache::with_base_dir_opt(dir.clone(), "none");
+        cache.attach(PE_A);
+        assert_eq!(
+            cache.test_entries_len(),
+            0,
+            "a speed-compiled record must not be served to a none compile"
+        );
+        let mem = test_memory(&[(&VA1, &code)], REGION, 0x1000);
+        assert_eq!(
+            cache.probe(&mem, VA1),
+            None,
+            "no probe hit from a speed record"
+        );
+        assert!(cache.never_vas().is_empty());
+    }
+
+    #[test]
+    fn none_compiled_record_is_not_served_to_a_speed_compile() {
+        let dir = scratch_dir("rec-none-into-speed");
+        let code = [0x90_u8; 64];
+        let key = jit_cache_key(PE_A, "speed");
+        let path = dir.join(format!("{key:016x}.bin"));
+        write_body(
+            &path,
+            &FileBody {
+                wie_version: env!("CARGO_PKG_VERSION").to_string(),
+                format_version: FORMAT_VERSION,
+                key,
+                opt_level: "speed".to_string(),
+                entries: vec![disk_rec(OptTier::Base, VA1, VA1 + 64)],
+            },
+        )
+        .expect("seed file");
+
+        let cache = PersistentJitCache::with_base_dir_opt(dir.clone(), "speed");
+        cache.attach(PE_A);
+        assert_eq!(
+            cache.test_entries_len(),
+            0,
+            "a none-compiled record must not be served to a speed compile"
+        );
+        let mem = test_memory(&[(&VA1, &code)], REGION, 0x1000);
+        assert_eq!(
+            cache.probe(&mem, VA1),
+            None,
+            "no probe hit from a none record"
+        );
+    }
+
+    #[test]
+    fn unknown_record_tier_code_is_rejected() {
+        let dir = scratch_dir("rec-unknown-code");
+        let opt = JitConfig::get().opt_level();
+        let key = jit_cache_key(PE_A, opt);
+        let path = dir.join(format!("{key:016x}.bin"));
+        let mut bad = disk_rec(OptTier::Base, VA1, VA1 + 64);
+        bad.compiled_at_opt = 200; // no such tier
+        write_body(
+            &path,
+            &FileBody {
+                wie_version: env!("CARGO_PKG_VERSION").to_string(),
+                format_version: FORMAT_VERSION,
+                key,
+                opt_level: opt.to_string(),
+                entries: vec![bad],
+            },
+        )
+        .expect("seed file");
+
+        let cache = PersistentJitCache::with_base_dir(dir.clone());
+        cache.attach(PE_A);
+        assert_eq!(
+            cache.test_entries_len(),
+            0,
+            "an unknown tier code must be rejected, never guessed"
+        );
+    }
+
+    #[test]
+    fn tiered_record_lands_in_the_tier_ledger_only() {
+        // End-to-end routing: a VA compiled at the tier level is filed under
+        // the TIER key, so the base run cannot read its own record back, while
+        // a later `WIE_JIT_OPT=speed` run loads that same file as its base.
+        let dir = scratch_dir("rec-tier-routing");
+        let code = [0x90_u8; 64];
+        let mem = test_memory(&[(&VA1, &code)], REGION, 0x1000);
+        {
+            let none = PersistentJitCache::with_base_dir_opt(dir.clone(), "none");
+            none.attach(PE_A);
+            none.mark_tiered(VA1);
+            none.record_ready(&mem, VA1, VA1 + 64, 7, 2);
+            assert_eq!(none.test_entries_len(), 0, "not in the base ledger");
+            assert_eq!(none.test_tier_entries_len(), 1, "in the tier ledger");
+            assert_eq!(none.probe(&mem, VA1), None, "base run cannot read it back");
+        }
+        // A second, unrelated VA in the same process stays on the base ledger.
+        {
+            let none = PersistentJitCache::with_base_dir_opt(dir.clone(), "none");
+            none.attach(PE_A);
+            let other = VA1 + 0x200;
+            none.record_ready(&mem, other, other + 64, 8, 2);
+            assert_eq!(none.test_entries_len(), 1);
+            assert_eq!(
+                none.test_tier_entries_len(),
+                0,
+                "a fresh handle never LOADS the tier ledger — it may write tier \
+                 verdicts but must not consume another level's"
+            );
+        }
+        // The `speed` run reads the tier file as its OWN base file.
+        {
+            let speed = PersistentJitCache::with_base_dir_opt(dir.clone(), "speed");
+            speed.attach(PE_A);
+            let probe = speed
+                .probe(&mem, VA1)
+                .expect("tier knowledge reaches speed");
+            assert_eq!(probe.insn_count, 7);
+            assert_eq!(speed.probe(&mem, VA1 + 0x200), None);
+        }
+    }
+
+    #[test]
+    fn format_version_is_three_and_v2_files_are_deleted() {
+        // v2 recorded no per-record level, so those files are not merely
+        // unreadable — they would be read as if every record were base-level.
+        assert_eq!(FORMAT_VERSION, 3);
+        let dir = scratch_dir("v2-reset");
+        let opt = JitConfig::get().opt_level();
+        let key = jit_cache_key(PE_A, opt);
+        let path = dir.join(format!("{key:016x}.bin"));
+        write_body(
+            &path,
+            &FileBody {
+                wie_version: env!("CARGO_PKG_VERSION").to_string(),
+                format_version: 2,
+                key,
+                opt_level: opt.to_string(),
+                entries: vec![disk_rec(OptTier::Base, VA1, VA1 + 16)],
+            },
+        )
+        .expect("seed v2 file");
+        assert!(path.exists());
+
+        let cache = PersistentJitCache::with_base_dir(dir.clone());
+        cache.attach(PE_A);
+        assert_eq!(cache.test_entries_len(), 0, "v2 records rejected");
+        assert!(!path.exists(), "v2 file deleted, not orphaned");
     }
 
     #[test]
