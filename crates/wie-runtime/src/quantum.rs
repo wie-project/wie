@@ -486,6 +486,11 @@ impl<'a> QuantumCore<'a> {
             if st.kernel.threads.active.tid != self.tid {
                 st.kernel.threads.activate(self.tid);
             }
+            // Bind the identity to THIS host thread, not to the shared
+            // `active` slot: the mutex is about to be released for the guest
+            // quantum, so a peer thread's activation must not change what
+            // `current_tid()` reports here.
+            wie_winapi::thread::bind_current_tid(self.tid);
             if let Some(step) = hooks.on_activated(self, &mut st)? {
                 return Ok(step);
             }
@@ -580,6 +585,7 @@ impl<'a> QuantumCore<'a> {
         if guard.kernel.threads.active.tid != self.tid {
             guard.kernel.threads.activate(self.tid);
         }
+        wie_winapi::thread::bind_current_tid(self.tid);
 
         match run {
             Ok(result) => {

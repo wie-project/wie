@@ -16,6 +16,8 @@
 //!   shared mirror. The `WinApiState` absorb/publish helpers keep the ACTIVE
 //!   engine's TEB slot and the host slot coherent across API dispatches.
 
+use std::cell::Cell;
+
 use ahash::HashMap;
 use ahash::HashMapExt;
 
@@ -27,6 +29,58 @@ pub const PRIMARY_THREAD_ID: u32 = 0x5678;
 
 /// First guest TID allocated for workers (`CreateThread`).
 pub const FIRST_WORKER_TID: u32 = 0x5679;
+
+thread_local! {
+    /// Guest TID of the thread that *this host thread* is currently running.
+    ///
+    /// `ThreadState` lives inside the process-wide `Arc<Mutex<WinApiState>>`,
+    /// so `active` is a single slot written by every guest thread's scheduler
+    /// loop and read by every handler. WIE releases that mutex before running
+    /// guest code (`QuantumCore::step` locks only around activation /
+    /// dispatch), so two guest threads overlap: whichever loop called
+    /// `activate()` last owns `active`, and a handler running on the *other*
+    /// host thread would read that foreign TID. Identity must not be inferred
+    /// from shared mutable state.
+    ///
+    /// WIE's threading is 1:1 — one host thread runs exactly one guest thread
+    /// at a time — so a thread-local is the correct owner: the binding is
+    /// written only by the loop that owns the guest thread and read only by
+    /// that same host thread, which makes it race-free by construction with no
+    /// lock on the hottest path (`GetCurrentThreadId` and friends).
+    ///
+    /// `UNBOUND` means "no guest thread bound on this host thread": the
+    /// presenter and other non-guest host threads reach handlers that consult
+    /// `current_tid()` without ever having run a quantum. Those fall back to
+    /// `active`, preserving the previous behaviour.
+    static BOUND_TID: Cell<u32> = const { Cell::new(UNBOUND_TID) };
+}
+
+/// Sentinel for "this host thread has no guest thread bound" (see [`BOUND_TID`]).
+///
+/// `0` is never a valid guest TID: [`PRIMARY_THREAD_ID`] is `0x5678` and
+/// workers are allocated from [`FIRST_WORKER_TID`], so it cannot collide.
+const UNBOUND_TID: u32 = 0;
+
+/// Bind the guest TID that the calling host thread is running.
+///
+/// Called from the scheduler loops (`QuantumCore::step` and the primary pump)
+/// immediately before each guest quantum, on the host thread that owns that
+/// guest thread. This is the only writer, which is what makes [`ThreadState::
+/// current_tid`] safe to read from a handler.
+pub fn bind_current_tid(tid: u32) {
+    BOUND_TID.with(|slot| slot.set(tid));
+}
+
+/// Clear the calling host thread's guest-TID binding.
+pub fn unbind_current_tid() {
+    BOUND_TID.with(|slot| slot.set(UNBOUND_TID));
+}
+
+/// Guest TID bound to the calling host thread, or [`UNBOUND_TID`] if none.
+#[must_use]
+pub fn bound_current_tid() -> u32 {
+    BOUND_TID.with(Cell::get)
+}
 
 /// Process-wide TLS index bookkeeping + the currently scheduled guest thread.
 ///
@@ -65,9 +119,26 @@ impl ThreadState {
         }
     }
 
-    /// Guest TID of the active thread.
+    /// Guest TID of the calling thread.
+    ///
+    /// Prefers the thread-local binding established by the scheduler loop that
+    /// owns this host thread ([`bind_current_tid`]) and falls back to
+    /// [`Self::active`] only on host threads that never ran a quantum (the
+    /// presenter, unit tests driving a bare [`ThreadState`]).
+    ///
+    /// Reading `active` unconditionally is wrong in the MT runtime: `active`
+    /// is one slot in state shared by all guest threads, and the WinAPI mutex
+    /// is released while guest code runs, so a peer thread's `activate()` can
+    /// land between this thread's activation and its handler dispatch. That
+    /// made `GetCurrentThreadId` report a peer's TID, which winpthreads'
+    /// `pthread_mutex_unlock` compares against the mutex owner and rejects,
+    /// driving the guest into its never-release spin.
     #[must_use]
     pub fn current_tid(&self) -> u32 {
+        let bound = bound_current_tid();
+        if bound != UNBOUND_TID {
+            return bound;
+        }
         self.active.tid
     }
 
@@ -154,5 +225,77 @@ impl GuestThread {
             tls_values: Vec::new(),
             last_error: 0,
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::indexing_slicing, clippy::as_conversions)]
+mod tests {
+    use super::{PRIMARY_THREAD_ID, ThreadState, bind_current_tid, unbind_current_tid};
+
+    /// The regression this guards: `WinApiState` (and therefore
+    /// [`ThreadState`]) is shared by every guest thread's host thread, and the
+    /// WinAPI mutex is released while guest code runs. So a peer's
+    /// `activate()` landing between this thread's activation and its handler
+    /// dispatch must not change what `current_tid()` reports here — that is
+    /// what made winpthreads' `pthread_mutex_unlock` reject the owner and spin
+    /// the guest forever (the `cpp_threads.exe` hang).
+    ///
+    /// Deterministic: each host thread binds its own TID and then the peer
+    /// deliberately re-activates the shared slot, after which both must still
+    /// observe their own identity. No timing, no sleeping, no load.
+    #[test]
+    fn current_tid_is_per_host_thread_not_the_shared_active_slot() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(ThreadState::primary()));
+        let worker_tid = {
+            let mut guard = state.lock().expect("state lock");
+            guard.alloc_worker()
+        };
+
+        let peer = state.clone();
+        let observed = std::thread::spawn(move || {
+            // This host thread owns `worker_tid`.
+            bind_current_tid(worker_tid);
+
+            // A peer host thread claims the shared `active` slot — exactly
+            // what the runtime does when another guest thread takes a quantum.
+            {
+                let mut guard = peer.lock().expect("state lock");
+                guard.activate(PRIMARY_THREAD_ID);
+            }
+
+            // Identity must still be this thread's, not the slot's new owner.
+            let mine = guard_current_tid(&peer);
+            unbind_current_tid();
+            mine
+        })
+        .join()
+        .expect("worker thread join");
+
+        assert_eq!(
+            observed, worker_tid,
+            "a host thread bound to {worker_tid:#x} must keep reporting its own TID \
+             after a peer re-activated the shared `active` slot"
+        );
+    }
+
+    /// Read `current_tid()` through the shared state, as a handler would.
+    fn guard_current_tid(state: &std::sync::Arc<std::sync::Mutex<ThreadState>>) -> u32 {
+        let guard = state.lock().expect("state lock");
+        guard.current_tid()
+    }
+
+    /// With nothing bound, `current_tid()` falls back to `active` so
+    /// non-guest host threads (presenter) and bare-`ThreadState` unit tests
+    /// keep their previous behaviour.
+    #[test]
+    fn current_tid_falls_back_to_active_when_unbound() {
+        unbind_current_tid();
+        let mut state = ThreadState::primary();
+        assert_eq!(state.current_tid(), PRIMARY_THREAD_ID);
+        let worker = state.alloc_worker();
+        state.activate(worker);
+        assert_eq!(state.current_tid(), worker);
+        unbind_current_tid();
     }
 }
