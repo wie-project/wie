@@ -142,6 +142,20 @@ pub(super) fn ensure_xmm_loaded(
     }
 }
 
+/// A packed op's result in both forms: the vector it actually computed, when the
+/// op ran on the vector unit, plus the lo/hi halves the SSA bank stores.
+///
+/// `vec` is `Some` exactly when the op was lowered to a vector instruction. The
+/// store path then writes that vector as-is instead of rebuilding one from the
+/// halves — the halves were *extracted from it* a moment earlier, so the rebuild
+/// was pure work. When the op ran in a host helper there is no vector to reuse
+/// and `vec` is `None`.
+pub(super) struct PackedXmm {
+    pub vec: Option<Value>,
+    pub lo: Value,
+    pub hi: Value,
+}
+
 /// Write XMM lo/hi SSA and immediately store into JitCtx (fault-safe write-through).
 pub(super) fn store_xmm_pair(
     bcx: &mut FunctionBuilder<'_>,
@@ -151,12 +165,31 @@ pub(super) fn store_xmm_pair(
     lo: Value,
     hi: Value,
 ) {
+    store_xmm_packed(bcx, mem, xmm, idx, PackedXmm { vec: None, lo, hi });
+}
+
+/// [`store_xmm_pair`] with the vector form supplied when the op still has it.
+///
+/// One guest packed op used to cost pack(a) + pack(b) + op + unpack + **repack**:
+/// `store_xmm_pair` rebuilt a vector from the two halves that `vec_to_pair` had
+/// just extracted from the result vector. Handing that vector straight to the
+/// store removes a splat, two `insertlane`s and a `bitcast` per op, and writes
+/// the same 16 bytes — the write-through still happens immediately, which is the
+/// fault-semantics guard this path exists for.
+pub(super) fn store_xmm_packed(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    xmm: &mut [Value; 32],
+    idx: usize,
+    packed: PackedXmm,
+) {
+    let PackedXmm { vec, lo, hi } = packed;
     xmm[idx * 2] = lo;
     xmm[idx * 2 + 1] = hi;
     let base = i64::from(OFF_XMM) + i64::try_from(idx.saturating_mul(16)).unwrap_or(0);
     let p = bcx.ins().iadd_imm(mem.ctx_ptr, base);
     if JitConfig::get().simd_enabled() {
-        let v = pair_to_i8x16(bcx, mem.flags, lo, hi);
+        let v = vec.unwrap_or_else(|| pair_to_i8x16(bcx, mem.flags, lo, hi));
         bcx.ins().store(mem.flags, v, p, 0);
     } else {
         let phi = bcx.ins().iadd_imm(mem.ctx_ptr, base + 8);

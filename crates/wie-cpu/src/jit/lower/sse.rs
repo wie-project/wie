@@ -2,7 +2,10 @@
 //! binops/shifts (Neon-accelerated), and the packed-integer host ABI helpers.
 
 use super::super::config::JitConfig;
-use super::analysis::{i8x16_to_pair, pair_to_i8x16, read_xmm_pair, store_xmm_pair, xmm_index};
+use super::analysis::{
+    PackedXmm, i8x16_to_pair, pair_to_i8x16, read_xmm_pair, store_xmm_packed, store_xmm_pair,
+    xmm_index,
+};
 use super::emit::MemEnv;
 use super::err::LowerError;
 use super::flags::iconst_u64;
@@ -852,11 +855,18 @@ pub(super) fn vec_binop(
     b_hi: Value,
     ty: Type,
     op: fn(&mut FunctionBuilder<'_>, Value, Value) -> Value,
-) -> (Value, Value) {
+) -> PackedXmm {
     let a = pair_to_vec(bcx, flags, a_lo, a_hi, ty);
     let b = pair_to_vec(bcx, flags, b_lo, b_hi, ty);
     let r = op(bcx, a, b);
-    vec_to_pair(bcx, flags, r)
+    let (lo, hi) = vec_to_pair(bcx, flags, r);
+    // `r` is kept: the store would otherwise rebuild this exact vector from
+    // `lo`/`hi`, which were just extracted from it.
+    PackedXmm {
+        vec: Some(r),
+        lo,
+        hi,
+    }
 }
 
 /// Host-helper fallback for a packed integer op (SIMD-off + pack/pmul*).
@@ -868,7 +878,7 @@ pub(super) fn sse_int_binop_helper(
     a_hi: Value,
     b_lo: Value,
     b_hi: Value,
-) -> Result<(Value, Value), LowerError> {
+) -> Result<PackedXmm, LowerError> {
     let sref = mem
         .sse_int_ref
         .ok_or_else(|| LowerError::verifier("internal: sse int helper not declared"))?;
@@ -877,7 +887,7 @@ pub(super) fn sse_int_binop_helper(
     let lo = bcx.inst_results(c1)[0];
     let c2 = bcx.ins().call(sref, &[op_v, a_hi, b_hi]);
     let hi = bcx.inst_results(c2)[0];
-    Ok((lo, hi))
+    Ok(PackedXmm { vec: None, lo, hi })
 }
 
 /// Packed integer binary op: dst xmm, src xmm/m128.
@@ -894,7 +904,7 @@ pub(super) fn lower_sse_int_binop(
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
     let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
-    let (lo, hi) = if JitConfig::get().simd_enabled() {
+    let packed = if JitConfig::get().simd_enabled() {
         match op {
             exec::SseIntOp::Paddb => vec_binop(
                 bcx,
@@ -1149,6 +1159,6 @@ pub(super) fn lower_sse_int_binop(
     } else {
         sse_int_binop_helper(bcx, mem, op, a_lo, a_hi, b_lo, b_hi)?
     };
-    store_xmm_pair(bcx, mem, xmm, di, lo, hi);
+    store_xmm_packed(bcx, mem, xmm, di, packed);
     Ok(())
 }
