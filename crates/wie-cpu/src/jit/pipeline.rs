@@ -1213,48 +1213,36 @@ impl JitCpu {
         // Rebuilding VAD-ranked pins every block was measurable on 7za.
         let mem_gen = self.shared.mem_gen.load(Ordering::Acquire);
         if self.thread.pins_gen != mem_gen {
-            let mem = read_unpoisoned(&self.shared.mem);
-            let infos = mem.jit_region_pins();
-            self.thread.ctx.pins = std::array::from_fn(|i| MemPin::from_info(infos[i]));
+            // Scoped so the read guard is released before the `&mut self`
+            // diagnostics call below; the guard must not span it.
+            {
+                let mem = read_unpoisoned(&self.shared.mem);
+                let infos = mem.jit_region_pins();
+                self.thread.ctx.pins = std::array::from_fn(|i| MemPin::from_info(infos[i]));
+            }
             self.thread.pins_gen = mem_gen;
+            // The pin *shape* stats are a pure function of `ctx.pins`, which
+            // only changes on the line above (`invalidate_tlb` forces the same
+            // rebuild by setting `pins_gen = u64::MAX`). They are read by the
+            // `WIE_RUNTIME_PROFILE` report and by nothing else, so recomputing
+            // them here yields the identical numbers while taking ~8 pin
+            // probes and three `JitStats` stores off every dispatch entry.
+            self.record_pin_shape_stats();
         }
-        // Gen-bump + pin-shape diagnostics (cheap; always on for stats).
-        if self.last_mem_gen != 0 && mem_gen > self.last_mem_gen {
-            self.stats.mem.gen_bumps = self
-                .stats
-                .mem
-                .gen_bumps
-                .saturating_add(mem_gen.saturating_sub(self.last_mem_gen));
-        }
-        self.last_mem_gen = mem_gen;
-        if mem_gen > self.stats.mem.gen_peak {
-            self.stats.mem.gen_peak = mem_gen;
-        }
-        {
-            let stack = self.thread.ctx.pins[0];
-            self.stats.mem.pin_stack_bytes = if stack.is_empty() {
-                0
-            } else {
-                stack.span_bytes()
-            };
-            let mut data_bytes = 0_u64;
-            let mut bits = 0_u64;
-            if !stack.is_empty() {
-                bits |= stack.allow & 0b11;
+        // Generation-bump diagnostics: one compare per entry, and both stores
+        // are skipped unless the generation actually moved.
+        if mem_gen != self.last_mem_gen {
+            if self.last_mem_gen != 0 && mem_gen > self.last_mem_gen {
+                self.stats.mem.gen_bumps = self
+                    .stats
+                    .mem
+                    .gen_bumps
+                    .saturating_add(mem_gen.saturating_sub(self.last_mem_gen));
             }
-            for (i, pin) in self.thread.ctx.pins.iter().enumerate().skip(1) {
-                if pin.is_empty() {
-                    continue;
-                }
-                data_bytes = data_bytes.saturating_add(pin.span_bytes());
-                // Pack first two data pins' allow into bits 2..5 for compact dump.
-                if i <= 2 {
-                    let shift = (i.saturating_sub(1).saturating_add(1)) * 2;
-                    bits |= (pin.allow & 0b11) << shift;
-                }
+            self.last_mem_gen = mem_gen;
+            if mem_gen > self.stats.mem.gen_peak {
+                self.stats.mem.gen_peak = mem_gen;
             }
-            self.stats.mem.pin_heap_bytes = data_bytes;
-            self.stats.mem.pin_allow_bits = bits;
         }
         // No lock here: the guest-memory address is captured once per engine
         // (see `PerThreadJitState::guest_mem`) because it is a field of the
@@ -1455,6 +1443,41 @@ impl JitCpu {
         // but only after the native frame has returned.
         self.drain_pending_code_writes();
         (fault, dynamic_insns)
+    }
+
+    /// Snapshot the pin-shape stats printed by the `WIE_RUNTIME_PROFILE` report
+    /// (`mem.pin_stack_bytes` / `pin_heap_bytes` / `pin_allow_bits`).
+    ///
+    /// Called from the pin-rebuild path — the only place `ctx.pins` can change —
+    /// rather than from every dispatch entry. `pins` is rebuilt when the
+    /// `GuestMemory` generation moves and nowhere else, so a per-entry walk
+    /// recomputed the same three numbers until the next rebuild: pure overhead
+    /// on the hot path for a diagnostic no one reads outside the report.
+    fn record_pin_shape_stats(&mut self) {
+        let stack = self.thread.ctx.pins[0];
+        self.stats.mem.pin_stack_bytes = if stack.is_empty() {
+            0
+        } else {
+            stack.span_bytes()
+        };
+        let mut data_bytes = 0_u64;
+        let mut bits = 0_u64;
+        if !stack.is_empty() {
+            bits |= stack.allow & 0b11;
+        }
+        for (i, pin) in self.thread.ctx.pins.iter().enumerate().skip(1) {
+            if pin.is_empty() {
+                continue;
+            }
+            data_bytes = data_bytes.saturating_add(pin.span_bytes());
+            // Pack first two data pins' allow into bits 2..5 for compact dump.
+            if i <= 2 {
+                let shift = (i.saturating_sub(1).saturating_add(1)) * 2;
+                bits |= (pin.allow & 0b11) << shift;
+            }
+        }
+        self.stats.mem.pin_heap_bytes = data_bytes;
+        self.stats.mem.pin_allow_bits = bits;
     }
 
     pub(super) fn invalidate_tlb(&mut self) {

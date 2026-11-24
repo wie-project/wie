@@ -1545,7 +1545,10 @@ fn ir_dump_rip_filter() -> Option<(u64, u64)> {
         let raw = std::env::var("WIE_JIT_DUMP_IR_RIP").ok()?;
         let parse = |s: &str| {
             let s = s.trim();
-            let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+            let s = s
+                .strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X"))
+                .unwrap_or(s);
             u64::from_str_radix(s, 16).ok()
         };
         match raw.split_once('-') {
