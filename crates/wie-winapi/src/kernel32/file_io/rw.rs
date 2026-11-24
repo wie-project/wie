@@ -21,6 +21,21 @@ pub(crate) fn write_host_console_handle(handle: u64, bytes: &[u8]) {
     // a raw fd write rather than `std::io`.
     crate::ucrt::write_all_fd(fd, bytes);
 }
+/// Read up to `dst.len()` bytes at `cursor` from the handle's cached stream, or
+/// from the host path when no stream is cached. Returns the byte count.
+fn read_into_host(
+    cached: &Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
+    host: &std::path::Path,
+    cursor: u64,
+    dst: &mut [u8],
+) -> usize {
+    if let Some(file) = cached {
+        crate::vfs::cached_read_at(file, cursor, dst).unwrap_or(0)
+    } else {
+        crate::vfs::host_read_at(host, cursor, dst).unwrap_or(0)
+    }
+}
+
 pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
     let state = &mut *ctx.state;
@@ -135,7 +150,6 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
             state.process.last_error = ERROR_INVALID_HANDLE;
             return ctx.finish(0);
         };
-        let mut data = vec![0_u8; requested];
         // Cache an open `File` per handle so streaming ReadFile loops don't
         // reopen the host file on every 64 KiB chunk.
         let cached = state
@@ -148,15 +162,34 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
                 state.file_io.cached_streams.insert(handle, f.clone());
                 Some(f)
             });
-        let n = if let Some(ref f) = cached {
-            crate::vfs::cached_read_at(f, cursor_before, &mut data).unwrap_or(0)
+        // Read straight into guest memory when the destination is one mapped,
+        // writable span. The old shape allocated `requested` bytes, let libc
+        // zero them, read into them, truncated to `n` and then copied the
+        // result into the guest: three passes per chunk over a buffer whose
+        // first memset was thrown away. `host_slice_mut` denies executable
+        // spans (so no SMC invalidation is owed), and a span that is not
+        // resolvable — multi-arena, or nothing mapped — falls back to the
+        // bounce buffer below.
+        //
+        // The probe and the use are two calls because the returned borrow must
+        // end before the fallback can touch `engine` mutably again.
+        let direct = requested > 0 && engine.host_slice_mut(buffer_va, requested).is_some();
+        let n = if direct {
+            let dst = engine
+                .host_slice_mut(buffer_va, requested)
+                .unwrap_or(&mut []);
+            read_into_host(&cached, &host, cursor_before, dst)
         } else {
-            crate::vfs::host_read_at(&host, cursor_before, &mut data).unwrap_or(0)
+            let mut bounce = vec![0_u8; requested];
+            let n = read_into_host(&cached, &host, cursor_before, &mut bounce);
+            if n > 0 {
+                let head = bounce.get(..n).context("ReadFile bounce bounds")?;
+                engine
+                    .mem_write(buffer_va, head)
+                    .context("failed to write ReadFile stream bytes")?;
+            }
+            n
         };
-        data.truncate(n);
-        engine
-            .mem_write(buffer_va, &data)
-            .context("failed to write ReadFile stream bytes")?;
         if let Some(open_file) = find_open_file_mut(state, handle) {
             open_file.cursor = cursor_before.saturating_add(u64::try_from(n).unwrap_or(0));
         }
