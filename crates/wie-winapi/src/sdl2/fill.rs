@@ -27,9 +27,8 @@ use wie_cpu::CpuEngine;
 use super::surface::{
     SURFACE_CLIP_RECT, Surface, intersect_rect, read_format, read_rect, read_surface,
 };
-use super::{LIBRARY, arg};
+use super::{arg, declined};
 use crate::gdi32::ArgReg;
-use crate::host_exports::fall_through;
 use crate::{HandlerContext, WinApiHandlerResult};
 
 /// The byte pattern SDL replicates across a row for one destination pixel
@@ -192,7 +191,7 @@ pub(crate) fn handle_fill_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
 
     let Some(surface) = read_surface(engine, dst_va)? else {
         // `SDL_InvalidParamError("SDL_FillRect(): dst")`.
-        return fall_through(ctx, LIBRARY, "SDL_FillRect");
+        return declined(ctx, "SDL_FillRect");
     };
     if rect_va == 0 {
         // `rect = &dst->clip_rect`; an empty clip rect fills nothing at all —
@@ -206,12 +205,12 @@ pub(crate) fn handle_fill_rect(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
             .context("surface clip rect address overflow")?;
         return match fill_rects(engine, &surface, clip_va, 1, color)? {
             Some(value) => ctx.finish(u64::try_from(value).unwrap_or(0)),
-            None => fall_through(ctx, LIBRARY, "SDL_FillRect"),
+            None => declined(ctx, "SDL_FillRect"),
         };
     }
     match fill_rects(engine, &surface, rect_va, 1, color)? {
         Some(value) => ctx.finish(u64::try_from(value).unwrap_or(0)),
-        None => fall_through(ctx, LIBRARY, "SDL_FillRect"),
+        None => declined(ctx, "SDL_FillRect"),
     }
 }
 
@@ -226,11 +225,11 @@ pub(crate) fn handle_fill_rects(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 
     let Some(surface) = read_surface(engine, dst_va)? else {
         // `SDL_InvalidParamError("SDL_FillRects(): dst")`.
-        return fall_through(ctx, LIBRARY, "SDL_FillRects");
+        return declined(ctx, "SDL_FillRects");
     };
     match fill_rects(engine, &surface, rects_va, count, color)? {
         Some(value) => ctx.finish(u64::try_from(value).unwrap_or(0)),
-        None => fall_through(ctx, LIBRARY, "SDL_FillRects"),
+        None => declined(ctx, "SDL_FillRects"),
     }
 }
 

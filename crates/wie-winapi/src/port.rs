@@ -111,12 +111,17 @@ pub use crate::dispatch_table::{
     is_winapi_implemented, is_winapi_library, resolve_winapi_id, winapi_id_export,
 };
 pub use crate::dynamic_apis::PREPLANTED_SOFT_APIS;
+// Guest-DLL host-export counters, rendered as `WIE_RUNTIME_PROFILE` report
+// lines. Published because the report is assembled in `wie-runtime` and these
+// numbers are the only way to tell "the interception never fired" from "it
+// fired and declined every case" — a distinction frame counts cannot make.
 pub use crate::fake_va::{
     ComIface, ComMethod, DInput8Iface, DirectInput8Method, DirectInputDevice8Method, FAKE_API_BASE,
     FAKE_API_SIZE, FakeVa, callback_return_trampoline_va, decode as decode_fake_va,
     dll_main_return_trampoline_va, encode_alias, encode_export, encode_unresolved,
     seh_continue_trampoline_va,
 };
+pub use crate::sdl2::report_lines as sdl2_host_export_report_lines;
 
 // ── §2 The session boundary ────────────────────────────────────────────────
 //

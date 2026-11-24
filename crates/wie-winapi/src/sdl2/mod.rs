@@ -43,11 +43,12 @@ pub(crate) mod blit;
 pub(crate) mod fill;
 pub(crate) mod surface;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use anyhow::{Context, Result};
 use wie_cpu::CpuEngine;
 
 use crate::gdi32::{ArgReg, read_arg};
-use crate::host_exports::fall_through;
 use crate::{HandlerContext, WinApiHandlerResult};
 
 /// Library name as it appears in the guest import table.
@@ -71,6 +72,205 @@ pub(crate) const EXPORTS: &[&str] = &[
 #[must_use]
 pub(crate) fn is_host_export(library: &str, name: &str) -> bool {
     library.eq_ignore_ascii_case(LIBRARY) && EXPORTS.iter().any(|e| e.eq_ignore_ascii_case(name))
+}
+
+/// Per-export call counters.
+///
+/// The report question "did the interception actually fire on this guest's
+/// path?" cannot be answered from frame counts — a slow run and a
+/// non-intercepting run look identical. These two numbers answer it directly:
+/// `calls` counts dispatches into the host handler, `declined` counts the ones
+/// the handler handed back to the guest's own implementation. `calls >
+/// declined` is host work actually done; `declined == calls` means the
+/// interception fires but never accelerates anything.
+#[derive(Debug, Default)]
+struct ExportStats {
+    calls: AtomicU64,
+    declined: AtomicU64,
+}
+
+impl ExportStats {
+    const fn new() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            declined: AtomicU64::new(0),
+        }
+    }
+
+    fn bump(counter: &AtomicU64) {
+        // Relaxed: a diagnostic tally, never a synchronisation point.
+        let _previous = counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One counter pair per [`EXPORTS`] entry, in the same order.
+static STATS: [ExportStats; EXPORTS.len()] = [const { ExportStats::new() }; EXPORTS.len()];
+
+/// Position of `name` in [`EXPORTS`], accepting the `SDL_BlitSurface` alias
+/// (`SDL_surface.h` defines it as `SDL_UpperBlit`, so it shares that handler).
+fn export_index(name: &str) -> Option<usize> {
+    if let Some(index) = EXPORTS.iter().position(|e| e.eq_ignore_ascii_case(name)) {
+        return Some(index);
+    }
+    if name.eq_ignore_ascii_case("SDL_BlitSurface") {
+        return EXPORTS
+            .iter()
+            .position(|e| e.eq_ignore_ascii_case("SDL_UpperBlit"));
+    }
+    None
+}
+
+/// Hand a call back to the guest's own implementation, tallying the decline.
+///
+/// Every decline goes through here rather than calling
+/// [`crate::host_exports::fall_through`] directly, so the counter cannot drift
+/// from the behaviour it describes.
+fn declined(ctx: &mut HandlerContext<'_>, name: &str) -> Result<WinApiHandlerResult> {
+    if let Some(index) = export_index(name)
+        && let Some(stats) = STATS.get(index)
+    {
+        ExportStats::bump(&stats.declined);
+    }
+    crate::host_exports::fall_through(ctx, LIBRARY, name)
+}
+
+/// Why a blit handler refused a call.
+///
+/// The counters exist because "it fired and declined every call" and "it never
+/// fired" look identical in a frame count, and even `calls/declined` does not
+/// say *which* gate refused. Each variant is one `return` path in
+/// [`blit::lower_blit`](crate::sdl2::blit), so a run's tally names the exact
+/// condition the guest's call failed, and therefore what to implement next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub(super) enum Decline {
+    /// The source surface has no `SDL_BlitMap`.
+    MapMissing = 0,
+    /// `map->dst` is not this destination — SDL is about to rebuild the map.
+    MapStale,
+    /// A palette was recoloured since the map was built (`SDL_SetPaletteColors`).
+    PaletteStale,
+    /// The map's format/pitch mirrors disagree with the surfaces.
+    MapMirror,
+    /// A pixel format or flag combination outside the reproduced set.
+    UnsupportedKind,
+    /// A surface whose pixels or pitch this module cannot address directly.
+    NotDirect,
+    /// The rects do not describe an addressable blit.
+    Geometry,
+    /// `src->locked` / `dst->locked` — SDL refuses these itself.
+    SurfaceLocked,
+    /// A NULL surface or rect.
+    NullArgument,
+    /// A pending stretch (`SDL_COPY_NEAREST`).
+    NearestPending,
+    /// The rects ask for scaling: SDL would pick a `*Scale` blitter, whose
+    /// fixed-point stepping this module does not reproduce.
+    Scaled,
+}
+
+impl Decline {
+    /// Number of variants — the counter array length.
+    pub(super) const COUNT: usize = 11;
+
+    /// Stable report label.
+    #[must_use]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::MapMissing => "map_missing",
+            Self::MapStale => "map_stale",
+            Self::PaletteStale => "palette_stale",
+            Self::MapMirror => "map_mirror",
+            Self::UnsupportedKind => "unsupported_kind",
+            Self::NotDirect => "not_direct",
+            Self::Geometry => "geometry",
+            Self::SurfaceLocked => "surface_locked",
+            Self::NullArgument => "null_argument",
+            Self::NearestPending => "nearest_pending",
+            Self::Scaled => "scaled",
+        }
+    }
+}
+
+/// One tally per [`Decline`] variant.
+static DECLINE_COUNTS: [AtomicU64; Decline::COUNT] = [const { AtomicU64::new(0) }; Decline::COUNT];
+
+/// Tally one refusal. Called from the handler's own `return` paths.
+pub(super) fn note_decline(reason: Decline) {
+    if let Some(counter) = DECLINE_COUNTS.get(reason as usize) {
+        ExportStats::bump(counter);
+    }
+}
+
+/// Why a blit handler refused a call — the reason of `Ok(None)`.
+pub(super) fn decline_count(reason: Decline) -> u64 {
+    DECLINE_COUNTS
+        .get(reason as usize)
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// `(export, calls, declined)` for every served export, in [`EXPORTS`] order.
+#[must_use]
+pub(crate) fn stats() -> Vec<(&'static str, u64, u64)> {
+    EXPORTS
+        .iter()
+        .zip(STATS.iter())
+        .map(|(name, stats)| {
+            (
+                *name,
+                stats.calls.load(Ordering::Relaxed),
+                stats.declined.load(Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+/// Report lines for the `WIE_RUNTIME_PROFILE` block.
+///
+/// `None` while nothing was dispatched: a guest that never touches SDL2 should
+/// not get an SDL2 section in its profile.
+#[must_use]
+pub fn report_lines() -> Vec<String> {
+    let stats = stats();
+    if stats.iter().all(|(_, calls, _)| *calls == 0) {
+        return Vec::new();
+    }
+    let rendered = stats
+        .iter()
+        .filter(|(_, calls, _)| *calls > 0)
+        .map(|(name, calls, declined)| format!("{name}={calls}/{declined}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut lines = vec![format!(
+        "sdl2_host_export: calls/declined {rendered} \
+         (native = calls - declined; a nonzero declined with zero native means \
+         the interception fires but every case fell through)"
+    )];
+    let reasons = [
+        Decline::MapMissing,
+        Decline::MapStale,
+        Decline::PaletteStale,
+        Decline::MapMirror,
+        Decline::UnsupportedKind,
+        Decline::NotDirect,
+        Decline::Geometry,
+        Decline::SurfaceLocked,
+        Decline::NullArgument,
+        Decline::NearestPending,
+        Decline::Scaled,
+    ]
+    .into_iter()
+    .filter(|reason| decline_count(*reason) > 0)
+    .map(|reason| format!("{}={}", reason.label(), decline_count(reason)))
+    .collect::<Vec<_>>();
+    if !reasons.is_empty() {
+        lines.push(format!(
+            "sdl2_blit_declines: {} (the gate each refused blit failed)",
+            reasons.join(" ")
+        ));
+    }
+    lines
 }
 
 /// Read one Win64 integer argument register.
@@ -106,6 +306,12 @@ pub(crate) fn dispatch(
     ctx: &mut HandlerContext<'_>,
     name: &str,
 ) -> Result<Option<WinApiHandlerResult>> {
+    let Some(index) = export_index(name) else {
+        return Ok(None);
+    };
+    if let Some(stats) = STATS.get(index) {
+        ExportStats::bump(&stats.calls);
+    }
     let lower = name.to_ascii_lowercase();
     let handled = match lower.as_str() {
         "sdl_locksurface" => lock_surface(ctx)?,
@@ -129,12 +335,12 @@ pub(crate) fn lock_surface(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
     let surface_va = arg(engine, ArgReg::Rcx, "SDL_LockSurface")?;
     let Some(surface) = surface::read_surface(engine, surface_va)? else {
         // SDL would dereference NULL and fault; let the guest produce that.
-        return fall_through(ctx, LIBRARY, "SDL_LockSurface");
+        return declined(ctx, "SDL_LockSurface");
     };
     if surface.must_lock() {
         // The lock un-RLEs the surface (`SDL_UnRLESurface`) — guest work that
         // rewrites the pixel buffer.
-        return fall_through(ctx, LIBRARY, "SDL_LockSurface");
+        return declined(ctx, "SDL_LockSurface");
     }
     surface::write_locked(engine, surface.va, surface.locked.wrapping_add(1))?;
     ctx.finish(0)
@@ -148,10 +354,10 @@ pub(crate) fn unlock_surface(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let engine = &mut *ctx.engine;
     let surface_va = arg(engine, ArgReg::Rcx, "SDL_UnlockSurface")?;
     let Some(surface) = surface::read_surface(engine, surface_va)? else {
-        return fall_through(ctx, LIBRARY, "SDL_UnlockSurface");
+        return declined(ctx, "SDL_UnlockSurface");
     };
     if surface.must_lock() {
-        return fall_through(ctx, LIBRARY, "SDL_UnlockSurface");
+        return declined(ctx, "SDL_UnlockSurface");
     }
     if surface.locked == 0 {
         // SDL returns immediately; nothing observable happens.

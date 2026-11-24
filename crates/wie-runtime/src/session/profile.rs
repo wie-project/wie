@@ -571,6 +571,11 @@ impl RuntimeProfile {
             // metric that decides which ISA family to lower next.
             lines.push(self.insn_coverage_line());
             lines.push(Self::insn_coverage_caveat_line().to_owned());
+            // Guest-DLL host-export counters (SDL2 today). Printed whenever the
+            // session dispatched at least one served export: "did the
+            // interception fire" is otherwise indistinguishable from "the guest
+            // was slow", which is exactly the question a frame count gets wrong.
+            lines.extend(wie_winapi::port::sdl2_host_export_report_lines());
         }
         if self.present_enqueued() > 0
             || self.frames_published() > 0

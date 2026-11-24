@@ -32,9 +32,8 @@ use super::surface::{
     BlitMap, Rect, Surface, intersect_rect, palette_version, read_blit_map, read_format, read_rect,
     read_surface, write_rect,
 };
-use super::{LIBRARY, arg, read_scratch};
+use super::{Decline, arg, declined, note_decline, read_scratch};
 use crate::gdi32::ArgReg;
-use crate::host_exports::fall_through;
 use crate::{HandlerContext, WinApiHandlerResult};
 
 // ── `SDL_COPY_*` mapping flags (`src/video/SDL_blit.h`) ─────────────────────
@@ -432,13 +431,23 @@ fn lower_blit(
     dst: &Surface,
     dstrect: Rect,
 ) -> Result<Option<i64>> {
+    // Scaling is a different blitter: `SDL_PrivateUpperBlitScaled` installs a
+    // `*Scale` variant whose fixed-point stepping walks the source on its own
+    // schedule, so the plain per-pixel loop below would read the wrong source
+    // for every column. Only the 1:1 case is reproduced.
+    if srcrect.w != dstrect.w || srcrect.h != dstrect.h {
+        note_decline(Decline::Scaled);
+        return Ok(None);
+    }
     let Some(map) = read_blit_map(engine, src.map_va)? else {
+        note_decline(Decline::MapMissing);
         return Ok(None);
     };
     // `SDL_LowerBlit`'s own mapping-validity test: a stale map means SDL is
     // about to rebuild it (`SDL_MapSurface`), which is guest work we must not
     // skip — it is what installs the palette table we would otherwise read.
     if map.dst != dst.va {
+        note_decline(Decline::MapStale);
         return Ok(None);
     }
     let src_fmt = read_format(engine, src.format_va)?;
@@ -448,6 +457,7 @@ fn lower_blit(
         (src_fmt.palette, map.src_palette_version),
     ] {
         if palette != 0 && palette_version(engine, palette)? != Some(version) {
+            note_decline(Decline::PaletteStale);
             return Ok(None);
         }
     }
@@ -460,12 +470,15 @@ fn lower_blit(
         || map.src_pitch != src.pitch
         || map.dst_pitch != dst.pitch
     {
+        note_decline(Decline::MapMirror);
         return Ok(None);
     }
     if !src.is_direct(src_fmt.bytes_per_pixel) || !dst.is_direct(dst_fmt.bytes_per_pixel) {
+        note_decline(Decline::NotDirect);
         return Ok(None);
     }
     let Some(plan) = plan(engine, src, dst, &src_fmt, &dst_fmt, &map)? else {
+        note_decline(Decline::UnsupportedKind);
         return Ok(None);
     };
     let Some(geom) = Geometry::new(
@@ -476,6 +489,7 @@ fn lower_blit(
         srcrect,
         dstrect,
     ) else {
+        note_decline(Decline::Geometry);
         return Ok(None);
     };
     run(engine, &plan, &geom)?;
@@ -493,18 +507,20 @@ pub(crate) fn handle_lower_blit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
 
     let (Some(src), Some(dst)) = (read_surface(engine, src_va)?, read_surface(engine, dst_va)?)
     else {
-        return fall_through(ctx, LIBRARY, "SDL_LowerBlit");
+        note_decline(Decline::NullArgument);
+        return declined(ctx, "SDL_LowerBlit");
     };
     // A NULL rect is a guest crash in SDL_LowerBlit (`srcrect->y`), so the
     // guest's own code must produce it.
     if srcrect_va == 0 || dstrect_va == 0 {
-        return fall_through(ctx, LIBRARY, "SDL_LowerBlit");
+        note_decline(Decline::NullArgument);
+        return declined(ctx, "SDL_LowerBlit");
     }
     let srcrect = read_rect(engine, srcrect_va)?;
     let dstrect = read_rect(engine, dstrect_va)?;
     match lower_blit(engine, &src, srcrect, &dst, dstrect)? {
         Some(value) => ctx.finish(u64::try_from(value).unwrap_or(0)),
-        None => fall_through(ctx, LIBRARY, "SDL_LowerBlit"),
+        None => declined(ctx, "SDL_LowerBlit"),
     }
 }
 
@@ -523,11 +539,12 @@ pub(crate) fn handle_upper_blit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     let (Some(src), Some(dst)) = (read_surface(engine, src_va)?, read_surface(engine, dst_va)?)
     else {
         // `SDL_InvalidParamError("src"/"dst")` — the guest must set the error.
-        return fall_through(ctx, LIBRARY, "SDL_UpperBlit");
+        return declined(ctx, "SDL_UpperBlit");
     };
     if src.locked != 0 || dst.locked != 0 {
         // "Surfaces must not be locked during blit".
-        return fall_through(ctx, LIBRARY, "SDL_UpperBlit");
+        note_decline(Decline::SurfaceLocked);
+        return declined(ctx, "SDL_UpperBlit");
     }
     // A pending stretch (`SDL_COPY_NEAREST`) makes SDL invalidate and rebuild
     // the mapping before blitting; that rebuild is guest state we must not
@@ -535,7 +552,8 @@ pub(crate) fn handle_upper_blit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     if let Some(map) = read_blit_map(engine, src.map_va)?
         && map.flags & SDL_COPY_NEAREST != 0
     {
-        return fall_through(ctx, LIBRARY, "SDL_UpperBlit");
+        note_decline(Decline::NearestPending);
+        return declined(ctx, "SDL_UpperBlit");
     }
 
     let whole_src = Rect {
@@ -586,7 +604,7 @@ pub(crate) fn handle_upper_blit(ctx: &mut HandlerContext<'_>) -> Result<WinApiHa
     }
     match lower_blit(engine, &src, r_src, &dst, r_dst)? {
         Some(value) => ctx.finish(u64::try_from(value).unwrap_or(0)),
-        None => fall_through(ctx, LIBRARY, "SDL_UpperBlit"),
+        None => declined(ctx, "SDL_UpperBlit"),
     }
 }
 

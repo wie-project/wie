@@ -580,3 +580,190 @@ fn unsupported_blit_falls_through_to_the_guest_implementation() {
     // Nothing was written: the guest's own code will do it.
     assert_eq!(read_bytes(&mut engine, DST_PIXELS, 48), vec![0xEE_u8; 48]);
 }
+
+// ── The intra-module (dispatch-slot) path ──────────────────────────────────
+//
+// An import-table patch only reaches *other* modules' calls. SDL2 calling its
+// own `SDL_LowerBlit` from `SDL_render_sw.c` never touches the IAT: in this
+// build every export is a trampoline that reads a writable pointer out of
+// `.data` and jumps through it, which is what makes the intra-module callers
+// reachable at all. These two tests are the mechanism-level proof:
+//
+// 1. `record` plants the fake VA in that slot, so the module's own `jmp` lands
+//    where the emulator traps;
+// 2. if the module rewrites the slot afterwards (SDL2's one-time dynapi init
+//    does exactly that), the next call re-arms it *and* falls through to the
+//    new body rather than the stale one.
+//
+// The runtime half — resolving the fake VA back to `(library, name)` and
+// stopping there — is shared with every other WinAPI id and is not SDL-specific.
+
+/// Fake guest image holding one export trampoline.
+const MODULE_BASE: u64 = 0x8000;
+const MODULE_SIZE: usize = 0x2000;
+/// `jmp qword ptr [rip+disp32]` at the module's export entry.
+const EXPORT_STUB: u64 = 0x8000;
+/// The writable pointer the trampoline reads.
+const SLOT: u64 = 0x8020;
+/// The module's own implementation, as the slot holds it before we plant.
+const MODULE_BODY: u64 = 0x8100;
+
+/// Lay out `48 FF 25 <disp32>` at [`EXPORT_STUB`] pointing at [`SLOT`], with
+/// `body` in the slot — the exact shape `arm` derives the slot from.
+fn write_export_trampoline(engine: &mut IcedCpu, body: u64) {
+    let disp = i32::try_from(SLOT - EXPORT_STUB - 7).expect("trampoline disp");
+    let mut stub = vec![0x48_u8, 0xff, 0x25];
+    stub.extend_from_slice(&disp.to_le_bytes());
+    engine.mem_write(EXPORT_STUB, &stub).expect("write stub");
+    engine
+        .mem_write(SLOT, &body.to_le_bytes())
+        .expect("write slot");
+}
+
+fn slot_value(engine: &mut IcedCpu) -> u64 {
+    let bytes = read_bytes(engine, SLOT, 8);
+    u64::from_le_bytes(bytes[..8].try_into().expect("slot bytes"))
+}
+
+/// `calls`/`declined` for one served export.
+fn counters(export: &str) -> (u64, u64) {
+    crate::sdl2::stats()
+        .into_iter()
+        .find(|(name, _, _)| *name == export)
+        .map(|(_, calls, declined)| (calls, declined))
+        .expect("served export")
+}
+
+/// A module's own call reaches the host handler through the dispatch slot.
+#[test]
+fn a_module_call_through_the_dispatch_slot_reaches_the_host_handler() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    setup_expanding_blit(&mut engine);
+    write_export_trampoline(&mut engine, MODULE_BODY);
+    // The planted value has to be a *decodable* fake VA or the emulator would
+    // run it as guest code instead of trapping.
+    let fake_va = crate::fake_va::encode_unresolved(7);
+    crate::host_exports::record_for_test(
+        &mut engine,
+        &mut state,
+        "SDL2.dll",
+        "SDL_LowerBlit",
+        fake_va,
+        EXPORT_STUB,
+        MODULE_BASE,
+        MODULE_SIZE,
+    );
+    assert_eq!(
+        slot_value(&mut engine),
+        fake_va,
+        "the module's dispatch slot must now hold the host fake VA, so an \
+         intra-module `jmp [slot]` lands on the host handler"
+    );
+    assert!(
+        matches!(
+            crate::fake_va::decode(fake_va),
+            Some(crate::fake_va::FakeVa::Unresolved(7))
+        ),
+        "the planted value must decode to a fake dispatch entry"
+    );
+
+    let before = counters("SDL_LowerBlit");
+    write_guest_rect(&mut engine, RECT, 0, 0, 4, 3);
+    let dst_rect = 0x5050_u64;
+    write_guest_rect(&mut engine, dst_rect, 0, 0, 4, 3);
+    write_regs(&mut engine, SRC_SURFACE, RECT, DST_SURFACE, dst_rect, 0);
+    // Exactly what the session calls once the stop decodes to
+    // (library, name): the same string dispatcher every WinAPI id uses.
+    let outcome = crate::dispatch_winapi(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        "SDL2.dll",
+        "SDL_LowerBlit",
+    )
+    .expect("dispatch must succeed");
+    assert_eq!(outcome.return_value, 0);
+
+    let after = counters("SDL_LowerBlit");
+    assert_eq!(after.0, before.0 + 1, "the handler must have been entered");
+    assert_eq!(
+        after.1, before.1,
+        "this blit is a palette expansion, so it must not have been declined"
+    );
+    // And it really did the work: palette-expanded pixels in the destination.
+    let out = read_bytes(&mut engine, DST_PIXELS, 48);
+    assert_eq!(&out[0..4], &0x0100_0000_u32.to_le_bytes());
+    assert_eq!(&out[44..48], &0x0100_000B_u32.to_le_bytes());
+}
+
+/// A slot the module rewrites after we planted is re-armed, and the call falls
+/// through to the *new* body — not to the stale pointer and not to itself.
+#[test]
+fn a_rewritten_dispatch_slot_is_re_armed_and_falls_through_to_the_new_body() {
+    let mut engine = test_engine();
+    let mut state = default_winapi_state();
+    setup_expanding_blit(&mut engine);
+    // Blend mode: a case the handler refuses, so it must hand the call back.
+    write_blit_map(
+        &mut engine,
+        BLIT_MAP,
+        DST_SURFACE,
+        0,
+        SRC_FORMAT,
+        DST_FORMAT,
+        4,
+        16,
+        LUT,
+        0x10,
+        0,
+        (1, 1),
+    );
+    write_export_trampoline(&mut engine, MODULE_BODY);
+    let fake_va = crate::fake_va::encode_unresolved(7);
+    crate::host_exports::record_for_test(
+        &mut engine,
+        &mut state,
+        "SDL2.dll",
+        "SDL_LowerBlit",
+        fake_va,
+        EXPORT_STUB,
+        MODULE_BASE,
+        MODULE_SIZE,
+    );
+
+    // SDL2's one-time dynapi init rewrites every slot with the real body after
+    // we may have planted ours.
+    let rewritten_body = 0x8200_u64;
+    engine
+        .mem_write(SLOT, &rewritten_body.to_le_bytes())
+        .expect("rewrite slot");
+
+    let before = counters("SDL_LowerBlit");
+    write_guest_rect(&mut engine, RECT, 0, 0, 4, 3);
+    let dst_rect = 0x5060_u64;
+    write_guest_rect(&mut engine, dst_rect, 0, 0, 4, 3);
+    write_regs(&mut engine, SRC_SURFACE, RECT, DST_SURFACE, dst_rect, 0);
+    let outcome = crate::dispatch_winapi(
+        &mut HandlerContext::new(&mut engine, test_environment(), &mut state),
+        "SDL2.dll",
+        "SDL_LowerBlit",
+    )
+    .expect("dispatch must succeed");
+
+    let after = counters("SDL_LowerBlit");
+    assert_eq!(after.0, before.0 + 1, "the handler must have been entered");
+    assert_eq!(after.1, before.1 + 1, "the blend blit must be declined");
+    assert_eq!(
+        outcome.return_address, rewritten_body,
+        "the fall-through must target the body the module wrote, not the stale one"
+    );
+    assert_eq!(
+        slot_value(&mut engine),
+        fake_va,
+        "the slot must be re-armed so the next intra-module call intercepts too"
+    );
+    assert_eq!(
+        read_bytes(&mut engine, DST_PIXELS, 48),
+        vec![0xEE_u8; 48],
+        "a declined blit must not have written a pixel"
+    );
+}
