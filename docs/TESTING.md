@@ -7,13 +7,13 @@ it is.
 
 | You are… | Run |
 | --- | --- |
-| iterating after an edit | `./scripts/test-fast.sh` |
+| iterating after an edit | `cargo nextest run --profile fast` |
 | about to open a PR | `./scripts/check.sh` (authoritative: fmt, clippy, **full** suite, micro-suite) |
 | touching memory lowering / JIT chaining / CPU dispatch | `./scripts/check.sh`, then `./scripts/run-micro-suite.sh all --matrix` |
 | measuring emulator performance | `cargo build -p wie-cli --release` first — never the `dev` profile |
 
-`scripts/test-fast.sh` is a convenience wrapper, **not** a second gate. It runs
-the whole workspace suite minus two slow groups (see below). If it is green,
+The `fast` profile is a convenience, **not** a second gate. It runs the whole
+workspace suite minus two slow groups (see below). If it is green,
 `scripts/check.sh` is what you actually need to pass.
 
 ## Prerequisites — the guest fixtures must exist
@@ -51,13 +51,13 @@ or the fetch step, not the emulator.
 ### Fast lane (inner dev loop)
 
 ```sh
-./scripts/test-fast.sh                      # whole workspace minus slow groups
-./scripts/test-fast.sh -p wie-cpu           # narrow to one crate
-./scripts/test-fast.sh -E 'test(/d3d9/)'    # narrow to a subset
+cargo nextest run --profile fast                # whole workspace minus slow groups
+cargo nextest run --profile fast -p wie-cpu     # narrow to one crate
+cargo nextest run --profile fast -E 'test(/d3d9/)'  # narrow to a subset
 ```
 
-It runs `cargo nextest run --profile fast`. The `fast` profile is defined in
-`.config/nextest.toml`; its `default-filter` excludes every test binary named
+This is the `fast` profile defined in `.config/nextest.toml`; its
+`default-filter` excludes every test binary named
 `micro_*`, `clock_stub` or `idle_park_wake` — i.e. the two slow groups below.
 It sets `fail-fast = true` and `retries = 0` so a red lane stops at the first
 real failure instead of grinding through 1700 tests. (nextest defaults to
@@ -69,9 +69,10 @@ defeat a caller-supplied `-p`.)
 expressions"* — so the exclusion is spelled `not binary(/…/)` rather than the
 more readable `all() - (…)`. The two select the same tests.)
 
-The script also exports `WIE_JIT_CACHE=0` (belt-and-braces; see
-[Persistent JIT cache](#persistent-jit-cache-and-tests)), prints a one-line
-summary of what it skipped and why, and exits non-zero on failure.
+There is no wrapper script for this lane any more: it is the one nextest
+invocation above, so set `WIE_JIT_CACHE=0` yourself (belt-and-braces; see
+[Persistent JIT cache](#persistent-jit-cache-and-tests)) when the code under
+test compiles guest code and you want a cold JIT every run.
 
 ### Full gate (pre-PR)
 
@@ -79,11 +80,23 @@ summary of what it skipped and why, and exits non-zero on failure.
 ./scripts/check.sh
 ```
 
-Runs, in order: `check-file-sizes.sh`, `cargo fmt --all --check`, `cargo clippy
---workspace --all-targets` (advisory — clippy lints are not denied), the FULL
+Runs, in order: the two policy checks (`check_file_sizes()` then
+`check_deps()` — both functions in this script, which is their only home),
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets` (advisory —
+clippy lints are not denied), `make -C micro-exes`, the FULL
 `cargo nextest run --workspace` (default profile, slow groups included), then
-`make -C micro-exes` and `scripts/run-micro-suite.sh`. Nothing in the fast lane
-short-circuits any of it.
+`scripts/run-micro-suite.sh`.
+
+The fixture build sits **before** nextest on purpose: the integration tests
+under `crates/wie-runtime/tests/micro_gui_window/` exec the guest PEs that
+`micro-exes/out` produces, and a missing fixture is a test *failure*, not a
+skip. Nothing short-circuits any step.
+
+Individual steps can be run on their own with
+`./scripts/check.sh --only <step>` (`--list` prints the names) — that is how
+the pre-commit hook, bacon's per-keystroke job and the two separately-named
+`ci.yml` steps reuse these checks. A `--only` call runs the same function the
+full gate runs.
 
 The nextest invocation here is byte-for-byte the one in
 `.github/workflows/ci.yml`, and both use the `default` profile, so both get
@@ -180,7 +193,7 @@ a legitimately slow run short.
 `slow-timeout`, and it picks up `[profile.default]`'s — verified by pointing a
 scratch config's default profile at a 15 s ceiling and watching `--profile
 fast` time out at exactly 15.007 s. So the 600 s ceiling protects the dev lane
-too, which is what you want: a hang in `test-fast.sh` now dies with a red
+too, which is what you want: a hang in the fast lane now dies with a red
 `TIMEOUT [600s]` line instead of sitting there until you Ctrl-C it. The
 `[[profile.default.overrides]]` blocks are *not* inherited (they are
 per-profile), which is harmless — the `fast` profile's `default-filter`

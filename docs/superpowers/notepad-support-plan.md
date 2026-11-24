@@ -1,5 +1,7 @@
 # Notepad Support Implementation Plan
 
+> **HISTORICAL WORKLOG — SUPERSEDED.** This is the implementation plan as it was written while the notepad depth-of-coverage work was in flight. It is kept for provenance only. It is **not current instructions**: its file paths (`src/dispatch_table/names.rs`, `src/state/tests.rs`, `src/kernel32.rs`, `src/user32/menu.rs`) predate the module-directory splits and no longer resolve, and its task checkboxes are a point-in-time snapshot. For how the dispatch surface works today, read [`../architecture/winapi-handling.md`](../architecture/winapi-handling.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Status:** Draft (2026-08-03). Target locked: ReactOS notepad via `katahiromz/RNotepad` (LGPL-2.1+, standalone mingw build).

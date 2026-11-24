@@ -6,7 +6,7 @@ Categorized by DLL. Based on the dispatch table and module structure in `crates/
 
 ## Recently landed (notepad milestone, 2026-08)
 
-The classic-Win32 depth-of-coverage work (see `docs/notepad-support-plan.md`) landed a large
+The classic-Win32 depth-of-coverage work (worklog: `docs/superpowers/notepad-support-plan.md` — historical, superseded) landed a large
 batch of handlers that earlier sections of this file list as missing. The stale bullets are
 superseded by this list:
 
