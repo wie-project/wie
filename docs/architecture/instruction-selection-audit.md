@@ -344,6 +344,19 @@ already computed, and 3 when wrapped by `bool_to_i64` (`gpr.rs:41` → `select(b
 *Blocks touched: all 12. Sites: `lower/flags.rs` (predicates), `lower/gpr.rs:41 bool_to_i64`,
 `lower/gpr.rs:47 flag_set`, `lower/insn.rs` (ALU result path).*
 
+**Correction, 2026-11-24 (after `90779b0`).** Two things in the section above are wrong, and they
+were wrong in the direction that inflated this item's value:
+
+1. The `cmp`+`cset` pair cited at `+0x100..+0x108` of `0x1800a1c60` is **not** a re-derived carry for
+   `add $0x4,%rdx` — it is the memory probe's `no_wrap` predicate. The class is real (it now takes
+   CF/OF from `adds`/`subs`), but that block's flag cost is one burst plus one pack per iteration,
+   ~59 of ~550 host instructions (**11 %**), not the headline figure.
+2. "38 %" was a count of every mnemonic that *could* belong to flag construction; the attributed
+   number is ~21 % of the body, by two independent methods (CLIF backward slice from the store into
+   `JitCtx+128` = 117/560; attributed machine code = 124/573) — see
+   `docs/architecture/xmm-pair-ceiling.md`. ~21 % is the figure to quote for EFLAGS construction;
+   the wide census number is a different counting rule, not a conflicting measurement.
+
 ### 5.3 The EFLAGS word is rebuilt bit by bit — size 5.5 %, removable 2.7 % (more if packing moves fully to block boundaries), 12/12
 
 101 flag-bit inserts (17 completed packs) in the 12 bodies. One pack, CLIF and machine:
