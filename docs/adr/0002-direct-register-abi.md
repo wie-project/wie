@@ -96,3 +96,44 @@ longer live:
   fallback, all unchanged. Tail chaining stays viable only once the prologue
   stub lets blocks adopt a tail-call-capable convention or Cranelift lifts the
   restriction; until then it is a blocked design, not a debug knob.
+
+## Status note (2026-11-24) — what the shipped hop actually does per edge
+
+Still the nested host C ABI `call`/`call_indirect`; the direct-register hand-off
+remains **blocked** for the reasons above. What changed is only *how the
+successor is found*, which used to be the largest controllable term in the
+per-hop host cost (`emit_chain_or_exit`, `lower/emit.rs`):
+
+1. **Tier 0 — direct `call`** when the successor was compiled into the same
+   module (`chain_refs` / `FuncRef`). Unchanged.
+2. **Tier 1 — edge IC as a branch cascade.** The four monomorphic
+   `edge_ic_{va,fn}` slots are probed as four `brif`s that each jump straight to
+   the shared transfer block with the fn pointer as a block parameter. The old
+   shape computed a first-match-wins `select`/`bor` chain unconditionally: ~63
+   CLIF ops per hop, all of it paid on the hit path. A slot-0 hit is now 11.
+3. **Tier 2 — the chain table's first two probe slots, inline.** The target VA
+   of a static edge is a compile-time constant, so `chain_slot_offset` does the
+   `chain_hash` multiply/shift/mask on the compiling thread and the probe is
+   `load chain_slots; iadd; 2 loads; 2 compares` (~14 CLIF ops). A dynamic edge
+   (`ret`, `call r/m`, a string op) folds the same arithmetic into emitted code
+   (~4 more ops). Either way the probe compares the slot's full VA against the
+   live RIP, so a wrong or stale offset can only *miss* — to the resolver — never
+   transfer to a wrong successor.
+4. **Shared transfer block.** All tiers converge on one block holding the hop
+   accounting, the `call_indirect`, the `chain_depth` restore and the trip flush,
+   instead of three near-identical copies.
+5. **Tier 3 — `wie_jit_chain_lookup`, the Rust resolver.** Now the residual
+   path: the rest of the linear probe plus the edge-IC install. `JitCtx::chain_helper_calls`
+   counts it; on `micro-exes/chain_hops` it is 2 calls per 39 182 hops.
+
+Invariant details that did **not** change, and must not: the
+`inv_gen`/`inv_gen_baked` guard runs before any chain machinery (stale
+generation ⇒ dispatcher), `MAX_CHAIN_DEPTH` still bounds the host nesting, a
+resolution miss still falls to the dispatcher with RIP advanced, and fault
+semantics are untouched.
+
+The per-hop GPR writeback is unchanged (`dirty || loaded`, plus
+`ALL_DIRTY` for the micro-stub path). Narrowing it per successor needs the
+successor's *transitively written* set, which a slot cannot carry — see
+`docs/architecture/chain-hop-handoff.md` for the reasoning and the per-hop op
+counts — so the conservative path stays.
