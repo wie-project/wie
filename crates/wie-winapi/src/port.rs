@@ -132,7 +132,9 @@ pub use crate::kernel32::load_stages::report_lines as load_library_report_lines;
 /// each new attribution adds a stage set, not another edit in `profile.rs`.
 #[must_use]
 pub fn handler_stage_report_lines() -> Vec<String> {
-    crate::kernel32::load_stages::report_lines()
+    let mut lines = crate::kernel32::load_stages::report_lines();
+    lines.extend(crate::gdi32::blit_stages::report_lines());
+    lines
 }
 
 // ── §2 The session boundary ────────────────────────────────────────────────

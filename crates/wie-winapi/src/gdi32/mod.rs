@@ -3,6 +3,7 @@
 //! resolves the same way it did when gdi32 was a single flat module.
 
 mod blit;
+pub(crate) mod blit_stages;
 mod dib;
 pub mod enumerate;
 mod font_system;

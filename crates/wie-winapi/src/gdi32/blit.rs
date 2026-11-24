@@ -84,6 +84,35 @@ impl IRect {
 /// disjoint pieces outside it (left / right / above / below). Applying this
 /// once per child, with non-overlapping children, leaves a set whose union is
 /// exactly the destination minus the children — the WS_CLIPCHILDREN clip.
+/// Does this blit write **every** logical pixel of the destination surface?
+///
+/// Only then may the surface be created without preserving the previous frame's
+/// content — the hand-back copy in [`crate::present`] exists so a *partial*
+/// painter keeps the pixels it does not touch. Erring towards `false` costs one
+/// memcpy; erring towards `true` loses pixels the caller expected to stay, so
+/// every uncertain case (several pieces from `WS_CLIPCHILDREN`, an empty list, a
+/// rect that does not reach the edge) answers `false`.
+#[cfg(all(test, debug_assertions))]
+pub(crate) fn covers_whole_surface(
+    rects: &[IRect],
+    offset_x: i32,
+    offset_y: i32,
+    width: u32,
+    height: u32,
+) -> bool {
+    let [only] = rects else {
+        return false;
+    };
+    let left = only.left.saturating_add(offset_x);
+    let top = only.top.saturating_add(offset_y);
+    let right = only.right.saturating_add(offset_x);
+    let bottom = only.bottom.saturating_add(offset_y);
+    left <= 0
+        && top <= 0
+        && right >= i32::try_from(width).unwrap_or(i32::MAX)
+        && bottom >= i32::try_from(height).unwrap_or(i32::MAX)
+}
+
 pub(crate) fn subtract_rect(rects: Vec<IRect>, child: IRect) -> Vec<IRect> {
     let mut out = Vec::new();
     for rect in rects {
@@ -636,8 +665,9 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     }
 
     // SRCCOPY path: read from source DIB, write to destination surface.
-    let Some((src_va, src_stride, src_w, src_h, top_down)) = resolve_src_info(state, hdc_src)
-    else {
+    let src_resolved =
+        crate::gdi32::blit_stages::timed_resolve_src(|| resolve_src_info(state, hdc_src));
+    let Some((src_va, src_stride, src_w, src_h, top_down)) = src_resolved else {
         let dc_bitmap = {
             let gdi = state.gdi_state();
             gdi.find_dc(crate::handles::Hdc::from(hdc_src))
@@ -652,7 +682,10 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
         );
         return ctx.finish(1);
     };
-    let Some(info) = resolve_dest_info(state, hdc_dst) else {
+    let dest_resolved =
+        crate::gdi32::blit_stages::timed_resolve_dst(|| resolve_dest_info(state, hdc_dst));
+    let Some(info) = dest_resolved else {
+        crate::gdi32::blit_stages::note_nothing("no destination info for the DC");
         return ctx.finish(1);
     };
 
@@ -694,7 +727,20 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     }
 
     // Ensure destination surface.
-    state.ensure_surface(info.hwnd, info.width, info.height);
+    //
+    // Measured, and deliberately left alone: a full-surface blit could pass
+    // `full_repaint` here and skip the hand-back copy that keeps a partial
+    // painter's base intact (233 us/call = the 7.9 MB memcpy at 1726x1146).
+    // Tried, and it is *not* a win in the configuration this guest runs in: with
+    // `present_enqueued=0` the channel hands back no spare buffer, so
+    // `ensure_surface_inner` falls into its `vec![0u32; needed]` arm and the
+    // copy becomes first-touch page faults on the row writes instead — `rows`
+    // went 365 -> 813 us against `ensure_surface` 233 -> 75 us, worse in total.
+    // Skipping the copy only pays when a spare is actually recycled, which is a
+    // property of the presenter, not of the blit.
+    crate::gdi32::blit_stages::timed_ensure_surface(|| {
+        state.ensure_surface(info.hwnd, info.width, info.height);
+    });
 
     // B9(c): time the mask copy (copy ①) — only when frame timing is enabled.
     let blit_t0 = crate::present::frame_timing_enabled().then(std::time::Instant::now);
@@ -732,7 +778,7 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     }
 
     // Blit rows: scope the dest borrow so we can re-borrow state for publish.
-    {
+    let copied = crate::gdi32::blit_stages::timed_rows(|| {
         // The dest pitch is the surface stride (64-padded); `info.width` is
         // the LOGICAL width and must not be used to index rows.
         let (dest, dest_stride) = state
@@ -740,7 +786,7 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
             .map(|s| (&mut s.pixels[..], s.stride))
             .unwrap_or((&mut [][..], 0));
         if dest.is_empty() {
-            return ctx.finish(1);
+            return false;
         }
         for rect in &rects {
             let rect_w = rect.width();
@@ -770,6 +816,11 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
                 rect_h,
             );
         }
+        true
+    });
+    if !copied {
+        crate::gdi32::blit_stages::note_nothing("destination surface is empty");
+        return ctx.finish(1);
     }
     // The blit wrote the union of the (WS_CLIPCHILDREN-clipped) dest pieces
     // into the ancestor surface — report it as the repainted region so the
@@ -791,9 +842,11 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
                 Some(union) => union_rect(union, piece),
             })
         });
-        if let Some(dirty) = dirty {
-            state.mark_dirty(info.hwnd, dirty);
-        }
+        crate::gdi32::blit_stages::timed_publish(|| {
+            if let Some(dirty) = dirty {
+                state.mark_dirty(info.hwnd, dirty);
+            }
+        });
     }
 
     if let Some(t0) = blit_t0 {
@@ -804,7 +857,7 @@ pub fn handle_bit_blt(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResul
     // full cycle). The surface buffer stays put and the dirty accumulator
     // keeps unioning until the drain, so the published frame is the
     // fully-painted composite with the union region.
-    state.publish_deferred(info.hwnd);
+    crate::gdi32::blit_stages::timed_publish(|| state.publish_deferred(info.hwnd));
 
     ctx.finish(1)
 }
@@ -1032,5 +1085,49 @@ mod tests {
         assert_eq!(first_len, 1024);
         assert_eq!(second_len, 64);
         assert_eq!(retained, 1024);
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod cover_tests {
+    use super::{IRect, covers_whole_surface};
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> IRect {
+        IRect {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    /// The predicate decides whether a frame's previous content may be dropped,
+    /// so its uncertain cases are pinned as firmly as its certain one.
+    #[test]
+    fn only_a_single_full_rect_counts_as_a_full_repaint() {
+        assert!(
+            covers_whole_surface(&[rect(0, 0, 100, 50)], 0, 0, 100, 50),
+            "an exact full rect is a full repaint"
+        );
+        assert!(
+            covers_whole_surface(&[rect(-10, -10, 200, 90)], 0, 0, 100, 50),
+            "a rect larger than the surface still covers it"
+        );
+        assert!(
+            covers_whole_surface(&[rect(-20, -5, 80, 45)], 20, 5, 100, 50),
+            "coverage is measured in surface space, not DC space"
+        );
+        assert!(
+            !covers_whole_surface(&[rect(0, 0, 99, 50)], 0, 0, 100, 50),
+            "one pixel short is a partial repaint"
+        );
+        assert!(
+            !covers_whole_surface(&[rect(0, 0, 40, 50), rect(60, 0, 100, 50)], 0, 0, 100, 50),
+            "a rect decomposed around a child never counts as full"
+        );
+        assert!(
+            !covers_whole_surface(&[], 0, 0, 100, 50),
+            "nothing to paint is not a full repaint"
+        );
     }
 }
