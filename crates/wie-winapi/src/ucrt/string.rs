@@ -2,6 +2,7 @@
 //! character-class helpers, and the secure-CRT `_s` variants (MSVCR100+).
 
 use crate::guest_memory::read_u64;
+use crate::guest_string;
 use crate::{HandlerContext, WinApiHandlerResult};
 use anyhow::Result;
 
@@ -527,27 +528,8 @@ pub(crate) fn handle_wcscmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         };
         return finish(engine, i32_status_to_u64(r));
     }
-    let mut i = 0_u64;
-    loop {
-        let mut ba = [0_u8; 2];
-        let mut bb = [0_u8; 2];
-        let off = i.wrapping_mul(2);
-        engine.mem_read(a.wrapping_add(off), &mut ba)?;
-        engine.mem_read(b.wrapping_add(off), &mut bb)?;
-        let wa = u16::from_le_bytes(ba);
-        let wb = u16::from_le_bytes(bb);
-        if wa != wb {
-            let r = i32::from(wa).wrapping_sub(i32::from(wb));
-            return finish(engine, i32_status_to_u64(r));
-        }
-        if wa == 0 {
-            return finish(engine, 0);
-        }
-        i = i.saturating_add(1);
-        if i > 1_000_000 {
-            return finish(engine, 0);
-        }
-    }
+    let r = guest_string::utf16_cmp(engine, a, b, 1_000_000)?;
+    finish(engine, i32_status_to_u64(r))
 }
 /// `wcsstr(haystack, needle)` — return pointer to first match or NULL.
 pub(crate) fn handle_wcsstr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -608,24 +590,8 @@ pub(crate) fn handle_wcslen(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     if s == 0 {
         return finish(engine, 0);
     }
-    let mut i = 0_u64;
-    loop {
-        let mut b = [0_u8; 2];
-        if engine
-            .mem_read(s.wrapping_add(i.wrapping_mul(2)), &mut b)
-            .is_err()
-        {
-            break;
-        }
-        if u16::from_le_bytes(b) == 0 {
-            break;
-        }
-        i = i.saturating_add(1);
-        if i > 1_000_000 {
-            break;
-        }
-    }
-    finish(engine, i)
+    let len = guest_string::utf16_len(engine, s, 1_000_000)?;
+    finish(engine, len)
 }
 /// `wcscpy(dest, src)` — copy the wide string including its NUL; returns `dest`.
 pub(crate) fn handle_wcscpy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -712,26 +678,10 @@ pub(crate) fn handle_wcsncmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     if count == 0 {
         return finish(engine, 0);
     }
-    for i in 0..count {
-        let mut ba = [0_u8; 2];
-        let mut bb = [0_u8; 2];
-        let off = i.wrapping_mul(2);
-        if engine.mem_read(a.wrapping_add(off), &mut ba).is_err()
-            || engine.mem_read(b.wrapping_add(off), &mut bb).is_err()
-        {
-            break;
-        }
-        let wa = u16::from_le_bytes(ba);
-        let wb = u16::from_le_bytes(bb);
-        if wa != wb {
-            let r = i32::from(wa).wrapping_sub(i32::from(wb));
-            return finish(engine, i32_status_to_u64(r));
-        }
-        if wa == 0 {
-            break;
-        }
-    }
-    finish(engine, 0)
+    // One lock per 4 KiB page on each side, not one per unit per side.
+    let count_us = usize::try_from(count).unwrap_or(0);
+    let r = guest_string::utf16_cmp(engine, a, b, count_us)?;
+    finish(engine, i32_status_to_u64(r))
 }
 /// `wcsncpy(dest, src, n)` — copy up to `n` wide units, padding with NULs.
 pub(crate) fn handle_wcsncpy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {

@@ -172,6 +172,218 @@ pub(crate) fn decode_utf16_lossy(units: &[u16]) -> String {
     String::from_utf16_lossy(&head)
 }
 
+/// Compare two guest UTF-16 strings unit by unit, page-sliced, up to `max_units`
+/// and stopping at the first NUL in either.
+///
+/// Returns the `wcscmp` convention: `0` when equal over the compared prefix,
+/// otherwise the sign-carrying difference of the first differing pair. Each
+/// side is read in 4 KiB borrowed slices, so a 260-character path comparison
+/// costs two lock acquisitions instead of 260 per side.
+pub(crate) fn utf16_cmp(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    a: u64,
+    b: u64,
+    max_units: usize,
+) -> Result<i32> {
+    let mut cursor_a = a;
+    let mut cursor_b = b;
+    let mut remaining = max_units;
+    // Odd-address tails: a unit whose halves land in different borrows.
+    let mut tail_a: Option<u8> = None;
+    let mut tail_b: Option<u8> = None;
+
+    while remaining > 0 {
+        let span = page_span(cursor_a, remaining);
+        let want = span.min(page_span(cursor_b, remaining)).min(remaining * 2);
+        if want == 0 {
+            break;
+        }
+        let (Some(sa), Some(sb)) = (
+            engine.host_slice(cursor_a, want),
+            engine.host_slice(cursor_b, want),
+        ) else {
+            // Fall back to a scalar unit so the pair still compares correctly.
+            let mut ba = [0_u8; 2];
+            let mut bb = [0_u8; 2];
+            if engine.mem_read(cursor_a, &mut ba).is_err()
+                || engine.mem_read(cursor_b, &mut bb).is_err()
+            {
+                break;
+            }
+            let (wa, wb) = (u16::from_le_bytes(ba), u16::from_le_bytes(bb));
+            if wa != wb {
+                return Ok(i32::from(wa).wrapping_sub(i32::from(wb)));
+            }
+            if wa == 0 {
+                return Ok(0);
+            }
+            remaining = remaining.saturating_sub(1);
+            cursor_a = cursor_a.wrapping_add(2);
+            cursor_b = cursor_b.wrapping_add(2);
+            tail_a = None;
+            tail_b = None;
+            continue;
+        };
+        let mut ia = sa.iter().copied();
+        let mut ib = sb.iter().copied();
+        if let (Some(la), Some(lb)) = (tail_a.take(), tail_b.take()) {
+            let (Some(ha), Some(hb)) = (ia.next(), ib.next()) else {
+                break;
+            };
+            let (wa, wb) = (u16::from_le_bytes([la, ha]), u16::from_le_bytes([lb, hb]));
+            if wa != wb {
+                return Ok(i32::from(wa).wrapping_sub(i32::from(wb)));
+            }
+            if wa == 0 {
+                return Ok(0);
+            }
+            remaining = remaining.saturating_sub(1);
+            cursor_a = cursor_a.wrapping_add(1);
+            cursor_b = cursor_b.wrapping_add(1);
+        }
+        let rest_a: Vec<u8> = ia.collect();
+        let rest_b: Vec<u8> = ib.collect();
+        let pairs_a = rest_a.as_chunks::<2>().0;
+        let pairs_b = rest_b.as_chunks::<2>().0;
+        let mut consumed = 0_usize;
+        for (pa, pb) in pairs_a.iter().zip(pairs_b.iter()) {
+            let (wa, wb) = (u16::from_le_bytes(*pa), u16::from_le_bytes(*pb));
+            if wa != wb {
+                return Ok(i32::from(wa).wrapping_sub(i32::from(wb)));
+            }
+            if wa == 0 {
+                return Ok(0);
+            }
+            consumed = consumed.saturating_add(2);
+        }
+        remaining = remaining.saturating_sub(consumed / 2);
+        if consumed == 0 {
+            break;
+        }
+        if consumed < rest_a.len() {
+            tail_a = rest_a.get(consumed).copied();
+        }
+        if consumed < rest_b.len() {
+            tail_b = rest_b.get(consumed).copied();
+        }
+        let advance = u64::try_from(consumed).unwrap_or(0);
+        cursor_a = cursor_a.wrapping_add(advance);
+        cursor_b = cursor_b.wrapping_add(advance);
+    }
+
+    Ok(0)
+}
+
+/// Bytes from `cursor` to the end of its guest page, capped by `max_units * 2`.
+fn page_span(cursor: u64, max_units: usize) -> usize {
+    let page_end = (cursor | (PAGE_SIZE - 1)).wrapping_add(1);
+    let in_page = usize::try_from(page_end.saturating_sub(cursor)).unwrap_or(0);
+    in_page.min(max_units.saturating_mul(2))
+}
+
+/// Length of a NUL-terminated guest UTF-16 string, in units, without allocating.
+///
+/// Page-sliced: one lock acquisition per 4 KiB page rather than one per unit.
+/// The wide-string handlers used to call `mem_read(.., &[0u8; 2])` per unit,
+/// so `wcslen` on a 260-character path paid 260 lock/acquisition/walk cycles.
+///
+/// Scans the borrowed page as little-endian pairs. An odd guest address means
+/// the first unit straddles the borrow, so that one unit is read scalar and the
+/// scan resumes one byte later — guest `wchar_t` is 2-aligned in practice, but
+/// a handler must not fault on a misaligned pointer it was simply given.
+pub(crate) fn utf16_len(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    address: u64,
+    max_units: usize,
+) -> Result<u64> {
+    if address == 0 || max_units == 0 {
+        return Ok(0);
+    }
+    let mut cursor = address;
+    let mut remaining = max_units;
+    let mut total: u64 = 0;
+    // A unit whose two bytes land in different borrows.
+    let mut pending_low: Option<u8> = None;
+
+    while remaining > 0 {
+        // Clamp to the page: a span that runs past the end of the mapping would
+        // fail to resolve even though its in-page prefix is readable.
+        let page_end = (cursor | (PAGE_SIZE - 1)).wrapping_add(1);
+        let in_page = usize::try_from(page_end.saturating_sub(cursor)).unwrap_or(0);
+        let want = remaining
+            .saturating_mul(2)
+            .min(PAGE_SIZE as usize)
+            .min(in_page);
+        if want == 0 {
+            break;
+        }
+        let Some(slice) = engine.host_slice(cursor, want) else {
+            // Unmapped or protect-denied span: one scalar unit, then re-probe.
+            let mut unit = [0_u8; 2];
+            if engine.mem_read(cursor, &mut unit).is_err() {
+                break;
+            }
+            if u16::from_le_bytes(unit) == 0 {
+                return Ok(total);
+            }
+            total = total.saturating_add(1);
+            remaining = remaining.saturating_sub(1);
+            cursor = cursor.wrapping_add(2);
+            pending_low = None;
+            continue;
+        };
+        let mut iter = slice.iter().copied();
+        if let Some(low) = pending_low.take() {
+            let Some(high) = iter.next() else {
+                break;
+            };
+            if u16::from_le_bytes([low, high]) == 0 {
+                return Ok(total);
+            }
+            total = total.saturating_add(1);
+            remaining = remaining.saturating_sub(1);
+            cursor = cursor.wrapping_add(1);
+        }
+        let rest: Vec<u8> = iter.collect();
+        // Whole pairs only; a trailing odd byte is carried into the next span.
+        let pairs = rest.as_chunks::<2>().0;
+        let mut units_in_span = 0_usize;
+        let mut stopped = false;
+        for pair in pairs {
+            if u16::from_le_bytes(*pair) == 0 {
+                stopped = true;
+                break;
+            }
+            units_in_span = units_in_span.saturating_add(1);
+        }
+        let consumed_bytes = if stopped {
+            units_in_span.saturating_add(1).saturating_mul(2)
+        } else {
+            pairs.len().saturating_mul(2)
+        };
+        total = total.saturating_add(u64::try_from(units_in_span).unwrap_or(0));
+        if stopped {
+            return Ok(total);
+        }
+        remaining = remaining.saturating_sub(units_in_span);
+        if consumed_bytes < rest.len() {
+            // Odd tail byte: the high half of the next unit.
+            pending_low = rest.get(consumed_bytes).copied();
+        }
+        let advance = if consumed_bytes == 0 && pending_low.is_some() {
+            1
+        } else {
+            consumed_bytes
+        };
+        if advance == 0 {
+            break;
+        }
+        cursor = cursor.wrapping_add(u64::try_from(advance).unwrap_or(0));
+    }
+
+    Ok(total)
+}
+
 /// Read up to `max_units` NUL-terminated UTF-16 units from guest memory.
 ///
 /// Uses 4 KiB page-sliced bulk reads — one lock acquisition per page instead
@@ -706,6 +918,162 @@ mod tests {
             .expect("write guest literal");
         let text = read_ansi_lossy(&mut engine, BUF, 64).expect("read ANSI");
         assert_eq!(text, "café");
+    }
+
+    /// The reference `wcscmp`: one `mem_read` per unit per side.
+    fn wcscmp_reference(engine: &mut IcedCpu, a: u64, b: u64, max_units: usize) -> i32 {
+        for i in 0..max_units {
+            let mut ba = [0_u8; 2];
+            let mut bb = [0_u8; 2];
+            let off = (i as u64) * 2;
+            if engine.mem_read(a + off, &mut ba).is_err()
+                || engine.mem_read(b + off, &mut bb).is_err()
+            {
+                return 0;
+            }
+            let (wa, wb) = (u16::from_le_bytes(ba), u16::from_le_bytes(bb));
+            if wa != wb {
+                return i32::from(wa).wrapping_sub(i32::from(wb));
+            }
+            if wa == 0 {
+                return 0;
+            }
+        }
+        0
+    }
+
+    #[test]
+    fn utf16_cmp_matches_the_per_unit_loop() {
+        let mut engine = test_engine();
+        let (a, b) = (0x3000_u64, 0x3200_u64);
+
+        // Equal strings.
+        write_utf16(&mut engine, a, "alpha");
+        write_utf16(&mut engine, b, "alpha");
+        assert_eq!(utf16_cmp(&mut engine, a, b, 1_000_000).expect("cmp"), 0);
+
+        // Differing at unit 2 ('p' vs 'x'): the sign is 'p' - 'x' < 0.
+        write_utf16(&mut engine, b, "alxha");
+        assert_eq!(
+            utf16_cmp(&mut engine, a, b, 1_000_000).expect("cmp"),
+            wcscmp_reference(&mut engine, a, b, 1_000_000)
+        );
+        assert!(utf16_cmp(&mut engine, a, b, 1_000_000).expect("cmp") < 0);
+
+        // A prefix terminates one side: "ab" vs "abc" compares the NUL pair.
+        write_utf16(&mut engine, a, "ab");
+        write_utf16(&mut engine, b, "abc");
+        assert_eq!(
+            utf16_cmp(&mut engine, a, b, 1_000_000).expect("cmp"),
+            wcscmp_reference(&mut engine, a, b, 1_000_000)
+        );
+
+        // The count stops the compare before the difference: equal prefix.
+        write_utf16(&mut engine, a, "aaxx");
+        write_utf16(&mut engine, b, "aayy");
+        assert_eq!(utf16_cmp(&mut engine, a, b, 2).expect("cmp"), 0);
+
+        // Cross-page: 300 identical units starting 0x100 before a page edge.
+        let long = "z".repeat(300);
+        write_utf16(&mut engine, 0x3F00, &long);
+        write_utf16(&mut engine, 0x7000, &long);
+        assert_eq!(
+            utf16_cmp(&mut engine, 0x3F00, 0x7000, 1_000_000).expect("cmp"),
+            0
+        );
+        assert_eq!(
+            utf16_cmp(&mut engine, 0x3F00, 0x7000, 1_000_000).expect("cmp"),
+            wcscmp_reference(&mut engine, 0x3F00, 0x7000, 1_000_000)
+        );
+    }
+
+    /// The reference `wcslen`: one `mem_read` per unit, exactly what the handler
+    /// did before it was page-sliced. The new scan must agree with it everywhere,
+    /// including the cases the slicing can get wrong (a unit straddling a page
+    /// boundary, an odd start address, a NUL on a page's last byte).
+    fn wcslen_reference(engine: &mut IcedCpu, address: u64, max_units: usize) -> u64 {
+        let mut i = 0_u64;
+        while usize::try_from(i).unwrap_or(usize::MAX) < max_units {
+            let mut b = [0_u8; 2];
+            if engine.mem_read(address + i * 2, &mut b).is_err() {
+                break;
+            }
+            if u16::from_le_bytes(b) == 0 {
+                break;
+            }
+            i += 1;
+        }
+        i
+    }
+
+    fn write_utf16(engine: &mut IcedCpu, address: u64, text: &str) {
+        let units: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+        engine.mem_write(address, &bytes).expect("write UTF-16");
+    }
+
+    #[test]
+    fn utf16_len_matches_the_per_unit_loop() {
+        let mut engine = test_engine();
+        // Even start, short: "hello".
+        write_utf16(&mut engine, 0x3000, "hello");
+        assert_eq!(
+            utf16_len(&mut engine, 0x3000, 1_000_000).expect("len"),
+            wcslen_reference(&mut engine, 0x3000, 1_000_000)
+        );
+        assert_eq!(utf16_len(&mut engine, 0x3000, 1_000_000).expect("len"), 5);
+
+        // Straddling the 0x4000 page boundary: 200 units from 0x3F00 covers
+        // 0x3F00..0x40C8, so the scan crosses one page.
+        let long = "a".repeat(200);
+        write_utf16(&mut engine, 0x3F00, &long);
+        assert_eq!(
+            utf16_len(&mut engine, 0x3F00, 1_000_000).expect("len"),
+            wcslen_reference(&mut engine, 0x3F00, 1_000_000)
+        );
+        assert_eq!(utf16_len(&mut engine, 0x3F00, 1_000_000).expect("len"), 200);
+
+        // NUL as a page's last unit: 0x4FFF is odd, so the *unit* at 0x4FFE is
+        // what must terminate, without touching the next page.
+        engine.mem_write(0x4FFE, &[b'z', 0]).expect("write tail");
+        assert_eq!(utf16_len(&mut engine, 0x4FFE, 1_000_000).expect("len"), 1);
+    }
+
+    /// A misaligned pointer: the unit straddles no page, but the address is odd,
+    /// so the pair cannot be read as an aligned `u16`.
+    #[test]
+    fn utf16_len_handles_an_odd_start_address() {
+        let mut engine = test_engine();
+        // Bytes: x x h 00 i 00 00 00 → reading from 0x3001 gives "hi".
+        engine
+            .mem_write(0x3000, &[0xFF, b'h', 0, b'i', 0, 0, 0, 0])
+            .expect("write bytes");
+        let len = utf16_len(&mut engine, 0x3001, 1_000_000).expect("len");
+        assert_eq!(len, 2, "two units at an odd address");
+    }
+
+    #[test]
+    fn utf16_len_respects_the_cap_and_an_unreadable_tail() {
+        let mut engine = test_engine();
+        // No NUL anywhere: the cap is the only stop.
+        let run = "b".repeat(32);
+        write_utf16(&mut engine, 0x3000, &run);
+        // Overwrite the terminator so the string has no NUL at all.
+        engine
+            .mem_write(0x3000 + 64, &[0x41, 0x41])
+            .expect("no NUL");
+        assert_eq!(utf16_len(&mut engine, 0x3000, 10).expect("len"), 10);
+        assert_eq!(utf16_len(&mut engine, 0x3000, 0).expect("len"), 0);
+        assert_eq!(utf16_len(&mut engine, 0, 1_000_000).expect("len"), 0);
+
+        // A string that walks off the mapped region (0x1000..0x101000) stops at
+        // the boundary instead of faulting: 16 non-zero bytes fill the mapping
+        // exactly, so the scan counts 8 units and then cannot read further.
+        engine
+            .mem_write(0x100FF0, &[0x41_u8; 16])
+            .expect("fill to the mapping end");
+        let len = utf16_len(&mut engine, 0x100FF0, 100_000).expect("len");
+        assert_eq!(len, 8, "units up to the end of the mapping");
     }
 
     /// The page-sliced reader must return the same bytes the old byte-at-a-time
