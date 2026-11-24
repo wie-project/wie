@@ -31,11 +31,20 @@ Two things fall out of it, both answerable without another run:
    −20 instructions per iteration (11.5 %)** — the invalidation contract is
    already strong enough: every mapping/protection change bumps `mem_gen`, so a
    per-iteration generation compare plus a per-operand span compare is a complete
-   guard. It is 31 instructions per iteration in both blocks, so it is the same
-   win everywhere (§8.5), and it is worth ~11 % of guest time.
+   guard. It is **15–16 instructions per memory operand per iteration** in all
+   three blocks attributed here (§8.3, §9.4) — 31 for the two-operand blocks and 63
+   for the four-operand one — so the saving scales with operand count and is worth
+   **≈14.6 % of guest time** over 96.1 % of leaf samples.
 
 Both are bigger than everything else on the table. Details, proofs and the
 per-fix verdicts below.
+
+This document attributes **three** blocks, not one: §1–§7 are `0x1800d8fb0`
+(54.1 % of guest time, 174 host instructions per iteration, 8 guest instructions),
+§8 is `0x1800a1c60` (27.4 %, 115 per iteration, 6 guest instructions) and §9 is
+`0x1800cef0b` (14.6 %, 177 per iteration, 10 guest instructions) — together
+**96.1 % of leaf samples**. The per-iteration rule, the counting rules and the
+verdict vocabulary are the same in all three sections.
 
 Date 2026-11-24, HEAD `bd9a5c7`, host macOS 26.5.2 / Apple Silicon, release
 build, `opt_level=none`, `WIE_JIT_REGION` off.
@@ -343,8 +352,9 @@ because it is the same 31 instructions in every hot block (§8.5).
 
 ## 6. Not measured, and what would change the numbers
 
-* **The other nine blocks' per-iteration bills.** This document attributes one
-  block. The same method needs one `lldb` attach per block on a live map; the
+* **The other seven blocks' per-iteration bills.** This document attributes the
+  top three blocks (54.1 %, 27.4 %, 14.6 % of guest time); the rest of the top ten
+  is still a census, not an attribution. The same method needs one `lldb` attach per block on a live map; the
   phase boundaries differ per block, so it is per-block work, not a script.
 * **The probe hoist's real saving.** 11.5 % (and 17.4 % of block #2) is a
   *bound* from instruction counts, not a paired timing: it assumes the hoisted
@@ -753,7 +763,8 @@ The hoisted form's *executed* cost is 2 × 4 + 3 = **11** (per operand a span
 compare and a branch, twice; plus one shared `mem_gen` compare and branch —
 §7.4's shape), so the saving is **20 instructions per iteration**: 11.5 % of
 block #1 and 17.4 % of block #2. Extrapolated over the two blocks that carry
-81.5 % of leaf samples, that is **~11 % of total guest time**. That is comparable
+81.5 % of leaf samples, that is **~11 % of total guest time** — §9.4 raises the
+same weighted figure to **≈14.6 %** once a four-operand block is in the sample. That is comparable
 to what the flag work removes over the same two blocks (39 on block #1, 23 on
 block #2), not double it as the 26.3 % figure implied; the reason to do the hoist
 first is that it is the same 20 instructions wherever it lands, while the flag
@@ -827,6 +838,233 @@ a property of one block's guest code.
 
 ---
 
+## 9. The third block, `0x1800cef0b` — four memory operands, and the guard is per operand
+
+`0x1800cef0b` is **14.6 % of guest time** and the last unattributed member of the
+top three. It is a **10-guest-instruction fill loop with four dword stores per
+iteration**, which makes it the first block in this campaign that is not a
+two-operand loop — and that is what answers the question §8 left open.
+
+### 9.1 Build provenance, and a caveat on comparing flag rows
+
+All numbers in this section come from one snapshot,
+`/tmp/wie-block3-a2c499f` = `target/release/wie` as built at 20:34 on
+2026-11-24, i.e. the tree at **`a2c499f`** ("flag word built only at the cold
+fault edge; fold self-loops at their latch") with `WIE_JIT_REGION` off. That
+commit landed before this slice started and is inside the binary; `region.rs` was
+edited again at 20:36, *after* the binary was linked, so the region lane's newest
+work is **not** in these numbers. The binary was copied to `/tmp` before the run
+because another lane was rebuilding `target/release/wie` at the time — the
+snapshot is what was measured, and a later rebuild cannot change it.
+
+Two consequences, both stated rather than papered over:
+
+* **This is still the block-path baseline.** The latch folding in `a2c499f` and
+  `162f73e` is region-gated; with the region off, the emitted block still has the
+  shape §8 described — a prologue that mirrors `JitCtx` into `[sp]`, a 17-parameter
+  self-loop header, an internal back edge, a 17-parameter writeback block. Block #3
+  is therefore directly comparable to blocks #1 and #2 on probe and slot numbers.
+* **It is *not* comparable on flag numbers.** `a2c499f` is `doom_startup`'s change,
+  and it works: the six-bit pack is now emitted only on the cold fault and exit
+  edges (§9.2 shows four of them, all cold). Blocks #1 and #2 were measured on
+  pre-`a2c499f` binaries, where the pack was inline on the hot path. The flag row of
+  §9.5 must therefore not be read as "block #3 has less flag work than the other
+  two" — it has *different* flag work, on a newer emitter.
+
+Run: one bounded invocation (`timeout -k 5 -s INT 120`), one `sample`, one
+`lldb -p` attach at t≈40 s. Files `/tmp/x4map.txt`, `/tmp/x4.clif`,
+`/tmp/x4asm.txt`, `/tmp/x4samp.txt`. The host was carrying a `cargo build` from
+another lane (load average 6.7), which costs nothing here: every number below is an
+instruction count, not a duration.
+
+`WIE_JIT_MAP` records three compiles of this block (`0x134510000`,
+`0x134574000`, `0x134588000`); the analysis reads the last, as in §8.
+
+**One honesty note on the 14.6 %.** That share is the leaf-sample attribution this
+slice was given; it is not re-derived here. The `sample` taken during the run
+(9.5 KB) contains no frame in any of the block's three host ranges, so it
+contributes nothing — the attribution rests on the disassembly and the CLIF below,
+which is the same basis the previous two blocks were attributed on.
+
+### 9.2 The function, phase by phase
+
+`0x134588000–0x134588b88` = **739 instructions**: twelve hot phases plus the cold
+and exit phases, 0 instructions uncovered. The back edge is
+`0x134588ac8 b 0x134588104`, so the loop head is `…8104` — *inside* the entry
+block, not at `…8000`.
+
+| phase | range | insns | category |
+| --- | --- | --- | --- |
+| P0 prologue: `JitCtx` → `[sp]` mirrors, pin descriptors | `…8000–…8100` | 65 | **per entry** |
+| D carrier decode: six `and/cmp/cset` from `[sp,#0x18]` | `…8104–…8150` | 20 | flags 18, slot 2 |
+| O1 store #1: address + guard (18 hot + 4 cold legs) | `…8154–…81a8` | 22 | address 3, **probe 15**, cold 4 |
+| O1 cold: hash/TLB recheck, helper call, fault cone + pack | `…81ac–…8290` | 58 | **per fault** |
+| O1 hit arm | `…8294–…82a0` | 4 | probe 1, value 2, move 1 |
+| O2 store #2: address + guard | `…82a4–…82f0` | 20 | address 5, **probe 15** |
+| O2 cold: recheck + call + cone + pack | `…82f4–…8424` | 77 | **per fault** |
+| O2 arms (pin, refill) | `…8428–…843c` | 6 | probe 1, value 4, cold 1 |
+| O3 store #3: address + guard | `…8440–…848c` | 20 | address 5, **probe 15** |
+| O3 cold: recheck + call + cone + pack | `…8490–…85c0` | 77 | **per fault** |
+| O3 arms | `…85c4–…85d8` | 6 | probe 1, value 4, cold 1 |
+| O4 store #4: address + guard | `…85dc–…8628` | 20 | address 5, **probe 15** |
+| O4 cold: recheck + call + cone + pack | `…862c–…8760` | 78 | **per fault** |
+| shared writeback block the four fault cones branch to | `…8764–…880c` | 43 | **per fault / exit** |
+| O4 arms | `…8810–…8834` | 10 | value 4, live slot 2, probe 1, cold 2, `b` 1 |
+| C counter + six-flag cone + `jne` | `…8838–…88a8` | 29 | flags 25, address 1, result 1, test 2 |
+| X exit: EFLAGS pack, 16-GPR writeback, inv-gen, trip, chain match/lookup | `…88ac–…8a3c` | 101 | **per exit** |
+| B back edge: 11 reload + 13 respill + trip + inv-gen + moves | `…8a40–…8ac8` | 35 | dead 22, live 5, inv-gen 5, trip 1, moves 3 |
+| X2 invalidated exit | `…8acc–…8b88` | 48 | per exit |
+| | | **739** | 0 uncovered |
+
+**Executed per iteration:** 20 + 18 + 4 + 20 + 3 + 20 + 3 + 20 + 5 + 29 + 35 =
+**177 host instructions for 10 guest instructions (17.7 : 1)**. Per entry 65; per
+exit ≈ 101 on the first chain match (the 43-instruction block at `…8764` belongs to
+the fault path, not to the exit). The fixed part is therefore ~166 instructions, so
+the 739-instruction function stops being a cost estimate as soon as the loop runs
+more than ~170 iterations — which it does.
+
+The laid-out range between back-edge target and back edge is `…8104–…8ac8` =
+626 instructions, of which 177 (28.3 %) execute — the same ~3.5× layout-to-execution
+ratio that §8.1 found, for the same reason: the four cold refill probes, the four
+fault cones and the fault writeback are all laid out inside it.
+
+### 9.3 Two-method cross-check
+
+The CLIF dump for the same RIP window contains 122 functions (the ten blocks of
+this loop plus recompiles). The one that is block #3 is `u0:7815` (1101 lines):
+**four `iconst.i64 4095`** (the page-size mask, once per memory operand), four
+occurrences of `0x0001_800c_ef0b` (the block's own RIP, in the four fault packs),
+and block heads `0`, `2`, `63`, `1` with `block2` carrying **17 parameters**.
+
+Two things that only the CLIF shows:
+
+* `block2` — the loop header — begins with the carrier decode:
+  `v117 = band.i64 v98, 64`, `v119 = icmp ne v117, 0`, then 128, 1, 2048, 4, 16.
+  So the decode is in the **loop header**, i.e. per iteration, which is what the
+  machine code's back edge to `…8104` says.
+* `v560 -> v564` … `v809 -> v564`: seventeen block-parameter aliases at the head of
+  the loop, the same 16 GPRs + carrier tuple §8.6 measured for block #2.
+
+### 9.4 The question: is the probe guard still exactly 31?
+
+**No — it is 63, and the reason is the only thing that could make it differ: this
+loop has four memory operands per iteration, not two.** Per operand it is
+**unchanged**:
+
+| block | memory operands / iteration | guard instructions, hot path | per operand |
+| --- | --- | --- | --- |
+| #1 `0x1800d8fb0` | 2 (one load, one store) | 31 | 15 + 16 |
+| #2 `0x1800a1c60` | 2 (one load, one store) | 31 | 15 + 16 |
+| #3 `0x1800cef0b` | **4 (four stores)** | **63** | 15 + 15 + 15 + 15 + 3 base loads |
+
+The three base loads are the pin's host base, reloaded once per hit arm (`…8294`,
+`…8434`, `…85d0`); the fourth operand reuses a register. Every guard has the same
+five predicates, the same four `ldur` of the pin descriptor / lo / hi / live bool,
+and the same branch-polarity split that §8 noted (one guard branches into its cold
+legs, three branch out to theirs).
+
+**So the invariant is per operand, and the campaign claim sharpens rather than
+breaks: every memory-heavy loop pays 15–16 host instructions per memory operand
+per iteration to validate a pin that fails once per 1024 iterations.** Hoisting
+removes 15.75 → 4 per operand, so the saving scales with operand count:
+
+| block | operands | probe today | hoisted (4/operand + 3 shared) | saved | share of iteration |
+| --- | --- | --- | --- | --- | --- |
+| #1 | 2 | 31 | 11 | 20 | 11.5 % of 174 |
+| #2 | 2 | 31 | 11 | 20 | 17.4 % of 115 |
+| #3 | 4 | 63 | 19 | **44** | **24.9 % of 177** |
+
+That closes the default-versus-knob question on the evidence, not on the argument:
+a knob would have to be set per *operand count*, which is a property of the guest
+loop the emitter already knows, so the emitter should just do it. The one thing
+that *would* justify a knob is a block whose stride crosses a page per iteration,
+and `HomeSpan` (§7.2) already rejects that case at emission time.
+
+Weighted over the three blocks, which hold **96.1 % of leaf samples**:
+0.541 × 11.5 + 0.274 × 17.4 + 0.146 × 24.9 = **≈ 14.6 % of guest time**, up from
+the ~11 % §8.5 estimated before a four-operand block was in the sample. The hoist
+is not a DoomRetro-shaped win; it grows with the operand count, and the earlier
+two-operand blocks were the *narrow* case.
+
+### 9.5 Which block is register-lightest, and is the spill share inverted?
+
+Frame-slot traffic on the executed path, all three blocks on the same rule (a slot
+op is any `ldur`/`stur` against `[sp]` other than the prologue, entry loads and
+exit writebacks):
+
+| block | slot ops / iteration | of which dead | share | live guest values in the body |
+| --- | --- | --- | --- | --- |
+| #1 `0x1800d8fb0` | 23 | 18 | 13.2 % of 174 | 5 (rdx rcx r8 r9 rax) |
+| #2 `0x1800a1c60` | 25 | 24 | 21.7 % of 115 | 4 (src, dst, count, value) |
+| #3 `0x1800cef0b` | 28 | 22 | 15.8 % of 177 | **3** (ptr, count, value) |
+
+**Block #3 is the register-lightest of the three, and it is *not* the worst
+spiller** — the ordering is #1 (13.2 %) < #3 (15.8 %) < #2 (21.7 %), while the
+live-value ordering is #3 < #2 < #1. So the inversion as stated does not
+reproduce: the lightest loop sits in the middle of the three.
+
+One correction to the premise: **8.4 % is not a number in this document.** The
+frame-slot shares measured here are the 13.2 / 21.7 / 15.8 % above; §2's 19.1 % is
+the mnemonic share of the *laid-out* 236 for block #1, not the executed path. The
+14.8 % figure the question refers to is §8.3's "guest work remainder" row for block
+#2, which is address and value work, not spill.
+
+There is, however, a real shape here worth naming, and it is not about the live set
+at all:
+
+**The edge work does not scale with the live set — it materialises the full
+17-value tuple every trip.** Block #3's loop carries three guest values, modifies
+four of the seventeen block parameters, and still pays 11 reloads + 13 respills at
+the latch: **22 of those 24 are provably dead** (eleven exact same-slot load→store
+pairs, §9.6). That is the largest dead *fraction* of the three blocks, and it is
+not the allocator doing worse with fewer values — it is the edge contract
+re-passing the whole tuple, so a lighter loop pays the same absolute cost and shows
+a bigger dead share. Naming it for the emitter's value live ranges: at
+`opt_level=none` the latch does not narrow its block arguments to the values the
+loop changed, and that is independent of register pressure.
+
+### 9.6 Ranked fixes
+
+| # | fix | bound (per iteration) | how bounded | file | verdict |
+| --- | --- | --- | --- | --- | --- |
+| 1 | **Hoist all four probes to the loop prologue** (§7's spec, unchanged) | **44 / 177 = 24.9 %** | 63 guard instructions measured; hoisted form 4 × 4 + 3 = 19 | `lower/mem.rs`, `lower/emit.rs` | **do** |
+| 2 | **Stop decoding the carrier inside the loop** — it is loop-invariant and only cold edges read it | **20 / 177 = 11.3 %** | proof below | `lower/flags.rs` + `lower/emit.rs` (the flush point) | **do** |
+| 3 | **Sink the five non-ZF flag materialisations into the exit edges** | **23 / 177 = 13.0 %** | the cone's only in-loop reader is `tst w22,#0xff` at `…88a4`; `x13/x15/x12/x23/x0` have no reader on `…8a40–…8ac8` | `lower/flags.rs` | **do**, and it composes with #2 |
+| 4 | **Drop the dead same-slot reload/respill pairs at the latch** | **22 / 177 = 12.4 %** | eleven exact pairs, register untouched in between | block-param edge contract (`lower/emit.rs` + `jit/ctx.rs`), or the region form | **defer** behind the region A/B — unchanged from §8.7 |
+| 5 | Load the store value once (`ldur x11,[sp,#0x48]` runs 4× per iteration) | 3 / 177 = 1.7 % | the slot is not written anywhere in the body | `lower/emit.rs` | defer — falls out of #4's narrowing, or of a cached value |
+| 6 | Anything aimed at the four bound compares or the address build | — | — | — | **drop** |
+
+**The proof for #2.** The carrier word lives in slot `0x18`. Inside the loop body
+the only writes to `0x18` are the decode's own two spills (`…8110`, `…8148`), and
+the back edge reloads it at `…8ac4` after reloading everything else — so the
+decode's input is the same word every iteration and its six outputs are
+loop-invariant. Its only consumers are the four cold fault packs, and the first of
+those (`…8240–…8280`) is an **identity round trip**: it masks the same word with
+`~0x8d5` and re-inserts the six bits it just decoded from it. In the CLIF the
+decode sits in `block2` (the loop header) and its consumers in `block63` (a cold
+block), which is the independent confirmation.
+
+Removing it costs nothing on the fault paths — the packs already load the word —
+and it removes 20 instructions from every iteration: 11.3 %.
+
+### 9.7 What the third block changes in the campaign
+
+* **The hoist's case is closed.** 15–16 per memory operand per iteration in three
+  blocks with 2, 2 and 4 operands; 14.6 % of guest time over 96.1 % of leaf
+  samples. Default, not knob.
+* **The flag work is now three fixes, not one.** §5's dead-pack removal and §8's
+  sink are joined by §9's loop-invariant decode. All three are the same disease —
+  flag state materialised where it is *written* rather than where it is *read* — in
+  three shapes. One line for `doom_startup`: *the cone is emitted at the writer, so
+  every flag writer whose flags are not read in-block pays for them on every
+  iteration; three blocks now show it.*
+* **The latch tuple is the second-largest cross-block item** and the only one with
+  a working alternative already measured: the region form reports 0 `JitCtx`
+  GPR-slot accesses per iteration. That A/B is now the cheapest way to test a ~12 %
+  item on all three blocks at once.
+
+---
+
 ## Appendix: reproducing
 
 ```sh
@@ -845,6 +1083,19 @@ llvm-objdump --triple=x86_64-pc-windows-msvc -d real_exes/doomretro/SDL2.dll \
 ```
 
 ```sh
+# slice 6: block #3 (0x1800cef0b), one bounded run; the binary is copied first so a
+# concurrent rebuild by another lane cannot change what was measured
+cp target/release/wie /tmp/wie-block3-a2c499f      # sha256 a9eadd04a3e100b6ca3697af...
+WIE_JIT_MAP=/tmp/x4map.txt WIE_JIT_DUMP_IR=/tmp/x4.clif \
+  WIE_JIT_DUMP_IR_RIP=0x1800cef00-0x1800cef40 \
+  timeout -k 5 -s INT 120 /tmp/wie-block3-a2c499f run --bottle doomretro --gui doomretro.exe \
+  -- -iwad 'C:\Program Files\DoomRetro\freedoom2.wad'
+grep -E ' 0x1800cef0b ' /tmp/x4map.txt   # three compiles; read the last (0x134588000)
+PID=$(pgrep -f 'wie-block3-a2c499f run' | tail -1)   # the wie pid, not the timeout wrapper
+lldb -p $PID --batch -o 'disassemble --start-address 0x134588000 --count 900' -o detach -o quit
+sample $PID 3 -file /tmp/x4samp.txt
+# 739-instruction function; back edge at 0x134588ac8 -> 0x134588104
+
 # slice 5: block #2 (0x1800a1c60), map + disassembly + CLIF in one bounded run
 WIE_JIT_MAP=/tmp/x3map.txt WIE_JIT_DUMP_IR=/tmp/x3.clif \
   WIE_JIT_DUMP_IR_RIP=0x1800a1c50-0x1800a1c90 \
