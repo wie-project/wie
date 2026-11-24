@@ -283,7 +283,7 @@ pub(super) struct BlockStackPinPlan {
 ///
 /// That is the planted in-guest `GetFileSize` helper
 /// (`wie-runtime/src/guest_io.rs`, `getfs_impl_va + 0x17`), and it is why
-/// `WIE_JIT_SUPER=all` used to die with SIGSEGV on `7za h`: the entry guard
+/// the removed `WIE_JIT_SUPER=all` mode used to die with SIGSEGV on `7za h`: the entry guard
 /// passed on the *caller's* `rbp` (a real stack address) while the emitted
 /// load used the pointer the block had just built, so the biased host address
 /// landed in the guest address space. A check that only fires once a base has
@@ -751,7 +751,7 @@ mod tests {
         0x75, 0x00, // jne +0
     ];
 
-    /// The exact shape that made `WIE_JIT_SUPER=all` segfault on `7za h`.
+    /// The exact shape that made the removed `WIE_JIT_SUPER=all` segfault on `7za h`.
     ///
     /// The block writes RBP *before* its only memory access, so the entry-value
     /// guard passed on the caller's RBP while the emitted bare host load used

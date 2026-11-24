@@ -4,6 +4,23 @@ Status: **Blocked** for the direct-register ABI (external constraint, named belo
 **Feasible, proceed** for the scoped partial win in [Decision](#decision) ·
 2026-10-03 — supersedes the open half of [ADR 0002](0002-direct-register-abi.md)
 
+**Status note (chain-store narrowing — tried and refuted).** Step 1 below was
+implemented and measured, and it lost: removing 27–75 % of the chain hop's GPR
+stores gave **paired medians 0.9955 / 1.0264 → reverted**. The proposed
+`WIE_JIT_CHAIN_STORES=dirty|loaded` gate therefore **never shipped and does not
+exist** in the tree; `grep -rn CHAIN_STORES crates/ scripts/` is empty. The
+stores are free — the hop is not where the time is (`docs/architecture/performance-ceiling.md`
+§5, "Chain-hop store elimination"). Read Step 1 as a *refuted* option, not a
+pending one; the design rationale below is kept because the measurement is what
+closes it, and because the same narrowing was the natural first move for anyone
+revisiting the hop.
+
+Step 0 is a different story and **did ship**: `chain_hops` and `chain_store_ops`
+are `JitCtx` fields today (`jit/pipeline.rs:1307`, asserted in
+`jit/tests/chain_hop_tests.rs:33-34`), so the arithmetic that refuted step 1 can
+be re-derived from a profile run instead of re-instrumented. Reverting step 1 took
+the predicate and the two `mark_dirty` sites only.
+
 ## Context
 
 [ADR 0002](0002-direct-register-abi.md) proposed keeping guest GPRs in native
@@ -396,9 +413,11 @@ already used for `WIE_JIT_VERIFIER` (`docs/RUNBOOK.md:186`, `docs/status.md:42`)
 - **Statistic: the median of the 15 per-pair ratios**, plus a **sign test on the
   pair signs** (exact binomial, no normality assumption).
 - **Both arms from one binary.** P1 must be an env knob read at lowering time
-  that selects the store predicate — e.g. `WIE_JIT_CHAIN_STORES=dirty|loaded` —
-  exactly as `WIE_JIT_VERIFIER` does. Cross-build comparison is contaminated by
-  rustc/Cranelift code-layout drift that an in-binary switch is not.
+  that selects the store predicate — `WIE_JIT_CHAIN_STORES=dirty|loaded`, exactly
+  as `WIE_JIT_VERIFIER` does. Cross-build comparison is contaminated by
+  rustc/Cranelift code-layout drift that an in-binary switch is not. (No such
+  variable exists today: the gate existed for the trial in the status note and
+  went with it.)
 - **Deadband:** pre-register ±5 %. A median ratio inside it is "no change", full
   stop — do not report it as a small win. Rationale: the host's own idle
   long_loop spread is 0.26 s median against 0.5–0.7 s at load 6–8, i.e. up to
@@ -467,7 +486,9 @@ silently. Upgrading to 0.135.1 unblocks nothing (verified by diff).
 the new chain-heavy fixture, and `7za.exe`. **No behaviour change; this is a
 read-only addition and it is what makes step 1 falsifiable.**
 
-**Step 1 — narrow the chain-edge store set to `dirty`.** Two parts, both small:
+**Step 1 — narrow the chain-edge store set to `dirty`. (Tried and refuted:
+0.9955 / 1.0264 paired medians, reverted — see the status note.)** Two parts,
+both small:
 
 1. `lower/emit.rs:121-131` — store iff `dirty[i]`, not `dirty[i] || loaded[i]`.
    Keep the `None` arm (micro-stub paths that pass no dirty mask) unchanged.
@@ -475,7 +496,8 @@ read-only addition and it is what makes step 1 falsifiable.**
    `{0, 1, 6, 7}` in both REP paths, with a comment recording that the host
    string helper mutates `ctx.gpr` directly and therefore bypasses `write_gpr`.
 3. Gate behind `WIE_JIT_CHAIN_STORES=dirty|loaded` (default `loaded`, i.e.
-   **opt-in**), read in `JitConfig`, so one binary serves both A/B arms.
+   **opt-in**), read in `JitConfig`, so one binary serves both A/B arms. The gate
+   was built for the A/B and went with it: no such variable is read today.
 
 Not in scope for this ADR, in order: P2 (narrow the entry load set — real, but
 its audit surface is every read site and its failure is a silent zero), tail
@@ -519,8 +541,10 @@ per-function register-set restriction).
   not identify. ADR 0002's expected outcome, "`long_loop` 0.25 s → ≤0.10 s", is
   **withdrawn as unreachable** (F1).
 - ADR 0002's reversibility claim ("opt-out via `WIE_JIT_DIRECT_REGS=0`") was
-  already void as of 2026-09-25 and stays void. P1 introduces a real bisect
-  switch, `WIE_JIT_CHAIN_STORES`, defaulting to today's behaviour.
+  already void as of 2026-09-25 and stays void. P1 *would have* introduced a real
+  bisect switch, `WIE_JIT_CHAIN_STORES`, defaulting to today's behaviour; the
+  narrowing it gated was refuted before shipping (0.9955), so the switch is not in
+  the tree either.
 - `WIE_JIT_DIRECT_REGS` and `WIE_JIT_TAILCHAIN` stay deleted. `RUNBOOK.md:155-156`
   is accurate as written; no change needed. `crates/wie-runtime/tests/runbook_knobs.rs:55-56, 310`
   asserts these two are *absent* from the knob table — that test stays green and
@@ -556,7 +580,8 @@ under ~1 ms on the target workload, stop here; steps below are not warranted.
   (`cpu_string`, `heap_alloc`) that exercise the two `mark_dirty` additions.
 - JIT-vs-iced differential on the chain-heavy fixture: identical output.
 - `scripts/run-micro-suite.sh` green in both arms
-  (`WIE_JIT_CHAIN_STORES=dirty` and `=loaded`).
+  (`WIE_JIT_CHAIN_STORES=dirty` and `=loaded`) — the arms as they existed during
+  the trial; there is no variable to set now.
 - **Deterministic assertion (the real acceptance test):** with
   `=loaded` vs `=dirty` on the same binary and same guest, `jit_insns`,
   `chain_hops` and guest output are **bit-identical**, and `chain_store_ops` is
@@ -578,11 +603,14 @@ has not been shown to be safe.
 **Step 0** is purely additive counters — delete the two `JitCtx` fields and their
 `WIE_RUNTIME_PROFILE` line; no production behaviour depends on them.
 
-**Step 1** is default-**off**: `WIE_JIT_CHAIN_STORES` defaults to `loaded`, which
-is today's emitted predicate. `=dirty` is opt-in. One env var restores the
-existing code path exactly, in the same binary — the `WIE_JIT_VERIFIER` shape,
-and the reason it is preferred over a build-time switch is that a single binary
-keeps both A/B arms free of cross-build codegen drift.
+**Step 1** is default-**off**: `WIE_JIT_CHAIN_STORES` would default to `loaded`,
+today's emitted predicate, with `=dirty` opt-in — one env var restoring the
+existing code path exactly, in the same binary, the `WIE_JIT_VERIFIER` shape, and
+the reason it beats a build-time switch is that a single binary keeps both A/B
+arms free of cross-build codegen drift. All of that is *how the trial was run*:
+the measurement came back null (0.9955 / 1.0264) and the whole change — predicate,
+`mark_dirty` sites and flag — was reverted, so reversibility here is a historical
+property, not a shipped one.
 
 Stageable: land step 0 standalone; land the two `mark_dirty` sites standalone
 (they are pure additions, no behaviour change — `writeback_gprs` still stores on

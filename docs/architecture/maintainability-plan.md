@@ -249,15 +249,16 @@ All three parts are false:
 ### T0.6 — `docs/RUNBOOK.md` knob table had drifted in both directions
 
 **Status: DONE.** The table is now test-enforced in both directions by
-`crates/wie-runtime/tests/runbook_knobs.rs` (T1.3), and holds 55 `WIE_*` rows
-(`grep -c '^| `WIE_' docs/RUNBOOK.md`).
+`crates/wie-runtime/tests/runbook_knobs.rs` (T1.3), and holds 52 `WIE_*` rows
+(`grep -c '^| \`WIE_' docs/RUNBOOK.md` — 55 before the three deleted knobs noted
+below lost their rows).
 
 Measured at the time: 39 rows, against `grep` of `WIE_*` reads across `crates/`:
 
-- **5 rows name knobs that no code reads**: `WIE_COMPACT_STRING`, `WIE_D3D9_INPLACE` (never existed / removed silently); `WIE_JIT_DIRECT_REGS`, `WIE_JIT_TAILCHAIN`, `WIE_JIT_VERIFY` (genuinely removed — `RUNBOOK.md:114` *says so in prose*, so the table rows are residue, not drift).
-- **10 live knobs have no row**: `WIE_ALLOW_MISSING_GUESTS`, `WIE_DEGRADE`, `WIE_GUEST_ENV`, `WIE_JIT_BG`, `WIE_JIT_EAGER_BLOCK_INSNS`, `WIE_JIT_SSA_FLAGS`, `WIE_JIT_TARGET_WORK`, `WIE_MT_DEBUG`, `WIE_NO_HOOK_SLICES`, `WIE_PRESENT_PACING_HZ`.
+- **5 rows name knobs that no code reads**: `WIE_COMPACT_STRING`, `WIE_D3D9_INPLACE` (never existed / removed silently); `WIE_JIT_DIRECT_REGS`, `WIE_JIT_TAILCHAIN`, `WIE_JIT_VERIFY` (genuinely removed — `RUNBOOK.md` *says so in prose*, in the "Removed knobs" note under the table, so the table rows were residue, not drift).
+- **9 live knobs have no row**: `WIE_ALLOW_MISSING_GUESTS`, `WIE_DEGRADE`, `WIE_GUEST_ENV`, `WIE_JIT_BG`, `WIE_JIT_SSA_FLAGS`, `WIE_JIT_TARGET_WORK`, `WIE_MT_DEBUG`, `WIE_NO_HOOK_SLICES`, `WIE_PRESENT_PACING_HZ`. (A tenth name on this list when it was measured, `WIE_JIT_EAGER_BLOCK_INSNS`, needs no row: the knob was **deleted** from the code along with the eager-by-size rule it gated and that rule's unit test, and `RUNBOOK.md` lists it under the removed knobs instead.)
 
-**Change.** Delete the two dead rows; fold the three removed-knob rows into the existing prose note; add an appendix block for the 10 undocumented tuning knobs — they are already documented in code doc-comments, so this is a pointer, not new writing.
+**Change.** Delete the two dead rows; fold the three removed-knob rows into the existing prose note; add an appendix block for the 9 undocumented tuning knobs — they are already documented in code doc-comments, so this is a pointer, not new writing.
 **Why it matters.** RUNBOOK is the de-facto schema for 16+ knobs and nothing verifies it against code. T1.3 makes it self-checking.
 
 ### T0.7 — ~~`docs/notepad-support-plan.md` is a 287 KB worklog that reads as instructions~~ **DONE**

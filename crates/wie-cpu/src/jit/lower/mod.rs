@@ -1174,7 +1174,7 @@ pub(super) fn compile_block(
 
         // Dual path when the block is stack-pin-shaped: super (bare host mem) vs
         // normal (sticky/pin probes). One block-wide guard on entry.
-        // Default `WIE_JIT_SUPER` = self-loops only; `=all` opt-in; `=0` off.
+        // Super path applies to self-loops only; `WIE_JIT_SUPER=0` turns it off.
         let dual_super = stack_plan.is_some()
             && stack_pin.is_some()
             && !has_string

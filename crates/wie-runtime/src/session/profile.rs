@@ -539,6 +539,31 @@ impl RuntimeProfile {
                     p.iced_fallbacks,
                     p.never_marks
                 ));
+                // Compile-cost model input: wall µs per compile, grouped by block
+                // instruction count. Bucket `i` covers `[2^i, 2^(i+1))`
+                // instructions, so the pairs give the `cost(n) = a + b·n` fit the
+                // promotion threshold is derived from. Empty buckets are omitted
+                // rather than printed as zeros. Single-threaded runs only: this
+                // histogram is one of `SHARED_DERIVED_STATS`, skipped by the
+                // cross-engine merge, so a multithreaded guest reports one
+                // engine's share.
+                let cost_model = (0..wie_cpu::PROFILE_BUCKETS)
+                    .filter(|&i| p.compile_by_insns.count(i) > 0)
+                    .map(|i| {
+                        format!(
+                            "{}:{}/{}",
+                            1_u64 << i,
+                            p.compile_by_insns.total_us(i),
+                            p.compile_by_insns.count(i)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if !cost_model.is_empty() {
+                    lines.push(format!(
+                        "jit_compile_cost: insns_us/count {}",
+                        cost_model.join(" ")
+                    ));
+                }
             }
             // Wave 4 instruction coverage. Deliberately outside the
             // present/frames gate below: a headless micro run publishes no

@@ -134,7 +134,7 @@ B=$(mktemp -d) && mkdir -p "$B/drive_c/App" && \
 1. **`SBB` flags** — MSVC COM `QueryInterface` uses `cmp` + `sbb r,r` + `sbb r,-1`. Wrong CF when `src+CF` overflowed the operand width picked the wrong interface → null call.
 2. **`VirtualAlloc(NULL, size, MEM_COMMIT)`** — treated as **RESERVE|COMMIT** (Windows/Wine-compatible) for LZMA2 buffers.
 3. **JIT dual_super GPR writeback** — only store live GPRs on block exit (do not zero callee-saved).
-4. **Default `WIE_JIT_SUPER=loop`** — non-loop stack super can host-fault on some real tools (`7za a`); self-loop super keeps `long_loop` fast. Opt in with `WIE_JIT_SUPER=all` only when bisecting.
+4. **Stack super path is self-loops only, by default** — that shape keeps `long_loop` fast, and the block-wide extension is gone: it measured 1.008 / 0.971 / 0.992 / 1.061 across mx9 / mx1 / `x` / `h` (noise) and it used to segfault on `7za h` (rc=139 — a guest address read as a host pointer, §4.5). There is no longer anything to opt into — `WIE_JIT_SUPER=0` is the ablation switch and every other value means the self-loop default. (The old `=all`/`=loop` values, and the host-fault they carried, are described in `docs/architecture/performance-ceiling.md` §4.5–§4.7.)
 5. **CRT/WinAPI MT** — `_beginthreadex`, semaphores, events, `WaitForMultipleObjects`, save-before-switch on the shared engine (see Multithreading above).
 6. **`WIN32_FIND_DATA` layout** — sizes at 28/32, `cFileName` at **44** (not BY_HANDLE offsets); wrong names made `7za a` recurse forever on empty path components.
 

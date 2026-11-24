@@ -42,11 +42,11 @@
 #   ./scripts/real-guest-perf.sh                  # default matrix, 3 reps
 #   ./scripts/real-guest-perf.sh --classes mx9 --reps 2
 #   ./scripts/real-guest-perf.sh --make-corpus /tmp/wie-perf-corpus
-#   ./scripts/real-guest-perf.sh --arms def,super_all,chain0
+#   ./scripts/real-guest-perf.sh --arms def,chain0,opt_speed
 #   ./scripts/real-guest-perf.sh --tsv > runs.tsv # rows only, for awk/pandas
 #
 # Default classes: mx1s, mx9s, h (about 14 s of guest work per arm per rep).
-# Default arms:    def, super_all, chain0, opt_speed.
+# Default arms:    def, chain0, opt_speed.
 # `mx9` and `mx1` (full 6.7 MB corpus) are opt-in: mx9 is about 1 min per run.
 #
 # Classes (corpus, then the guest argv after `--`):
@@ -59,7 +59,6 @@
 #
 # Arms (env difference from `def`):
 #   def        (none)
-#   super_all  WIE_JIT_SUPER=all     block-wide stack super path
 #   chain0     WIE_JIT_CHAIN=0       no FuncRef chaining / chain table
 #   opt_speed  WIE_JIT_OPT=speed     Cranelift optimiser on every block
 #   workers0   WIE_JIT_BG=0          no background compile worker
@@ -79,7 +78,7 @@ CORPUS="${WIE_PERF_CORPUS:-/tmp/wie-perf-corpus}"
 OUT="${WIE_PERF_OUT:-/tmp/wie-perf}"
 REPS="${WIE_PERF_REPS:-3}"
 CLASSES="mx1s,mx9s,h"
-ARMS="def,super_all,chain0,opt_speed"
+ARMS="def,chain0,opt_speed"
 MAX_LOAD="${WIE_PERF_MAX_LOAD:-2.0}"
 MAX_API="${WIE_PERF_MAX_API:-400000000}"
 TIMEOUT="${WIE_PERF_TIMEOUT:-900}"
@@ -263,7 +262,6 @@ class_insn_band() {
 arm_env() {
   case "$1" in
     def)       echo "" ;;
-    super_all) echo "WIE_JIT_SUPER=all" ;;
     chain0)    echo "WIE_JIT_CHAIN=0" ;;
     opt_speed) echo "WIE_JIT_OPT=speed" ;;
     workers0)  echo "WIE_JIT_BG=0" ;;

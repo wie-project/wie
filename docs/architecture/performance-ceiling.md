@@ -27,7 +27,7 @@ were made free and nothing else changed: `1 / (1 - measured share)`.
 | **L4** | First-execution compiles: a block executed **once** is compiled anyway | eager compiles: 7592 (`mx9`), 7173 (`mx1`), 5784 (`x`), 1893 (`h`); `h` compiles 2087 blocks to retire 5.5M instructions | bounded by the stall it removes: **1.11x `h`**, ~1.1x `x`, ≈1.005x mx9 | S–M | Low | Yes | Patch-ish (needs a "compile on 2nd execution" decision, not a knob) |
 | **L5** | Emitted-code quality: base tier compiles at Cranelift `opt_level=none` | emitted code = **58% of mx9's guest thread**; `WIE_JIT_OPT=speed` on mx9 (below) | see §4.5 measurement | S (default flip) | Medium: compile cost per block ~1.5–1.7x (already measured in `docs/status.md`) | Yes (knob) | Patch |
 | **L6** | Chain-hop machinery | chain edges are already winning: `WIE_JIT_CHAIN=0` costs **1.53x** on `mx1` (median of 2 interleaved pairs) | no gain available by *removing* work; the gain is in making entries cheap (L1) and fewer (L7) | — | — | — | Landed |
-| **L7** | Region/trace formation: entries per guest instruction | **81.2M entries on mx9 (93.9 insns/entry), measured 2026-11-25** — chaining + the persistent frame already removed two thirds of the 226M/41.6 this row was costed with; `x` 26.8 insns/entry. `WIE_JIT_SUPER=all` does **not** form regions (it is a per-block memory path) and measured 1.008 on mx9 — see §4.7 | multiplies a share L1 already cut: 400-insn regions would divide entries ~10x, but the entry path is **≈5–6% of the guest thread now** (85 ns/entry), so **≈1.05x, not the ≈1.4x this was costed at** — §4.7 | L (region discovery + exit stubs) | High (exactness on faults/SMC) | Yes | Architecture |
+| **L7** | Region/trace formation: entries per guest instruction | **81.2M entries on mx9 (93.9 insns/entry), measured 2026-11-25** — chaining + the persistent frame already removed two thirds of the 226M/41.6 this row was costed with; `x` 26.8 insns/entry. `WIE_JIT_SUPER=all` (that mode is **deleted** from the code) does **not** form regions — it is a per-block memory path — and measured 1.008 on mx9 — see §4.7 | multiplies a share L1 already cut: 400-insn regions would divide entries ~10x, but the entry path is **≈5–6% of the guest thread now** (85 ns/entry), so **≈1.05x, not the ≈1.4x this was costed at** — §4.7 | L (region discovery + exit stubs) | High (exactness on faults/SMC) | Yes | Architecture |
 | **L8** | Host stops / API resolution / handler dispatch | `handler_ms` ≤ **1.2%** of wall on every measured class (0.11% mx9, 0.22% mx1, 1.18% `x`, 0.50% `h`); `resolve_ms` ≤ 0.54 ms | **≤1.2%** — dead end for load-heavy guests | S | Low | Yes | Patch |
 | **L9** | Threading / N guest threads | 4 compile workers are **85–90% idle** while the guest blocks on the compile mutex 24% of the time; the mutex, not CPU, is the serialising resource | bounded by L2; not independently measurable here | L | High | — | Architecture (peer-owned measurement) |
 
@@ -445,6 +445,12 @@ on it must first make the super path survive a real guest. That is a correctness
 in a diagnostic knob today, and it sits in `crates/wie-cpu/src/jit/lower/` (peer-owned
 this round).
 
+*Read this whole subsection as superseded twice, in the order it happened: the crash
+was fixed on 2026-11-24 (§4.5's update below), and the `=all` **value was then deleted
+from the code** in the same pass that recorded the noise measurement (§4.7).
+`WIE_JIT_SUPER` survives as an off-switch only, so no arm below can be run today — the
+numbers are kept because they are the reason the mode is gone.*
+
 > **Update, 2026-11-24 — fixed, and the L7 lever is now measurable.** The crash was
 > not in the lowering's super branch but in the eligibility proof that decides whether
 > to emit it (`crates/wie-cpu/src/jit/block.rs::analyze_block_stack_pin`). It rejected
@@ -466,8 +472,17 @@ this round).
 > check missed), four unit tests pin the rule, and with it the super path is
 > byte-exact: `a -mx1` and `a -mx9` produce identical archive MD5s with and without
 > `SUPER=all` over the calibrated corpus, and the whole micro-suite passes under
-> `WIE_JIT_SUPER=all`. L7 can be planned now — measure it with
-> `scripts/real-guest-perf.sh --arms def,super_all`.
+> `WIE_JIT_SUPER=all`. L7 can be planned now — the `super_all` arm of
+> `scripts/real-guest-perf.sh` was the harness for that, and it existed only while the
+> value did.
+>
+> **Then the mode itself was deleted.** The measurement in §4.7 showed it
+> buys nothing (1.008 / 0.971 / 0.992 / 1.061), and a byte-exact arm that cannot pay is
+> a trap rather than a tool, so `WIE_JIT_SUPER` is now an off-switch only: `0`/`off`/
+> `false` disables the self-loop super path, and every other value — including `all`,
+> `loop` and `1` — means the default. The `super_all` arm was removed from
+> `scripts/real-guest-perf.sh` in the same change; `--arms def,chain0,opt_speed` is the
+> default set. There is no longer any way to turn the block-wide mode on.
 
 ### 4.6 L6 — Chaining is already the best thing in the emulator
 
@@ -495,8 +510,9 @@ costed against, because L1 landed. Region formation (superblocks/traces) attacks
   percentages with "≈220 M entries per run", this harness measures 81.2M for the same
   7.62G instructions. Whichever is right, one of the two is a stale binary or a
   different workload, and the L7 ceiling moves with it.
-* `WIE_JIT_SUPER` today only turns *self-loops* into a super path (`SUPER=all` measured
-  below in §4.5's batch). Turning general straight-line runs into regions needs block
+* `WIE_JIT_SUPER` only ever turned *self-loops* into a super path — and it is now an
+  off-switch only (`=0` disables even that; the `=all` mode was deleted after measuring
+  noise, §4.7's table below). Turning general straight-line runs into regions needs block
   discovery across edges plus exact exit stubs for faults/SMC/protect — that is why it
   is an architecture change, and it is the one that also makes the code cache more
   effective (fewer, larger units to persist).
@@ -504,11 +520,15 @@ costed against, because L1 landed. Region formation (superblocks/traces) attacks
 > **Measured 2026-11-25 — `SUPER=all` is not a region lever, and the candidate win was
 > noise.** With the eligibility bug in §4.5 fixed, the earlier "0.86–0.90x on mx9"
 > reading (n=1, small corpus) needed confirmation on the calibrated full corpus and
-> proper reps before anyone flipped a default on it:
+> proper reps before anyone flipped a default on it. The arm existed only for this
+> measurement; it — and the mode — are gone, so reproduce it from a checkout taken
+> before the deletion:
 >
 > ```
 > ./scripts/real-guest-perf.sh --classes mx9,mx1,x,h --arms def,super_all --reps 3 \
 >     --max-load 6 --out /tmp/perf-A          # host load at rep start 3.07-4.10
+> # ^ as it was run. The `super_all` arm is gone (removed with the mode), so this
+> #   command fails today with `unknown arm: super_all` on a current checkout.
 > ```
 >
 > | class | `def` wall (median) | `all`/`def` ratio (median, min..max) | entries `def` → `all` |
@@ -520,7 +540,9 @@ costed against, because L1 landed. Region formation (superblocks/traces) attacks
 >
 > Every spread straddles 1.0, so the rule stated before the run — flip the default only
 > if *both* load-heavy classes improve ≥5% with no class regressing — is **not** met,
-> and the default stays `loop`. Archives are byte-identical either way (`a -mx1`
+> and the default stayed `loop`. (There is no `loop` value now: the whole three-way
+> enum went with the mode, and the surviving default is "on for self-loops, `0` turns
+> it off".) Archives are byte-identical either way (`a -mx1`
 > `e136e4ea…`, `a -mx9` `04c96f0f…`, same MD5 under both arms).
 >
 > The reason the ratio cannot move is in the mechanism, and it corrects this section:
@@ -534,13 +556,15 @@ costed against, because L1 landed. Region formation (superblocks/traces) attacks
 > untouched on the load-heavy class (and 4% *higher*, within noise).
 >
 > Consequence for planning: L7 must be attacked with real region discovery across
-> edges (block discovery + exit stubs), not by making `all` the default. The knob is
-> worth keeping as a byte-exactness arm (a different memory lowering for every
-> stack-pin-shaped block, identical archives, micro-suite green under it).
+> edges (block discovery + exit stubs), not by making `all` the default. The argument
+> for keeping the knob as a byte-exactness arm (a different memory lowering for every
+> stack-pin-shaped block, identical archives, micro-suite green under it) was weighed
+> and **lost**: a second memory path that cannot pay is a trap, so the value and the
+> arm are gone and only the off-switch is left.
 >
 > Regression side, same protocol: `long_loop` is 0.40 s under `all` vs 0.42 s at
 > defaults (median of 6 interleaved pairs, load 2.1; budget 0.55), and the whole
-> micro-suite passes under `all` — so the arm is safe, it just does not buy wall clock.
+> micro-suite passes under `all` — so the mode was safe, it just does not buy wall clock.
 
 ### 4.8 L8 — Host stops, resolution, handlers (≤1.2%)
 
@@ -586,9 +610,12 @@ lever; access to the module is. Cross-thread scaling measurement is a peer's lan
 | WinAPI name resolution (`resolve_winapi_id` linear scan, `is_winapi_library` list) | `resolve_ms = 0.54` on `x`, `0.00` elsewhere — it is not on the hot path at all. Making it a perfect hash changes nothing measurable. |
 | The existing lazy-compile knob (`WIE_JIT_TARGET_WORK`) | 0.996 median on `h` (4/5 pairs), 0.987 on `x` (2/3). It does not gate eager first-execution compiles, which is where `h`'s cost is. |
 | Chain-hop store elimination | Already measured in round 2: removing 27–75% of the hop's GPR stores gave paired medians 0.9955/1.0264 → reverted. The stores are free; the hop is not where the time is. |
+| Per-thread TLB warm-start (publish a running engine's TLB, copy it into every later engine) | **Sound and still slower: 0.87 / 0.95 / 0.98** paired on `-mx9` (`-mmt=2`/`-mmt=4`), with `cpu_user` **up in every pair** (88.7 → 104.1 s). A `TlbValue` carries its generation, so a stale copy is refused as a miss rather than used — the change is correct, it just loses: the snapshot is the *pump's* working set, and the worker evicts it with its own misses. Built, measured, reverted (§10.10). |
+| Generation-gated fast path for the SMC drain (`drain_pending_code_writes`) | **Worth 0.4%** — 2.59 ns saved per entry × 240 M polls ≈ 0.6 s on mx9; the pessimistic bracket (the ~7.5 ns/poll sampling figure, 1.43% inclusive) reaches 1.4–1.5%, and nothing above it. The poll takes a mutex that is never contended and finds a page **27 529 times in 239 852 130 polls (0.011%)**; `lock → take(empty) → drop` is 7.4–8.4 ns. Built behind a knob and A/B'd (89.43 → 86.85 ns/entry, median pair ratio 1.0701 on the entry-dominated guest), then **not landed**: a change to the invalidation protocol does not buy half a percent in a closing round. The 0.9% `__psynch_mutexwait` that first put it on the list is the **compile** lock — misattributed to the drain — §5 of [`dispatcher-entry-attribution.md`](dispatcher-entry-attribution.md). |
+| Per-block XMM masks (skip the 256 B bank snapshot for a pure-GPR block) | **Unsound, not merely unprofitable — rejected for correctness.** A chained successor may load any live `xmm` from `JitCtx`, and the successor is chosen at runtime, so this block's mask says nothing about what the rest of the native run will read. The `uses_sse`-gated variant shipped once and wrote `0x0000` pairs for notepad's CRLF `movd [rcx], xmm0`. The snapshot it would save is 8.2 ns/entry (1.4% of mx9); a *sound* mask needs the union over the dynamic chain, and the only sound alternative — frame-authoritative bank plus a coherency flag every non-JIT writer must clear — is a cross-module invariant whose failure mode is a silent wrong answer. §3 of [`dispatcher-entry-attribution.md`](dispatcher-entry-attribution.md). |
 | More compile workers | `WIE_JIT_WORKERS=1` was indistinguishable from the default on `mx1s` (1.146, 0.925 — median 1.03, opposite signs). |
 | Tuning `--max-api` / stop counts | Stops are bounded by handler time (≤1.2%) and `resolve_ms`; mx9 does 20 424 stops in 102.6 s. |
-| `WIE_JIT_HOTNESS_THRESHOLD` as a promotion-threshold knob | **The knob's value is ignored.** `select_hot_threshold` (`jit/pipeline.rs`) takes it as `fixed_hotness` and uses it only as an `== 0` switch for the forced-eager regime; every non-zero value produces the same `work_weighted_threshold(pure_insns, target_work)`. Only `WIE_JIT_TARGET_WORK` moves the threshold (and it measured 0.996 / 0.987 — §4.4). Round 3 found this while looking for a cheap way to express the lazy policy; it is a documentation defect in `docs/RUNBOOK.md`, not a lever. |
+| `WIE_JIT_HOTNESS_THRESHOLD` as a promotion-threshold knob | **The knob's value was never read** — `select_hot_threshold` (`jit/pipeline.rs`) used it only as an `== 0` switch for the forced-eager regime, so every non-zero value produced the same `work_weighted_threshold(pure_insns, target_work)`. Only `WIE_JIT_TARGET_WORK` moves the threshold (and it measured 0.996 / 0.987 — §4.4). Round 3 found this while looking for a cheap way to express the lazy policy. **The knob is now deleted, not just corrected in the docs**: the `== 0` switch became a plain `forced_eager: bool` parameter (`cfg!(test)` at the one call site), so there is no env var to set and the `docs/RUNBOOK.md` row is gone with it. |
 
 ---
 
@@ -676,13 +703,15 @@ has a provable mechanism, and its measured share is 32% of the heaviest real wor
   — see the update in §4.5. The root cause was the super-path *eligibility* proof, not
   the lowering: a block that assigns its own base register was accepted, so the
   entry-value guard proved the wrong address. `scripts/real-guest-perf.sh --arms
-  def,super_all` is the harness L7 needs.
+  def,super_all` was the harness L7 needs — and that arm, like the mode it selected,
+  has since been **deleted** (the default arm set is `def,chain0,opt_speed`).
 * ~~**The fixed super path is a candidate 0.86–0.90x win on mx9**~~ **Refuted
   2026-11-25.** With reps and the calibrated full corpus it is 1.008 (0.968..1.133) on
   mx9, 0.971 on mx1, 0.992 on `x`, 1.061 on `h`: noise, not a win, and the entry count
   it was supposed to attack does not move because the knob is a per-block memory path,
-  not region formation — §4.7 has the table and the mechanism. The default stays
-  `loop`; record the number, do not flip it.
+  not region formation — §4.7 has the table and the mechanism. Record the number,
+  do not flip it — and since the mode has been **deleted** the question is closed
+  anyway: `WIE_JIT_SUPER` is an off-switch only, so there is no default to flip.
 * **The gates were run with a peer's in-flight edits in the tree** (`jit/lower/*`,
   `jit/block.rs`). They are green as reported in §6, but a peer's next edit can change
   that; my own change this round was a Markdown file.
@@ -707,8 +736,9 @@ has a provable mechanism, and its measured share is 32% of the heaviest real wor
    from 32% to ≈5–6% of the guest thread once L1 landed
    ([`dispatcher-entry-attribution.md`](dispatcher-entry-attribution.md)), so a 10x
    entry cut is now **≈1.05x**, not ≈1.4x. Not `WIE_JIT_SUPER=all`: the segfault that
-   used to gate this is fixed (§4.5), but the knob is a per-block memory path rather than
-   region formation and measured 1.008 on mx9 (§4.7).
+   used to gate this is fixed (§4.5), but the mode is a per-block memory path rather than
+   region formation, it measured 1.008 on mx9 (§4.7), and it has since been **deleted** —
+   `WIE_JIT_SUPER` is an off-switch only, so L7 is not a knob flip at all.
 5. **A real-guest perf harness.** `./scripts/run-micro-suite.sh` and `--only perf` gate
    `long_loop`, a compute micro that tells us nothing about file I/O, compilation or
    allocation. Everything in this document came from ad-hoc scripts plus the
@@ -734,7 +764,7 @@ CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --re
 
 # the checked-in harness: corpus, interleaved arms, per-class ratios
 ./scripts/real-guest-perf.sh --make-corpus /tmp/wie-perf-corpus
-./scripts/real-guest-perf.sh                       # mx1s, mx9s, h x def/super_all/chain0/opt_speed
+./scripts/real-guest-perf.sh                       # mx1s, mx9s, h x def/chain0/opt_speed
 ./scripts/real-guest-perf.sh --classes mx9,mx1 --reps 2
 
 # one workload, one run, counters (no slice knob needed since 2026-11-24: the

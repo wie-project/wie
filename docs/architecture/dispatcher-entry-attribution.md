@@ -356,8 +356,9 @@ completed. Mutating `note_code_write` to drop its bump makes the first fail;
 moving the watermark update before the `mem::take` makes the third fail.
 
 The blunt version of the same question — *does this path matter at all?* — is
-answered by the `WIE_L2_SKIP_DRAIN` ablation used to build the counters. Skipping
-the drain on `chain_hops` does not make the run faster: it changes the program
+answered by the drain-skipping ablation used to build the counters (a temporary
+patch, deleted before shipping like `WIE_L2_ABLATE` above). Skipping the drain on
+`chain_hops` does not make the run faster: it changes the program
 (3 199 997 → 800 000 dispatcher entries, 19.6 M → 10.0 M instructions, 268 ms →
 2.8 s). A dropped invalidation is not a subtle slowdown, it is a different guest.
 

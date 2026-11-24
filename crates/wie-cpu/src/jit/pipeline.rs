@@ -602,9 +602,8 @@ impl JitCpu {
                     is_loop,
                     pure_insns,
                     JitConfig::get().pure_loop_hotness(),
-                    JitConfig::get().hotness_threshold(),
+                    cfg!(test),
                     JitConfig::get().target_work(),
-                    JitConfig::get().eager_block_insns(),
                 );
                 // Boot mode: first 5 M guest insns use threshold = 1 and bypass
                 // deferral doubling (inline token bucket handles thrash).
@@ -1497,39 +1496,36 @@ pub(super) fn ranges_overlap(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
 /// Select the visit threshold and eagerness for a decoded block.
 ///
 /// Fast-UCRT blocks always compile eagerly. Self-loops use the dedicated loop
-/// hotness. Otherwise promotion is **work-weighted**: a block of N
-/// instructions promotes after `clamp(target_work / N, FLOOR, CEILING)`
-/// visits — accumulated interpreted work exceeding predicted compile cost ×
-/// margin — so a 9-insn block keeps ≈100 visits (the historical flat
-/// behavior) while a 90-insn block needs only ~10. A `fixed_hotness` of `0`
-/// (forced under `cfg(test)`) means "compile everything eagerly on first
-/// sight" and bypasses the size model entirely. The eager-by-size rule
-/// (`pure_insns >= eager_block_insns`, default off) additionally forces a
-/// first-sight compile.
+/// hotness — a back-edge is the cheapest possible hotness signal, because one
+/// entry can run the block a million times (HotSpot draws the same distinction
+/// between an invocation counter and a back-edge counter). Otherwise promotion
+/// is **work-weighted**: a block of N instructions promotes after
+/// `clamp(target_work / N, FLOOR, CEILING)` visits — accumulated interpreted
+/// work exceeding predicted compile cost × margin — so a 9-insn block keeps
+/// ≈100 visits (the historical flat behavior) while a 90-insn block needs
+/// only ~10. `forced_eager` (true under `cfg(test)`) means "compile everything
+/// eagerly on first sight" and bypasses the size model entirely.
 ///
 /// Returns `(threshold, eager)`. `eager` is true when the block must compile
-/// on its first visit. `eager_block_insns == 0` disables the large-body rule.
+/// on its first visit.
 #[must_use]
 pub(super) fn select_hot_threshold(
     is_ucrt: bool,
     is_loop: bool,
     pure_insns: usize,
     loop_hotness: u32,
-    fixed_hotness: u32,
+    forced_eager: bool,
     target_work: u64,
-    eager_block_insns: usize,
 ) -> (u32, bool) {
     if is_ucrt {
         (2, true)
     } else if is_loop {
         (loop_hotness, loop_hotness == 0)
-    } else if fixed_hotness == 0 {
+    } else if forced_eager {
         // Unit-suite / forced-eager regime: byte-for-byte deterministic.
         (0, true)
     } else {
-        let thr = work_weighted_threshold(pure_insns, target_work);
-        let eager = eager_block_insns > 0 && pure_insns >= eager_block_insns;
-        (thr, eager)
+        (work_weighted_threshold(pure_insns, target_work), false)
     }
 }
 
@@ -1638,7 +1634,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     const TARGET: u64 = 900; // mirrored default; kept explicit so tests are self-contained
-    const CUTOFF: usize = 48;
 
     // --- Work-weighted promotion math ---
 
@@ -1646,7 +1641,7 @@ mod tests {
     #[test]
     fn nine_insn_block_keeps_historical_threshold() {
         assert_eq!(work_weighted_threshold(9, TARGET), 100);
-        let (thr, eager) = select_hot_threshold(false, false, 9, 8, 100, TARGET, 0);
+        let (thr, eager) = select_hot_threshold(false, false, 9, 8, false, TARGET);
         assert_eq!(thr, 100);
         assert!(!eager, "mid-size block stays visit-gated");
     }
@@ -1669,7 +1664,7 @@ mod tests {
     fn huge_block_clamps_at_floor() {
         assert_eq!(work_weighted_threshold(96, TARGET), 9);
         assert_eq!(work_weighted_threshold(usize::MAX, TARGET), 8);
-        let (thr, eager) = select_hot_threshold(false, false, 96, 8, 100, TARGET, 0);
+        let (thr, eager) = select_hot_threshold(false, false, 96, 8, false, TARGET);
         assert_eq!(thr, 9);
         assert!(!eager);
     }
@@ -1688,15 +1683,15 @@ mod tests {
     /// cutoff, or regime.
     #[test]
     fn ucrt_always_eager() {
-        assert!(select_hot_threshold(true, false, 1, 8, 100, TARGET, 0).1);
-        assert!(select_hot_threshold(true, false, 1, 8, 0, TARGET, 48).1);
+        assert!(select_hot_threshold(true, false, 1, 8, false, TARGET).1);
+        assert!(select_hot_threshold(true, false, 1, 8, true, TARGET).1);
     }
 
     /// Self-loops use the dedicated loop hotness, not the size model; with a
     /// nonzero loop hotness they are not eager.
     #[test]
     fn self_loop_uses_loop_hotness_not_body_rule() {
-        let (thr, eager) = select_hot_threshold(false, true, 10_000, 8, 100, TARGET, CUTOFF);
+        let (thr, eager) = select_hot_threshold(false, true, 10_000, 8, false, TARGET);
         assert_eq!(thr, 8);
         assert!(
             !eager,
@@ -1704,34 +1699,19 @@ mod tests {
         );
     }
 
-    /// A zero regime switch (unit-suite value) compiles everything eagerly,
+    /// The forced-eager regime (unit-suite value) compiles everything eagerly,
     /// independent of body size — this is the byte-for-byte deterministic
     /// path the unit suite relies on.
     #[test]
-    fn zero_fixed_hotness_is_eager_regardless_of_size() {
+    fn forced_eager_regardless_of_size() {
         assert_eq!(
-            select_hot_threshold(false, false, 4, 8, 0, TARGET, 0),
+            select_hot_threshold(false, false, 4, 8, true, TARGET),
             (0, true)
         );
         assert_eq!(
-            select_hot_threshold(false, false, 10_000, 8, 0, TARGET, 48),
+            select_hot_threshold(false, false, 10_000, 8, true, TARGET),
             (0, true)
         );
-    }
-
-    /// The eager-by-size rule is off by default (`eager_block_insns == 0`)
-    /// but still works when re-enabled via env: a large Pure body compiles
-    /// eagerly with its work-weighted threshold as cooldown base.
-    #[test]
-    fn eager_by_size_rule_disabled_then_reenableable() {
-        // Default: disabled — large bodies are visit-gated.
-        let (thr, eager) = select_hot_threshold(false, false, 96, 8, 100, TARGET, 0);
-        assert!(!eager);
-        assert_eq!(thr, 9);
-        // Re-enabled: same body goes eager on first sight.
-        let (thr, eager) = select_hot_threshold(false, false, 96, 8, 100, TARGET, 48);
-        assert!(eager, "large pure body must compile eagerly when enabled");
-        assert_eq!(thr, work_weighted_threshold(96, TARGET));
     }
 
     // --- Cooldown hysteresis math ---

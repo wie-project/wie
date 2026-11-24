@@ -42,7 +42,7 @@ pub(super) fn simd_dual(
         iced.step_once().expect("iced step");
     }
 
-    // --- JIT (eager compile: hotness is 0 under cfg(test)) ---
+    // --- JIT (eager compile: blocks are forced eager under cfg(test)) ---
     let mut cpu = JitCpu::open_x86_64();
     map_code_region(&mut cpu, SIMD_BASE, 0x2000);
     cpu.mem_write(SIMD_BASE, &full).expect("jit code");

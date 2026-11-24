@@ -179,7 +179,7 @@ per-class ratios from the median of per-rep pairs:
 
 ```bash
 ./scripts/real-guest-perf.sh --make-corpus /tmp/wie-perf-corpus
-./scripts/real-guest-perf.sh                    # mx1s, mx9s, h × def/super_all/chain0/opt_speed
+./scripts/real-guest-perf.sh                    # mx1s, mx9s, h × def/chain0/opt_speed
 ./scripts/real-guest-perf.sh --classes mx9 --reps 2     # ~1 min per run, opt-in
 ```
 
@@ -203,7 +203,7 @@ merely *mentions* a dead knob does not keep its row alive.
 
 > **Wave3 defaults (final gate):** padded surface pool + wgpu scratch, latest-wins coalescing/throttling (`drain_pending_publishes` + `retry_delay`), pre-reserve (Q4/C) and size-class TLS are **default on** — steady zero-alloc with no env required. CompactString and the D3D9 in-place pooled target are likewise unconditional now: neither ever shipped an env gate, so `WIE_COMPACT_STRING` / `WIE_D3D9_INPLACE` never existed as knobs and are not listed below. The JIT direct register hand-off (Q8/C) is **still unbuilt** despite the "default on" wording in ADR-0002 (implementation status note added 2026-09-02 — zero call sites; see `docs/implementation-plan.md` Wave 3), so there is no knob for it and none is listed below. 64 px pitch padding is implemented (ADR-0001 status note, 2026-09-02) — `WIE_SURFACE_PAD=0` opts out.
 >
-> **Removed knobs — do not go looking for these.** Four names appear in older
+> **Removed knobs — do not go looking for these.** Seven names appear in older
 > notes and older checkouts but no code reads them any more. Each is listed here
 > rather than as a table row, because a row would read as a working switch:
 >
@@ -211,6 +211,9 @@ merely *mentions* a dead knob does not keep its row alive.
 > - `WIE_JIT_TAILCHAIN` — removed 2026-09-25; Cranelift 0.133 rejects tail-call hops under every ABI convention these blocks use, so the shipped chain hop is the nested-call + `MAX_CHAIN_DEPTH` guard shape (ADR-0002 status note, `bcf3880`).
 > - `WIE_JIT_VERIFY` — never implemented; use `WIE_JIT_VERIFIER` above.
 > - `WIE_HOST_SLEEP` — **deprecated and no longer parsed**; `Sleep(n>0)` parking is controlled entirely by `WIE_IDLE=park` (see `crates/wie-winapi/src/idle.rs`).
+> - `WIE_JIT_HOTNESS_THRESHOLD` — **deleted**; its value was never read. `select_hot_threshold` used it only as an `== 0` switch, and that regime is now a `forced_eager` boolean in the signature (`cfg!(test)`). Promotion is always work-weighted: use `WIE_JIT_TARGET_WORK`.
+> - `WIE_JIT_EAGER_BLOCK_INSNS` — **deleted** with the eager-by-size rule and its unit test. It defaulted to 0 (off) because the arithmetic never worked: a one-shot 96-insn block costs ~9 µs interpreted against ~1 ms compiled, so paying to compile it is a ~100× loss when it never revisits.
+> - `WIE_IDLE_PARK_MS` — **removed 2026-11**: no code reads it any more. Its last consumer (`apply_message_park`) went with the idle rework in `8da12a5`, leaving the accessor with zero callers; persistent/GUI idle parks are event-driven, so there was no quantum left to configure.
 
 | Variable | Effect |
 | --- | --- |
@@ -219,7 +222,7 @@ merely *mentions* a dead knob does not keep its row alive.
 | `WIE_JIT_MEM=sticky` \| `pin` \| `slow` | JIT mem lower (default **pin** = sticky + stack pin + top-2 data pins; `sticky` = stack pin only; `slow` = helper-only oracle) |
 | `WIE_JIT_MEM_TRACE=1` | Dump helper mem-path histogram on finalize |
 | `WIE_JIT_OPCODE_HISTO=1` | Sample an opcode histogram over the iced residue (top 60 mnemonics), appended to the `WIE_RUNTIME_PROFILE` report. Set it together with `WIE_RUNTIME_PROFILE` and SIGINT a long-running target to see which instructions keep escaping the JIT. Capture long-running targets only — micro-exes exit in milliseconds and the SIGINT path never arms |
-| `WIE_JIT_SUPER=loop` \| `0` \| `all` | Block-wide stack super path: default **loop** (self-loops only). `all`/`1` extends it to every block whose memory operands are **all** `base+disp` on one RSP/RBP base — the entry guard then proves the whole range once and each access is a bare host load/store. A block that *assigns* that base is refused (assigning it makes it a data pointer, not a stack base), and so is any block with an index register, a non-stack memory operand, a string op or a fast call. Safe as a measurement arm since the in-guest accelerator helpers (`7za h`) were fixed: a block that built `rbp` from a table and then dereferenced it used to reach the super path and segfault. Compare arms with `scripts/real-guest-perf.sh --arms def,super_all`. Measured 2026-11-25 on the calibrated corpus (3 interleaved pairs, load 3.1–4.1): mx9 **1.008** (0.968..1.133), mx1 **0.971** (0.938..1.053), `x` **0.992**, `h` **1.061** — noise, so the default stays `loop`. The knob is a per-block memory path, not region formation: it cannot change how often a block is *entered*, only what an access inside it costs |
+| `WIE_JIT_SUPER=0` | **Ablation switch** for the block-wide stack super path, which is on for **self-loops only**. The path proves the whole stack range once on entry and turns each access into a bare host load/store; a block that *assigns* the base is refused (assigning it makes it a data pointer, not a stack base), as is any block with an index register, a non-stack memory operand, a string op or a fast call. There is no `=all`: it measured 1.008 / 0.971 / 0.992 / 1.061 across mx9 / mx1 / `x` / `h` (interleaved pairs, 2026-11-25) — noise — because it emits two paths *inside* one block and so cannot change how often a block is entered, which is the only thing a memory path could win on. It is deleted, not merely defaulted off, because it also used to segfault on `7za h`. Nothing validates the value, so a stale `=all` in an old script is accepted and ignored — it silently measures the self-loop default |
 | `WIE_JIT_CHAIN=0` | Disable FuncRef chaining / chain table / edge IC |
 | `WIE_STRING_BULK=0` | Disable host-span bulk REP MOVS/STOS |
 | `WIE_STRING_INLINE=0` | Disable inline 16–64 B REP Neon path |
@@ -228,12 +231,10 @@ merely *mentions* a dead knob does not keep its row alive.
 | `WIE_JIT_OPT=none\|speed_and_size\|speed` | Cranelift opt_level (default **none**). Cheap compile by default: 7-Zip is ~1.5x faster cold / ~1.7x warm; a pure-compute loop no longer pays for it, because `WIE_JIT_TIER` compiles self-loop blocks at `speed` per block (measured: `long_loop` 0.240/0.249 s with tier-up vs 0.323/0.335 s without). Set `speed` to force every block. Also part of the persistent cache key, so the two never share a ledger. |
 | `WIE_JIT_TIER=0` | **Bisect switch for per-block tier-up** (default **on**). `0`/`false`/`off`/`no` builds one Cranelift module at the base `opt_level` and compiles every block there — the pre-2026-09-27 behaviour, verified against a pre-change binary (identical profile counters, wall inside noise). Use it to attribute any regression to tier-up. Note: with it off, the four `jit::tests::tier_tests` cases fail by design. |
 | `WIE_JIT_TIER_BUDGET` | Cap on tier-up **decisions** per run (default **8**, clamped to 65,536; `0` = tier nothing). Charged at decision time, before the compile. Sized from measurement: a compute-bound guest needs 1 (`long_loop`) and repays 1.35x, while 7-Zip Extra has 18 self-loops and repays none (measured +19 ms `emu_ms` warm for 8 speculative tier compiles). Lower it to keep speculative `speed` compiles off a tool's start-up; raise it for multi-kernel compute guests. The `jit_tier: tier_compiles=… tier_rejects=… budget_left=…` line in `WIE_RUNTIME_PROFILE` reports the outcome. |
-| `WIE_JIT_HOTNESS_THRESHOLD` | **Experimental** fixed hotness threshold override (default **100**; clamped to `[1, 1_000_000]`) |
 | `WIE_JIT_LOOP_HOTNESS` | Visits before a **known pure self-loop** compiles (default **8**; `0` in tests). One Cranelift pass beats paying the iced warmup, so loops tier sooner than general blocks; lowering it further thrashes short non-loop blocks on 7-Zip and costs wall clock |
-| `WIE_JIT_TARGET_WORK` | Work-weighted promotion target (default **900**, clamped; keeps a 9-insn block at ≈100 visits). The hotness accounting knob to reach for when a guest's block mix defeats the fixed `WIE_JIT_HOTNESS_THRESHOLD` |
-| `WIE_JIT_BG=0` | Disable the background compile worker (default **on** for real runs, **off** under `cfg(test)` where hotness is 0 and every block is eager anyway). With it off, compilation happens inline on the guest thread |
+| `WIE_JIT_TARGET_WORK` | Work-weighted promotion target (default **900**, clamped; keeps a 9-insn block at ≈100 visits). The only hotness accounting knob: promotion is always work-weighted, so a block of N instructions waits `clamp(target_work / N, 8, 10_000)` visits. That `1/N` shape is only correct if compile cost is flat in block size, which measurement says it is not — see `docs/architecture/compile-selection-policy.md`, which also records why the corrected shape is not shipped yet |
+| `WIE_JIT_BG=0` | Disable the background compile worker (default **on** for real runs, **off** under `cfg(test)`, where every block is forced eager anyway and the inline path keeps the unit suite deterministic). With it off, compilation happens inline on the guest thread |
 | `WIE_JIT_BG_TIMEOUT_US` | Max guest-wait for a background compile before falling back to inline (default **1000**). A single compile is ~50–500 µs, so this is ~20× headroom; the fallback only fires on queue backlog or a dead worker |
-| `WIE_JIT_EAGER_BLOCK_INSNS` | Eager-compile cutoff for large one-shot `Pure` blocks (default **0**, disabled). The original size rule lost its arithmetic — a one-shot 96-insn block costs ~9 µs interpreted vs ~1 ms compiled, a ~100× loss when the block never revisits. Set `>0` to re-enable it for diagnosis |
 | `WIE_JIT_SSA_FLAGS=0` | Disable the extra Cranelift SSA construction flags. Off-by-default tuning surface; `0`/`false`/`off` disables |
 | `WIE_EXEC_TRACE=1` | Iced-residue diagnostics: per-mnemonic interpreter counters, a first-sight log of every mnemonic kept out of the JIT, and the mem-path histogram. Works in **release** too — 7-Zip residual discovery should not require a debug build. Run `WIE_EXEC_TRACE=1 <exe>` to see what stays in the interpreter, and cross-check `insn_coverage` against the counters |
 | `WIE_DEGRADE=0` | Restore the hard stop on an unimplemented mnemonic (degrade-not-die is default **on**). `0`/`false`/`off` makes an unknown opcode fail loudly instead of executing partially — use it to bisect "guest misbehaves" down to "guest hit an opcode we do not implement" |
@@ -257,7 +258,6 @@ merely *mentions* a dead knob does not keep its row alive.
 | `WIE_GUEST_IO=0` \| `all` | I/O accelerator: default seeks/size in-guest; `all` also guest Read |
 | `WIE_GUEST_MBWC=1` | Guest MultiByte↔WideChar helpers |
 | `WIE_IDLE=busy\|yield\|park` | Host idle policy: micros default **yield**; interactive default **park** |
-| `WIE_IDLE_PARK_MS` | Message-park quantum (sleep-poll paths only; persistent/GUI idle parks are event-driven) |
 | `WIE_IDLE_CAP_MS` | Hard cap on a **single** `Sleep` park in ms (default **60000**, min 1). Bounds how long one guest `Sleep(huge)` can wedge a parked host thread |
 | `WIE_API_TRACE=1` | Full API dump (head+tail only by default) |
 | `WIE_INPUT_SCRIPT=<path>` | GUI input script path |

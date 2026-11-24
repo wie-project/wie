@@ -55,27 +55,27 @@ pub(super) enum JitMemMode {
     Pin,
 }
 
-/// Block-wide stack super path (`WIE_JIT_SUPER`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SuperMode {
-    Off,
-    LoopOnly,
-    All,
-}
-
 /// Consolidated JIT configuration, initialized once from the environment.
 ///
 /// The flat bool surface mirrors the one-knob-per-env-var contract (`WIE_JIT_*`);
 /// folding the toggles into enums would obscure that mapping for no benefit.
 pub(super) struct JitConfig {
-    hotness_threshold: u32,
     pure_loop_hotness: u32,
-    eager_block_insns: usize,
     target_work: u64,
     opcode_hist_enabled: bool,
     jit_mem_mode: JitMemMode,
     mem_path_trace: bool,
-    super_mode: SuperMode,
+    /// `WIE_JIT_SUPER=0` — ablation switch for the stack super path.
+    ///
+    /// The super path is on for self-loop blocks; that is the only shape it
+    /// helps, because it emits *two* paths inside one block (bare host memory
+    /// vs the sticky/pin probes) and so cannot reduce entry counts, which is
+    /// the only thing a memory path could win on. The former `=all` extended
+    /// it to every stack-pin-shaped block and measured 1.008 / 0.971 / 0.992 /
+    /// 1.061 across the four harness classes (mx9 / mx1 / `x` / `h`) — noise —
+    /// and it used to segfault on `7za h` (see `jit/block.rs`); the value was
+    /// removed rather than kept as a trap.
+    super_disabled: bool,
     chain_enabled: bool,
     ssa_flags_enabled: bool,
     bg_enabled: bool,
@@ -137,18 +137,9 @@ impl JitConfig {
 
     fn from_env() -> Self {
         Self {
-            // Compile after this many visits to the same guest entry (skip
-            // cold code). Default 100: lower values cut residual iced but thrash
-            // short non-loop blocks on 7za and increase wall. Tests use 0.
-            hotness_threshold: hotness_threshold_from_env(),
             // Known pure self-loops: compile sooner (one Cranelift pass vs iced
             // warmup). Default 8; tests 0.
             pure_loop_hotness: env_u32("WIE_JIT_LOOP_HOTNESS", 8, true),
-            // Large one-shot Pure blocks skip the fixed hotness wait (see
-            // `eager_block_insns_from_env`). Default 0 (disabled — the size
-            // rule lost its arithmetic justification, see perf-plan §4);
-            // `>0` re-enables for diagnosis.
-            eager_block_insns: eager_block_insns_from_env(),
             // Work-weighted promotion target (`WIE_JIT_TARGET_WORK`).
             target_work: target_work_from_env(),
             // Sampled opcode histogram over the iced residue
@@ -184,26 +175,28 @@ impl JitConfig {
                 std::env::var("WIE_EXEC_TRACE"),
                 Ok(v) if v == "1" || v.eq_ignore_ascii_case("true")
             ),
-            // - unset / `loop` — default: only self-loop blocks (`long_loop`-style)
-            // - `0` / `off` / `false` — disabled (sticky/pin probes only)
-            // - `all` / `1` / `true` — all stack-pin-shaped blocks (experimental)
-            super_mode: match std::env::var("WIE_JIT_SUPER") {
-                Ok(v)
-                    if v == "0"
+            // Off-switch only: the super path is on for self-loop blocks.
+            // `=all` was removed — see the `super_disabled` field.
+            super_disabled: match std::env::var("WIE_JIT_SUPER") {
+                Ok(v) => {
+                    let off = v == "0"
                         || v.eq_ignore_ascii_case("off")
-                        || v.eq_ignore_ascii_case("false") =>
-                {
-                    SuperMode::Off
+                        || v.eq_ignore_ascii_case("false");
+                    if !off {
+                        // Any other value — including the deleted `all`/`1`/`loop`
+                        // — silently means the default. Say so, because an old
+                        // measurement arm or CI job setting `=all` would
+                        // otherwise look like it ran the super path when it ran
+                        // the ordinary one.
+                        tracing::warn!(
+                            value = %v,
+                            "WIE_JIT_SUPER is an off-switch only (0/off/false); \
+                             this value selects the default self-loop-only super path"
+                        );
+                    }
+                    off
                 }
-                Ok(v)
-                    if v == "1"
-                        || v.eq_ignore_ascii_case("true")
-                        || v.eq_ignore_ascii_case("on")
-                        || v.eq_ignore_ascii_case("all") =>
-                {
-                    SuperMode::All
-                }
-                _ => SuperMode::LoopOnly,
+                Err(_) => false,
             },
             // Late-bound + direct block chaining (`WIE_JIT_CHAIN=0` disables).
             chain_enabled: !matches!(
@@ -215,8 +208,10 @@ impl JitConfig {
                 Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             ),
             // Background compiler worker. Default: on for real runs, off under
-            // `cfg(test)` (hotness is 0 there, so every block is eager; the
-            // deterministic inline-compile path keeps the unit suite stable).
+            // `cfg(test)` (every block is forced eager there — see the
+            // `forced_eager` argument in `pipeline::select_hot_threshold` — so
+            // the deterministic inline-compile path keeps the unit suite
+            // stable).
             // Dedicated worker tests force it on per-`JitShared` via
             // [`JitShared::bg_force`].
             bg_enabled: match std::env::var("WIE_JIT_BG") {
@@ -346,7 +341,7 @@ impl JitConfig {
         // Lowering-shape knobs. Order is fixed; each contributes a distinct bit
         // so no two knob combinations collide by construction.
         h = mix(h, self.jit_mem_mode as u64);
-        h = mix(h, self.super_mode as u64);
+        h = mix(h, u64::from(self.super_disabled));
         h = mix(h, u64::from(self.chain_enabled));
         h = mix(h, u64::from(self.ssa_flags_enabled));
         h = mix(h, u64::from(self.simd_enabled));
@@ -360,31 +355,11 @@ impl JitConfig {
         h
     }
 
-    /// Hotness regime switch. Nonzero selects work-weighted promotion (the
-    /// numeric value is no longer the visit count itself); `0` — forced under
-    /// `cfg(test)` — means "compile everything eagerly on first sight" so the
-    /// unit suite stays byte-for-byte deterministic.
-    #[must_use]
-    pub(super) fn hotness_threshold(&self) -> u32 {
-        self.hotness_threshold
-    }
-
     /// Known pure self-loops: compile sooner (one Cranelift pass vs iced
     /// warmup). Default 8; tests 0.
     #[must_use]
     pub(super) fn pure_loop_hotness(&self) -> u32 {
         self.pure_loop_hotness
-    }
-
-    /// One-shot eager-compile cutoff. Pure, non-loop, non-UCRT blocks with at
-    /// least this many guest instructions (lowerable body length) compile on
-    /// first sight instead of waiting out the visit threshold. Default 0
-    /// (disabled): a one-shot large block costs far more compiled than
-    /// interpreted whenever it does not revisit, so eager-by-size is a loss —
-    /// set `WIE_JIT_EAGER_BLOCK_INSNS` to re-enable for diagnosis.
-    #[must_use]
-    pub(super) fn eager_block_insns(&self) -> usize {
-        self.eager_block_insns
     }
 
     /// Work-weighted promotion target: a block of N instructions promotes
@@ -419,15 +394,11 @@ impl JitConfig {
         self.mem_path_trace
     }
 
-    /// Whether stack-super IR is allowed for this block (`self_loop` blocks
-    /// always are; `all` extends it to every stack-pin-shaped block).
+    /// Whether stack-super IR is allowed for this block: self-loops only, and
+    /// not under `WIE_JIT_SUPER=0`.
     #[must_use]
     pub(crate) fn super_enabled(&self, self_loop: bool) -> bool {
-        match self.super_mode {
-            SuperMode::Off => false,
-            SuperMode::LoopOnly => self_loop,
-            SuperMode::All => true,
-        }
+        self_loop && !self.super_disabled
     }
 
     /// Late-bound + direct block chaining (`WIE_JIT_CHAIN=0` disables).
@@ -442,8 +413,8 @@ impl JitConfig {
     }
 
     /// Background compiler worker. Default: on for real runs, off under
-    /// `cfg(test)` (hotness is 0 there, so every block is eager; the
-    /// deterministic inline-compile path keeps the unit suite stable).
+    /// `cfg(test)` (every block is forced eager there, so the deterministic
+    /// inline-compile path keeps the unit suite stable).
     #[must_use]
     pub(super) fn bg_enabled(&self) -> bool {
         self.bg_enabled
@@ -533,44 +504,6 @@ impl JitConfig {
     pub(crate) fn verifier_enabled(&self) -> bool {
         self.verifier_enabled
     }
-}
-
-/// Upper bound on the fixed hotness threshold (`WIE_JIT_HOTNESS_THRESHOLD`).
-///
-/// Clamping keeps an experimental override from deferring a genuinely hot block
-/// forever; the default (100) is far below this cap.
-const HOTNESS_THRESHOLD_MAX: u32 = 1_000_000;
-
-/// Parse the hotness regime switch from `WIE_JIT_HOTNESS_THRESHOLD`.
-///
-/// Nonzero (default 100) selects work-weighted promotion; the value itself no
-/// longer sets a visit count. `0` forces eager-everything. Under `cfg(test)`
-/// the switch is 0 so every block compiles eagerly on first sight
-/// (deterministic unit suite).
-fn hotness_threshold_from_env() -> u32 {
-    if cfg!(test) {
-        return 0;
-    }
-    let raw = std::env::var("WIE_JIT_HOTNESS_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(100);
-    raw.clamp(0, HOTNESS_THRESHOLD_MAX)
-}
-
-/// Eager-compile cutoff for large one-shot Pure blocks (`WIE_JIT_EAGER_BLOCK_INSNS`).
-///
-/// Default 0: disabled. The original rationale failed arithmetic — a one-shot
-/// 96-insn block costs ~9 µs interpreted vs ~1 ms compiled, so forcing a
-/// first-sight compile is a ~100× loss whenever the block does not revisit.
-/// A positive value re-enables the rule for diagnosis. The decision cost is a
-/// usize compare during decode; when the regime switch is already `0` (unit
-/// suite) the block compiles eagerly regardless.
-fn eager_block_insns_from_env() -> usize {
-    std::env::var("WIE_JIT_EAGER_BLOCK_INSNS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0)
 }
 
 /// Parse the work-weighted promotion target from `WIE_JIT_TARGET_WORK`.

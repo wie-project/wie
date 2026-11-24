@@ -127,7 +127,7 @@ fn straight_line_block_is_charged_its_static_length() {
     cpu.mem_write(base, &code).expect("write block");
     cpu.write_rip(base).expect("rip");
 
-    // One native frame: `cfg(test)` hotness is 0, so the block compiles on its
+    // One native frame: blocks are forced eager under `cfg(test)`, so it compiles on its
     // first visit and all three instructions retire together.
     let (result, retired) = cpu.step_one().expect("step");
     assert!(
@@ -152,7 +152,7 @@ fn straight_line_block_is_charged_its_static_length() {
 /// The sharp form of the same contract: a self-loop with a **known** trip
 /// count must be charged `trips * insn_count`, exactly.
 ///
-/// `cfg(test)` hotness is 0, so the block compiles on its first visit and the
+/// Blocks are forced eager under `cfg(test)`, so this compiles on its first visit and the
 /// whole loop runs inside one native frame — the count is therefore a precise
 /// equality, not a bound. This is what pins "one charge per trip" rather than
 /// "one charge per block entry" (which would report 2) or "one charge per

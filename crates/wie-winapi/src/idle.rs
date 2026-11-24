@@ -79,12 +79,6 @@ pub fn idle_sleep_cap_ms() -> u64 {
     parse_u64_env("WIE_IDLE_CAP_MS").unwrap_or(60_000).max(1)
 }
 
-/// Quantum for one empty-message park (ms). Default 25.
-#[must_use]
-pub fn idle_message_park_ms() -> u64 {
-    parse_u64_env("WIE_IDLE_PARK_MS").unwrap_or(25).max(1)
-}
-
 /// Duration for `Sleep(requested_ms)` under park policy (after cap).
 #[must_use]
 pub fn sleep_park_duration(requested_ms: u64) -> Duration {
