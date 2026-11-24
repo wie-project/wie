@@ -453,6 +453,31 @@ fn read_guest_rect(
     )))
 }
 
+/// Encode one scanline of host texels into `dst` as `0xAARRGGBB` little-endian
+/// bytes. Texels past the end of `pixels` encode as 0, so a lock block the
+/// record does not fully cover still reads as transparent black.
+///
+/// `dst` is whole texels (`len % 4 == 0`); every byte is written, which is what
+/// lets the callers reuse one staging buffer across scanlines.
+fn encode_scanline(pixels: &[u32], start: usize, dst: &mut [u8]) {
+    for (col, chunk) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let texel = pixels.get(start.saturating_add(col)).copied().unwrap_or(0);
+        chunk.copy_from_slice(&texel.to_le_bytes());
+    }
+}
+
+/// Decode one scanline of `0xAARRGGBB` little-endian guest bytes into host
+/// texels, starting at `start`. Stops at the end of `pixels`, so a clipped row
+/// never writes past the level's texels.
+fn decode_scanline(pixels: &mut [u32], start: usize, bytes: &[u8]) {
+    for (col, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+        let Some(slot) = pixels.get_mut(start.saturating_add(col)) else {
+            break;
+        };
+        *slot = u32::from_le_bytes(*chunk);
+    }
+}
+
 /// Shared LockRect body: allocate a guest block, point `pLockedRect` at it
 /// (or at the rect's top-left), and remember the region for the copy-back.
 ///
@@ -606,31 +631,60 @@ fn lock_rect_render_target(
         u32::try_from(r.2.saturating_sub(r.0)).unwrap_or(0)
     }))
     .unwrap_or(0);
-    for row in 0..height {
-        let src_row = top.saturating_add(i32::try_from(row).unwrap_or(0));
-        if src_row < 0 || src_row >= i32::try_from(height).unwrap_or(0) {
-            continue;
+    // One `pixels` borrow for the whole read-back (the per-row map lookup is
+    // gone) and, on the row path below, one staging buffer instead of a fresh
+    // `vec!` per scanline: O(height) allocations became O(1) — 768 × 4 KB per
+    // 1024×768 lock before this.
+    let pixels: &[u32] = state
+        .d3d9()
+        .d3d9_render_targets
+        .get(&rt_va)
+        .map_or(&[], |record| record.pixels.as_slice());
+    let width_us = usize::try_from(width).unwrap_or(0);
+    let left_us = usize::try_from(left).unwrap_or(0);
+    let row_len = row_width.saturating_mul(4);
+    // Fast path: a full-width rect from row 0 spans contiguous texels AND
+    // contiguous guest bytes, so `host_slice_mut` borrows the whole block and
+    // the rect lands in one pass — no staging copy, no `mem_write` per row. A
+    // span crossing arenas (or executable/denied) yields `None` and falls
+    // through to the per-row path below.
+    let span = usize::try_from(total).unwrap_or(0);
+    let mut copied = false;
+    if row_width == width_us
+        && left == 0
+        && top == 0
+        && span != 0
+        && let Some(whole) = engine.host_slice_mut(block, span)
+    {
+        let pitch_us = usize::try_from(pitch).unwrap_or(0);
+        for row in 0..height {
+            let row_us = usize::try_from(row).unwrap_or(0);
+            let offset = row_us.saturating_mul(pitch_us);
+            let Some(scanline) = whole.get_mut(offset..offset.saturating_add(row_len)) else {
+                break;
+            };
+            encode_scanline(pixels, row_us.saturating_mul(width_us), scanline);
         }
-        let mut row_bytes = vec![0_u8; row_width.saturating_mul(4)];
-        if let Some(record) = state.d3d9().d3d9_render_targets.get(&rt_va) {
+        copied = true;
+    }
+    if !copied {
+        let mut row_bytes = vec![0_u8; row_len];
+        for row in 0..height {
+            let src_row = top.saturating_add(i32::try_from(row).unwrap_or(0));
+            if src_row < 0 || src_row >= i32::try_from(height).unwrap_or(0) {
+                continue;
+            }
             let row_start = usize::try_from(src_row)
                 .unwrap_or(0)
-                .saturating_mul(usize::try_from(width).unwrap_or(0))
-                .saturating_add(usize::try_from(left).unwrap_or(0));
-            for (col, chunk) in row_bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                let texel = record
-                    .pixels
-                    .get(row_start.saturating_add(col))
-                    .copied()
-                    .unwrap_or(0);
-                chunk.copy_from_slice(&texel.to_le_bytes());
+                .saturating_mul(width_us)
+                .saturating_add(left_us);
+            encode_scanline(pixels, row_start, &mut row_bytes);
+            let dst = block.saturating_add(
+                u64::try_from(i64::from(row).saturating_mul(i64::from(pitch))).unwrap_or(0),
+            );
+            if engine.mem_write(dst, &row_bytes).is_err() {
+                break;
             }
-        }
-        let dst = block.saturating_add(
-            u64::try_from(i64::from(row).saturating_mul(i64::from(pitch))).unwrap_or(0),
-        );
-        if engine.mem_write(dst, &row_bytes).is_err() {
-            break;
         }
     }
     let offset = u64::try_from(i64::from(top).saturating_mul(i64::from(pitch)))
@@ -691,34 +745,62 @@ fn unlock_rect_render_target(
     );
     if left < right && top < bottom {
         let row_width = usize::try_from(right.saturating_sub(left)).unwrap_or(0);
-        let mut row_bytes = vec![0_u8; row_width.saturating_mul(4)];
-        for row in top..bottom {
-            let src = locked_va
-                .saturating_add(
-                    u64::try_from(i64::from(row).saturating_mul(i64::try_from(pitch).unwrap_or(0)))
-                        .unwrap_or(0),
-                )
-                .saturating_add(u64::try_from(i64::from(left).saturating_mul(4)).unwrap_or(0));
-            if engine.mem_read(src, &mut row_bytes).is_err() {
-                continue;
-            }
-            let mut texels: Vec<u32> = Vec::with_capacity(row_width);
-            for chunk in row_bytes.as_chunks::<4>().0 {
-                texels.push(u32::from_le_bytes(*chunk));
-            }
-            let row_start = usize::try_from(row)
-                .unwrap_or(0)
-                .saturating_mul(usize::try_from(width).unwrap_or(0));
+        let left_us = usize::try_from(left).unwrap_or(0);
+        let width_us = usize::try_from(width).unwrap_or(0);
+        let pitch_us = usize::try_from(pitch).unwrap_or(0);
+        let row_len = row_width.saturating_mul(4);
+        // One scanline of guest bytes lands in the RT's texels at `row`. The
+        // decode is inline: the per-scanline `Vec<u32>` this replaces was one
+        // allocation per row (768 of them for a 1024×768 lock).
+        let write_row = |state: &mut WinApiState, row: i32, bytes: &[u8]| {
+            let row_start = usize::try_from(row).unwrap_or(0).saturating_mul(width_us);
             if let Some(record) = state.d3d9().d3d9_render_targets.get_mut(&rt_va) {
                 let pixels = std::sync::Arc::make_mut(&mut record.pixels);
-                for (col, texel) in texels.into_iter().enumerate() {
-                    let index = row_start
-                        .saturating_add(usize::try_from(left).unwrap_or(0))
-                        .saturating_add(col);
-                    if let Some(slot) = pixels.get_mut(index) {
-                        *slot = texel;
-                    }
+                decode_scanline(pixels, row_start.saturating_add(left_us), bytes);
+            }
+        };
+        // Fast path: for a full-width rect `pitch == row_len`, so the rect's
+        // rows are contiguous in the locked block and one `host_slice` borrow
+        // covers all of them — no per-scanline `mem_read`, no staging buffer.
+        // A span crossing arenas yields `None` and falls through to the rows.
+        let mut copied = false;
+        if row_width == width_us && left == 0 {
+            let rows = usize::try_from(bottom.saturating_sub(top)).unwrap_or(0);
+            let span = rows.saturating_mul(pitch_us);
+            let top_va = locked_va.saturating_add(
+                u64::try_from(usize::try_from(top).unwrap_or(0).saturating_mul(pitch_us))
+                    .unwrap_or(0),
+            );
+            if span != 0
+                && let Some(src) = engine.host_slice(top_va, span)
+            {
+                for row in top..bottom {
+                    let offset = usize::try_from(row.saturating_sub(top))
+                        .unwrap_or(0)
+                        .saturating_mul(pitch_us);
+                    let Some(scanline) = src.get(offset..offset.saturating_add(row_len)) else {
+                        break;
+                    };
+                    write_row(state, row, scanline);
                 }
+                copied = true;
+            }
+        }
+        if !copied {
+            let mut row_bytes = vec![0_u8; row_len];
+            for row in top..bottom {
+                let src = locked_va
+                    .saturating_add(
+                        u64::try_from(
+                            i64::from(row).saturating_mul(i64::try_from(pitch).unwrap_or(0)),
+                        )
+                        .unwrap_or(0),
+                    )
+                    .saturating_add(u64::try_from(i64::from(left).saturating_mul(4)).unwrap_or(0));
+                if engine.mem_read(src, &mut row_bytes).is_err() {
+                    continue;
+                }
+                write_row(state, row, &row_bytes);
             }
         }
     }
@@ -876,42 +958,71 @@ fn unlock_rect_common(
     );
     if left < right && top < bottom {
         let row_width = usize::try_from(right.saturating_sub(left)).unwrap_or(0);
-        let mut row_bytes = vec![0_u8; row_width.saturating_mul(4)];
-        for row in top..bottom {
-            let src = locked_va
-                .saturating_add(
-                    u64::try_from(i64::from(row).saturating_mul(i64::try_from(pitch).unwrap_or(0)))
-                        .unwrap_or(0),
-                )
-                .saturating_add(u64::try_from(i64::from(left).saturating_mul(4)).unwrap_or(0));
-            if engine.mem_read(src, &mut row_bytes).is_err() {
-                continue;
-            }
-            // Copy the row into the level's host texels (D3DCOLOR byte order).
-            let mut texels: Vec<u32> = Vec::with_capacity(row_width);
-            for chunk in row_bytes.as_chunks::<4>().0 {
-                texels.push(u32::from_le_bytes(*chunk));
-            }
-            let row_start = usize::try_from(row)
+        let left_us = usize::try_from(left).unwrap_or(0);
+        let width_us = usize::try_from(width).unwrap_or(0);
+        let pitch_us = usize::try_from(pitch).unwrap_or(0);
+        let row_len = row_width.saturating_mul(4);
+        // Copy one scanline into the locked level's host texels (D3DCOLOR byte
+        // order). Inline decode: the per-scanline `Vec<u32>` this replaces was
+        // one allocation per row.
+        let write_row = |state: &mut WinApiState, row: i32, bytes: &[u8]| {
+            let start = usize::try_from(row)
                 .unwrap_or(0)
-                .saturating_mul(usize::try_from(width).unwrap_or(0));
-            for (col, texel) in texels.into_iter().enumerate() {
-                let index = row_start
-                    .saturating_add(usize::try_from(left).unwrap_or(0))
-                    .saturating_add(col);
-                if locked_level == 0 {
-                    if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va)
-                        && let Some(slot) =
-                            std::sync::Arc::make_mut(&mut record.pixels).get_mut(index)
-                    {
-                        *slot = texel;
-                    }
-                } else if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va)
-                    && let Some(mip) = record.mip_levels.get_mut(locked_level as usize - 1)
-                    && let Some(slot) = std::sync::Arc::make_mut(&mut mip.pixels).get_mut(index)
-                {
-                    *slot = texel;
+                .saturating_mul(width_us)
+                .saturating_add(left_us);
+            if locked_level == 0 {
+                if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va) {
+                    let pixels = std::sync::Arc::make_mut(&mut record.pixels);
+                    decode_scanline(pixels, start, bytes);
                 }
+            } else if let Some(record) = state.d3d9().d3d9_textures.get_mut(&texture_va)
+                && let Some(mip) = record.mip_levels.get_mut(locked_level as usize - 1)
+            {
+                let pixels = std::sync::Arc::make_mut(&mut mip.pixels);
+                decode_scanline(pixels, start, bytes);
+            }
+        };
+        // Fast path: as in the render-target form, a full-width rect's rows are
+        // contiguous in the locked block (`pitch == row_len`), so one
+        // `host_slice` borrow covers the rect. `None` falls back per row.
+        let mut copied = false;
+        if row_width == width_us && left == 0 {
+            let rows = usize::try_from(bottom.saturating_sub(top)).unwrap_or(0);
+            let span = rows.saturating_mul(pitch_us);
+            let top_va = locked_va.saturating_add(
+                u64::try_from(usize::try_from(top).unwrap_or(0).saturating_mul(pitch_us))
+                    .unwrap_or(0),
+            );
+            if span != 0
+                && let Some(src) = engine.host_slice(top_va, span)
+            {
+                for row in top..bottom {
+                    let offset = usize::try_from(row.saturating_sub(top))
+                        .unwrap_or(0)
+                        .saturating_mul(pitch_us);
+                    let Some(scanline) = src.get(offset..offset.saturating_add(row_len)) else {
+                        break;
+                    };
+                    write_row(state, row, scanline);
+                }
+                copied = true;
+            }
+        }
+        if !copied {
+            let mut row_bytes = vec![0_u8; row_len];
+            for row in top..bottom {
+                let src = locked_va
+                    .saturating_add(
+                        u64::try_from(
+                            i64::from(row).saturating_mul(i64::try_from(pitch).unwrap_or(0)),
+                        )
+                        .unwrap_or(0),
+                    )
+                    .saturating_add(u64::try_from(i64::from(left).saturating_mul(4)).unwrap_or(0));
+                if engine.mem_read(src, &mut row_bytes).is_err() {
+                    continue;
+                }
+                write_row(state, row, &row_bytes);
             }
         }
     }
@@ -1253,4 +1364,381 @@ pub fn handle_texture_get_level_count(ctx: &mut HandlerContext<'_>) -> Result<Wi
     let return_value = u64::from(levels);
 
     ctx.finish(return_value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::tests::winapi_state_default_with_bump_heap;
+    use wie_cpu::{CpuEngine, IcedCpu};
+
+    /// The render-target handle (a `d3d9_render_targets` key, never deref'd).
+    const RT_VA: u64 = 0x9000_0000;
+    /// The texture handle (a `d3d9_textures` key, never deref'd).
+    const TEXTURE_VA: u64 = 0x9000_1000;
+    /// Guest scratch below the fixture's bump heap (`[0x2000, 0x10000)`): the
+    /// `D3DLOCKED_RECT` the lock form writes, and the `RECT` it reads.
+    const LOCKED_RECT_VA: u64 = 0x1000;
+    const RECT_VA: u64 = 0x1080;
+    /// The fixture heap's guest control block (`attach_guest_control(0x2000)`),
+    /// and the bump cursor the tests seed past that block.
+    const HEAP_CTRL_VA: u64 = 0x2000;
+    const HEAP_BUMP_VA: u64 = 0x2100;
+
+    /// Guest memory for the copy loops: 1 MB of RW at `0x1000`, which covers
+    /// both the scratch VAs and the bump heap the lock blocks come from.
+    ///
+    /// Read+write, not `ALL`: `host_slice_mut` refuses executable spans (a
+    /// store to code has to go through the SMC path), so an executable mapping
+    /// would send every write-back down the per-row fallback and leave the
+    /// whole-block path untested.
+    fn test_engine() -> IcedCpu {
+        let mut cpu = IcedCpu::open_x86_64();
+        cpu.mem_map(0x1000, 0x10_0000, wie_cpu::RwxPerms::READ_WRITE)
+            .expect("map test memory");
+        cpu
+    }
+
+    /// Engine + state with the fixture heap's bump cursor seeded the way a real
+    /// guest seeds it: `alloc_coherent` pulls the cursor out of the guest
+    /// control block, and a fresh mapping reads as 0 — not a valid bump.
+    fn setup() -> (IcedCpu, WinApiState) {
+        let mut engine = test_engine();
+        write_guest(
+            &mut engine,
+            HEAP_CTRL_VA.saturating_add(wie_cpu::guest_layout::HEAP_CTRL_BUMP_OFFSET),
+            &HEAP_BUMP_VA.to_le_bytes(),
+        );
+        (engine, winapi_state_default_with_bump_heap())
+    }
+
+    fn read_guest(engine: &mut IcedCpu, address: u64, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0_u8; len];
+        engine.mem_read(address, &mut bytes).expect("guest read");
+        bytes
+    }
+
+    fn write_guest(engine: &mut IcedCpu, address: u64, bytes: &[u8]) {
+        engine.mem_write(address, bytes).expect("guest write");
+    }
+
+    /// Texels as the guest sees them through a lock: `0xAARRGGBB` little-endian.
+    fn texels_to_bytes(texels: &[u32]) -> Vec<u8> {
+        texels
+            .iter()
+            .flat_map(|texel| texel.to_le_bytes())
+            .collect()
+    }
+
+    /// `D3DLOCKED_RECT` as the handler left it: `(Pitch, pBits)`.
+    fn locked_rect_of(engine: &mut IcedCpu) -> (u32, u64) {
+        let pitch = read_guest(engine, LOCKED_RECT_VA, 4)
+            .try_into()
+            .expect("4 bytes");
+        let p_bits = read_guest(engine, LOCKED_RECT_VA.saturating_add(8), 8)
+            .try_into()
+            .expect("8 bytes");
+        (u32::from_le_bytes(pitch), u64::from_le_bytes(p_bits))
+    }
+
+    /// Write a `RECT` for the next `LockRect` (four `LONG`s).
+    fn put_rect(engine: &mut IcedCpu, rect: (i32, i32, i32, i32)) {
+        let (left, top, right, bottom) = rect;
+        let mut bytes = Vec::with_capacity(16);
+        for value in [left, top, right, bottom] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        write_guest(engine, RECT_VA, &bytes);
+    }
+
+    fn insert_render_target(state: &mut WinApiState, width: u32, height: u32, texels: Vec<u32>) {
+        state.d3d9().d3d9_render_targets.insert(
+            RT_VA,
+            RenderTargetRecord {
+                handle: RT_VA,
+                width,
+                height,
+                format: D3DFMT_A8R8G8B8,
+                pixels: std::sync::Arc::new(texels),
+                locked_va: 0,
+                locked_rect: None,
+            },
+        );
+    }
+
+    fn insert_texture(state: &mut WinApiState, width: u32, height: u32, texels: Vec<u32>) {
+        state.d3d9().d3d9_textures.insert(
+            TEXTURE_VA,
+            TextureRecord {
+                handle: TEXTURE_VA,
+                width,
+                height,
+                levels: 1,
+                format: D3DFMT_A8R8G8B8,
+                pixels: std::sync::Arc::new(texels),
+                mip_levels: Vec::new(),
+                surface_vas: Vec::new(),
+                locked_va: 0,
+                locked_level: 0,
+                locked_rect: None,
+            },
+        );
+    }
+
+    fn render_target_texels(state: &mut WinApiState) -> Vec<u32> {
+        state
+            .d3d9()
+            .d3d9_render_targets
+            .get(&RT_VA)
+            .map(|record| record.pixels.as_ref().clone())
+            .expect("render target record")
+    }
+
+    fn texture_texels(state: &mut WinApiState) -> Vec<u32> {
+        state
+            .d3d9()
+            .d3d9_textures
+            .get(&TEXTURE_VA)
+            .map(|record| record.pixels.as_ref().clone())
+            .expect("texture record")
+    }
+
+    /// `0xFF00_0000 | index`: every texel distinct, so a misplaced write shows.
+    fn sample_texels(count: u32) -> Vec<u32> {
+        (0..count).map(|index| 0xFF00_0000 | index).collect()
+    }
+
+    #[test]
+    fn render_target_lock_round_trips_a_full_surface() {
+        let (mut engine, mut state) = setup();
+        let texels = sample_texels(12); // 4x3
+        insert_render_target(&mut state, 4, 3, texels.clone());
+
+        let result = lock_rect_render_target(&mut engine, &mut state, RT_VA, LOCKED_RECT_VA, 0)
+            .expect("lock read-back runs");
+        assert_eq!(result, D3D_OK, "LockRect(NULL rect) succeeds");
+
+        let (pitch, p_bits) = locked_rect_of(&mut engine);
+        assert_eq!(pitch, 16, "pitch is width * 4");
+        assert_eq!(
+            read_guest(&mut engine, p_bits, 48),
+            texels_to_bytes(&texels),
+            "a full-surface lock exposes every texel, row by row"
+        );
+
+        // The guest edits the surface through the pointer it was given.
+        let mut edited = texels.clone();
+        edited[0] = 0x1122_3344;
+        edited[11] = 0x5566_7788;
+        write_guest(&mut engine, p_bits, &texels_to_bytes(&edited));
+
+        assert_eq!(
+            unlock_rect_render_target(&mut engine, &mut state, RT_VA),
+            D3D_OK,
+            "UnlockRect succeeds"
+        );
+        assert_eq!(
+            render_target_texels(&mut state),
+            edited,
+            "the guest's edits land back in the texels"
+        );
+    }
+
+    #[test]
+    fn render_target_unlock_writes_back_only_the_clipped_rect() {
+        let (mut engine, mut state) = setup();
+        let texels = sample_texels(12); // 4x3
+        insert_render_target(&mut state, 4, 3, texels.clone());
+
+        // Columns 1..3, rows 0..2: the span is two texels (8 bytes) of a
+        // sixteen-byte row, so only the clipped span of each row may move.
+        let rect = (1, 0, 3, 2);
+        put_rect(&mut engine, rect);
+        let result =
+            lock_rect_render_target(&mut engine, &mut state, RT_VA, LOCKED_RECT_VA, RECT_VA)
+                .expect("clipped lock runs");
+        assert_eq!(result, D3D_OK);
+
+        let (pitch, p_bits) = locked_rect_of(&mut engine);
+        assert_eq!(pitch, 16, "the clipped rect keeps the surface pitch");
+        // The read-back writes each row's clipped span at that row's start in
+        // the locked block, so the block base is pBits minus the rect origin.
+        let block = p_bits.saturating_sub(4); // one texel of `left` offset
+        for row in 0..3_usize {
+            let first = row.saturating_mul(4).saturating_add(1);
+            let span = texels.get(first..first + 2).expect("span in range");
+            let at = block.saturating_add(u64::try_from(row).unwrap_or(0).saturating_mul(16));
+            assert_eq!(
+                read_guest(&mut engine, at, 8),
+                texels_to_bytes(span),
+                "row {row} copies the clipped span and no neighbouring texel"
+            );
+        }
+
+        // Both rect rows edited through the pointer the guest was given: the
+        // write-back must own exactly those texels.
+        let mut expected = texels.clone();
+        expected[1] = 0xAABB_CCDD;
+        expected[2] = 0x0011_2233;
+        expected[5] = 0x4455_6677;
+        expected[6] = 0x8899_AABB;
+        write_guest(
+            &mut engine,
+            p_bits,
+            &texels_to_bytes(&[expected[1], expected[2]]),
+        );
+        write_guest(
+            &mut engine,
+            p_bits.saturating_add(16),
+            &texels_to_bytes(&[expected[5], expected[6]]),
+        );
+
+        assert_eq!(
+            unlock_rect_render_target(&mut engine, &mut state, RT_VA),
+            D3D_OK
+        );
+        assert_eq!(
+            render_target_texels(&mut state),
+            expected,
+            "rows outside the rect keep their texels"
+        );
+    }
+
+    #[test]
+    fn render_target_lock_honours_a_pitch_wider_than_the_rect() {
+        let (mut engine, mut state) = setup();
+        let texels = sample_texels(12); // 4x3
+        insert_render_target(&mut state, 4, 3, texels.clone());
+
+        // Columns 0..2 of every row: the span is 8 bytes wide, the pitch 16 —
+        // the geometry that rules out a contiguous whole-rect copy.
+        let rect = (0, 0, 2, 3);
+        put_rect(&mut engine, rect);
+        let result =
+            lock_rect_render_target(&mut engine, &mut state, RT_VA, LOCKED_RECT_VA, RECT_VA)
+                .expect("narrow lock runs");
+        assert_eq!(result, D3D_OK);
+
+        let (pitch, p_bits) = locked_rect_of(&mut engine);
+        let row_width = u32::try_from(rect.2 - rect.0).unwrap_or(0);
+        assert_eq!(pitch, 16);
+        assert_ne!(
+            pitch,
+            row_width * 4,
+            "the rect is narrower than a surface row"
+        );
+
+        // Consecutive rect rows sit one surface pitch apart in the block.
+        for row in 0..3_usize {
+            let first = row.saturating_mul(4);
+            let span = texels.get(first..first + 2).expect("span in range");
+            let at = p_bits.saturating_add(u64::try_from(row).unwrap_or(0).saturating_mul(16));
+            assert_eq!(
+                read_guest(&mut engine, at, 8),
+                texels_to_bytes(span),
+                "rect row {row} starts one pitch after the previous row"
+            );
+        }
+
+        let mut expected = texels.clone();
+        expected[1] = 0x0F0E_0D0C;
+        expected[5] = 0x0B0A_0908;
+        expected[9] = 0x0706_0504;
+        write_guest(
+            &mut engine,
+            p_bits,
+            &texels_to_bytes(&[expected[0], expected[1]]),
+        );
+        write_guest(
+            &mut engine,
+            p_bits.saturating_add(16),
+            &texels_to_bytes(&[expected[4], expected[5]]),
+        );
+        write_guest(
+            &mut engine,
+            p_bits.saturating_add(32),
+            &texels_to_bytes(&[expected[8], expected[9]]),
+        );
+
+        assert_eq!(
+            unlock_rect_render_target(&mut engine, &mut state, RT_VA),
+            D3D_OK
+        );
+        assert_eq!(
+            render_target_texels(&mut state),
+            expected,
+            "every rect row round-trips through the pitched block"
+        );
+    }
+
+    #[test]
+    fn texture_lock_round_trips_a_full_surface() {
+        let (mut engine, mut state) = setup();
+        let texels = sample_texels(12); // 4x3
+        insert_texture(&mut state, 4, 3, texels);
+
+        let result = lock_rect_common(&mut engine, &mut state, TEXTURE_VA, 0, LOCKED_RECT_VA, 0)
+            .expect("texture lock runs");
+        assert_eq!(result, D3D_OK);
+
+        let (pitch, p_bits) = locked_rect_of(&mut engine);
+        assert_eq!(pitch, 16, "pitch is width * 4");
+        let written = sample_texels(12)
+            .iter()
+            .map(|texel| texel ^ 0x00FF_FFFF)
+            .collect::<Vec<u32>>();
+        write_guest(&mut engine, p_bits, &texels_to_bytes(&written));
+
+        assert_eq!(
+            unlock_rect_common(&mut engine, &mut state, TEXTURE_VA),
+            D3D_OK
+        );
+        assert_eq!(
+            texture_texels(&mut state),
+            written,
+            "the guest's texels land back in the texture"
+        );
+    }
+
+    #[test]
+    fn texture_unlock_writes_back_only_the_clipped_rect() {
+        let (mut engine, mut state) = setup();
+        let texels = sample_texels(12); // 4x3
+        insert_texture(&mut state, 4, 3, texels.clone());
+
+        let rect = (1, 1, 3, 2);
+        put_rect(&mut engine, rect);
+        let result = lock_rect_common(
+            &mut engine,
+            &mut state,
+            TEXTURE_VA,
+            0,
+            LOCKED_RECT_VA,
+            RECT_VA,
+        )
+        .expect("clipped texture lock runs");
+        assert_eq!(result, D3D_OK);
+
+        let (pitch, p_bits) = locked_rect_of(&mut engine);
+        assert_eq!(pitch, 16);
+        // One row of two texels, written through the rect's pointer.
+        let mut expected = texels;
+        expected[5] = 0x7777_0001;
+        expected[6] = 0x7777_0002;
+        write_guest(
+            &mut engine,
+            p_bits,
+            &texels_to_bytes(&[expected[5], expected[6]]),
+        );
+
+        assert_eq!(
+            unlock_rect_common(&mut engine, &mut state, TEXTURE_VA),
+            D3D_OK
+        );
+        assert_eq!(
+            texture_texels(&mut state),
+            expected,
+            "only the rect's texels change; the rest of the row and surface stay"
+        );
+    }
 }
