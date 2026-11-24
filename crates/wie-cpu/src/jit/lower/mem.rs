@@ -1,6 +1,7 @@
 //! Guest-memory access: host-callable `wie_jit_*` helpers (registered as JIT
 //! symbols) and the IR-emitting load/store/pin helpers used by block emission.
 
+use super::super::block::DecodedInsn;
 use super::emit::{HoistedPin, MemEnv, RefillProbe, check_fault_after_ucrt};
 use super::err::LowerError;
 use super::flags::iconst_u64;
@@ -381,7 +382,13 @@ pub(super) fn hoist_refill(
     let table = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_REFILL));
     let mem_gen_p = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_MEM_GEN));
     let mem_gen = bcx.ins().load(types::I64, flags, mem_gen_p, 0);
-    RefillProbe { table, mem_gen }
+    RefillProbe {
+        table,
+        mem_gen,
+        // The caller fills these in with `attach_homes` once it knows the block's
+        // access widths; `None`/empty means the block emits today's code.
+        homes: Vec::new(),
+    }
 }
 
 /// Probe the direct-mapped refill table — the inline fast path for **every**
@@ -527,7 +534,6 @@ pub(super) fn refill_tlb_probe(
 ///
 /// `bias` is `host_base - stage_lo`, computed for the non-empty case; on an empty
 /// span it is meaningless, and unreachable, because the interval cannot match.
-#[cfg_attr(not(test), expect(dead_code))]
 #[derive(Clone, Copy)]
 pub(super) struct HomeSpan {
     /// Inclusive lower bound — the stage's guest base.
@@ -542,10 +548,8 @@ pub(super) struct HomeSpan {
 ///
 /// Paired with [`SPAN_EMPTY_HI`] it is unreachable by construction: the access
 /// test is `addr >= lo && addr <= hi`, i.e. `addr >= 1 && addr <= 0`.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(super) const SPAN_EMPTY_LO: i64 = 1;
 /// `hi` of a span that cannot match any address (see [`HomeSpan`]).
-#[cfg_attr(not(test), expect(dead_code))]
 pub(super) const SPAN_EMPTY_HI: i64 = 0;
 
 /// Publish one pin descriptor as a [`HomeSpan`] — the prologue half of the hoist
@@ -571,7 +575,6 @@ pub(super) const SPAN_EMPTY_HI: i64 = 0;
 /// operand; `write` selects the permission bit the operand needs. The span is
 /// loop-invariant (it is built entirely from the hoisted descriptor), so it needs
 /// no block parameter on the back edge.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(super) fn span_of_pin(
     bcx: &mut FunctionBuilder<'_>,
     pin: &HoistedPin,
@@ -697,7 +700,6 @@ pub(super) fn span_of_slot(
 
 /// `select(ok, v, empty)` — the empty arm is an immediate, so the backend folds
 /// it into the `csel`.
-#[cfg_attr(not(test), expect(dead_code))]
 fn select_or_empty(bcx: &mut FunctionBuilder<'_>, ok: Value, v: Value, empty: i64) -> Value {
     let e = bcx.ins().iconst(types::I64, empty);
     bcx.ins().select(ok, v, e)
@@ -723,7 +725,6 @@ fn select_or_empty(bcx: &mut FunctionBuilder<'_>, ok: Value, v: Value, empty: i6
 ///
 /// `host` is defined in the block the guards return in, so it dominates the
 /// caller's hit block, the same contract as [`hoisted_pin_probe`].
-#[cfg_attr(not(test), expect(dead_code))]
 pub(super) fn home_span_probe(
     bcx: &mut FunctionBuilder<'_>,
     span: &HomeSpan,
@@ -750,23 +751,37 @@ pub(super) fn home_span_probe(
 /// failure edge is the block's exit path, not an operand's fallback: when the
 /// mapping moved, every descriptor the prologue read is suspect.
 ///
-/// # What this check does and does not observe
+/// # What this check observes — and why the wiring does **not** use it
 ///
 /// It compares `JitCtx::mem_gen` as it stands at the access against the value the
 /// prologue loaded. The dispatcher is the only writer of that field
-/// (`pipeline.rs`, `run_compiled`), so within one `run_compiled` frame the two
-/// agree by construction and the *only* thing that can make them differ is a host
-/// helper that re-stamps the field mid-frame. The check is therefore two things
-/// at once, and both are worth stating plainly:
+/// (`pipeline.rs`, `run_compiled`), so inside one `run_compiled` frame the two
+/// agree by construction: the compare can fire only if something re-stamps the
+/// field mid-frame, and nothing does. It is a checked assumption costing three
+/// instructions per iteration, not a live observation of
+/// `GuestMemory::generation` (a guest map/protect bumps the *shared* atomic, not
+/// the frame's copy).
 ///
-/// * a **checked assumption** — it costs three instructions per iteration and it
-///   fails loudly (through the exit path) if `mem_gen` is ever made to move
-///   inside a frame;
-/// * **not** a live observation of `GuestMemory::generation`. A guest
-///   map/protect issued mid-frame bumps the *shared* atomic, not the frame's
-///   copy, and is caught (as today) by the block exiting through the dispatcher.
-///   Closing that window for real needs a pointer to the shared atomic in
-///   `JitCtx`; see the report that accompanies this change.
+/// Two tests settle what it is worth, and both are in `mem_hoist_tests.rs`:
+///
+/// * `a_reprotect_between_executions_is_caught` — a real `VirtualProtect` between
+///   two executions of the same compiled block *is* caught: the prologue re-reads
+///   the descriptor and the generation on every entry, so execution 2 publishes
+///   from a descriptor that lost `W` and refuses the store. Its negative control
+///   (run once by hand, never committed) removed the dispatcher entry and kept
+///   the stale descriptor: the span was then taken and the store landed through a
+///   page the guest had made read-only — a silent protection violation, and the
+///   reason that per-entry reload is load-bearing rather than incidental.
+/// * `only_an_in_frame_move_needs_the_generation_compare` — with the compare the
+///   access exits; without it the access is served. So it buys exactly the case
+///   that cannot happen.
+///
+/// Hence the recommended wiring calls [`home_span_probe`], not this: the
+/// protection case is covered by the per-entry reload that already exists and is
+/// now tested, and the three instructions per iteration are pure cost. This
+/// function stays for a caller that *can* have a moving generation inside its own
+/// code region (the region lane, which already emits an invalidation guard on its
+/// back edge), where piggybacking is cheaper than a second mechanism.
 #[cfg_attr(not(test), expect(dead_code))]
 pub(super) fn generation_recheck(
     bcx: &mut FunctionBuilder<'_>,
@@ -803,9 +818,130 @@ pub(super) fn hoisted_access_probe(
     home_span_probe(bcx, span, addr, fail)
 }
 
-/// Emit one operand's hoisted access: the fast path, its hit block, and control
-/// continuing in the **fallback block**, where the caller emits the operand's
-/// unchanged chain and jumps to the same `merge`.
+/// One published home: `(access width, direction, span)`.
+///
+/// The key is the pair, not the instruction: `call_load` reads the
+/// `(size, false)` entry and `call_store` the `(size, true)` one, so two operands
+/// of the same width share a home, and a block whose operands are all one width
+/// pays for exactly two spans.
+pub(super) type HomeEntry = (u32, bool, HomeSpan);
+
+/// The distinct access widths of a block's memory operands — the input to
+/// [`block_homes`].
+///
+/// **Widths only.** The direction is deliberately *not* inferred here: a wrong
+/// direction would publish a span carrying the wrong permission bit, and that is
+/// the one thing this design must never get wrong. Publishing both directions per
+/// width is exact by construction (each is built with its own `need`), while an
+/// unused pair costs a few words of prologue text rather than a wrong answer.
+///
+/// iced's `InstrInfo` is the decoder's own table, so "does this instruction touch
+/// memory, and how wide" is read rather than guessed. The result is an
+/// over-approximation of what the lowering will actually access (implicit stack
+/// operands of `push`/`call` included): publishing a home nothing uses is dead
+/// text, and *missing* a home only means that operand keeps today's probe.
+///
+/// The block's terminator is not in `insns`; a `call [mem]` operand is therefore
+/// not hoisted. That is a missed opportunity on a shape that is not a hot
+/// self-loop, not a hole.
+pub(super) fn block_home_sizes(insns: &[DecodedInsn]) -> Vec<u32> {
+    let mut factory = iced_x86::InstructionInfoFactory::new();
+    let mut sizes: Vec<u32> = Vec::new();
+    for insn in insns {
+        // `used_memory()` is the decoder's own list of the memory locations an
+        // instruction touches; an instruction with none is skipped, and a `push`
+        // that only *implicitly* touches the stack still counts (its widths are
+        // then published and possibly unused, which is free).
+        let sizes_here: Vec<u32> = {
+            let info = factory.info(&insn.instr);
+            info.used_memory()
+                .iter()
+                .map(|m| u32::try_from(m.memory_size().size()).unwrap_or(0))
+                .collect()
+        };
+        let Some(size) = sizes_here.into_iter().find(|s| matches!(s, 1 | 2 | 4 | 8)) else {
+            continue;
+        };
+        if matches!(size, 1 | 2 | 4 | 8) && !sizes.contains(&size) {
+            sizes.push(size);
+            if sizes.len() == 4 {
+                break;
+            }
+        }
+    }
+    sizes
+}
+
+/// Publish one [`HomeSpan`] per `(width, direction)` pair from a hoisted pin
+/// descriptor — the prologue half of the hoist, emitted once per block entry.
+///
+/// Sixteen host instructions per span (measured: see the report accompanying
+/// this change), so a one-width loop pays ~32 at entry. Nothing here is
+/// loop-carried: a pin-derived span is a function of the entry-loaded descriptor
+/// alone, so the back edge's block-parameter contract is untouched.
+pub(super) fn block_homes(
+    bcx: &mut FunctionBuilder<'_>,
+    pin: Option<HoistedPin>,
+    insns: &[DecodedInsn],
+    self_loop: bool,
+) -> Vec<HomeEntry> {
+    // The three ways a block gets no guard, all decided here so a call site cannot
+    // get the policy wrong: no descriptor (inline mem off, or the stack super path,
+    // which emits bare host memops and must not carry one), a block that is not a
+    // self-loop (it runs once, so a prologue span cannot be amortised), or no
+    // memory width the guard could serve. All three fall through to exactly today's
+    // code.
+    let Some(pin) = pin.filter(|_| self_loop) else {
+        return Vec::new();
+    };
+    let sizes = block_home_sizes(insns);
+    if sizes.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(sizes.len() * 2);
+    for size in sizes {
+        for write in [false, true] {
+            out.push((size, write, span_of_pin(bcx, &pin, size, write)));
+        }
+    }
+    out
+}
+
+/// Attach the published homes to this block's probe descriptor.
+///
+/// A no-op when there is no descriptor — which is what makes `WIE_JIT_MEM=slow`,
+/// the stack super path, region mode and memory-free blocks all fall out
+/// *structurally* rather than by four sites remembering to pass `Vec::new()`.
+pub(super) fn attach_homes(
+    refill: &Option<RefillProbe>,
+    homes: Vec<HomeEntry>,
+) -> Option<RefillProbe> {
+    refill.as_ref().map(|r| RefillProbe {
+        table: r.table,
+        mem_gen: r.mem_gen,
+        homes,
+    })
+}
+
+/// The home published for this operand, or `None` for today's code path.
+///
+/// A linear scan over at most eight entries, at **emission** time only: it costs
+/// nothing on the emitted path.
+pub(super) fn home_for(refill: Option<&RefillProbe>, width: u32, write: bool) -> Option<HomeSpan> {
+    refill?
+        .homes
+        .iter()
+        .find(|(w, dir, _)| *w == width && *dir == write)
+        .map(|(_, _, span)| *span)
+}
+
+/// Emit one operand's hoisted access **with** the in-frame generation check, its
+/// hit block, and control continuing in the **fallback block**, where the caller
+/// emits the operand's unchanged chain and jumps to the same `merge`.
+///
+/// The recommended wiring does not use this: it calls [`home_span_probe`] and
+/// keeps the chain as the only failure edge, which costs three fewer instructions
+/// per iteration. See [`generation_recheck`] for the two tests that decide that.
 ///
 /// This is [`home_span_probe`]/[`hoisted_access_probe`] plus the CFG plumbing
 /// [`emit_probe_stage`] already does for a probe, so the call-site change inside
@@ -945,6 +1081,20 @@ pub(super) fn call_load(
     let merge = bcx.create_block();
     bcx.append_block_param(merge, types::I64);
 
+    // Hoisted fast path: a home published at entry from the stack-pin descriptor.
+    // On *any* failed predicate this falls into the chain below, which validates
+    // everything from scratch — the hoist only adds an edge into it, and the
+    // descriptor it was published from is re-read on every block entry (which is
+    // what catches a re-protect; see `mem_hoist_tests::a_reprotect_between_executions_is_caught`).
+    if let Some(span) = home_for(mem.refill.as_ref(), size, false) {
+        let fail = bcx.create_block();
+        let host = home_span_probe(bcx, &span, addr, fail);
+        let v = load_guest_bytes(bcx, mem.guest_flags, host, size);
+        bcx.ins().jump(merge, &[BlockArg::Value(v)]);
+        bcx.switch_to_block(fail);
+        bcx.seal_block(fail);
+    }
+
     if let Some(ref pin) = mem.stack_pin {
         emit_probe_stage(
             bcx,
@@ -954,11 +1104,11 @@ pub(super) fn call_load(
         );
     }
 
-    if let Some(refill) = mem.refill {
+    if let Some(refill) = mem.refill.as_ref() {
         emit_probe_stage(
             bcx,
             merge,
-            |bcx, miss| refill_tlb_probe(bcx, &refill, mem.flags, addr, size, false, miss),
+            |bcx, miss| refill_tlb_probe(bcx, refill, mem.flags, addr, size, false, miss),
             |bcx, host| Some(load_guest_bytes(bcx, mem.guest_flags, host, size)),
         );
     }
@@ -1063,6 +1213,16 @@ pub(super) fn call_store(
     // Same CFG order as `call_load`: stack → refill table → data pin → helper.
     let merge = bcx.create_block();
 
+    // Hoisted fast path (see `call_load`): the write-direction home.
+    if let Some(span) = home_for(mem.refill.as_ref(), size, true) {
+        let fail = bcx.create_block();
+        let host = home_span_probe(bcx, &span, addr, fail);
+        store_guest_bytes(bcx, mem.guest_flags, host, size, value);
+        bcx.ins().jump(merge, &[]);
+        bcx.switch_to_block(fail);
+        bcx.seal_block(fail);
+    }
+
     if let Some(ref pin) = mem.stack_pin {
         emit_probe_stage(
             bcx,
@@ -1075,11 +1235,11 @@ pub(super) fn call_store(
         );
     }
 
-    if let Some(refill) = mem.refill {
+    if let Some(refill) = mem.refill.as_ref() {
         emit_probe_stage(
             bcx,
             merge,
-            |bcx, miss| refill_tlb_probe(bcx, &refill, mem.flags, addr, size, true, miss),
+            |bcx, miss| refill_tlb_probe(bcx, refill, mem.flags, addr, size, true, miss),
             |bcx, host| {
                 store_guest_bytes(bcx, mem.guest_flags, host, size, value);
                 None

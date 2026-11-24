@@ -1036,7 +1036,7 @@ use gpr::{
     read_op_mem, reg_index, sext_to_i64, write_gpr, write_op_mem,
 };
 use insn::{PendingFlags, ShiftKind, flush_pending_deferred};
-use mem::{call_load, call_store, hoist_pin_slot, hoist_refill};
+use mem::{attach_homes, block_homes, call_load, call_store, hoist_pin_slot, hoist_refill};
 
 pub(super) use gpr::wie_div64;
 pub(super) use mem::{
@@ -1529,6 +1529,15 @@ pub(super) fn compile_block(
                 bcx.switch_to_block(start_blk);
                 bcx.seal_block(start_blk);
 
+                // In `start_blk` (entered once), never in `loop_header` — the back
+                // edge targets that one. Empty on the super path.
+                let homes = if is_super {
+                    Vec::new()
+                } else {
+                    block_homes(&mut bcx, stack_pin, insns, self_loop)
+                };
+                let refill = attach_homes(&refill, homes);
+
                 let mut path_gpr = entry_gpr;
                 let mut path_loaded = entry_loaded;
                 let mut path_dirty = [false; 16];
@@ -1658,7 +1667,10 @@ pub(super) fn compile_block(
                 }
             }
         } else {
-            // Single path (no block-wide super, or ineligible shape).
+            // Single path (no block-wide super, or ineligible shape). The homes go
+            // in this **entry** block, before the jump below — `loop_header` is what
+            // the back edge targets, so a span built there would be per-iteration.
+            let refill = attach_homes(&refill, block_homes(&mut bcx, stack_pin, insns, self_loop));
             let loop_header = if self_loop {
                 let h = bcx.create_block();
                 for &is_live in live_eff.iter().take(16) {

@@ -947,12 +947,28 @@ pub(super) struct SuperStack {
 /// instead of on every memory operand. `mem_gen` is invariant for the block for
 /// the same reason [`HoistedPin::live`] is — the generation only moves on a
 /// guest map/protect, which returns through the dispatcher.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct RefillProbe {
     /// `ctx_ptr + OFF_REFILL` — base of the [`RefillSlot`](super::RefillSlot) array.
     pub(super) table: Value,
     /// `ctx.mem_gen`, the generation half of the slot tag.
     pub(super) mem_gen: Value,
+    /// Hoisted per-operand translation homes, published at entry by
+    /// [`mem::block_homes`](super::mem::block_homes).
+    ///
+    /// They live here, rather than on [`MemEnv`] beside `stack_pin`, because this
+    /// descriptor already **is** the "this block has an inline memory probe"
+    /// flag: it is `None` under `WIE_JIT_MEM=slow`, on the stack super path (which
+    /// emits bare host memops and must carry no guard), in region mode, and in a
+    /// block with no memory operand. Tying the homes to it makes the gating
+    /// structural instead of a convention four construction sites have to
+    /// remember — with no descriptor there is no guard, and the emitted code is
+    /// byte-for-byte today's.
+    ///
+    /// Empty is also "no guard": a block that is not a self-loop never publishes
+    /// one (it runs once, so a prologue span cannot be amortised), and a miss
+    /// always falls through to the probe chain, never into a hole.
+    pub(super) homes: Vec<super::mem::HomeEntry>,
 }
 
 pub(super) struct MemEnv {

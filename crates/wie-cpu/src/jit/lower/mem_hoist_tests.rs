@@ -20,6 +20,7 @@
 //! loudly on it rather than to confirm a hit rate.
 use super::super::{GuestVa, HostAddr, MemPin, REFILL_SLOTS, RefillSlot, refill_slot};
 use super::*;
+use crate::exec::StepResult;
 use crate::mem::protect;
 use crate::mem::{MEM_COMMIT, MEM_RESERVE};
 use crate::{CpuEngine, JitCpu};
@@ -53,8 +54,13 @@ type ProbeFn = extern "C" fn(*mut JitCtx, u64, u64) -> u64;
 enum Shape {
     /// Today's chain: `hoisted_pin_probe` → `refill_tlb_probe` → miss.
     Today,
-    /// The hoist: publish a span, validate per access, chain as `fail`.
+    /// The hoist with the in-frame generation check: span, gen compare, chain.
     Hoisted,
+    /// **Exactly the phase-1 wiring** for `call_load`/`call_store`: validate the
+    /// span, fall into the chain on a miss, and no generation compare at all —
+    /// `home_span_probe`, not `hoisted_stage`. The two tests that name this shape
+    /// are the evidence for dropping the compare.
+    HoistedPlain,
 }
 
 /// Which descriptor the operand's translation comes from, and therefore which
@@ -221,6 +227,30 @@ fn build(shape: Shape, origin: Origin, size: u32, write: bool, hook: bool) -> Pr
                 &refill,
                 with_refill,
             ),
+            Shape::HoistedPlain => {
+                let span = span_of_pin(&mut bcx, &pin, size, write);
+                // The phase-1 wiring, verbatim.
+                let fail = bcx.create_block();
+                let host = home_span_probe(&mut bcx, &span, addr, fail);
+                if let Some(v) = hit(&mut bcx, size, write, val, host) {
+                    bcx.ins().jump(merge, &[BlockArg::Value(v)]);
+                } else {
+                    bcx.ins().jump(merge, &[]);
+                }
+                bcx.switch_to_block(fail);
+                bcx.seal_block(fail);
+                today_chain(
+                    &mut bcx,
+                    merge,
+                    addr,
+                    size,
+                    write,
+                    val,
+                    &pin,
+                    &refill,
+                    with_refill,
+                );
+            }
             Shape::Hoisted => {
                 let span = match origin {
                     Origin::Pin | Origin::PinThenRefill => span_of_pin(&mut bcx, &pin, size, write),
@@ -299,8 +329,12 @@ struct Fixture {
     host: *mut u8,
 }
 
-/// Two RW pages, a canary at `+0x40`, and a pin over page 0 in slot 0.
-fn fixture(gen_offset: u64, allow: u64) -> Fixture {
+/// Two RW pages and a canary at `+0x40`, with `ctx.pins` left **empty**: any
+/// descriptor present after a `dispatcher_entry` can only have come from
+/// `jit_region_pins`, which is what makes
+/// [`a_reprotect_between_executions_is_caught`] an end-to-end test rather than a
+/// test of a fixture.
+fn bare_pages() -> Fixture {
     let idx = NEXT_DATA.fetch_add(1, Ordering::Relaxed);
     let data = DATA_BASE.saturating_add(idx.saturating_mul(DATA_STRIDE));
     let mut cpu = JitCpu::open_x86_64();
@@ -314,15 +348,26 @@ fn fixture(gen_offset: u64, allow: u64) -> Fixture {
     cpu.mem_write(data.saturating_add(0x40), &CANARY.to_ne_bytes())
         .expect("stamp the canary");
     let host = cpu.host_span(data, 0x1000, false).expect("host base");
-    let stamp = cpu.thread.ctx.mem_gen ^ gen_offset;
-    cpu.thread.ctx.pins[0] = MemPin {
-        guest_base: GuestVa::new(data),
-        guest_end: GuestVa::new(data.saturating_add(0x2000)),
-        host_base: HostAddr::from_ptr(host),
+    Fixture { cpu, data, host }
+}
+
+/// [`bare_pages`] plus a hand-built pin over page 0 in slot 0, for the tests that
+/// are about the guard rather than about the descriptor's provenance.
+///
+/// `gen_offset` non-zero plants a pin whose generation does not match the frame's
+/// (a dead descriptor); it is `^`-ed onto the frame's value rather than set, so
+/// the test keeps working whatever the frame's generation happens to be.
+fn fixture(gen_offset: u64, allow: u64) -> Fixture {
+    let mut fx = bare_pages();
+    let stamp = fx.cpu.thread.ctx.mem_gen ^ gen_offset;
+    fx.cpu.thread.ctx.pins[0] = MemPin {
+        guest_base: GuestVa::new(fx.data),
+        guest_end: GuestVa::new(fx.data.saturating_add(0x2000)),
+        host_base: HostAddr::from_ptr(fx.host),
         mem_gen: stamp,
         allow,
     };
-    Fixture { cpu, data, host }
+    fx
 }
 
 fn run(f: ProbeFn, cpu: &mut JitCpu, addr: u64, val: u64) -> u64 {
@@ -354,6 +399,192 @@ fn install_slot(cpu: &mut JitCpu, page: u64, host: *mut u8, allow: u64) {
     let key = page >> 12;
     cpu.thread.ctx.refill[refill_slot(key)] =
         RefillSlot::new(key ^ cpu.thread.ctx.mem_gen, host, allow);
+}
+
+/// Three `nop`s: a block whose only job is to be *stepped*, because running any
+/// block is how the dispatcher does its entry work.
+const NOP3: [u8; 3] = [0x90, 0x90, 0x90];
+/// Where the `nop` block jumps; the dispatcher stops before executing it.
+const STOP_OFF: u64 = 0x100;
+const CODE_BASE: u64 = 0x6c00_0000;
+const CODE_STRIDE: u64 = 0x1_0000;
+static NEXT_CODE: AtomicU64 = AtomicU64::new(0);
+
+fn code_page(cpu: &mut JitCpu, insn: [u8; 3]) -> u64 {
+    let idx = NEXT_CODE.fetch_add(1, Ordering::Relaxed);
+    let base = CODE_BASE.saturating_add(idx.saturating_mul(CODE_STRIDE));
+    cpu.virtual_alloc(
+        base,
+        usize::try_from(CODE_STRIDE).expect("stride fits"),
+        MEM_RESERVE | MEM_COMMIT,
+        protect::PAGE_EXECUTE_READWRITE,
+    )
+    .expect("map the fixture's code page");
+    let stop = usize::try_from(STOP_OFF).expect("stop offset fits");
+    let mut page = vec![0x90_u8; stop + 2];
+    page[0..3].copy_from_slice(&insn);
+    let rel = i32::try_from(STOP_OFF.saturating_sub(8)).expect("rel32 fits");
+    page[3] = 0xe9;
+    page[4..8].copy_from_slice(&rel.to_le_bytes());
+    page[stop] = 0x0f;
+    page[stop + 1] = 0x0b;
+    cpu.mem_write(base, &page).expect("write the fixture bytes");
+    base
+}
+
+/// Run one block through the dispatcher.
+///
+/// This is not a convenience: `run_compiled` is where the frame's
+/// `ctx.mem_gen` is stamped and where `ctx.pins` is rebuilt when the generation
+/// moved, so stepping a block is the *only* faithful way to perform "the next
+/// dispatcher entry" without owning `emit.rs`. Nothing about the probe under test
+/// is assumed by doing it this way — the block being stepped is an unrelated
+/// `nop`.
+fn dispatcher_entry(cpu: &mut JitCpu, code: u64) {
+    cpu.write_rip(code).expect("set rip");
+    let (result, _retired) = cpu.step_one().expect("step the nop block");
+    assert!(
+        matches!(result, StepResult::Continue),
+        "the nop block must retire, got {result:?}"
+    );
+}
+
+/// The engine's **own** descriptor for `addr`, straight out of `ctx.pins` after a
+/// dispatcher entry — never a hand-built `MemPin`.
+fn engine_pin(cpu: &JitCpu, addr: u64) -> Option<MemPin> {
+    cpu.thread.ctx.pins.iter().copied().find(|p| {
+        !p.is_empty() && p.guest_base.0 <= addr && addr.saturating_add(8) <= p.guest_end.0
+    })
+}
+
+/// A protection change between two executions of the **same compiled block** is
+/// caught by the prologue, which re-reads the descriptor on every entry.
+///
+/// The machinery is the engine's, not the test's: `virtual_protect` bumps the
+/// generation and invalidates the TLB (`cc913ea`: every protection change,
+/// including a refused one's undo), and `dispatcher_entry` runs `run_compiled`,
+/// which re-stamps `ctx.mem_gen` and rebuilds `ctx.pins` from `jit_region_pins`.
+/// So execution 2 publishes its span from a descriptor that lost `W` — and it
+/// must not take the fast path, and must not write the page.
+///
+/// This is the test that lets the in-frame generation compare be dropped: the
+/// span is a pure function of the descriptor, the descriptor is re-read per
+/// entry, and every protection change reaches the descriptor before the next
+/// entry. See also `only_an_in_frame_move_needs_the_generation_compare`.
+#[test]
+fn a_reprotect_between_executions_is_caught() {
+    // No hand-built descriptor: `ctx.pins` starts empty, so every pin below is the
+    // engine's own.
+    let mut fx = bare_pages();
+    assert!(
+        engine_pin(&fx.cpu, fx.data).is_none(),
+        "the fixture must not pre-plant a descriptor, or the test proves less"
+    );
+    let page = fx.data;
+    let nop = code_page(&mut fx.cpu, NOP3);
+    // Let the dispatcher build the frame for the current generation, then borrow
+    // *its* descriptor for the page under test.
+    dispatcher_entry(&mut fx.cpu, nop);
+    let live = engine_pin(&fx.cpu, page.saturating_add(0x40))
+        .expect("the engine must pin the fixture's data page");
+    assert!(
+        live.allow & TLB_PROT_W != 0,
+        "the page starts writable, or the first execution proves nothing"
+    );
+    fx.cpu.thread.ctx.pins[0] = live;
+    let gen0 = fx.cpu.thread.ctx.mem_gen;
+
+    // Execution 1: the span is published from a writable descriptor.
+    let probe = build(Shape::HoistedPlain, Origin::Pin, 8, true, false);
+    let at1 = page.saturating_add(0x100);
+    assert_eq!(
+        run(probe.run, &mut fx.cpu, at1, 0xaaaa_bbbb_cccc_dddd),
+        DONE
+    );
+    assert_eq!(read_u64(&mut fx.cpu, at1), 0xaaaa_bbbb_cccc_dddd);
+
+    // The guest's own VirtualProtect: read-only, through the real machinery.
+    fx.cpu
+        .virtual_protect(page, 0x1000, protect::PAGE_READONLY)
+        .expect("re-protect the page read-only");
+
+    // The next dispatcher entry: re-stamp the generation, rebuild the pins.
+    dispatcher_entry(&mut fx.cpu, nop);
+    let gen1 = fx.cpu.thread.ctx.mem_gen;
+    assert_ne!(
+        gen1, gen0,
+        "a protection change must move the frame's generation (cc913ea)"
+    );
+    match engine_pin(&fx.cpu, page.saturating_add(0x40)) {
+        Some(p) => assert_eq!(
+            p.allow & TLB_PROT_W,
+            0,
+            "the rebuilt descriptor must have lost W"
+        ),
+        None => panic!("the engine must still describe the page it re-protected"),
+    }
+    let after = engine_pin(&fx.cpu, page.saturating_add(0x40)).expect("pin");
+    fx.cpu.thread.ctx.pins[0] = after;
+
+    // Execution 2, same compiled block: the span must be empty, the store refused.
+    let at2 = page.saturating_add(0x140);
+    assert_eq!(
+        run(probe.run, &mut fx.cpu, at2, 0x1234_5678_9abc_def0),
+        MISS,
+        "a re-protected page must not be served from the span"
+    );
+    assert_eq!(
+        read_u64(&mut fx.cpu, at2),
+        0,
+        "…and the store must not land"
+    );
+    // The read direction is still allowed, and is still served.
+    let read_probe = build(Shape::HoistedPlain, Origin::Pin, 8, false, false);
+    assert_eq!(
+        run(read_probe.run, &mut fx.cpu, page.saturating_add(0x40), 0),
+        CANARY,
+        "a read-only page must still be readable through the hoist"
+    );
+}
+
+/// What the in-frame generation compare buys, and what it does not.
+///
+/// The compare reads `JitCtx::mem_gen` at the access and compares it with the
+/// value the prologue loaded. Nothing inside a `run_compiled` frame writes that
+/// field except the dispatcher, so the only way to make the two disagree is for
+/// something to re-stamp it mid-frame — which is what this test does, harmlessly
+/// (the page itself is untouched, so a take is not a memory-safety failure here,
+/// it is the observation).
+///
+/// Two rows, same frame mutation, both shapes:
+///
+/// * with the compare (`Shape::Hoisted`) the access goes to the generation edge;
+/// * without it — the phase-1 wiring, `Shape::HoistedPlain` — the access is served.
+///
+/// So the compare observes exactly one thing, the thing that cannot happen today.
+/// The re-protect case that *can* happen is
+/// [`a_reprotect_between_executions_is_caught`], and the prologue catches it.
+#[test]
+fn only_an_in_frame_move_needs_the_generation_compare() {
+    // Row 1: the compare fires.
+    let mut fx = fixture(0, TLB_PROT_R | TLB_PROT_W);
+    let at = fx.data.saturating_add(0x180);
+    let checked = build(Shape::Hoisted, Origin::Pin, 8, true, true);
+    assert_eq!(
+        run(checked.run, &mut fx.cpu, at, 0x5555_aaaa_5555_aaaa),
+        STALE,
+        "the in-frame compare must refuse an access whose frame moved under it"
+    );
+
+    // Row 2: without it, the same access is served.
+    let mut fx = fixture(0, TLB_PROT_R | TLB_PROT_W);
+    let at = fx.data.saturating_add(0x180);
+    let plain = build(Shape::HoistedPlain, Origin::Pin, 8, true, true);
+    assert_eq!(
+        run(plain.run, &mut fx.cpu, at, 0x5555_aaaa_5555_aaaa),
+        DONE,
+        "without the compare nothing observes the moved frame — which is the point"
+    );
 }
 
 /// A live pin, a pinned load: the fast path must serve it and read the bytes
