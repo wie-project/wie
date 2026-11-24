@@ -25,8 +25,6 @@ pub(super) struct MmapArena {
     size: usize,
     /// Host mapping base from `mmap` (null after drop).
     host: *mut u8,
-    /// Software permission bits (may apply `mprotect`).
-    perms: u32,
     /// Last host `mprotect` applied per host frame (guest frame VA → prot).
     ///
     /// Absent = the `mmap` default (`PROT_READ | PROT_WRITE`), so a freshly
@@ -63,14 +61,16 @@ impl std::fmt::Debug for MmapArena {
             .field("guest_base", &format_args!("{:#x}", self.guest_base))
             .field("size", &format_args!("{:#x}", self.size))
             .field("host", &self.host)
-            .field("perms", &self.perms)
             .finish()
     }
 }
 
 impl MmapArena {
     /// Map a new anonymous private region for `[guest_base, guest_base+size)`.
-    pub(super) fn map_new(guest_base: u64, size: usize, perms: u32) -> Result<Self, CpuError> {
+    ///
+    /// `mmap` always requests `PROT_READ | PROT_WRITE`; guest rights are never
+    /// expressed here (see [`crate::mem::protect`]).
+    pub(super) fn map_new(guest_base: u64, size: usize) -> Result<Self, CpuError> {
         if size == 0 {
             return Err(CpuError::Message("mmap arena size 0".into()));
         }
@@ -94,7 +94,6 @@ impl MmapArena {
             guest_base,
             size,
             host: ptr.cast(),
-            perms,
             host_prot: ahash::HashMap::new(),
         })
     }
@@ -112,11 +111,6 @@ impl MmapArena {
     #[inline]
     pub(super) fn host(&self) -> *mut u8 {
         self.host
-    }
-
-    #[inline]
-    pub(super) fn set_perms(&mut self, perms: u32) {
-        self.perms = perms;
     }
 
     /// Exclusive end guest VA (`base + size`), saturating.
@@ -435,24 +429,27 @@ impl ArenaSet {
     }
 
     /// Map `[address, end)` as arena(s), matching HashMap page semantics:
-    /// - exact rematch → update perms only;
-    /// - already-mapped pages → update covering arena perms, keep data;
+    /// - exact rematch → reuse the arena, keep data;
+    /// - already-mapped pages → leave them in their arena, add the rest;
     /// - unmapped runs → new contiguous arenas (coalesced).
     ///
     /// Conflicting remaps that would need to split an existing larger arena
     /// are not supported: if a page is mapped, it stays in its arena.
+    ///
+    /// `_perms` is accepted and ignored: arenas never stored rights, so a remap
+    /// has nothing to update. The parameter stays for the
+    /// [`crate::mem::backend::GuestMemBackend::map`] signature.
     pub(super) fn map_range(
         &mut self,
         address: u64,
         end: u64,
         size: usize,
-        perms: u32,
+        _perms: u32,
     ) -> Result<(), CpuError> {
         if address == end {
             return Ok(());
         }
-        if let Some(existing) = self.find_exact(address, size) {
-            existing.set_perms(perms);
+        if self.find_exact(address, size).is_some() {
             return Ok(());
         }
 
@@ -462,23 +459,14 @@ impl ArenaSet {
         // iterate every page for the 512 MiB heap and shadow (~530K
         // page iterations total).
         if !self.any_overlap(address, end) {
-            let arena = MmapArena::map_new(address, size, perms)?;
+            let arena = MmapArena::map_new(address, size)?;
             self.insert(arena)?;
             return Ok(());
         }
 
-        // First pass: update perms on arenas that already cover pages in range.
-        let mut page_va = address;
-        while page_va < end {
-            if let Some(a) = self.find_va_mut(page_va) {
-                a.set_perms(perms);
-            }
-            page_va = page_va.saturating_add(PAGE_SIZE);
-        }
-
         // Second pass: map contiguous unmapped runs as new arenas.
         let mut run_start: Option<u64> = None;
-        page_va = address;
+        let mut page_va = address;
         while page_va < end {
             let mapped = self.find_va(page_va).is_some();
             if mapped {
@@ -486,7 +474,7 @@ impl ArenaSet {
                     let run_size = usize::try_from(page_va.saturating_sub(start))
                         .map_err(|_| CpuError::Message("mmap arena run size overflow".into()))?;
                     if run_size > 0 {
-                        let arena = MmapArena::map_new(start, run_size, perms)?;
+                        let arena = MmapArena::map_new(start, run_size)?;
                         self.insert(arena)?;
                     }
                 }
@@ -499,7 +487,7 @@ impl ArenaSet {
             let run_size = usize::try_from(end.saturating_sub(start))
                 .map_err(|_| CpuError::Message("mmap arena run size overflow".into()))?;
             if run_size > 0 {
-                let arena = MmapArena::map_new(start, run_size, perms)?;
+                let arena = MmapArena::map_new(start, run_size)?;
                 self.insert(arena)?;
             }
         }
@@ -708,14 +696,18 @@ mod tests {
         assert_eq!(p1 as usize - p0 as usize, PAGE_SIZE_USIZE);
     }
 
+    /// An exact remap reuses the existing arena (no second mapping, data kept).
     #[test]
-    fn exact_rematch_updates_perms() {
+    fn exact_rematch_reuses_single_arena() {
         let mut set = ArenaSet::new();
         let (addr, end) = check_map_args(0x20_0000, 0x1000).expect("args");
         set.map_range(addr, end, 0x1000, 7).expect("map");
+        set.write(0x20_0010, &[0x22, 0x33]).expect("write");
         set.map_range(addr, end, 0x1000, 5).expect("remap");
-        assert_eq!(set.find_va(0x20_0000).expect("a").perms, 5);
         assert_eq!(set.arenas.len(), 1);
+        let mut buf = [0_u8; 2];
+        set.read(0x20_0010, &mut buf).expect("read");
+        assert_eq!(buf, [0x22, 0x33]);
     }
 
     #[test]
@@ -731,7 +723,6 @@ mod tests {
         set.read(0x30_0010, &mut buf).expect("read");
         assert_eq!(buf, [0x11, 0x22]);
         assert!(set.page_data_ptr(0x30_1000 >> 12).is_some());
-        assert_eq!(set.find_va(0x30_0000).expect("a0").perms, 5);
     }
 
     #[test]

@@ -283,9 +283,9 @@ impl super::GuestMemory {
         }
         let allow_r = run.protect.allows_read();
         let allow_x = run.protect.allows_execute();
-        // W soft-translate is denied on executable pages so stores
-        // cannot silently SMC under sticky/pin/TLB without `GuestMemory::write`.
-        let allow_w = run.protect.allows_write() && !allow_x;
+        // W-on-X: writes are denied on executable pages so stores cannot
+        // silently SMC under sticky/pin/TLB without `GuestMemory::write`.
+        let allow_w = run.protect.allow_write_for();
         // NOACCESS / no usable rights → no TLB entry.
         // Keep RX pages installable for data reads (allow_r).
         if !allow_r && !allow_w && !allow_x {

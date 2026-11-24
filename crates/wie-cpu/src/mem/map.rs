@@ -85,9 +85,10 @@ impl super::GuestMemory {
                 return None;
             }
             allow_r &= run.protect.allows_read();
-            // Never soft-translate writes onto executable pages so
-            // SMC always hits `GuestMemory::write` + code-invalidate drain.
-            allow_w &= run.protect.allows_write() && !run.protect.allows_execute();
+            // W-on-X (see `PageProtect::allow_write_for`): never soft-translate
+            // writes onto executable pages, so SMC always hits
+            // `GuestMemory::write` + code-invalidate drain.
+            allow_w &= run.protect.allow_write_for();
             saw = true;
             let next = run.end_page;
             if next <= page {
