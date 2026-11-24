@@ -9,9 +9,9 @@ use super::mem::call_load;
 use super::string::lower_string;
 use super::{
     EDGE_IC_SLOTS, MAX_CHAIN_DEPTH, OFF_CHAIN_DEPTH, OFF_CHAIN_HOPS, OFF_CHAIN_STORE_OPS,
-    OFF_EDGE_IC_FN, OFF_EDGE_IC_VA, OFF_FAULT, OFF_INSN_ACC, OFF_INV_GEN_PTR, OFF_RIP,
-    OFF_SHADOW_RET, OFF_SHADOW_SP, SHADOW_DEPTH, TLB_PROT_R, TLB_PROT_W, flag_cond, flag_cond_fs,
-    lower_term,
+    OFF_EDGE_IC_FN, OFF_EDGE_IC_VA, OFF_FAULT, OFF_INSN_ACC, OFF_INV_GEN_BAKED, OFF_INV_GEN_PTR,
+    OFF_RIP, OFF_SHADOW_RET, OFF_SHADOW_SP, SHADOW_DEPTH, TLB_PROT_R, TLB_PROT_W, flag_cond,
+    flag_cond_fs, lower_term,
 };
 
 use super::super::block::{BlockStackPinPlan, BlockTerm, DecodedInsn, is_string_op};
@@ -307,15 +307,34 @@ pub(super) fn shadow_pop_check(
 /// Loads `JitShared::invalidate_gen` through `ctx.inv_gen_ptr` (a sequential
 /// atomic load — on ARM64 an acquire `ldar`, and `other_side_effects` keeps
 /// Cranelift from hoisting or CSE-ing it out of hot backedge loops) and
-/// compares it against the generation baked into this block at compile time.
+/// compares it against `JitCtx::inv_gen_baked`, read out of the frame's
+/// context rather than baked in as an immediate.
+///
+/// **The bake is the frame's, not the block's.** `ctx.inv_gen_baked` is stamped
+/// by the dispatcher from `meta.inv_gen` on entry to `run_compiled`, and
+/// `trampolines::chain_tail` already compares against that same value, so this
+/// guard now matches the Rust-side twin exactly. The guard is therefore
+/// *coarser* than a per-block bake: a block chained to from an entry compiled
+/// before an unrelated invalidation sees a stale frame bake and exits even
+/// though its own bytes are untouched. That direction is the safe one —
+/// `invalidate_gen` is monotonic, so a stale bake can only ever cost an
+/// **extra exit to the dispatcher**, never a wrong answer — and it is what
+/// makes a restored blob chainable at all: with a per-block literal baked in,
+/// a blob written by an earlier process carried the wrong value forever and
+/// bailed at every edge.
+///
+/// **Invariant: the emitted code carries no per-process value.** Every runtime
+/// input reaches the guard through `JitCtx` (a relocation-free struct the host
+/// fills per dispatch) or through a re-checked relocation, so a blob's
+/// behaviour after restore depends only on this process's state. This is what
+/// [`crate::jit::engine::code_cache`] relies on to replay a blob without
+/// re-deriving anything from the capturing process.
 ///
 /// On mismatch the `on_stale` closure flushes whatever state the caller still
 /// holds in SSA (registers / RIP), then control returns to the Rust
 /// dispatcher exactly like the depth-exceeded exit. The next dispatch sees
-/// the bumped generation, purges its chain table, re-decodes fresh guest
-/// bytes and bakes a fresh generation. A low/benign mismatch read costs one
-/// spurious exit + resync; a high/stale miss is impossible because the bake
-/// happens before guest bytes are decoded.
+/// the bumped generation, purges its chain table, and re-decodes fresh guest
+/// bytes.
 ///
 /// Returns the continuation block (current position switched onto it) that
 /// execution takes when no invalidation was observed.
@@ -323,14 +342,14 @@ fn emit_inv_gen_check(
     bcx: &mut FunctionBuilder<'_>,
     ctx_ptr: Value,
     flags: MemFlagsData,
-    inv_gen_baked: u64,
     trip: &TripCounter,
     on_stale: impl FnOnce(&mut FunctionBuilder<'_>),
 ) -> Block {
     let ptr_slot = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_INV_GEN_PTR));
     let gen_ptr = bcx.ins().load(types::I64, flags, ptr_slot, 0);
     let cur_gen = bcx.ins().atomic_load(types::I64, flags, gen_ptr);
-    let baked = iconst_u64(bcx, inv_gen_baked);
+    let baked_slot = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_INV_GEN_BAKED));
+    let baked = bcx.ins().load(types::I64, flags, baked_slot, 0);
     let stale = bcx.ins().icmp(IntCC::NotEqual, cur_gen, baked);
     let stale_blk = bcx.create_block();
     let cont_blk = bcx.create_block();
@@ -371,7 +390,6 @@ pub(super) fn emit_chain_or_exit(
     lookup_ref: FuncRef,
     block_sig_ref: SigRef,
     inv_guard: bool,
-    inv_gen_baked: u64,
     trip: &TripCounter,
 ) {
     let rip_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RIP));
@@ -393,7 +411,7 @@ pub(super) fn emit_chain_or_exit(
         // Cross-thread invalidation guard before touching any chain
         // machinery: RIP (= exit_rip) + GPRs are already flushed above, so a
         // mismatch just returns to the dispatcher for purge + re-decode.
-        let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, trip, |_| {});
+        let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, trip, |_| {});
     }
 
     // Host-stack guard: each hop nests a C frame. Cap and re-enter from Rust.
@@ -516,7 +534,6 @@ pub(super) fn lower_self_loop_term(
     lookup_ref: FuncRef,
     block_sig_ref: SigRef,
     inv_guard: bool,
-    inv_gen_baked: u64,
     trip: TripCounter,
 ) -> Result<bool, String> {
     match term {
@@ -530,7 +547,7 @@ pub(super) fn lower_self_loop_term(
                 // Guarded backedge: on generation mismatch, flush SSA state
                 // (regs + RIP = start_rip) and return to the dispatcher; the
                 // next dispatch re-decodes the loop body from current bytes.
-                let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, &trip, |bcx| {
+                let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, &trip, |bcx| {
                     writeback_gprs(
                         bcx,
                         ctx_ptr,
@@ -572,23 +589,22 @@ pub(super) fn lower_self_loop_term(
                     if inv_guard {
                         // Same guarded backedge for jcc edges that re-enter
                         // this block.
-                        let _ =
-                            emit_inv_gen_check(bcx, ctx_ptr, flags, inv_gen_baked, &trip, |bcx| {
-                                writeback_gprs(
-                                    bcx,
-                                    ctx_ptr,
-                                    flags,
-                                    gpr,
-                                    gpr_loaded,
-                                    Some(gpr_dirty),
-                                    rflags,
-                                    rflags_ptr,
-                                    true,
-                                );
-                                let rip_val = iconst_u64(bcx, start_rip);
-                                let rip_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RIP));
-                                bcx.ins().store(flags, rip_val, rip_ptr, 0);
-                            });
+                        let _ = emit_inv_gen_check(bcx, ctx_ptr, flags, &trip, |bcx| {
+                            writeback_gprs(
+                                bcx,
+                                ctx_ptr,
+                                flags,
+                                gpr,
+                                gpr_loaded,
+                                Some(gpr_dirty),
+                                rflags,
+                                rflags_ptr,
+                                true,
+                            );
+                            let rip_val = iconst_u64(bcx, start_rip);
+                            let rip_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RIP));
+                            bcx.ins().store(flags, rip_val, rip_ptr, 0);
+                        });
                     }
                     bcx.ins().jump(loop_header, &args);
                 } else {
@@ -609,7 +625,6 @@ pub(super) fn lower_self_loop_term(
                         lookup_ref,
                         block_sig_ref,
                         inv_guard,
-                        inv_gen_baked,
                         &trip,
                     );
                 }
@@ -642,7 +657,6 @@ pub(super) fn lower_jcc_chain(
     lookup_ref: FuncRef,
     block_sig_ref: SigRef,
     inv_guard: bool,
-    inv_gen_baked: u64,
     trip: &TripCounter,
 ) -> Result<bool, String> {
     let cond = match flag_state {
@@ -672,7 +686,6 @@ pub(super) fn lower_jcc_chain(
             lookup_ref,
             block_sig_ref,
             inv_guard,
-            inv_gen_baked,
             trip,
         );
     }
@@ -926,7 +939,6 @@ pub(super) fn emit_body_and_term(
     lookup_ref: FuncRef,
     block_sig_ref: SigRef,
     inv_guard: bool,
-    inv_gen_baked: u64,
     gpr_vals: &mut [Value; 16],
     gpr_loaded: &mut [bool; 16],
     gpr_dirty: &mut [bool; 16],
@@ -1025,7 +1037,6 @@ pub(super) fn emit_body_and_term(
                 lookup_ref,
                 block_sig_ref,
                 inv_guard,
-                inv_gen_baked,
                 &trip,
             );
         } else if self_loop {
@@ -1050,7 +1061,6 @@ pub(super) fn emit_body_and_term(
                 lookup_ref,
                 block_sig_ref,
                 inv_guard,
-                inv_gen_baked,
                 trip,
             )?;
         } else {
@@ -1100,7 +1110,6 @@ pub(super) fn emit_body_and_term(
                         lookup_ref,
                         block_sig_ref,
                         inv_guard,
-                        inv_gen_baked,
                         &trip,
                     )?;
                 }
@@ -1121,7 +1130,6 @@ pub(super) fn emit_body_and_term(
                         lookup_ref,
                         block_sig_ref,
                         inv_guard,
-                        inv_gen_baked,
                         &trip,
                     );
                 }
@@ -1142,7 +1150,6 @@ pub(super) fn emit_body_and_term(
                         lookup_ref,
                         block_sig_ref,
                         inv_guard,
-                        inv_gen_baked,
                         &trip,
                     );
                 }
@@ -1165,7 +1172,6 @@ pub(super) fn emit_body_and_term(
             lookup_ref,
             block_sig_ref,
             inv_guard,
-            inv_gen_baked,
             &trip,
         );
     } else {
@@ -1186,7 +1192,6 @@ pub(super) fn emit_body_and_term(
             lookup_ref,
             block_sig_ref,
             inv_guard,
-            inv_gen_baked,
             &trip,
         );
     }

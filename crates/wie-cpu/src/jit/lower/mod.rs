@@ -366,9 +366,18 @@ pub(super) struct JitCtx {
     /// target lives for the process lifetime, so the pointer stays valid for
     /// every `run_compiled`.
     pub inv_gen_ptr: *const AtomicU64,
-    /// Invalidate-generation value baked into this block's guards at compile
-    /// time. Rust-side trampolines (`chain_tail`) compare the live generation
-    /// against this snapshot with the same contract as the emitted guards.
+    /// Invalidation generation this host frame was entered under — stamped by
+    /// the dispatcher from the entry block's `CompiledRunMeta::inv_gen`, i.e.
+    /// **the frame's**, not each block's.
+    ///
+    /// Both guards read it from here rather than carrying a compile-time
+    /// immediate: the emitted chain-hop / self-loop backedge guard
+    /// ([`super::emit::emit_inv_gen_check`]) and the Rust-side trampoline
+    /// ([`crate::jit::trampolines::chain_tail`]). That is what makes a
+    /// persisted blob chainable — with a per-block literal baked in, a blob
+    /// written by an earlier process carried the wrong value forever and bailed
+    /// to the dispatcher at every edge. Reading it here also keeps the emitted
+    /// code free of any per-process value.
     pub inv_gen_baked: u64,
     /// Guest instructions **dynamically** retired by this `run_compiled`
     /// (every block in the host chain, including chained successors and
@@ -1212,7 +1221,6 @@ pub(super) fn compile_block(
                     lookup_ref,
                     block_sig_ref,
                     inv_guard,
-                    inv_gen_baked,
                     &mut path_gpr,
                     &mut path_loaded,
                     &mut path_dirty,
@@ -1335,7 +1343,6 @@ pub(super) fn compile_block(
                 lookup_ref,
                 block_sig_ref,
                 inv_guard,
-                inv_gen_baked,
                 &mut gpr_vals,
                 &mut gpr_loaded,
                 &mut gpr_dirty,
