@@ -4,7 +4,7 @@
 use crate::guest_memory::read_u64;
 use crate::guest_string;
 use crate::{HandlerContext, WinApiHandlerResult};
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::{EINVAL, ERANGE, finish, i32_status_to_u64, read_guest_str};
 pub(crate) fn handle_memcpy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -280,6 +280,11 @@ pub(crate) fn handle_strtok(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
         finish(engine, 0)
     }
 }
+/// Byte budget of one `strstr` operand. The per-byte loop this replaced capped
+/// at the same order of magnitude; it exists so a string with no NUL cannot
+/// scan forever.
+const STRSTR_SCAN_BYTES: usize = 1_000_000;
+
 /// `strstr(haystack, needle)` — pointer to the FIRST occurrence of `needle`
 /// in `haystack`, or NULL. Empty needle → haystack.
 pub(crate) fn handle_strstr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -289,60 +294,25 @@ pub(crate) fn handle_strstr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     if haystack == 0 || needle == 0 {
         return finish(engine, 0);
     }
-    // Read both NUL-terminated strings into host buffers (NUL excluded so a
-    // mid-string needle match does not need to align the terminators).
-    let mut hay = Vec::new();
-    let mut ndl = Vec::new();
-    let mut i = 0_u64;
-    loop {
-        let mut b = [0_u8; 1];
-        if engine.mem_read(haystack.wrapping_add(i), &mut b).is_err() {
-            break;
-        }
-        if b[0] == 0 || i > 1_000_000 {
-            break;
-        }
-        hay.push(b[0]);
-        i = i.saturating_add(1);
-    }
-    i = 0;
-    loop {
-        let mut b = [0_u8; 1];
-        if engine.mem_read(needle.wrapping_add(i), &mut b).is_err() {
-            break;
-        }
-        if b[0] == 0 || i > 1_000_000 {
-            break;
-        }
-        ndl.push(b[0]);
-        i = i.saturating_add(1);
-    }
+    // Both operands come back page-sliced (one bulk read per 4 KiB page, NUL
+    // excluded, capacity taken from the byte budget instead of a `push` per
+    // byte), so the search runs over host slices. `_best_effort` keeps the
+    // per-byte loop's shape: an unreadable page ends the string instead of
+    // failing the call.
+    let hay = guest_string::read_ansi_bytes_best_effort(engine, haystack, STRSTR_SCAN_BYTES)?;
+    let ndl = guest_string::read_ansi_bytes_best_effort(engine, needle, STRSTR_SCAN_BYTES)?;
     if ndl.is_empty() {
         return finish(engine, haystack);
     }
-    // Sliding match over the host buffers.
-    let mut pos = 0_usize;
-    while pos < hay.len() {
-        let mut matched = true;
-        let mut k = 0_usize;
-        while k < ndl.len() {
-            let Some(h) = hay.get(pos + k) else {
-                matched = false;
-                break;
-            };
-            if *h != ndl[k] {
-                matched = false;
-                break;
-            }
-            k += 1;
-        }
-        if matched {
-            return finish(
-                engine,
-                haystack.wrapping_add(u64::try_from(pos).unwrap_or(0)),
-            );
-        }
-        pos += 1;
+    // `windows` yields nothing when the needle is longer than the haystack.
+    if let Some(pos) = hay
+        .windows(ndl.len())
+        .position(|window| window == ndl.as_slice())
+    {
+        return finish(
+            engine,
+            haystack.wrapping_add(u64::try_from(pos).unwrap_or(0)),
+        );
     }
     finish(engine, 0)
 }
@@ -531,6 +501,203 @@ pub(crate) fn handle_wcscmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     let r = guest_string::utf16_cmp(engine, a, b, 1_000_000)?;
     finish(engine, i32_status_to_u64(r))
 }
+// ── Page-sliced wide-string scans ──────────────────────────────────────
+//
+// Every `wcs*` handler below used to call `mem_read(.., &[0u8; 2])` once per
+// unit, so a 260-character path paid 260 lock/acquisition/walk cycles per side.
+// The shape is the one `guest_string::utf16_len`/`utf16_cmp` already use: one
+// bulk access per 4 KiB guest page, with the scan itself running over host
+// slices. `mem_read` (not `host_slice`) carries the page here because it also
+// survives a cross-arena span and an odd start address, where a `host_slice`
+// borrow would fail and force the scalar fallback the readers had to hand-roll.
+
+/// 4 KiB — the guest page size, and the size of one page-sliced access.
+const PAGE_BYTES: u64 = 4096;
+
+/// UTF-16 units per page-sliced chunk (one 4 KiB access).
+const CHUNK_UNITS: usize = PAGE_BYTES as usize / std::mem::size_of::<u16>();
+
+/// Bytes from `cursor` to the end of its 4 KiB guest page.
+fn page_tail(cursor: u64) -> usize {
+    let page_end = (cursor | (PAGE_BYTES - 1)).wrapping_add(1);
+    usize::try_from(page_end.saturating_sub(cursor)).unwrap_or(0)
+}
+
+/// Why a page-sliced wide read stopped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnitsEnd {
+    /// The whole requested unit span was read.
+    Span,
+    /// A NUL unit was read, and it is the last unit in `out`.
+    Nul,
+    /// An unreadable guest page ended the read; `out` holds the readable prefix.
+    Fault,
+}
+
+/// Read up to `max_units` UTF-16 units at `addr` into `out`, one bulk access
+/// per guest page, stopping at the first NUL unit (which is kept, so `wcsrchr`
+/// can match the terminator and `wcscpy` can copy it).
+///
+/// A stop that is not the caller's own limit is reported rather than swallowed:
+/// `Fault` still leaves the readable prefix in `out`, because the per-unit loops
+/// processed that prefix before giving up. `fault_is_error` turns the fault into
+/// an error instead — the same split `guest_string`'s ANSI reader makes between
+/// `read_ansi_bytes` and `read_ansi_bytes_best_effort`.
+fn read_units_at(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    addr: u64,
+    max_units: usize,
+    out: &mut Vec<u16>,
+    fault_is_error: bool,
+) -> Result<UnitsEnd> {
+    out.clear();
+    let mut buf = [0_u8; PAGE_BYTES as usize];
+    let mut cursor = addr;
+    let mut remaining = max_units;
+    while remaining > 0 {
+        // An even `take` keeps the unit offset identical in the next chunk, so a
+        // unit never straddles two reads and an odd start address needs no
+        // special case: a unit is two consecutive bytes, alignment is not part
+        // of the contract.
+        let budget = remaining.saturating_mul(2).min(buf.len());
+        let take = budget.min(page_tail(cursor)) & !1;
+        if take == 0 {
+            // Last byte of a page (or a one-byte page remainder): one scalar
+            // pair, then re-probe — the same fallback `utf16_len` takes.
+            let mut pair = [0_u8; 2];
+            if let Err(error) = engine.mem_read(cursor, &mut pair) {
+                if fault_is_error {
+                    return Err(error).context("unreadable page in a wide-string scan");
+                }
+                return Ok(UnitsEnd::Fault);
+            }
+            let unit = u16::from_le_bytes(pair);
+            out.push(unit);
+            if unit == 0 {
+                return Ok(UnitsEnd::Nul);
+            }
+            remaining = remaining.saturating_sub(1);
+            cursor = cursor.wrapping_add(2);
+            continue;
+        }
+        let Some(dst) = buf.get_mut(..take) else {
+            return Ok(UnitsEnd::Fault);
+        };
+        if let Err(error) = engine.mem_read(cursor, dst) {
+            if fault_is_error {
+                return Err(error).context("unreadable page in a wide-string scan");
+            }
+            return Ok(UnitsEnd::Fault);
+        }
+        // `take` is even, so every byte of the chunk lands in a whole unit. The
+        // NUL check ends the decode here rather than after a whole page: a 260
+        // unit path must not pay for the 2048 units the page could hold.
+        for pair in dst.as_chunks::<2>().0 {
+            let unit = u16::from_le_bytes(*pair);
+            out.push(unit);
+            if unit == 0 {
+                return Ok(UnitsEnd::Nul);
+            }
+        }
+        remaining = remaining.saturating_sub(take / 2);
+        cursor = cursor.wrapping_add(u64::try_from(take).unwrap_or(0));
+    }
+    Ok(UnitsEnd::Span)
+}
+
+/// Read the NUL-terminated wide string at `addr` into `out`, NUL excluded,
+/// page-sliced like [`read_units_at`] — which means the terminator is found on
+/// the host side, one chunk at a time, instead of by one guest read per unit.
+fn read_wide_string_at(
+    engine: &mut dyn wie_cpu::CpuEngine,
+    addr: u64,
+    max_units: usize,
+    out: &mut Vec<u16>,
+    fault_is_error: bool,
+) -> Result<()> {
+    out.clear();
+    let mut chunk: Vec<u16> = Vec::with_capacity(CHUNK_UNITS.min(max_units));
+    let mut cursor = addr;
+    let mut remaining = max_units;
+    while remaining > 0 {
+        let want = remaining.min(CHUNK_UNITS);
+        let end = read_units_at(engine, cursor, want, &mut chunk, fault_is_error)?;
+        let content = if end == UnitsEnd::Nul {
+            chunk.get(..chunk.len().saturating_sub(1)).unwrap_or(&[])
+        } else {
+            chunk.as_slice()
+        };
+        out.extend_from_slice(content);
+        if end != UnitsEnd::Span || chunk.is_empty() {
+            return Ok(());
+        }
+        remaining = remaining.saturating_sub(chunk.len());
+        cursor = cursor.wrapping_add(u64::try_from(chunk.len().saturating_mul(2)).unwrap_or(0));
+    }
+    Ok(())
+}
+
+/// Write `units` at `addr`, one bulk store per guest page.
+///
+/// Write faults are dropped: the per-unit loops dropped them too (a `wcs*`
+/// destination is the caller's promise, not something to report), and a
+/// partially writable buffer must keep the prefix that did land.
+fn write_units_at(engine: &mut dyn wie_cpu::CpuEngine, mut addr: u64, mut units: &[u16]) {
+    let mut buf = [0_u8; PAGE_BYTES as usize];
+    while let Some((unit, rest)) = units.split_first() {
+        let in_page = page_tail(addr) & !1;
+        if in_page < 2 {
+            // A unit spanning two pages: one scalar store, then re-probe.
+            drop(engine.mem_write(addr, &unit.to_le_bytes()));
+            addr = addr.wrapping_add(2);
+            units = rest;
+            continue;
+        }
+        let count = (in_page / 2).min(units.len());
+        let Some(dst) = buf.get_mut(..count.saturating_mul(2)) else {
+            return;
+        };
+        for (pair, unit) in dst.as_chunks_mut::<2>().0.iter_mut().zip(units) {
+            *pair = unit.to_le_bytes();
+        }
+        drop(engine.mem_write(addr, dst));
+        addr = addr.wrapping_add(u64::try_from(count.saturating_mul(2)).unwrap_or(0));
+        units = units.get(count..).unwrap_or(&[]);
+    }
+}
+
+/// Copy the NUL-terminated wide string at `src` over `dest`, terminator
+/// included, one page-sliced chunk at a time.
+///
+/// Streaming rather than materialise-then-store keeps the host copy bounded: the
+/// scan cap is 1 M units, which as a host buffer would be a 2 MB allocation for
+/// a plain `wcscpy`. It also preserves the forward copy order of the old
+/// per-unit loop.
+fn copy_wide_string(engine: &mut dyn wie_cpu::CpuEngine, dest: u64, src: u64) -> Result<()> {
+    let mut chunk: Vec<u16> = Vec::with_capacity(CHUNK_UNITS);
+    let mut read_cursor = src;
+    let mut write_cursor = dest;
+    let mut remaining = 1_000_000_usize;
+    while remaining > 0 {
+        let want = remaining.min(CHUNK_UNITS);
+        let end = read_units_at(engine, read_cursor, want, &mut chunk, false)?;
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        // The chunk already ends at the terminator when there is one: `wcscpy`
+        // and `wcscat` write it, so it is copied rather than trimmed.
+        write_units_at(engine, write_cursor, &chunk);
+        if end != UnitsEnd::Span {
+            return Ok(());
+        }
+        let advance = u64::try_from(chunk.len().saturating_mul(2)).unwrap_or(0);
+        read_cursor = read_cursor.wrapping_add(advance);
+        write_cursor = write_cursor.wrapping_add(advance);
+        remaining = remaining.saturating_sub(chunk.len());
+    }
+    Ok(())
+}
+
 /// `wcsstr(haystack, needle)` — return pointer to first match or NULL.
 pub(crate) fn handle_wcsstr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
     let engine = &mut *ctx.engine;
@@ -539,44 +706,19 @@ pub(crate) fn handle_wcsstr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     if hay == 0 || needle == 0 {
         return finish(engine, 0);
     }
-    // Read needle
-    let mut ndl = Vec::new();
-    let mut i = 0_u64;
-    loop {
-        let mut b = [0_u8; 2];
-        engine.mem_read(needle.wrapping_add(i.wrapping_mul(2)), &mut b)?;
-        let w = u16::from_le_bytes(b);
-        if w == 0 {
-            break;
-        }
-        ndl.push(w);
-        i = i.saturating_add(1);
-        if i > 100_000 {
-            break;
-        }
-    }
+    // Both operands are read page-sliced; an unreadable page still fails the
+    // call, which is what the per-unit loop did (it propagated `mem_read`).
+    let mut ndl: Vec<u16> = Vec::with_capacity(CHUNK_UNITS);
+    read_wide_string_at(engine, needle, 100_000, &mut ndl, true)?;
     if ndl.is_empty() {
         return finish(engine, hay);
     }
-    // Scan haystack
-    let mut hay_units = Vec::new();
-    i = 0;
-    loop {
-        let mut b = [0_u8; 2];
-        engine.mem_read(hay.wrapping_add(i.wrapping_mul(2)), &mut b)?;
-        let w = u16::from_le_bytes(b);
-        if w == 0 {
-            break;
-        }
-        hay_units.push(w);
-        i = i.saturating_add(1);
-        if i > 1_000_000 {
-            break;
-        }
-    }
+    let mut hay_units: Vec<u16> = Vec::with_capacity(CHUNK_UNITS);
+    read_wide_string_at(engine, hay, 1_000_000, &mut hay_units, true)?;
+    // `windows` yields nothing when the needle is longer than the haystack.
     if let Some(pos) = hay_units
         .windows(ndl.len())
-        .position(|w| w == ndl.as_slice())
+        .position(|window| window == ndl.as_slice())
     {
         let addr = hay.wrapping_add(u64::try_from(pos).unwrap_or(0).wrapping_mul(2));
         return finish(engine, addr);
@@ -601,24 +743,7 @@ pub(crate) fn handle_wcscpy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     if dest == 0 || src == 0 {
         return finish(engine, dest);
     }
-    let mut i = 0_u64;
-    loop {
-        let mut b = [0_u8; 2];
-        if engine
-            .mem_read(src.wrapping_add(i.wrapping_mul(2)), &mut b)
-            .is_err()
-        {
-            break;
-        }
-        drop(engine.mem_write(dest.wrapping_add(i.wrapping_mul(2)), &b));
-        if u16::from_le_bytes(b) == 0 {
-            break;
-        }
-        i = i.saturating_add(1);
-        if i > 1_000_000 {
-            break;
-        }
-    }
+    copy_wide_string(engine, dest, src)?;
     finish(engine, dest)
 }
 /// `wcscat(dest, src)` — append `src` over `dest`'s terminator; returns `dest`.
@@ -629,43 +754,11 @@ pub(crate) fn handle_wcscat(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandle
     if dest == 0 || src == 0 {
         return finish(engine, dest);
     }
-    // Locate the end of dest.
-    let mut i = 0_u64;
-    loop {
-        let mut b = [0_u8; 2];
-        if engine
-            .mem_read(dest.wrapping_add(i.wrapping_mul(2)), &mut b)
-            .is_err()
-        {
-            break;
-        }
-        if u16::from_le_bytes(b) == 0 {
-            break;
-        }
-        i = i.saturating_add(1);
-        if i > 1_000_000 {
-            break;
-        }
-    }
+    // Locate the end of dest: page-sliced, and an unreadable page ends the scan,
+    // exactly as the per-unit walk did.
+    let offset = guest_string::utf16_len(engine, dest, 1_000_000)?;
     // Copy src over the terminator.
-    let mut j = 0_u64;
-    loop {
-        let mut b = [0_u8; 2];
-        if engine
-            .mem_read(src.wrapping_add(j.wrapping_mul(2)), &mut b)
-            .is_err()
-        {
-            break;
-        }
-        drop(engine.mem_write(dest.wrapping_add(i.wrapping_add(j).wrapping_mul(2)), &b));
-        if u16::from_le_bytes(b) == 0 {
-            break;
-        }
-        j = j.saturating_add(1);
-        if j > 1_000_000 {
-            break;
-        }
-    }
+    copy_wide_string(engine, dest.wrapping_add(offset.wrapping_mul(2)), src)?;
     finish(engine, dest)
 }
 /// `wcsncmp(a, b, n)` — compare up to `n` wide units.
@@ -689,31 +782,30 @@ pub(crate) fn handle_wcsncpy(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
     let dest = engine.read_rcx()?;
     let src = engine.read_rdx()?;
     let n = engine.read_r8()?;
-    let count = n.min(4096);
+    let count = usize::try_from(n.min(4096)).unwrap_or(0);
     if dest == 0 || src == 0 || count == 0 {
         return finish(engine, dest);
     }
-    for i in 0..count {
-        let mut b = [0_u8; 2];
-        let mut unit = 0_u16;
-        if engine
-            .mem_read(src.wrapping_add(i.wrapping_mul(2)), &mut b)
-            .is_ok()
-        {
-            unit = u16::from_le_bytes(b);
-        }
-        drop(engine.mem_write(dest.wrapping_add(i.wrapping_mul(2)), &b));
-        if unit == 0 {
-            // Real wcsncpy pads the remainder of the destination with NULs.
-            let pad = [0_u8; 2];
-            for j in (i + 1)..count {
-                drop(engine.mem_write(dest.wrapping_add(j.wrapping_mul(2)), &pad));
-            }
-            break;
-        }
-    }
+    // One bounded page-sliced read of the source, then one page-sliced store:
+    // the short-source padding is a host `resize`, not a store per unit. An
+    // unreadable source page ends the read, and the remainder is padded — which
+    // is what the per-unit loop did (a failed read left its `[0u8; 2]` as the
+    // written pair and padded the rest).
+    let mut out: Vec<u16> = Vec::with_capacity(count);
+    read_wide_string_at(engine, src, count, &mut out, false)?;
+    out.resize(count, 0);
+    write_units_at(engine, dest, &out);
     finish(engine, dest)
 }
+/// The ASCII fold `_wcsnicmp` applies per unit: codes above 0xFF map to
+/// themselves, `A`–`Z` fold to lowercase (the same fold the ctype helpers use,
+/// so non-ASCII never folds).
+fn fold_ascii(unit: u16) -> u16 {
+    u8::try_from(unit)
+        .map(|b| u16::from(b.to_ascii_lowercase()))
+        .unwrap_or(unit)
+}
+
 /// `_wcsnicmp(a, b, n)` — case-insensitive `wcsncmp` (ASCII fold, like the
 /// ctype helpers; non-ASCII maps to itself).
 pub(crate) fn handle_wcsnicmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerResult> {
@@ -721,35 +813,41 @@ pub(crate) fn handle_wcsnicmp(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
     let a = engine.read_rcx()?;
     let b = engine.read_rdx()?;
     let n = engine.read_r8()?;
-    let count = n.min(1_000_000);
-    if count == 0 {
+    let mut remaining = usize::try_from(n.min(1_000_000)).unwrap_or(0);
+    if remaining == 0 {
         return finish(engine, 0);
     }
-    for i in 0..count {
-        let mut ba = [0_u8; 2];
-        let mut bb = [0_u8; 2];
-        let off = i.wrapping_mul(2);
-        if engine.mem_read(a.wrapping_add(off), &mut ba).is_err()
-            || engine.mem_read(b.wrapping_add(off), &mut bb).is_err()
-        {
-            break;
+    // Lockstep page-sliced compare: both cursors advance by the same amount, so
+    // one bulk read per 4 KiB page per side replaces one read per unit per side
+    // while the bail-out on the first differing unit is unchanged.
+    let mut chunk_a: Vec<u16> = Vec::with_capacity(CHUNK_UNITS);
+    let mut chunk_b: Vec<u16> = Vec::with_capacity(CHUNK_UNITS);
+    let mut cursor_a = a;
+    let mut cursor_b = b;
+    while remaining > 0 {
+        let want = remaining.min(CHUNK_UNITS);
+        let end_a = read_units_at(engine, cursor_a, want, &mut chunk_a, false)?;
+        let end_b = read_units_at(engine, cursor_b, want, &mut chunk_b, false)?;
+        for (wa, wb) in chunk_a.iter().zip(chunk_b.iter()) {
+            let (la, lb) = (fold_ascii(*wa), fold_ascii(*wb));
+            if la != lb {
+                let r = i32::from(la).wrapping_sub(i32::from(lb));
+                return finish(engine, i32_status_to_u64(r));
+            }
+            if *wa == 0 {
+                return finish(engine, 0);
+            }
         }
-        let wa = u16::from_le_bytes(ba);
-        let wb = u16::from_le_bytes(bb);
-        // ASCII fold only (matches the ctype helpers); non-ASCII maps to itself.
-        let la = u8::try_from(wa)
-            .map(|b| u16::from(b.to_ascii_lowercase()))
-            .unwrap_or(wa);
-        let lb = u8::try_from(wb)
-            .map(|b| u16::from(b.to_ascii_lowercase()))
-            .unwrap_or(wb);
-        if la != lb {
-            let r = i32::from(la).wrapping_sub(i32::from(lb));
-            return finish(engine, i32_status_to_u64(r));
+        let compared = chunk_a.len().min(chunk_b.len());
+        if end_a != UnitsEnd::Span || end_b != UnitsEnd::Span {
+            // A terminator (already compared above) or an unreadable page ends
+            // the compare equal, as the per-unit `break` did.
+            return finish(engine, 0);
         }
-        if wa == 0 {
-            break;
-        }
+        remaining = remaining.saturating_sub(compared);
+        let advance = u64::try_from(compared.saturating_mul(2)).unwrap_or(0);
+        cursor_a = cursor_a.wrapping_add(advance);
+        cursor_b = cursor_b.wrapping_add(advance);
     }
     finish(engine, 0)
 }
@@ -772,26 +870,26 @@ pub(crate) fn handle_wcsrchr(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandl
         return finish(engine, 0);
     }
     let mut last: u64 = 0;
-    let mut i = 0_u64;
-    loop {
-        let mut b = [0_u8; 2];
-        if engine
-            .mem_read(s.wrapping_add(i.wrapping_mul(2)), &mut b)
-            .is_err()
-        {
+    let mut chunk: Vec<u16> = Vec::with_capacity(CHUNK_UNITS);
+    let mut cursor = s;
+    let mut remaining = 1_000_000_usize;
+    while remaining > 0 {
+        let want = remaining.min(CHUNK_UNITS);
+        let end = read_units_at(engine, cursor, want, &mut chunk, false)?;
+        if chunk.is_empty() {
             break;
         }
-        let w = u16::from_le_bytes(b);
-        if w == c {
-            last = s.wrapping_add(i.wrapping_mul(2));
+        // A chunk never runs past a terminator, and the terminator is itself a
+        // matchable unit (`wcsrchr(s, 0)` finds it), so the last match in the
+        // chunk is the last match in the readable string.
+        if let Some(pos) = chunk.iter().rposition(|&unit| unit == c) {
+            last = cursor.wrapping_add(u64::try_from(pos).unwrap_or(0).wrapping_mul(2));
         }
-        if w == 0 {
+        if end != UnitsEnd::Span {
             break;
         }
-        i = i.saturating_add(1);
-        if i > 1_000_000 {
-            break;
-        }
+        remaining = remaining.saturating_sub(chunk.len());
+        cursor = cursor.wrapping_add(u64::try_from(chunk.len().saturating_mul(2)).unwrap_or(0));
     }
     finish(engine, last)
 }

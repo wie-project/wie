@@ -527,6 +527,338 @@ fn wcsrchr_finds_last_occurrence() {
     assert_eq!(r.return_value, 0x3000 + 8);
 }
 
+/// The wide handlers read guest memory a page at a time now, so the page edge is
+/// where a slicing bug would show: 200 units written at 0x3F00 run to 0x40C8 and
+/// every handler below splits its access at 0x4000. The needle sits on the far
+/// side of the edge so a match has to survive the split.
+#[test]
+fn wide_handlers_cross_a_page_boundary() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    let long = format!("{}needle{}", "a".repeat(150), "b".repeat(44));
+    assert_eq!(long.len(), 200, "one page span, 200 units");
+    write_wide(&mut engine, 0x3F00, &long);
+    let upper = format!("{}NEEDLE{}", "A".repeat(150), "B".repeat(44));
+    write_wide(&mut engine, 0x6000, &upper);
+    write_wide(&mut engine, 0x7800, "needle");
+
+    // Length: one bulk read per page instead of one per unit.
+    write_regs(&mut engine, 0x3F00, 0, 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "wcslen",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 200);
+
+    // Copy across the page edge, terminator included.
+    write_regs(&mut engine, 0x5000, 0x3F00, 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "wcscpy",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x5000);
+    assert_eq!(read_wide(&mut engine, 0x5000), long);
+    let mut terminator = [0xFF_u8; 2];
+    engine
+        .mem_read(0x5000 + 400, &mut terminator)
+        .expect("read terminator slot");
+    assert_eq!(terminator, [0, 0], "the NUL unit crossed the edge too");
+
+    // Append over the terminator: dest's own scan crosses 0x4000, and so does
+    // the source read.
+    write_wide(&mut engine, 0x7000, "xy");
+    write_regs(&mut engine, 0x5000, 0x7000, 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "wcscat",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x5000);
+    assert_eq!(read_wide(&mut engine, 0x5000), format!("{long}xy"));
+
+    // The needle starts at 0x3F00 + 300 bytes, on the second page.
+    write_regs(&mut engine, 0x3F00, 0x7800, 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "wcsstr",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x3F00 + 300);
+
+    // Last occurrence, not first: unit 199 is the last 'b' of the run.
+    write_regs(&mut engine, 0x3F00, u64::from(b'b'), 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-private-l1-1-0.dll",
+        "wcsrchr",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x3F00 + 398);
+
+    // Case-insensitive compare of the same 200 units in two different cases,
+    // both strings straddling a page edge.
+    write_regs(&mut engine, 0x3F00, 0x6000, 200, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "_wcsnicmp",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0, "the ASCII fold applies across the split");
+    write_regs(&mut engine, 0x3F00, 0x6000, 200, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "wcsncmp",
+        &mut engine,
+        &mut state,
+    );
+    assert_ne!(r.return_value, 0, "case-sensitive compare still differs");
+}
+
+/// `strstr` used to grow its haystack `Vec` one byte per iteration; it now reads
+/// page-sliced. The match has to survive a page edge and the needle has to land
+/// on the far page.
+#[test]
+fn strstr_crosses_a_page_boundary() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    // 300 'x' from 0x7F00, so "find" starts at 0x802C — past the 0x8000 edge.
+    let mut hay = vec![b'x'; 300];
+    hay.extend_from_slice(b"find");
+    hay.extend_from_slice(&[b'z'; 10]);
+    engine.mem_write(0x7F00, &hay).expect("write haystack");
+    engine.mem_write(0x7000, b"find\0").expect("write needle");
+
+    write_regs(&mut engine, 0x7F00, 0x7000, 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "strstr",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x7F00 + 300);
+
+    // Absent needle → NULL.
+    engine.mem_write(0x7000, b"nope\0").expect("write needle");
+    write_regs(&mut engine, 0x7F00, 0x7000, 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "strstr",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0);
+}
+
+/// A string whose tail runs off the end of the mapping. The tolerant handlers
+/// keep the readable prefix — that is what the per-unit loops did, one failed
+/// `mem_read` at a time — and must not turn the fault into a handler error.
+/// `wcsstr` is the exception: it propagated the fault before and still does, so
+/// it is not exercised here (`dispatch` panics on an `Err`).
+#[test]
+fn wide_strings_hit_an_unreadable_tail() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    // The test mapping ends at 0x101000: 8 units, no terminator.
+    engine
+        .mem_write(0x100FF0, &utf16_units("abcdefgh"))
+        .expect("write to the mapping end");
+    // Dest pre-filled with 'Z' so a partial copy is visible.
+    let patrol = utf16_units(&"Z".repeat(12));
+    engine.mem_write(0x3000, &patrol).expect("write dest");
+
+    // Copy: 8 units land, the terminator slot stays untouched, no error.
+    write_regs(&mut engine, 0x3000, 0x100FF0, 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "wcscpy",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x3000);
+    let mut dest = [0_u8; 24];
+    engine.mem_read(0x3000, &mut dest).expect("read dest");
+    let mut expected = utf16_units("abcdefgh");
+    expected.extend_from_slice(&utf16_units("ZZZZ"));
+    assert_eq!(
+        dest.as_slice(),
+        expected.as_slice(),
+        "the readable prefix copies; nothing past it is touched"
+    );
+
+    // wcsncpy treats the fault as end-of-source and zero-pads the count.
+    engine
+        .mem_write(0x3200, &utf16_units(&"Z".repeat(12)))
+        .expect("write dest");
+    write_regs(&mut engine, 0x3200, 0x100FF0, 12, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "wcsncpy",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x3200);
+    let mut padded = [0_u8; 24];
+    engine.mem_read(0x3200, &mut padded).expect("read dest");
+    let mut expected = utf16_units("abcdefgh");
+    expected.extend_from_slice(&[0_u8; 8]);
+    assert_eq!(
+        padded.as_slice(),
+        expected.as_slice(),
+        "short source is NUL-padded to the count"
+    );
+
+    // The compare stops at the fault and calls the prefixes equal.
+    engine
+        .mem_write(0x3400, &utf16_units("abcdefgh"))
+        .expect("write comparand");
+    write_regs(&mut engine, 0x100FF0, 0x3400, 100, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "_wcsnicmp",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0);
+
+    // A match inside the readable prefix still answers; the NUL that is not
+    // there does not.
+    write_regs(&mut engine, 0x100FF0, u64::from(b'd'), 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-private-l1-1-0.dll",
+        "wcsrchr",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x100FF0 + 6);
+    write_regs(&mut engine, 0x100FF0, 0, 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-private-l1-1-0.dll",
+        "wcsrchr",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0, "no readable terminator to report");
+}
+
+/// An empty source: `wcscpy` writes the lone terminator and stops, `wcscat`
+/// appends nothing, `wcsncpy` pads the whole count, and the search/compare
+/// handlers see a string of length zero.
+#[test]
+fn empty_wide_source_copies_only_the_terminator() {
+    let mut engine = test_engine();
+    let mut state = test_state();
+    write_wide(&mut engine, 0x4000, ""); // the empty source
+    engine
+        .mem_write(0x3000, &utf16_units("zzzz"))
+        .expect("write dest");
+
+    write_regs(&mut engine, 0x3000, 0x4000, 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "wcscpy",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x3000);
+    assert_eq!(
+        read_wide(&mut engine, 0x3000),
+        "",
+        "wcscpy writes the lone terminator"
+    );
+    let mut dest = [0_u8; 8];
+    engine.mem_read(0x3000, &mut dest).expect("read dest");
+    assert_eq!(
+        dest,
+        [0, 0, b'z', 0, b'z', 0, b'z', 0],
+        "nothing past the terminator is touched"
+    );
+
+    // Appending nothing leaves the destination byte-identical.
+    write_wide(&mut engine, 0x3400, "ab");
+    write_regs(&mut engine, 0x3400, 0x4000, 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "wcscat",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x3400);
+    assert_eq!(read_wide(&mut engine, 0x3400), "ab");
+
+    // wcsncpy pads the full count with NULs.
+    engine
+        .mem_write(0x3600, &utf16_units("QQQ"))
+        .expect("write dest");
+    write_regs(&mut engine, 0x3600, 0x4000, 3, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "wcsncpy",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x3600);
+    let mut padded = [0xFF_u8; 6];
+    engine.mem_read(0x3600, &mut padded).expect("read dest");
+    assert_eq!(padded, [0_u8; 6], "three NUL units");
+
+    // "ab" vs "": the first pair differs, so the sign comes from 'a' - 0.
+    write_regs(&mut engine, 0x3400, 0x4000, 4, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "_wcsnicmp",
+        &mut engine,
+        &mut state,
+    );
+    assert!(
+        r.return_value != 0,
+        "a prefix of a string is not equal to it"
+    );
+
+    // An empty needle matches at the start of the haystack, wide and narrow.
+    write_regs(&mut engine, 0x3400, 0x4000, 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "wcsstr",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x3400);
+    engine
+        .mem_write(0x5000, b"hello\0")
+        .expect("write ANSI haystack");
+    engine.mem_write(0x5100, b"\0").expect("write empty needle");
+    write_regs(&mut engine, 0x5000, 0x5100, 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-string-l1-1-0.dll",
+        "strstr",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x5000);
+
+    // The empty string's own terminator is still findable by wcsrchr.
+    write_regs(&mut engine, 0x4000, 0, 0, 0);
+    let r = dispatch(
+        "api-ms-win-crt-private-l1-1-0.dll",
+        "wcsrchr",
+        &mut engine,
+        &mut state,
+    );
+    assert_eq!(r.return_value, 0x4000);
+}
+
+/// The guest bytes of `text` as UTF-16LE units, no terminator.
+fn utf16_units(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
 // --- _vsnwprintf / _vsnprintf (bounded printf-family format engine) ---
 
 #[test]
