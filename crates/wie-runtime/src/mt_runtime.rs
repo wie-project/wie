@@ -29,16 +29,20 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 ///
 /// Guest threads (primary pump + workers) and the host presenter contend
 /// for the same `WinApiState` mutex. When runtime profiling is enabled each
-/// acquisition times its wait and records into the matching side's atomics;
-/// when disabled the [`Self::enabled`] gate short-circuits before
-/// `Instant::now()`, so the hot path pays one relaxed atomic load per lock
-/// acquisition and nothing else.
+/// **contended** acquisition (one that had to block; see [`lock_timed`]) times
+/// its wait and records into the matching side's atomics; when disabled the
+/// [`Self::enabled`] gate short-circuits before `Instant::now()`, so the hot
+/// path pays one relaxed atomic load per lock acquisition and nothing else.
+/// An uncontended acquisition records nothing in either mode, because it did
+/// not wait — timing it measured the instrumentation, not the emulator.
 #[derive(Debug)]
 pub(crate) struct LockWaitStats {
     /// Profiling gate (set by the session when `WIE_RUNTIME_PROFILE` or
     /// `enable_frame_timing` activates).
     enabled: AtomicBool,
-    /// Guest-side accumulated wait nanoseconds (primary + worker threads).
+    /// Guest-side accumulated **blocking** wait nanoseconds (primary + worker
+    /// threads). Uncontended acquisitions contribute zero, not their
+    /// instrumentation cost.
     guest_total_ns: AtomicU64,
     /// Largest single guest-side wait (ns).
     guest_max_ns: AtomicU64,
@@ -147,14 +151,47 @@ pub(crate) fn lock_wait<'a>(m: &'a Mutex<WinApiState>, stats: &LockWaitStats) ->
 /// [`lock_wait`] without the lock-order record: the timing half, generic over
 /// the guarded value so the wait-accounting tests can drive it with a plain
 /// mutex instead of standing up a whole `WinApiState`.
+///
+/// # Why an uncontended acquisition reads no clock
+///
+/// Timing an acquisition the obvious way — `Instant::now()`, block, `elapsed()` —
+/// costs two host clock reads *per acquisition*, contended or not. `lock_wait`
+/// is taken several times per guest quantum and measured at **8.6 M acquisitions
+/// per 60 s** on a DOOM Retro run, i.e. ~17 M clock reads for a statistic whose
+/// interesting events are the contended ones (of which there were a handful).
+/// That cost lands on the guest thread and shows up in a profile as
+/// `mach_absolute_time`, not as lock contention.
+///
+/// So the clock is now read only on the path that actually waits: `try_lock`
+/// first, and only a `WouldBlock` pays for the deadline. The blocking wait is
+/// still the std `Mutex` (a futex-backed park), which takes its own deadline
+/// internally — there is no spin loop here to re-read the clock per iteration,
+/// and the OS primitive already does the waiting.
+///
+/// `try_lock` failure is the exact condition the recorded number means, so this
+/// also makes the accumulator *more* meaningful than it was: `guest_total_ns`
+/// used to sum each uncontended acquisition's ~30 ns of instrumentation, which
+/// on 8.6 M acquisitions dwarfed the real contention.
+///
+/// Poison behaviour is unchanged: [`lock`] recovers a poisoned guard via
+/// `into_inner()`, and `try_lock` reports a poisoned-but-acquired lock through
+/// `TryLockError::Poisoned`, whose `into_inner()` is the same recovery.
 pub(crate) fn lock_timed<'a, T>(m: &'a Mutex<T>, stats: &LockWaitStats) -> MutexGuard<'a, T> {
     if !stats.enabled() {
         return lock(m);
     }
-    let t0 = Instant::now();
-    let guard = lock(m);
-    stats.record_guest(u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX));
-    guard
+    match m.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            // The one clock read: a single deadline for the whole wait, taken
+            // once before the blocking acquire rather than per spin iteration.
+            let t0 = Instant::now();
+            let guard = lock(m);
+            stats.record_guest(u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            guard
+        }
+    }
 }
 
 /// The big `WinApiState` guard, carrying its lock-order record; see
@@ -1236,6 +1273,51 @@ mod tests {
         assert_eq!(snap.guest_max_ns, 0);
         assert_eq!(snap.presenter_total_ns, 0);
         assert_eq!(snap.presenter_max_ns, 0);
+    }
+
+    /// **An uncontended acquisition must not be timed at all.**
+    ///
+    /// `lock_wait` is taken several times per guest quantum; on a DOOM Retro
+    /// run that is 8.6 M acquisitions per 60 s. Timing each one with
+    /// `Instant::now()`/`elapsed()` put ~17 M host clock reads on the guest
+    /// thread for a statistic that only means anything when the lock actually
+    /// blocked, which profiled as `mach_absolute_time` overhead rather than as
+    /// contention. The contract is therefore: enabled profiling plus a free
+    /// lock records nothing, and a *contended* acquisition still records (the
+    /// sibling test above covers that half).
+    #[test]
+    fn lock_timed_uncontended_records_no_wait() {
+        let stats = LockWaitStats::new();
+        stats.set_enabled(true);
+        let state = Mutex::new(11_u32);
+        for _ in 0..100 {
+            let guard = lock_timed(&state, &stats);
+            assert_eq!(*guard, 11);
+        }
+        let snap = stats.snapshot();
+        assert_eq!(snap.guest_total_ns, 0, "a free lock has no wait to record");
+        assert_eq!(snap.guest_max_ns, 0);
+    }
+
+    /// A poisoned-but-free lock must still yield its guard: `try_lock` reports
+    /// that case as `Poisoned`, and the recovery has to match [`lock`]'s
+    /// (`into_inner`), otherwise enabling profiling would turn a recoverable
+    /// poison into a panic on a path that used to recover.
+    #[test]
+    fn lock_timed_recovers_a_poisoned_guard() {
+        let stats = LockWaitStats::new();
+        stats.set_enabled(true);
+        let state = Arc::new(Mutex::new(3_u32));
+        let poisoner = Arc::clone(&state);
+        let panicked = std::thread::spawn(move || {
+            let _guard = poisoner.lock().expect("first lock");
+            panic!("poison the mutex");
+        })
+        .join();
+        assert!(panicked.is_err(), "the holder must have panicked");
+
+        let guard = lock_timed(&state, &stats);
+        assert_eq!(*guard, 3, "the value survives the poisoning thread");
     }
 
     /// The `record_presenter` side accumulates independently of the guest
