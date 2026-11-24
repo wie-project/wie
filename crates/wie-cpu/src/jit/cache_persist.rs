@@ -1,28 +1,32 @@
-//! Persistent JIT code-cache ledger (`WIE_JIT_CACHE`).
+//! Persistent JIT cache **ledger** (`WIE_JIT_CACHE`): per-PE *metadata* about
+//! blocks that compiled, or did not.
 //!
-//! **Chosen approach: known-good metadata ledger, NOT raw machine-code
-//! restore.** Re-materializing Cranelift-emitted aarch64 code is not feasible
-//! safely with the current [`JitEngine`] setup:
+//! # What this stores, and what it deliberately does not
 //!
-//! - `is_pic = false` + `use_colocated_libcalls = false`: block bodies bake
-//!   absolute / short-branch references to libcall trampolines and import
-//!   stubs inside the same `JITModule` text region. Region base addresses and
-//!   inter-section distances differ between runs (mmap ASLR + differing
-//!   allocation sequences), so replayed bytes would branch into garbage.
-//! - Cranelift does not expose per-function relocation records we could re-
-//!   apply on restore.
-//! - Restored blocks cannot join the `FuncId`-keyed chain-table world without
-//!   going through the module, which defeats the purpose.
-//!
-//! The ledger therefore persists per-PE *metadata*: file key =
-//! `(pe_hash, opt_level)` (see [`jit_cache_key`]), in-file key =
-//! `(guest_va, fnv1a(guest bytes))`, value = `{guest_start, guest_end,
-//! insn_count, inv_gen, never, compiled_at_opt}` (spec metadata minus
-//! machine-code bytes). On warm boot, [`JitShared::attach_pe_cache`] bulk-loads
-//! the file; every later
+//! The ledger persists per-PE *metadata*: file key = `(pe_hash, opt_level)` (see
+//! [`jit_cache_key`]), in-file key = `(guest_va, fnv1a(guest bytes))`, value =
+//! `{guest_start, guest_end, insn_count, inv_gen, never, compiled_at_opt}`.
+//! On warm boot, [`JitShared::attach_pe_cache`] bulk-loads the file; every later
 //! consumption re-validates the CURRENT guest bytes against the recorded hash
-//! before acting on it, so any stale/SMC-diverged entry simply probes as
-//! absent and falls back to the normal cold path.
+//! before acting on it, so any stale/SMC-diverged entry simply probes as absent
+//! and falls back to the normal cold path.
+//!
+//! **No machine code is stored here.** Re-materializing Cranelift-emitted aarch64
+//! code needs the emitted bytes *and* their relocations, and cranelift-jit
+//! applies relocations inside `define_function_with_control_plane` and keeps the
+//! patched result private — so capturing the pre-relocation form is an
+//! interception on the define, not a read of anything that exists afterwards.
+//! That is a different subsystem with a different risk profile, and it lives in
+//! [`crate::jit::engine::code_cache`] behind its own **off-by-default** knob
+//! (`WIE_JIT_CODE_CACHE`). Keeping it separate is deliberate: this ledger's
+//! worst case is a wasted compile, whereas replayed code's worst case is a wrong
+//! answer, and the two should not share a switch, a file, or a blast radius.
+//!
+//! Warm-boot savings from *this module alone* (honest accounting): known-good
+//! blocks skip the Hot visit-threshold warmup entirely (immediate background
+//! compile), and known-bad (`Never`) blocks skip repeated decode attempts. The
+//! ~3 ms/block Cranelift cost itself is NOT eliminated here — that is what
+//! `WIE_JIT_CODE_CACHE` is for.
 //!
 //! **The file key alone is not enough once opt level becomes per-block.** With
 //! hot-block tiering one process compiles the same guest VA at *both* levels,
@@ -36,12 +40,13 @@
 //!   match the level the file declares, so a foreign record can never be served
 //!   to a compile expecting the other level (defence in depth behind the key).
 //!
-//! Warm-boot savings (honest accounting): known-good blocks skip the Hot
-//! visit-threshold warmup entirely (immediate background compile), and
-//! known-bad (`Never`) blocks skip repeated decode attempts. The ~3 ms/block
-//! Cranelift cost itself is NOT eliminated by this module; eliminating it
-//! requires either position-independent emit with serialized relocations or a
-//! real tier-0 emitter (see docs/RUNBOOK.md knob table note).
+//! Note that `inv_gen` is a **per-process** counter starting at zero, so a
+//! persisted value is only meaningful as "the generation at capture time" —
+//! which is exactly why the code cache (which bakes it into the emitted edge
+//! guard) has to compare it against the live value. Here it is carried for
+//! diagnosis and for the cross-process story in the module docs above; no
+//! in-process consumption compares it, because every consumption is already
+//! hash-validated against live guest bytes.
 
 use super::config::JitConfig;
 use super::tier::{OptTier, TIER_OPT_LEVEL};
@@ -944,6 +949,16 @@ fn resolve_config(explicit: Option<String>, under_test: bool) -> Option<PathBuf>
         }
         Some(v) => Some(PathBuf::from(v)),
     }
+}
+
+/// Directory holding persisted machine code (`WIE_JIT_CODE_CACHE`).
+///
+/// A sibling `code/` subdirectory of the ledger's own directory, so the two
+/// caches share one root (one `WIE_CACHE_DIR` to point at, one place to clear)
+/// but never the same file: the ledger's `.bin` and the code cache's `.code`
+/// have unrelated formats, and resetting one must not touch the other.
+pub(crate) fn code_cache_dir() -> PathBuf {
+    default_cache_dir().join("code")
 }
 
 /// Default cache directory: `$WIE_CACHE_DIR`, else XDG cache home, else the

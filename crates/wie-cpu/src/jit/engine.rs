@@ -41,10 +41,231 @@ use super::lower::{
 };
 use super::tier::{OptTier, TIER_OPT_LEVEL};
 
+/// Persisted-machine-code format, guards and counters (`WIE_JIT_CODE_CACHE`).
+///
+/// Declared here rather than in [`super::mod`] so the code cache can reach the
+/// per-tier module internals it restores into without widening any module's
+/// visibility past `crate::jit`.
+mod code_cache;
+
+#[allow(unused_imports)] // wired up by the JitShared plumbing in a follow-up edit
+pub(crate) use code_cache::{CodeCache, CodeCacheCounts};
+pub(super) use code_cache::{CodeRestoreOutcome, PersistedCode};
+
+use cranelift_module::{FuncId, Module, ModuleDeclarations, ModuleReloc};
+
+/// Pre-relocation emit artifacts of one just-defined function, lifted off the
+/// `CompiledCode` before `cranelift-jit` patches host addresses into it.
+///
+/// This is the *only* point in the JIT where the emitted block exists in a
+/// relocatable form. After `finalize_definitions()` the code carries this
+/// process's absolute addresses and is useless as a cross-run artifact, so the
+/// capture has to happen inside the define (see [`CapturingModule`]).
+pub(crate) struct CapturedCode {
+    /// The function this belongs to, valid in the capturing module.
+    pub(super) func_id: FuncId,
+    /// Code alignment cranelift-jit used for the blob; replayed verbatim so a
+    /// restored function is placed exactly like a compiled one.
+    pub(super) align: u64,
+    /// Unrelocated machine code.
+    pub(super) bytes: Vec<u8>,
+    /// Relocations for [`Self::bytes`], in cranelift's own order.
+    pub(super) relocs: Vec<ModuleReloc>,
+}
+
+/// A [`cranelift_jit::JITModule`] that keeps a copy of every function's
+/// pre-relocation bytes, so the on-disk code cache has something to persist.
+///
+/// # Why this wrapper exists
+///
+/// `cranelift-jit` applies relocations *inside*
+/// `define_function_with_control_plane` and keeps the patched bytes private.
+/// `Module::define_function_bytes` is the public inverse — it takes bytes plus
+/// relocs and defines a function from them — but nothing exposes the input side
+/// of the first call. Overriding the one trait method that performs the define
+/// is therefore the whole interception seam; no change to the lowering path is
+/// needed, because `Module::define_function` (what [`super::lower`] calls)
+/// forwards to `define_function_with_control_plane`.
+///
+/// Everything else is reached through [`Deref`], so the lowering path's calls
+/// (`declare_func_in_func`, `declare_anonymous_function`,
+/// `finalize_definitions`, `get_finalized_function`, `clear_context`) keep
+/// resolving to the inner `JITModule` unchanged.
+pub(crate) struct CapturingModule {
+    inner: cranelift_jit::JITModule,
+    /// Code emitted by the most recent successful define, not yet drained.
+    ///
+    /// One slot is enough because every compile holds `JitShared::engine`
+    /// exclusively for the whole define → finalize → drain sequence.
+    captured: Option<CapturedCode>,
+}
+
+impl std::ops::Deref for CapturingModule {
+    type Target = cranelift_jit::JITModule;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for CapturingModule {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl CapturingModule {
+    fn new(inner: cranelift_jit::JITModule) -> Self {
+        Self {
+            inner,
+            captured: None,
+        }
+    }
+
+    /// Take the code emitted for `func_id`, if that is what was captured last.
+    ///
+    /// Any capture belonging to a different function is **discarded, not
+    /// returned**: a stale capture paired with the wrong `FuncId` would attach
+    /// one block's code to another's record, which is exactly the kind of silent
+    /// miscompile the cache exists to avoid.
+    pub(super) fn take_captured(&mut self, func_id: FuncId) -> Option<CapturedCode> {
+        match &self.captured {
+            Some(c) if c.func_id == func_id => self.captured.take(),
+            Some(_) => {
+                self.captured = None;
+                None
+            }
+            None => None,
+        }
+    }
+}
+
+impl cranelift_module::Module for CapturingModule {
+    fn isa(&self) -> &dyn cranelift_codegen::isa::TargetIsa {
+        cranelift_module::Module::isa(&self.inner)
+    }
+
+    fn declarations(&self) -> &ModuleDeclarations {
+        cranelift_module::Module::declarations(&self.inner)
+    }
+
+    fn declare_function(
+        &mut self,
+        name: &str,
+        linkage: cranelift_module::Linkage,
+        signature: &cranelift_codegen::ir::Signature,
+    ) -> cranelift_module::ModuleResult<FuncId> {
+        cranelift_module::Module::declare_function(&mut self.inner, name, linkage, signature)
+    }
+
+    fn declare_anonymous_function(
+        &mut self,
+        signature: &cranelift_codegen::ir::Signature,
+    ) -> cranelift_module::ModuleResult<FuncId> {
+        cranelift_module::Module::declare_anonymous_function(&mut self.inner, signature)
+    }
+
+    /// Explicitly forwarded rather than relying on the trait's default.
+    ///
+    /// The default already routes through
+    /// [`Self::define_function_with_control_plane`] (and therefore through the
+    /// capture), but the capture is load-bearing enough that depending on
+    /// method-resolution order between `DerefMut` and this trait is not a
+    /// trade worth making: if `DerefMut` ever won, every blob would silently
+    /// come back empty and the cache would look like a 0% hit rate.
+    fn define_function(
+        &mut self,
+        func: FuncId,
+        ctx: &mut cranelift_codegen::Context,
+    ) -> cranelift_module::ModuleResult<()> {
+        let mut cp = cranelift_codegen::control::ControlPlane::default();
+        self.define_function_with_control_plane(func, ctx, &mut cp)
+    }
+
+    /// Capture, then delegate. Capturing *after* the inner define is safe
+    /// because `Module::define_function_with_control_plane` documents that the
+    /// `Context` holds the compiled function on return — and `CompiledCode`'s
+    /// buffer is the un-relocated one; `JITModule` patches a *copy* inside the
+    /// blob it allocates.
+    fn define_function_with_control_plane(
+        &mut self,
+        func: FuncId,
+        ctx: &mut cranelift_codegen::Context,
+        ctrl_plane: &mut cranelift_codegen::control::ControlPlane,
+    ) -> cranelift_module::ModuleResult<()> {
+        let result = cranelift_module::Module::define_function_with_control_plane(
+            &mut self.inner,
+            func,
+            ctx,
+            ctrl_plane,
+        );
+        // A failed define leaves the context without a `CompiledCode`; keep
+        // whatever was captured before rather than a half-updated slot.
+        if let Err(e) = result {
+            return Err(e);
+        }
+        self.captured = ctx.compiled_code().map(|cc| CapturedCode {
+            func_id: func,
+            align: (cc.buffer.alignment as u64)
+                .max(self.inner.isa().function_alignment().minimum as u64)
+                .max(self.inner.isa().symbol_alignment()),
+            bytes: cc.code_buffer().to_vec(),
+            relocs: cc
+                .buffer
+                .relocs()
+                .iter()
+                .map(|r| ModuleReloc::from_mach_reloc(r, &ctx.func, func))
+                .collect(),
+        });
+        result
+    }
+
+    fn define_function_bytes(
+        &mut self,
+        func_id: FuncId,
+        alignment: u64,
+        bytes: &[u8],
+        relocs: &[ModuleReloc],
+    ) -> cranelift_module::ModuleResult<()> {
+        cranelift_module::Module::define_function_bytes(
+            &mut self.inner,
+            func_id,
+            alignment,
+            bytes,
+            relocs,
+        )
+    }
+
+    fn define_data(
+        &mut self,
+        data_id: cranelift_module::DataId,
+        data: &cranelift_module::DataDescription,
+    ) -> cranelift_module::ModuleResult<()> {
+        cranelift_module::Module::define_data(&mut self.inner, data_id, data)
+    }
+
+    fn declare_data(
+        &mut self,
+        name: &str,
+        linkage: cranelift_module::Linkage,
+        writable: bool,
+        tls: bool,
+    ) -> cranelift_module::ModuleResult<cranelift_module::DataId> {
+        cranelift_module::Module::declare_data(&mut self.inner, name, linkage, writable, tls)
+    }
+
+    fn declare_anonymous_data(
+        &mut self,
+        writable: bool,
+        tls: bool,
+    ) -> cranelift_module::ModuleResult<cranelift_module::DataId> {
+        cranelift_module::Module::declare_anonymous_data(&mut self.inner, writable, tls)
+    }
+}
+
 /// The per-tier Cranelift machinery: one `JITModule`, one compile `Context`,
 /// and that module's own import `FuncId`s.
 pub(crate) struct IsaEngine {
-    pub(super) module: cranelift_jit::JITModule,
+    pub(super) module: CapturingModule,
     pub(super) ctx: cranelift_codegen::Context,
     pub(super) func_ctx: cranelift::prelude::FunctionBuilderContext,
     /// Shared signature: `(i64 ctx_ptr)` — host C ABI (callable from Rust).
@@ -133,6 +354,12 @@ impl JitEngine {
     /// Whether a tier-up module exists (i.e. tiering is armed at all).
     pub(super) fn has_tier_module(&self) -> bool {
         self.tier.is_some()
+    }
+
+    /// Mutable handle on the base module, for identity queries that do not need
+    /// to know which tier owns the answer.
+    pub(super) fn base_mut(&mut self) -> &mut IsaEngine {
+        &mut self.base
     }
 }
 
@@ -397,7 +624,7 @@ impl IsaEngine {
             .map_err(|e| e.to_string())?;
 
         Ok(Self {
-            module,
+            module: CapturingModule::new(module),
             ctx: cranelift_codegen::Context::new(),
             func_ctx: FunctionBuilderContext::new(),
             block_sig,
@@ -426,5 +653,132 @@ impl IsaEngine {
                 fflush,
             },
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Emitted-code capture and restore (`WIE_JIT_CODE_CACHE`)
+// ---------------------------------------------------------------------------
+
+impl IsaEngine {
+    /// Number of **import** declarations at the head of this module.
+    ///
+    /// Derived from the live declaration table rather than a hand-kept list, so
+    /// it cannot drift from [`IsaEngine::new`]. Imports are declared first and
+    /// only imports are `Linkage::Import`, so the prefix is exactly
+    /// `FuncId` 0..`import_count()` — which is what makes a persisted
+    /// `FuncId` index meaningful again in a later process.
+    pub(super) fn import_count(&self) -> u32 {
+        let decls = cranelift_module::Module::declarations(&self.module);
+        let mut n = 0_u32;
+        // `get_functions` is the non-panicking accessor (`get_function_decl`
+        // indexes a `SecondaryMap` and traps past the end), and it walks the
+        // declaration table in `FuncId` order.
+        for (id, decl) in decls.get_functions() {
+            if id.as_u32() != n || !matches!(decl.linkage, cranelift_module::Linkage::Import) {
+                return n;
+            }
+            n = n.saturating_add(1);
+        }
+        n
+    }
+
+    /// Name of import declaration `index`, or `None` when `index` is not an
+    /// import in this module.
+    ///
+    /// The per-relocation half of the persisted-file identity check: a code
+    /// blob's relocation says "call import #7", which only means anything if
+    /// import #7 in *this* process is the same host helper.
+    pub(super) fn import_name_at(&self, index: u32) -> Option<&str> {
+        if index >= self.import_count() {
+            return None;
+        }
+        cranelift_module::Module::declarations(&self.module)
+            .get_functions()
+            .find(|(id, _)| id.as_u32() == index)
+            .and_then(|(_, decl)| decl.name.as_deref())
+    }
+
+    /// FNV-1a over the ordered import names: the on-disk code file's identity
+    /// check. Reordering or renaming a single helper invalidates every blob,
+    /// which is the safe direction.
+    pub(super) fn import_fingerprint(&self) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325_u64;
+        for i in 0..self.import_count() {
+            let name = self.import_name_at(i).unwrap_or("<anon>");
+            h ^= name.len() as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            for b in name.as_bytes() {
+                h ^= u64::from(*b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// Drain the pre-relocation code just emitted for `func_id` in the tier
+    /// this engine owns, if it was captured.
+    pub(super) fn take_captured(&mut self, func_id: FuncId) -> Option<CapturedCode> {
+        self.module.take_captured(func_id)
+    }
+
+    /// Define a block from persisted bytes instead of compiling it.
+    ///
+    /// Returns the finalized entry point. Fails — never panics, never maps
+    /// unvalidated bytes — when any relocation target is not a host import this
+    /// module declares under the same name.
+    ///
+    /// Rejects, deliberately and by design (see
+    /// [`crate::jit::cache_persist`]):
+    /// - `FunctionOffset` — a direct `bl` to another compiled block. Those
+    ///   `FuncId`s are allocated in declaration order, so they name a different
+    ///   function (or nothing) in the next process. A blob with any of these is
+    ///   the block-level form of the chain table and is never persisted.
+    /// - `LibCall` / `KnownSymbol` / `User` in a non-zero namespace (a data
+    ///   object) — resolvable only through a linker cranelift-jit does not have.
+    ///
+    /// So a restore *rejects* rather than mis-restores; the caller compiles.
+    pub(super) fn define_persisted(
+        &mut self,
+        code: &PersistedCode,
+    ) -> Result<(FuncId, *const u8), CodeRestoreOutcome> {
+        use cranelift_module::ModuleRelocTarget as Target;
+
+        if code.code.is_empty() || code.align == 0 {
+            return Err(CodeRestoreOutcome::Malformed);
+        }
+        for r in &code.relocs {
+            let Target::User {
+                namespace: 0,
+                index,
+            } = r.name
+            else {
+                return Err(CodeRestoreOutcome::UnrelocatableTarget);
+            };
+            // The name check is what makes "import #7" mean the same thing in
+            // this process as it did in the one that wrote the file.
+            if self.import_name_at(index).is_none() {
+                return Err(CodeRestoreOutcome::UnrelocatableTarget);
+            }
+        }
+
+        let sig = self.block_sig.clone();
+        let func_id = self
+            .module
+            .declare_anonymous_function(&sig)
+            .map_err(|_| CodeRestoreOutcome::Malformed)?;
+        self.module
+            .define_function_bytes(func_id, code.align, &code.code, &code.relocs)
+            .map_err(|_| CodeRestoreOutcome::Malformed)?;
+        // Only the function just defined is pending: every compile finalizes
+        // before releasing `JitShared::engine`, which this call also holds.
+        self.module
+            .finalize_definitions()
+            .map_err(|_| CodeRestoreOutcome::Malformed)?;
+        let ptr = self.module.get_finalized_function(func_id);
+        if ptr.is_null() {
+            return Err(CodeRestoreOutcome::Malformed);
+        }
+        Ok((func_id, ptr))
     }
 }
