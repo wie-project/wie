@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Notepad end-to-end acceptance scenario (docs/notepad-support-plan.md Task 6.1).
+# Notepad end-to-end acceptance scenario (docs/superpowers/notepad-support-plan.md Task 6.1).
 #
-# Drives real_exes/notepad.exe (RNotepad, fetched by scripts/fetch-rnotepad.sh)
+# Drives real_exes/notepad.exe (RNotepad, fetched by scripts/fetch.sh notepad)
 # through the notepad-milestone features and asserts the outcomes that can be
 # verified headlessly:
 #
@@ -43,7 +43,7 @@ say() { printf '\n== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 # --- preflight ---------------------------------------------------------------
-[[ -f "$NOTEPAD" ]] || fail "real_exes/notepad.exe missing — run ./scripts/fetch-rnotepad.sh"
+[[ -f "$NOTEPAD" ]] || fail "real_exes/notepad.exe missing — run ./scripts/fetch.sh notepad"
 [[ -x "$WIE_CLI" ]] || fail "wie missing at $WIE_CLI — build with: cargo build -p wie-cli"
 
 # --- step 0: bottle + fixture (headless) -------------------------------------

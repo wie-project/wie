@@ -17,6 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Toolchain before every check step below: fmt, clippy, nextest,
+      # check.sh (cargo metadata) and check-non-macos.sh (cargo check) all
+      # need a working cargo. `stable` matches rust-toolchain.toml, which is the
+      # single source of truth for the toolchain version — do not pin a second
+      # one here.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -63,8 +68,27 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
+      # The two policy checks below live in scripts/check.sh as functions (that
+      # file is the single source of truth for the gate). They are invoked here
+      # one step at a time with --only, NOT as a bare `./scripts/check.sh`:
+      # CI runs each check as its own named step, with the cache and toolchain
+      # set up above and the expensive steps (clippy, fixtures, nextest,
+      # micro-suite) below. A full `check.sh` call would re-run all of those
+      # inside one step and collapse the separately-named, individually
+      # retryable stages — and would re-download/rebuild with no cache benefit.
+      # `--only` runs the identical function the local full gate runs.
       - name: File sizes
-        run: ./scripts/check-file-sizes.sh
+        run: ./scripts/check.sh --only file-sizes
+
+      # The crate layering (wie-pe -> wie-cpu -> wie-winapi -> wie-runtime ->
+      # wie-cli) is documented in CLAUDE.md as load-bearing, but no test asserted
+      # it: an added `use` or a new `path =` entry could invert a layer and all
+      # the ~1,900 tests would still pass. This pins the internal edge set
+      # (check_deps() in scripts/check.sh). It runs right after the file-size
+      # check because it costs ~1s (cargo metadata, no compile) and should fail
+      # before anything expensive starts.
+      - name: Crate dependency direction
+        run: ./scripts/check.sh --only dep-direction
 
       # No -D warnings: scripts/check.sh (the authoritative local gate) runs
       # clippy advisory, and the workspace lint table denies no clippy lints
@@ -125,3 +149,58 @@ jobs:
           ./scripts/run-micro-suite.sh pthread_tests
           ./scripts/run-micro-suite.sh cpp_exes
           ./scripts/run-micro-suite.sh dll_tests
+
+  # ---------------------------------------------------------------------------
+  # Compile-check a non-Apple target.
+  #
+  # WHY: crates/wie-cli/Cargo.toml gates 9 dependencies behind
+  # [target.'cfg(target_os = "macos")'.dependencies] with ~60 lines of
+  # commentary asserting that non-Apple builds stay clean. Nothing verified that
+  # claim — this is the first non-Apple compile check in the repo. It catches a
+  # non-macOS-hostile dependency or `std::os::macos` path landing in a
+  # non-gated [dependencies] entry.
+  #
+  # WHY ubuntu-latest: the check is only meaningful on a machine that is not
+  # itself Apple. Running `cargo check --target x86_64-unknown-linux-gnu` from a
+  # macOS runner would still need the target's rust-std, but the host matches the
+  # target so a stray host-only assumption could pass unnoticed.
+  #
+  # No C cross-linker and no system packages are needed: `cargo check` links
+  # nothing, so only the target's rust-std is required, and dtolnay/rust-toolchain
+  # installs it. `stable` matches rust-toolchain.toml (the single source of truth
+  # for the toolchain version); the target is the only addition here.
+  #
+  # SCOPE: the whole workspace, `--all-targets`, no crate exclusions — an
+  # exclusion list silently stops covering a crate once it goes stale, which is
+  # the failure this job exists to prevent. wie-cli's macOS-only subtree (the
+  # winit/wgpu windowed presenter) is cfg-gated at the `mod` declarations in
+  # crates/wie-cli/src/gui/mod.rs, so it compiles out cleanly off-Apple while the
+  # portable entries still build.
+  #
+  # NOT continue-on-error, deliberately. The first run of this job FAILED on a
+  # real defect: `winit` was NOT platform-gated (it sat in wie-cli's plain
+  # [dependencies] with default-features = false + features = ["rwh_06"], so on
+  # a non-Apple target winit 0.30 selects no backend and hits its own
+  # `compile_error!("The platform you're compiling for is not supported by
+  # winit")`). It compiled on macOS only by accident, because winit's macOS
+  # backend is unconditional so that feature set happened to suffice there. The
+  # script originally checked the other four crates explicitly and named this
+  # blocker in its header plus a tripwire that reported when the exclusion went
+  # stale. That is now FIXED: winit moved into the macOS target table and the
+  # GUI subtree it feeds is gated, so the script checks --workspace outright.
+  # Keep it strict — continue-on-error would let exactly this class of breakage
+  # back in unnoticed.
+  # ---------------------------------------------------------------------------
+  non-macos-check:
+    name: Non-macOS compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Non-macOS compile check
+        run: ./scripts/check-non-macos.sh

@@ -107,8 +107,8 @@ max-threads = 1
 
 # ---------------------------------------------------------------------------
 # `fast` — the inner dev loop. Everything except the two groups above.
-# `./scripts/test-fast.sh` wraps it. Use it while iterating, then run
-# `./scripts/check.sh` before opening a PR.
+# Run it directly with `cargo nextest run --profile fast` while iterating, then
+# run `./scripts/check.sh` before opening a PR.
 #
 # `default-filter` accepts exactly ONE predicate: unions, set difference and
 # `not group(...)` are all rejected with "predicate not allowed in

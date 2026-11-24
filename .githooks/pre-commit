@@ -14,7 +14,10 @@ if ! cargo fmt --all --check --manifest-path "$ROOT/Cargo.toml"; then
 fi
 
 echo "pre-commit: file sizes..."
-if ! "$ROOT/scripts/check-file-sizes.sh"; then
+# `./scripts/check.sh --only file-sizes` — the hook needs the policy check
+# without the build/test steps behind it. Same function the full gate runs;
+# check.sh is the only place the rule lives.
+if ! "$ROOT/scripts/check.sh" --only file-sizes; then
     exit 1
 fi
 
