@@ -13,6 +13,7 @@
 //! - a block that does not loop is still charged exactly its static length,
 //!   so the counter cannot inflate the denominator either.
 
+use super::harness::map_code_page;
 use super::*;
 
 /// Guest code region for these tests (unique per test-file convention).
@@ -30,13 +31,7 @@ fn self_loop_reports_dynamic_retired_instructions() {
     const ITERS: u64 = 1 << 23;
 
     let mut cpu = JitCpu::open_x86_64();
-    cpu.virtual_alloc(
-        TRIP_BASE,
-        0x1000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc");
+    map_code_page(&mut cpu, TRIP_BASE);
     // `dec ecx` is `FF /1` in 64-bit mode (0x48–0x4f are REX prefixes there,
     // not the 32-bit `dec` encodings); `jne rel8(-4)` at +2 targets the block
     // entry, so the body is exactly the two decoded instructions (the
@@ -118,13 +113,7 @@ fn self_loop_reports_dynamic_retired_instructions() {
 #[test]
 fn straight_line_block_is_charged_its_static_length() {
     let mut cpu = JitCpu::open_x86_64();
-    cpu.virtual_alloc(
-        TRIP_BASE + 0x2000,
-        0x1000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc");
+    map_code_page(&mut cpu, TRIP_BASE + 0x2000);
     let base = TRIP_BASE + 0x2000;
     // Three lowerable ALU insns and nothing else. No terminator, so the block
     // ends where the following `ud2` begins — `ud2` is not lowerable, so it is
@@ -172,13 +161,7 @@ fn straight_line_block_is_charged_its_static_length() {
 fn short_self_loop_charges_exact_trip_count() {
     const ITERS: u64 = 3;
     let mut cpu = JitCpu::open_x86_64();
-    cpu.virtual_alloc(
-        TRIP_BASE + 0x4000,
-        0x1000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc");
+    map_code_page(&mut cpu, TRIP_BASE + 0x4000);
     let base = TRIP_BASE + 0x4000;
     cpu.mem_write(base, &[0xff, 0xc9, 0x75, 0xfc])
         .expect("write loop");

@@ -22,13 +22,13 @@
 // correctness argument: they prove the atomic paths still route every access
 // through the software page-permission oracle, so making the RMW atomic did
 // not turn it into an unchecked host write.
+use super::harness::{BACKENDS, Backend, Engine, map_code_page, open, open_worker};
 use super::*;
 use crate::ThreadContext;
 use crate::exec::{AccessType, StepResult as StepResultAlias};
-use crate::regs::Rflags;
 use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+use std::sync::Barrier;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
 
 /// `xchg dword ptr [rbx], eax` — 87 /r. Implicitly locked on x86-64 (no LOCK
 /// prefix in the encoding), which is why the memory form must be atomic.
@@ -61,76 +61,7 @@ pub(super) const LOCK_WORD: u64 = DATA_BASE;
 /// fallback has to supply the mutual exclusion.
 pub(super) const UNALIGNED_WORD: u64 = DATA_BASE + 1;
 
-// ── Engine plumbing ─────────────────────────────────────────────────────
-
-pub(super) enum Engine {
-    Iced(Box<IcedCpu>),
-    Jit(Box<JitCpu>),
-}
-
-impl Engine {
-    pub(super) fn cpu(&mut self) -> &mut dyn CpuEngine {
-        match self {
-            Self::Iced(c) => c.as_mut(),
-            Self::Jit(c) => c.as_mut(),
-        }
-    }
-
-    /// Execute enough to retire the single RMW under test.
-    pub(super) fn run_rmw(&mut self) -> StepResultAlias {
-        match self {
-            Self::Iced(c) => c.step_once_result().expect("iced step"),
-            Self::Jit(c) => {
-                let (result, _retired) = c.step_one().expect("jit step");
-                result
-            }
-        }
-    }
-
-    pub(super) fn set_state(&mut self, ctx: &ThreadContext) {
-        self.cpu().restore_thread_context(ctx);
-        // A real guest thread switch does the same TLB/chain drop; without it a
-        // JIT engine would reuse the previous trial's translated pointers.
-        self.cpu().on_thread_switch();
-    }
-
-    pub(super) fn rax(&mut self) -> u64 {
-        self.cpu().read_rax().expect("read rax")
-    }
-
-    /// ZF after the RMW (CMPXCHG is the only instruction here that sets it).
-    fn zf(&mut self) -> bool {
-        let rflags = self.cpu().snapshot_thread_context().rflags;
-        (rflags & Rflags::ZF) == Rflags::ZF
-    }
-}
-
-pub(super) fn open(backend: Backend) -> Engine {
-    match backend {
-        Backend::Iced => Engine::Iced(Box::new(IcedCpu::open_x86_64())),
-        Backend::Jit => Engine::Jit(Box::new(JitCpu::open_x86_64())),
-    }
-}
-
-/// A fresh per-thread engine over the *same* guest memory — the 1:1 model the
-/// runtime uses for guest threads (`IcedCpu::new_standalone_with_mem` /
-/// `JitCpu::new_shared`), and the reason two guest threads can race at all.
-pub(super) fn open_worker(primary: &Engine) -> Engine {
-    match primary {
-        Engine::Iced(c) => Engine::Iced(Box::new(IcedCpu::new_standalone_with_mem(Arc::clone(
-            c.guest_mem_arc(),
-        )))),
-        Engine::Jit(c) => Engine::Jit(Box::new(JitCpu::new_shared(Arc::clone(c.shared_jit())))),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Backend {
-    Iced,
-    Jit,
-}
-
-pub(super) const BACKENDS: [Backend; 2] = [Backend::Iced, Backend::Jit];
+// ── RMW fixtures ────────────────────────────────────────────────────────
 
 /// Register file for one RMW: RIP at the code page, RBX pointing at the word.
 pub(super) fn ctx(code_base: u64, word: u64, rax: u64, rcx: u64) -> ThreadContext {
@@ -155,13 +86,7 @@ pub(super) fn plant(primary: &mut Engine, code_base: u64, op: &[u8], word: u64, 
     // `host_span(.., write=true)` refuses executable spans, so an RWX data page
     // would push every RMW in these tests onto the fallback and the host-atomic
     // arm would go untested.
-    cpu.virtual_alloc(
-        code_base,
-        0x1000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("code alloc");
+    map_code_page(cpu, code_base);
     cpu.virtual_alloc(
         DATA_BASE,
         0x1000,

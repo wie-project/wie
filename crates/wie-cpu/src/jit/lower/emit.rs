@@ -14,8 +14,10 @@ use super::{
     flag_cond_fs, lower_term,
 };
 
-use super::super::block::{BlockStackPinPlan, BlockTerm, DecodedInsn, is_string_op};
+use super::super::block::{BlockStackPinPlan, BlockTerm, DecodedInsn};
 use super::super::fast_api::{self, FastApiKind};
+use super::err::{LowerError, noted};
+use super::opclass::is_string_op;
 
 use ahash::HashMap;
 use cranelift::codegen::ir::{BlockArg, FuncRef, SigRef};
@@ -535,7 +537,7 @@ pub(super) fn lower_self_loop_term(
     block_sig_ref: SigRef,
     inv_guard: bool,
     trip: TripCounter,
-) -> Result<bool, String> {
+) -> Result<bool, LowerError> {
     match term {
         BlockTerm::Jmp { target } if target == start_rip => {
             // Stay in native SSA — pass live regs as header params (no store/reload).
@@ -631,7 +633,7 @@ pub(super) fn lower_self_loop_term(
             }
             Ok(true)
         }
-        _ => Err("self_loop term not jcc/jmp".into()),
+        _ => Err(LowerError::form("self_loop_terminator")),
     }
 }
 
@@ -658,7 +660,7 @@ pub(super) fn lower_jcc_chain(
     block_sig_ref: SigRef,
     inv_guard: bool,
     trip: &TripCounter,
-) -> Result<bool, String> {
+) -> Result<bool, LowerError> {
     let cond = match flag_state {
         Some(fs) => flag_cond_fs(bcx, fs, mnemonic)?,
         None => flag_cond(bcx, rflags, mnemonic)?,
@@ -700,7 +702,7 @@ pub(super) fn lower_fast_ucrt(
     dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let rcx = gpr[1];
     let rdx = gpr[2];
     let r8 = gpr[8];
@@ -729,7 +731,8 @@ pub(super) fn lower_fast_ucrt(
         // P3: inline `strlen` as a byte-scan loop in IR.
         FastApiKind::Strlen => lower_inline_strlen(bcx, gpr, dirty, rflags, mem),
         FastApiKind::Malloc => {
-            let fref = mem.ucrt_refs[kind as usize].ok_or("malloc import")?;
+            let fref = mem.ucrt_refs[kind as usize]
+                .ok_or_else(|| LowerError::verifier("internal: malloc import not declared"))?;
             let call = bcx.ins().call(fref, &[mem.ctx_ptr, rcx]);
             gpr[0] = bcx.inst_results(call)[0];
             mark_dirty(dirty, 0);
@@ -737,7 +740,8 @@ pub(super) fn lower_fast_ucrt(
             Ok(())
         }
         FastApiKind::Free => {
-            let fref = mem.ucrt_refs[kind as usize].ok_or("free import")?;
+            let fref = mem.ucrt_refs[kind as usize]
+                .ok_or_else(|| LowerError::verifier("internal: free import not declared"))?;
             bcx.ins().call(fref, &[mem.ctx_ptr, rcx]);
             gpr[0] = iconst_u64(bcx, 0);
             mark_dirty(dirty, 0);
@@ -745,7 +749,8 @@ pub(super) fn lower_fast_ucrt(
             Ok(())
         }
         FastApiKind::Memcpy => {
-            let fref = mem.ucrt_refs[kind as usize].ok_or("memcpy import")?;
+            let fref = mem.ucrt_refs[kind as usize]
+                .ok_or_else(|| LowerError::verifier("internal: memcpy import not declared"))?;
             let call = bcx.ins().call(fref, &[mem.ctx_ptr, rcx, rdx, r8]);
             gpr[0] = bcx.inst_results(call)[0];
             mark_dirty(dirty, 0);
@@ -753,7 +758,8 @@ pub(super) fn lower_fast_ucrt(
             Ok(())
         }
         FastApiKind::Fwrite => {
-            let fref = mem.ucrt_refs[kind as usize].ok_or("fwrite import")?;
+            let fref = mem.ucrt_refs[kind as usize]
+                .ok_or_else(|| LowerError::verifier("internal: fwrite import not declared"))?;
             let call = bcx.ins().call(fref, &[mem.ctx_ptr, rcx, rdx, r8, r9]);
             gpr[0] = bcx.inst_results(call)[0];
             mark_dirty(dirty, 0);
@@ -761,7 +767,8 @@ pub(super) fn lower_fast_ucrt(
             Ok(())
         }
         FastApiKind::Fflush => {
-            let fref = mem.ucrt_refs[kind as usize].ok_or("fflush import")?;
+            let fref = mem.ucrt_refs[kind as usize]
+                .ok_or_else(|| LowerError::verifier("internal: fflush import not declared"))?;
             let call = bcx.ins().call(fref, &[rcx]);
             gpr[0] = bcx.inst_results(call)[0];
             mark_dirty(dirty, 0);
@@ -777,7 +784,7 @@ pub(super) fn lower_inline_strlen(
     dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let s = gpr[1];
     let zero = iconst_u64(bcx, 0);
     // s == 0 → 0
@@ -947,7 +954,7 @@ pub(super) fn emit_body_and_term(
     xmm_loaded: &mut [bool; 16],
     mem_env: &mut MemEnv,
     trip: TripCounter,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let mut pending = PendingFlags::None;
     let mut string_exit_rip: Option<Value> = None;
     let ssa_flags = super::super::config::JitConfig::get().ssa_flags_enabled();
@@ -960,11 +967,16 @@ pub(super) fn emit_body_and_term(
     for d in body {
         ensure_gprs_loaded(bcx, ctx_ptr, gpr_vals, gpr_loaded, &d.instr, flags);
         ensure_xmm_loaded(bcx, ctx_ptr, flags, &d.instr, xmm_vals, xmm_loaded);
+        // Every per-instruction refusal is recorded HERE, once, while the
+        // instruction is still in hand: one place for both lowering paths, so an
+        // `Unsupported` and an "admitted mnemonic, unsupported operand form"
+        // refusal are counted and bucketed the same way and can be compared.
         if is_string_op(&d.instr) {
             flush_pending(bcx, rflags_val, &mut pending, &mut flag_state);
-            string_exit_rip = Some(lower_string(
-                bcx, &d.instr, gpr_vals, rflags_val, gpr_loaded, mem_env,
-            )?);
+            string_exit_rip = Some(
+                lower_string(bcx, &d.instr, gpr_vals, rflags_val, gpr_loaded, mem_env)
+                    .map_err(|e| noted(&d.instr, e))?,
+            );
             // The string helper round-trips packed rflags through JitCtx.
             resync_state(bcx, &mut flag_state, *rflags_val);
         } else {
@@ -978,7 +990,8 @@ pub(super) fn emit_body_and_term(
                 &mut flag_state,
                 mem_env,
                 xmm_vals,
-            )?;
+            )
+            .map_err(|e| noted(&d.instr, e))?;
         }
     }
 

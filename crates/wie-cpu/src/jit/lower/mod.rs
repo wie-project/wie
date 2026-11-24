@@ -3,6 +3,7 @@
 //! The TLB/pin/sticky constants, `JitCtx` layout, and the per-block compile
 //! entry point (`compile_block`) live here.
 
+use self::err::LowerError;
 use super::block::{BlockTerm, DecodedInsn, analyze_block_stack_pin};
 use super::config::JitConfig;
 use super::engine::IsaEngine;
@@ -624,6 +625,7 @@ pub(super) fn chain_table_clear(chain_slots: &mut [ChainSlot]) {
 
 mod analysis;
 mod emit;
+pub(crate) mod err;
 
 /// MemFlags valid for `bitcast`: endianness only — the verifier rejects
 /// notrap/aligned/alias-region bits on a pure register reinterpretation.
@@ -638,10 +640,14 @@ mod flags;
 mod gpr;
 mod insn;
 mod mem;
+pub(crate) mod opclass;
 mod sse;
 mod sse_fp;
 mod string;
 mod tlb;
+
+#[cfg(test)]
+mod opclass_tests;
 
 use analysis::{
     analyze_def_xmm, analyze_live_gprs, analyze_live_xmm, block_has_fp, block_has_mem,
@@ -675,70 +681,6 @@ fn empty_chain_refs() -> &'static HashMap<u64, FuncRef> {
     EMPTY.get_or_init(HashMap::new)
 }
 
-/// Complete the live-in and flags sets for operands the decoder does not expose.
-///
-/// `analysis::mark_insn_gprs` derives liveness from a decoded instruction's
-/// *explicit* operands plus a hand-written list of implicit cases (RSP for
-/// push/pop/call/ret, RAX/RCX/RSI/RDI for string ops, RAX/RDX for the sign
-/// extensions). `block_needs_flags` is likewise a mnemonic list. Two RMW
-/// mnemonics read or write state neither list mentions, and both are lowered
-/// here, so the block was compiled against an `entry_gpr` full of
-/// `iconst 0` placeholders and without an RFLAGS carrier:
-///
-/// * `CmpXchg` compares its destination against the **implicit** accumulator
-///   (AX/EAX/RAX — the ISA has no 8-bit form). A block that does not otherwise
-///   touch RAX therefore compared against `0` and picked the wrong branch; on the
-///   16-bit form the write-back merged into the placeholder and zeroed the upper
-///   bits of RAX. It also *writes* ZF, so the flags carrier must be present.
-/// * `Xadd` writes flags on every form (like `Add`), so it needs the carrier
-///   too.
-/// * `Div`/`Idiv` are **one**-operand encodings (`div ecx`) whose dividend is the
-///   implicit `EDX:EAX` pair and whose quotient/remainder land back in
-///   `EAX`/`EDX`. Neither register appears in the decode, so without this the
-///   block divided an `iconst 0` dividend: `div ecx` with EAX=100, ECX=7 gave
-///   EAX=14, EDX=2 on the interpreter and **EAX=0, EDX=0** on the JIT, with no
-///   fault and no diagnostic. `lower_div` reads both through `read_gpr`, so
-///   marking them live here is what makes the pair real.
-///
-/// This only ever *adds* what an instruction genuinely reads or writes — it
-/// cannot make a live set wider than the ISA requires — so it does not trade
-/// JIT throughput for the fix.
-///
-/// **This list is the second half of a decision that starts in `block.rs`.**
-/// `is_lowerable` decides that a mnemonic may be compiled; this function decides
-/// which registers that compilation is allowed to assume. Splitting one decision
-/// across two files is what let `CmpXchg` and `Div`/`Idiv` each ship silent
-/// wrong-code bugs: a mnemonic can be admitted here, lowered against an
-/// `iconst 0` placeholder, and produce garbage with no fault. `implicit_operand_tests`
-/// in `jit/tests` is the cross-file guard — it pins every mnemonic in this table
-/// against the interpreter, so admitting a new implicit-operand mnemonic without
-/// adding it here fails a test rather than a customer's guest.
-fn implicit_operand_completion(
-    insns: &[DecodedInsn],
-    live: &mut [bool; 16],
-    needs_flags: &mut bool,
-) {
-    for d in insns {
-        match d.instr.mnemonic() {
-            Mnemonic::Cmpxchg => {
-                live[0] = true; // RAX: the implicit accumulator
-                *needs_flags = true; // ZF
-            }
-            Mnemonic::Xadd => {
-                *needs_flags = true; // CF/PF/AF/ZF/SF/OF, as `Add` does
-            }
-            // Dividend EDX:EAX in, quotient EAX / remainder EDX out. The 16-bit
-            // form narrows to DX:AX, which is the same two slots at a smaller
-            // width, so the live-in set is identical.
-            Mnemonic::Div | Mnemonic::Idiv => {
-                live[0] = true; // EAX/AX: low dividend, then quotient
-                live[2] = true; // EDX/DX: high dividend, then remainder
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Lower one block into `eng`'s module and finalize it.
 ///
 /// `chain` MUST contain only `FuncId`s declared by the SAME module `eng`
@@ -767,12 +709,17 @@ pub(super) fn compile_block(
     bytes_len: u32,
     inv_gen_baked: u64,
     tier: OptTier,
-) -> Result<CompiledBlock, String> {
-    let mut live = analyze_live_gprs(insns);
+) -> Result<CompiledBlock, LowerError> {
+    let live = analyze_live_gprs(insns);
     let live_xmm = analyze_live_xmm(insns);
     let def_xmm = analyze_def_xmm(insns);
-    let mut needs_flags = block_needs_flags(insns, term);
-    implicit_operand_completion(insns, &mut live, &mut needs_flags);
+    // Implicit operands and the RFLAGS requirement both come from the same
+    // operation-class table the decoder's admission gate reads
+    // ([`opclass`]), so a mnemonic cannot be admitted there and compiled here
+    // against an `iconst 0` placeholder for a register it reads implicitly.
+    // `analyze_live_gprs` walks that table, and `jit::tests::implicit_operands`
+    // pins the result against the interpreter.
+    let needs_flags = block_needs_flags(insns, term);
     let has_fast_call = call_fast.is_some();
     let has_mem = block_has_mem(insns)
         || matches!(term, Some(BlockTerm::Call { .. } | BlockTerm::Ret))
@@ -821,7 +768,7 @@ pub(super) fn compile_block(
     if term.is_some() {
         let (t, b) = insns
             .split_last()
-            .ok_or_else(|| "empty block with term".to_string())?;
+            .ok_or_else(|| LowerError::verifier("internal: empty block with a terminator"))?;
         body = b;
         term_insn = Some(t);
     } else {
@@ -838,7 +785,7 @@ pub(super) fn compile_block(
     let func_id = eng
         .module
         .declare_anonymous_function(&eng.block_sig)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| LowerError::verifier(e.to_string()))?;
 
     eng.ctx.func.signature = eng.block_sig.clone();
     eng.ctx.func.name = UserFuncName::user(0, func_id.as_u32());
@@ -1396,11 +1343,11 @@ pub(super) fn compile_block(
 
     eng.module
         .define_function(func_id, &mut eng.ctx)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| LowerError::verifier(e.to_string()))?;
     eng.module.clear_context(&mut eng.ctx);
     eng.module
         .finalize_definitions()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| LowerError::verifier(e.to_string()))?;
 
     let code = eng.module.get_finalized_function(func_id);
     let func = unsafe { std::mem::transmute::<*const u8, unsafe extern "C" fn(*mut JitCtx)>(code) };
@@ -1436,7 +1383,7 @@ pub(super) fn lower_term(
     flag_state: Option<&FlagState>,
     mem: &mut MemEnv,
     term_ip: u64,
-) -> Result<Value, String> {
+) -> Result<Value, LowerError> {
     match term {
         BlockTerm::Jmp { target } => Ok(iconst_u64(bcx, target)),
         BlockTerm::Jcc {
@@ -1478,7 +1425,7 @@ pub(super) fn flag_cond(
     bcx: &mut FunctionBuilder<'_>,
     rflags: Value,
     m: Mnemonic,
-) -> Result<Value, String> {
+) -> Result<Value, LowerError> {
     let zf = flag_set(bcx, rflags, Rflags::ZF);
     let cf = flag_set(bcx, rflags, Rflags::CF);
     let sf = flag_set(bcx, rflags, Rflags::SF);
@@ -1497,7 +1444,7 @@ pub(super) fn flag_cond_fs(
     bcx: &mut FunctionBuilder<'_>,
     fs: &FlagState,
     m: Mnemonic,
-) -> Result<Value, String> {
+) -> Result<Value, LowerError> {
     let zf = bool_to_i64(bcx, fs.zf);
     let cf = bool_to_i64(bcx, fs.cf);
     let sf = bool_to_i64(bcx, fs.sf);
@@ -1515,7 +1462,7 @@ fn cond_from_bits(
     sf1: Value,
     of1: Value,
     pf1: Value,
-) -> Result<Value, String> {
+) -> Result<Value, LowerError> {
     let zero = iconst_u64(bcx, 0);
     let one = iconst_u64(bcx, 1);
     let not_zf = bcx.ins().bxor(zf1, one);
@@ -1555,7 +1502,7 @@ fn cond_from_bits(
         Mnemonic::Jns | Mnemonic::Cmovns | Mnemonic::Setns => not_sf,
         Mnemonic::Jp | Mnemonic::Cmovp | Mnemonic::Setp => pf1,
         Mnemonic::Jnp | Mnemonic::Cmovnp | Mnemonic::Setnp => not_pf,
-        other => return Err(format!("cond {other:?}")),
+        _ => return Err(LowerError::form("condition_mnemonic")),
     };
     Ok(bcx.ins().icmp(IntCC::NotEqual, cond_i64, zero))
 }
@@ -1571,7 +1518,7 @@ pub(super) fn lower_cmov(
     flag_state: Option<&FlagState>,
     mem: &mut MemEnv,
     m: Mnemonic,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let cond = match flag_state {
         Some(fs) => flag_cond_fs(bcx, fs, m)?,
         None => flag_cond(bcx, rflags, m)?,
@@ -1600,7 +1547,7 @@ pub(super) fn lower_setcc(
     flag_state: Option<&FlagState>,
     mem: &mut MemEnv,
     m: Mnemonic,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let cond = match flag_state {
         Some(fs) => flag_cond_fs(bcx, fs, m)?,
         None => flag_cond(bcx, rflags, m)?,
@@ -1614,7 +1561,7 @@ pub(super) fn lower_setcc(
             let addr = effective_addr(bcx, instr, gpr, mem)?;
             call_store(bcx, mem, gpr, rflags, addr, 1, val, instr.ip())
         }
-        _ => Err("setcc form".into()),
+        _ => Err(LowerError::form("setcc_form")),
     }
 }
 
@@ -1631,7 +1578,7 @@ pub(super) fn lower_shift_lazy(
     flag_state: &mut Option<FlagState>,
     mem: &mut MemEnv,
     kind: ShiftKind,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     // Prior ALU flags must be in `rflags` before we record a Shift pending
     // (shift flags are applied relative to current rflags for OF when count!=1).
     flush_pending(bcx, rflags, pending, flag_state);

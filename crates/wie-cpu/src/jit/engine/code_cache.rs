@@ -18,17 +18,69 @@
 //!
 //! | Class | Relocation | Replayable? |
 //! | --- | --- | --- |
-//! | Our declared host helpers (`load`, `store`, `f32_binop`, …) | `Arm64Call` / `Aarch64AdrPrelPgHi21` + `Aarch64AddAbsLo12Nc` to `User{0, idx}` | **Yes** — a fixed, ordered import list in [`IsaEngine::new`] |
+//! | Our declared host helpers (`load`, `store`, `f32_binop`, …) | `Arm64Call` / `Aarch64AdrPrelPgHi21` + `Aarch64AddAbsLo12Nc` / `Abs8` / `Abs4` to `User{0, idx}` with `idx < import_count` | **Yes** — a fixed, ordered import list in [`IsaEngine::new`], re-checked by name |
 //! | Intra-function branches and blocks | *none* | Yes — Cranelift resolves them at emit time and emits no relocation |
-//! | Chain-table direct calls to another block | `Arm64Call` to `FunctionOffset(FuncId, ..)` | **No** — `FuncId`s are allocated in declaration order, so the index names a different function next run |
+//! | Direct chain-table calls to another compiled block | `Arm64Call` to `User{0, idx}` with `idx >= import_count` | **Yes, since v3** — recorded as the successor's *guest VA* and re-resolved against the live chain table (next section) |
+//! | Any *other* reference to a block `FuncId` (adrp/add, absolute data) | `Aarch64*` / `Abs*` to `User{0, idx}` with `idx >= import_count` | **No** — only a direct call has a guest-VA-shaped meaning this format can re-derive |
 //! | Cranelift internal libcalls (`Memcpy`), data objects, linker-known symbols | `LibCall` / `User{1, ..}` / `KnownSymbol` | **No** — resolved through a linker `cranelift-jit` does not have |
 //! | `is_pic` GOT references | `Aarch64AdrGotPage21` / `Aarch64Ld64GotLo12Nc` | **N/A** — `cranelift-jit` asserts `is_pic == false` and panics on these |
 //!
-//! So the complete reference set is *enumerable*, and the policy is therefore
-//! blunt and total: a block is persisted **iff every one of its relocations
-//! targets a host import**, and on restore every such target is re-checked
-//! against the live module's import list by name. Anything else is refused and
+//! The first and third rows are told apart by the `FuncId` **index**, not by the
+//! relocation kind: [`IsaEngine::new`] declares the imports first and only
+//! imports are `Linkage::Import`, so `idx < import_count` names a host helper and
+//! every other index names a function this process allocated for a compiled
+//! block. (Testing only `namespace == 0` — which every block reference also
+//! satisfies — is how chained blocks used to be *persisted* and then *refused at
+//! restore*, showing up in the `target` counter rather than never being written.)
+//!
+//! So the reference set is *enumerable*, and the policy is blunt and total: a
+//! block is persisted **iff every one of its relocations is in one of the two
+//! replayable classes above**. On restore every import is re-checked against the
+//! live module's import list by name and every chain edge is re-resolved from
+//! its guest VA through the live chain table. Anything else is refused and
 //! recompiled. Refusing costs a compile; guessing costs a crash.
+//!
+//! # Chain edges: a guest VA crosses the boundary, never an address
+//!
+//! A direct chain edge is `Arm64Call` to another compiled block's `FuncId`, and
+//! a `FuncId` is an index into *this* process's declaration order — meaningless
+//! in the next one. The format therefore stores, per edge, the **guest VA it
+//! transfers to** (the block's `exit_rip`) and nothing else, and restore turns
+//! that VA back into a live `FuncId` through
+//! [`JitShared::chain_func_for`](crate::jit::shared::JitShared::chain_func_for)
+//! — the single-VA form of the same tier-tagged snapshot
+//! [`JitShared::chain_map_for`](crate::jit::shared::JitShared::chain_map_for)
+//! offers a fresh compile. Why that cannot honour a stale target:
+//!
+//! 1. **The VA is invariant.** The probe has already proven the blob's bytes are
+//!    byte-identical to live guest memory at `[va, guest_end)` (FNV-1a below),
+//!    and decoding is a pure function of those bytes — so the successor this
+//!    blob names is exactly the successor a fresh decode of the *current* bytes
+//!    names. Nothing about the recording process's layout survives.
+//! 2. **The code behind it is this run's.** Only the VA crosses; the address
+//!    comes from this process's table, so a live hit is a block that *this* run
+//!    compiled, tagged with the tier whose module declared it (`FuncId`s are
+//!    module-local, so the tag is what keeps the edge same-tier).
+//! 3. **A live hit implies current bytes.** `JitCpu::invalidate_code_range`
+//!    drops the overlapping `Ready` entry *and* its `chain_ids` entry before the
+//!    `Release` bump; `insert_ready` does the same when it replaces one. So a successor whose guest bytes
+//!    moved is *absent*, and absence is a refusal, not a guess. This is the same
+//!    invariant a compile-time chain already relies on — re-resolution adds no
+//!    trust of its own.
+//! 4. **The record side refuses ambiguity.** `FuncId -> VA` is read from the
+//!    authoritative forward table, never from a parallel index, and a scan that
+//!    finds two entries claiming one `(tier, FuncId)` yields *no* VA — so the
+//!    answer does not depend on `FuncId`s never being reused.
+//! 5. **The edge is still guarded.** Replayed or compiled, a chain edge runs the
+//!    frame-generation guard before it touches any chain machinery, so an
+//!    invalidation between restore and execution costs a dispatcher exit instead
+//!    of honouring a dead target (see the invariant section below).
+//!
+//! A chain edge whose successor is not chainable at restore time — never
+//! compiled in this run, or invalidated since — refuses the *whole* blob
+//! (`UnrelocatableTarget`) and the block is compiled as if there were no cache.
+//! A second edge recorded at one offset, or an edge recorded with a non-
+//! `Arm64Call` kind, is refused by [`PersistedCode::structurally_sound`].
 //!
 //! # The non-obvious invariant: no per-process value in the emitted code
 //!
@@ -37,10 +89,12 @@
 //! that emitted it. The design guarantees that by construction: **the emitted
 //! code contains no per-process value at all.** Every runtime input arrives
 //! either through [`JitCtx`](crate::jit::lower::JitCtx) — `pins`, `mem_ptr`,
-//! `chain_slots`, `inv_gen_ptr` — or through a relocation re-checked against
-//! the live module's import list by name. Cranelift emits no absolute address
-//! of its own (see the relocation table above), so a blob is a pure function
-//! of guest bytes plus the frame the host builds around it.
+//! `chain_slots`, `inv_gen_ptr` — through a relocation re-checked against the
+//! live module's import list by name, or, for a direct chain edge, through a
+//! guest VA re-resolved against the live chain table (previous section).
+//! Cranelift emits no absolute address of its own (see the relocation table
+//! above), so a blob is a pure function of guest bytes plus the frame the host
+//! builds around it.
 //!
 //! This was not free. Every edge out of a block guards against cross-thread
 //! code invalidation by comparing the live `JitShared::invalidate_gen` against
@@ -77,8 +131,10 @@
 //! Note what deliberately does **not** cover this: the guest-byte FNV-1a hashes
 //! `[va, guest_end)` — the block's *own* bytes — while chaining reaches *other*
 //! blocks, which is the entire exposure; and the import fingerprint covers host
-//! addresses, which is orthogonal. Neither can see the reasoning above, so it
-//! stays written down here.
+//! addresses, which is orthogonal. Neither can see the reasoning above. A chain
+//! edge into another block is covered instead by that *successor's* own `Ready`
+//! invariant (fact 1) plus refusal-when-absent, which is why the chain section
+//! above spells out how the target is re-derived rather than hashed.
 //!
 //! # Everything else that can invalidate a blob
 //!
@@ -101,7 +157,12 @@
 //! The cache file is untrusted input. Every length, index and offset is
 //! bounds-checked before it reaches `Module::define_function_bytes`, because
 //! cranelift-jit's relocation applier writes at `blob_ptr + reloc.offset` with
-//! only a `debug_assert` on that offset.
+//! only a `debug_assert` on that offset. A recorded chain target is bounds- and
+//! integrity-checked like every other field but is *not* re-derived from the
+//! block's own bytes: a file edited by someone who can write the cache directory
+//! could name a different live block. That is the same trust boundary the code
+//! bytes themselves sit on — such a writer could replace the machine code
+//! outright — and `disk_integrity` is what makes the accidental case a refusal.
 
 use super::super::config::JitConfig;
 use super::super::tier::OptTier;
@@ -122,6 +183,15 @@ const MAGIC: [u8; 8] = *b"WIECODE\x01";
 
 /// On-disk format version.
 ///
+/// **v3** — direct chain edges are persisted. A block whose emitted code calls
+/// another compiled block (a `bl` to that block's `FuncId`) is no longer
+/// refused: the edge is stored as the successor's **guest VA**
+/// ([`ChainReloc`]) and re-resolved against the live chain table on restore
+/// (module docs). `DiskBlob` gains the `chain_relocs` list, so the layout moved
+/// as well — and the bump is mandatory regardless:
+/// `JitConfig::emit_fingerprint` hashes config knobs and build shape, **not**
+/// emitter source, so no lowering change can move it on its own.
+///
 /// **v2** — the emitted invalidation guard reads its bake from `JitCtx` instead
 /// of carrying a per-block compile-time immediate (module docs on the
 /// no-per-process-value invariant), so a restored blob's chain edges behave
@@ -139,7 +209,7 @@ const MAGIC: [u8; 8] = *b"WIECODE\x01";
 ///
 /// Bumping this invalidates every `.code` file, which is the correct behaviour:
 /// the blobs are only meaningful under the exact layout that produced them.
-const CODE_FORMAT_VERSION: u32 = 2;
+const CODE_FORMAT_VERSION: u32 = 3;
 
 /// Relocation kinds that may appear in a persisted blob, and their on-disk
 /// codes.
@@ -239,8 +309,9 @@ pub(crate) enum CodeRestoreOutcome {
     /// list, or emitter fingerprint.
     FileMismatch,
     /// Passed the cheap guards but failed a structural or target check: unknown
-    /// relocation kind, out-of-range offset, addend out of bounds, or a target
-    /// that is not a host import this module declares under the same name.
+    /// relocation kind, out-of-range offset, addend out of bounds, a target that
+    /// is not a host import this module declares under the same name, or a chain
+    /// edge whose successor is not chainable in this run.
     UnrelocatableTarget,
     /// Zero-length code, or an unusable alignment.
     Malformed,
@@ -265,6 +336,23 @@ impl CodeRestoreOutcome {
     }
 }
 
+/// One outgoing **direct chain edge**, recorded as the successor's guest VA.
+///
+/// The emitted edge is an `Arm64Call` to another compiled block's `FuncId`, and
+/// a `FuncId` is an index into the declaring process's allocation order — it
+/// names a different function, or nothing, in the next one. What *is* invariant
+/// is the guest VA the edge transfers control to (the block's `exit_rip`), so
+/// that is what is stored; restore re-resolves it against the live chain table
+/// and refuses the blob when the successor is not chainable (module docs, "Chain
+/// edges: a guest VA crosses the boundary, never an address").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChainReloc {
+    /// Byte offset of the `bl` inside the blob's code.
+    pub offset: u32,
+    /// Guest VA the edge hands control to.
+    pub target_va: u64,
+}
+
 /// One persisted blob: a block's pre-relocation code plus its relocations.
 #[derive(Clone)]
 pub(crate) struct PersistedCode {
@@ -286,7 +374,14 @@ pub(crate) struct PersistedCode {
     pub compiled_at_opt: OptTier,
     pub align: u64,
     pub code: Vec<u8>,
+    /// Relocations naming a **host import** (`User{0, index}` with
+    /// `index < import_count`), re-checked by name on restore.
+    ///
+    /// [`classify_capture_relocs`] is the only place that decides an index
+    /// belongs here rather than in [`Self::chain_relocs`].
     pub relocs: Vec<ModuleReloc>,
+    /// Relocations naming another compiled block, recorded as guest VAs.
+    pub chain_relocs: Vec<ChainReloc>,
 }
 
 impl PersistedCode {
@@ -302,7 +397,9 @@ impl PersistedCode {
         if self.align == 0 || !self.align.is_power_of_two() || self.align > MAX_ALIGN {
             return false;
         }
-        if self.guest_end < self.va || self.relocs.len() > MAX_RELOCS {
+        if self.guest_end < self.va
+            || self.relocs.len().saturating_add(self.chain_relocs.len()) > MAX_RELOCS
+        {
             return false;
         }
         let len = u64::try_from(self.code.len()).unwrap_or(u64::MAX);
@@ -322,17 +419,131 @@ impl PersistedCode {
                 return false;
             }
         }
+        for (i, c) in self.chain_relocs.iter().enumerate() {
+            let offset = u64::from(c.offset);
+            // A chain edge is always a `bl`: one 4-byte instruction.
+            if offset > len || 4 > len - offset {
+                return false;
+            }
+            // Two relocations patching the same bytes would make one of them
+            // silently win, so any collision is ambiguous rather than mergeable.
+            if self.relocs.iter().any(|r| r.offset == c.offset)
+                || self.chain_relocs[..i].iter().any(|o| o.offset == c.offset)
+            {
+                return false;
+            }
+            // Guest VA 0 is not code: no block is compiled there.
+            if c.target_va == 0 {
+                return false;
+            }
+        }
         true
     }
 
     /// Whether every relocation targets a host **import**, the only class this
-    /// cache persists. See the module docs' table for why each other class is
-    /// unreplayable.
+    /// cache persists *without* a guest-VA re-resolution.
+    ///
+    /// Note what this does **not** check: that the index is below the module's
+    /// import count, which is the actual import/block discriminator (module
+    /// docs). That bound is [`Self::import_indices_in_range`]'s job, because it
+    /// is the one form that needs the live module; [`classify_capture_relocs`]
+    /// applies it before a blob is ever built.
     pub(crate) fn all_targets_are_imports(&self) -> bool {
         self.relocs
             .iter()
             .all(|r| matches!(r.name, ModuleRelocTarget::User { namespace: 0, .. }))
     }
+
+    /// Whether every import relocation names one of `import_count` imports of the
+    /// module that will define it.
+    ///
+    /// Load-time check: a file written for a module whose import count differs
+    /// has already failed `imports_fp`, so this is belt-and-braces against a file
+    /// whose *index* (not identity) is wrong — the case that would otherwise put
+    /// a block `FuncId` in the import class.
+    pub(crate) fn import_indices_in_range(&self, import_count: u32) -> bool {
+        self.relocs.iter().all(|r| {
+            matches!(
+                r.name,
+                ModuleRelocTarget::User {
+                    namespace: 0,
+                    index
+                } if index < import_count
+            )
+        })
+    }
+
+    /// The relocation list this blob must be defined with **in this process**.
+    ///
+    /// `live_chain` re-resolves a recorded chain edge's guest VA to the `FuncId`
+    /// this run compiled for that VA (its only implementation is
+    /// `JitShared::chain_func_for`). `None` — the caller refuses the whole blob
+    /// and compiles instead — when any successor is not chainable now, which is
+    /// the one direction that must never be guessed at.
+    pub(crate) fn resolved_relocs(
+        &self,
+        live_chain: impl Fn(u64) -> Option<cranelift_module::FuncId>,
+    ) -> Option<Vec<ModuleReloc>> {
+        let mut out = Vec::with_capacity(self.relocs.len().saturating_add(self.chain_relocs.len()));
+        out.extend_from_slice(&self.relocs);
+        for c in &self.chain_relocs {
+            let func_id = live_chain(c.target_va)?;
+            out.push(ModuleReloc {
+                offset: c.offset,
+                kind: Reloc::Arm64Call,
+                name: ModuleRelocTarget::User {
+                    namespace: 0,
+                    index: func_id.as_u32(),
+                },
+                addend: 0,
+            });
+        }
+        Some(out)
+    }
+}
+
+/// Split a captured block's relocations into the format's two replayable
+/// classes — host imports and direct chain edges — or `None` when the block
+/// carries anything else.
+///
+/// **This is the whole policy in one place**, and it is total: every relocation
+/// lands in exactly one class or takes the whole block out of the cache.
+/// `import_count` is the live module's (`FuncId`s below it are imports because
+/// they are declared first), and `chain_va` maps a block `FuncId` of the same
+/// tier back to the guest VA this run installed it at — `None` there means the
+/// capture names a block this run can no longer name, which is a refusal rather
+/// than a guess.
+pub(crate) fn classify_capture_relocs(
+    raw: Vec<ModuleReloc>,
+    import_count: u32,
+    chain_va: impl Fn(cranelift_module::FuncId) -> Option<u64>,
+) -> Option<(Vec<ModuleReloc>, Vec<ChainReloc>)> {
+    let mut imports = Vec::with_capacity(raw.len());
+    let mut chain = Vec::new();
+    for r in raw {
+        let ModuleRelocTarget::User {
+            namespace: 0,
+            index,
+        } = r.name
+        else {
+            return None;
+        };
+        if index < import_count {
+            imports.push(r);
+            continue;
+        }
+        // A block `FuncId`. Only a direct call carries a guest-VA-shaped
+        // meaning; a data reference to a block has none this format can
+        // re-derive, and a non-zero addend is not something a `bl` produces.
+        if !matches!(r.kind, Reloc::Arm64Call) || r.addend != 0 {
+            return None;
+        }
+        chain.push(ChainReloc {
+            offset: r.offset,
+            target_va: chain_va(cranelift_module::FuncId::from_u32(index))?,
+        });
+    }
+    Some((imports, chain))
 }
 
 #[derive(bincode::Encode, bincode::Decode)]
@@ -384,6 +595,10 @@ fn disk_integrity(b: &DiskBlob) -> u64 {
         h = fnv(h, &r.target.to_le_bytes());
         h = fnv(h, &r.addend.to_le_bytes());
     }
+    for c in &b.chain_relocs {
+        h = fnv(h, &c.offset.to_le_bytes());
+        h = fnv(h, &c.target_va.to_le_bytes());
+    }
     h
 }
 
@@ -402,6 +617,9 @@ struct DiskBlob {
     align: u64,
     code: Vec<u8>,
     relocs: Vec<DiskReloc>,
+    /// Direct chain edges, kept apart from `relocs` because their target is a
+    /// guest VA rather than an import index (module docs).
+    chain_relocs: Vec<DiskChainReloc>,
 }
 
 #[derive(bincode::Encode, bincode::Decode)]
@@ -411,6 +629,13 @@ struct DiskReloc {
     /// `User{namespace: 0, index}` — an index into [`IsaEngine`]'s import list.
     target: u32,
     addend: i64,
+}
+
+#[derive(bincode::Encode, bincode::Decode)]
+struct DiskChainReloc {
+    offset: u32,
+    /// Successor guest VA, re-resolved against the live chain table on restore.
+    target_va: u64,
 }
 
 fn disk_blob(p: &PersistedCode) -> Option<DiskBlob> {
@@ -426,6 +651,14 @@ fn disk_blob(p: &PersistedCode) -> Option<DiskBlob> {
             addend: r.addend,
         });
     }
+    let chain_relocs = p
+        .chain_relocs
+        .iter()
+        .map(|c| DiskChainReloc {
+            offset: c.offset,
+            target_va: c.target_va,
+        })
+        .collect();
     let mut b = DiskBlob {
         integrity: 0,
         va: p.va,
@@ -437,6 +670,7 @@ fn disk_blob(p: &PersistedCode) -> Option<DiskBlob> {
         align: p.align,
         code: p.code.clone(),
         relocs,
+        chain_relocs,
     };
     b.integrity = disk_integrity(&b);
     Some(b)
@@ -459,6 +693,14 @@ fn from_disk(b: DiskBlob) -> Option<PersistedCode> {
             addend: r.addend,
         });
     }
+    let chain_relocs = b
+        .chain_relocs
+        .into_iter()
+        .map(|c| ChainReloc {
+            offset: c.offset,
+            target_va: c.target_va,
+        })
+        .collect();
     Some(PersistedCode {
         va: b.va,
         guest_end: b.guest_end,
@@ -469,6 +711,7 @@ fn from_disk(b: DiskBlob) -> Option<PersistedCode> {
         align: b.align,
         code: b.code,
         relocs,
+        chain_relocs,
     })
 }
 
@@ -494,9 +737,10 @@ pub(crate) struct CodeCacheCounters {
     pub refused_file_mismatch: AtomicU64,
     pub refused_unrelocatable: AtomicU64,
     pub refused_malformed: AtomicU64,
-    /// Blocks whose emitted code had a relocation this format refuses to
-    /// persist (today: a direct chain call), so they were recorded as metadata
-    /// only. Non-zero is expected and healthy.
+    /// Blocks whose emitted code had a relocation this format cannot replay — a
+    /// data reference to another block, a libcall, or a chain edge whose
+    /// successor this run cannot name — so they were recorded as metadata only.
+    /// Non-zero is expected and healthy.
     pub skipped_unpersistable: AtomicU64,
     /// Successful whole-file rewrites performed. Equals 1 per session with the
     /// session-teardown flush, and proves the flush is no longer dependent on
@@ -594,9 +838,16 @@ impl CodeCacheCounts {
 }
 
 struct FlushState {
-    /// Records appended since the last successful write. Only a safety net for
-    /// the window between the table snapshot in [`CodeCache::flush`] and the
-    /// table swap; the table itself is always authoritative.
+    /// Records appended since the last successful write.
+    ///
+    /// A safety net for one narrow window, not a second source of truth: the
+    /// table scan in [`CodeCache::write_file_now`] is a lock-free iteration, so
+    /// an insert that lands after the iteration has passed its slot would
+    /// otherwise be missing from that rewrite. `record` inserts into the table
+    /// *before* it queues here, so every record this list can contribute is
+    /// already in the table as well — and the table is authoritative:
+    /// [`CodeCache::write_file_now`] skips any queued record whose VA is no
+    /// longer in it.
     pending: Vec<PersistedCode>,
     last_flush: Instant,
     warned_err: bool,
@@ -736,7 +987,7 @@ impl CodeCache {
                 return;
             }
         }
-        let map = self.load_file(&identity);
+        let map = self.load_file(&identity, eng.import_count());
         {
             let mut tables = self.tables.write().unwrap_or_else(|e| e.into_inner());
             tables.insert(key, Arc::new(map));
@@ -748,7 +999,11 @@ impl CodeCache {
         self.base_dir.join(format!("{key:016x}.code"))
     }
 
-    fn load_file(&self, identity: &FileIdentity) -> papaya::HashMap<u64, PersistedCode> {
+    fn load_file(
+        &self,
+        identity: &FileIdentity,
+        import_count: u32,
+    ) -> papaya::HashMap<u64, PersistedCode> {
         let path = self.file_path(identity.key);
         let Ok(raw) = fs::read(&path) else {
             return papaya::HashMap::new(); // cold boot, stay quiet
@@ -795,7 +1050,10 @@ impl CodeCache {
                     rejected = rejected.saturating_add(1);
                     continue;
                 };
-                if !p.structurally_sound() || !p.all_targets_are_imports() {
+                if !p.structurally_sound()
+                    || !p.all_targets_are_imports()
+                    || !p.import_indices_in_range(import_count)
+                {
                     rejected = rejected.saturating_add(1);
                     continue;
                 }
@@ -820,9 +1078,12 @@ impl CodeCache {
 
     /// Persist one block's emitted code.
     ///
-    /// Skipped (counted, not silent) when the capture is absent, when the block
-    /// carries a relocation this format refuses, or when it would not pass
-    /// [`PersistedCode::structurally_sound`].
+    /// Skipped (counted, not silent) when the block carries a relocation this
+    /// format refuses, or when it would not pass
+    /// [`PersistedCode::structurally_sound`]. Blocks whose *capture* has to be
+    /// classified before a [`PersistedCode`] can exist at all — every one of
+    /// them, since [`classify_capture_relocs`] is what splits imports from chain
+    /// edges — are counted by [`Self::note_unpersistable`] instead.
     pub(crate) fn record(&self, code: PersistedCode) {
         if !self.enabled || !code.structurally_sound() || !code.all_targets_are_imports() {
             self.counters
@@ -855,6 +1116,21 @@ impl CodeCache {
         }
         self.dirty.store(1, Ordering::Release);
         self.flush_tick();
+    }
+
+    /// Count one block whose captured relocations this format cannot replay.
+    ///
+    /// The `skipped_unpersistable` bucket for the case that never reaches
+    /// [`Self::record`]: [`classify_capture_relocs`] rejected the capture (a data
+    /// reference to another block, a libcall, or a chain edge whose successor
+    /// this run can no longer name). Same counter, so the report stays one number
+    /// meaning "emitted code we could not prove replayable".
+    pub(crate) fn note_unpersistable(&self) {
+        if self.enabled {
+            self.counters
+                .skipped_unpersistable
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Byte-validated lookup.
@@ -1001,6 +1277,17 @@ impl CodeCache {
             }
         }
         for p in &pending {
+            // The table is authoritative, and this is where that is enforced:
+            // a queued record whose blob has left the table since — an
+            // invalidated range, a replaced entry — must not be written back.
+            // `record` inserts into the table *before* it queues, so a flush that
+            // raced the push can only ever miss a live blob here, never resurrect
+            // a dead one; doing this at the invalidation site instead could not
+            // cover that race, and would have to be repeated at every future way
+            // a blob can leave the table.
+            if pin.get(&p.va).is_none() {
+                continue;
+            }
             if !blobs.iter().any(|b| b.va == p.va)
                 && let Some(b) = disk_blob(p)
             {
@@ -1050,6 +1337,19 @@ impl CodeCache {
     }
 
     /// Drop every blob overlapping `[addr, end)` and rewrite (SMC / X-loss).
+    ///
+    /// Queued `pending` copies are **not** filtered here: [`Self::write_file_now`]
+    /// drops any queued record whose VA is no longer in the table, which covers
+    /// this case in one place and also copes with `record`'s insert-then-queue
+    /// ordering (filtering here would race that push).
+    ///
+    /// **Known limit.** The rewrite is a whole-table snapshot and is skipped when
+    /// that snapshot is empty, so invalidating the *last* blob leaves the previous
+    /// file — and its now-dead record — on disk until something else dirties the
+    /// cache. A later process then pays one failed byte-hash per probe of that VA,
+    /// which is the cost the caller's doc comment says this method avoids. It is a
+    /// staleness cost, not a correctness one: the blob is still a pure function of
+    /// those guest bytes, so restoring it would be sound.
     pub(crate) fn invalidate_range(&self, addr: u64, end: u64) {
         if !self.enabled || end <= addr {
             return;

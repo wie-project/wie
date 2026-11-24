@@ -2,6 +2,7 @@
 //! select/replace helpers.
 
 use super::emit::MemEnv;
+use super::err::LowerError;
 use super::gpr::{bool_to_i64, flag_set, op_width_bits, read_op_mem, sext_to_i64, write_op_mem};
 use super::insn::{PendingFlags, ShiftKind};
 
@@ -20,7 +21,7 @@ pub(super) fn lower_inc_dec_lazy(
     pending: &mut PendingFlags,
     mem: &mut MemEnv,
     inc: bool,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let bits = op_width_bits(instr, 0)?;
     let a_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
     let a = mask_width(bcx, a_raw, bits);
@@ -47,7 +48,7 @@ pub(super) fn lower_not(
     dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let bits = op_width_bits(instr, 0)?;
     let a_raw = read_op_mem(bcx, instr, 0, gpr, rflags, mem)?;
     let a = mask_width(bcx, a_raw, bits);
@@ -64,7 +65,7 @@ pub(super) fn lower_neg_lazy(
     rflags: &mut Value,
     pending: &mut PendingFlags,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let bits = op_width_bits(instr, 0)?;
     let a_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
     let a = mask_width(bcx, a_raw, bits);

@@ -12,12 +12,13 @@ use super::fast_api::JitFastPathConfig;
 use super::pipeline::CompiledRunMeta;
 use super::{CacheEntry, JitCpu};
 use crate::exec::{HookWindow, StepResult};
+use crate::lock::{read_unpoisoned, write_unpoisoned};
 use crate::{CodeHookOutcome, CpuEngine, CpuError, InvalidMemoryAccess, RunUntilHook, RwxPerms};
 use std::sync::atomic::Ordering;
 
 impl CpuEngine for JitCpu {
     fn mem_map(&mut self, address: u64, size: usize, perms: RwxPerms) -> Result<(), CpuError> {
-        let mut mem = self.shared.mem.write().unwrap();
+        let mut mem = write_unpoisoned(&self.shared.mem);
         let r = mem.map(address, size, perms);
         self.shared
             .mem_gen
@@ -26,34 +27,25 @@ impl CpuEngine for JitCpu {
     }
 
     fn mem_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), CpuError> {
-        self.shared.mem.write().unwrap().write(address, bytes)?;
+        write_unpoisoned(&self.shared.mem).write(address, bytes)?;
         self.note_code_write(address, bytes.len());
         self.drain_pending_code_writes();
         Ok(())
     }
 
     fn mem_read(&mut self, address: u64, bytes: &mut [u8]) -> Result<(), CpuError> {
-        self.shared.mem.read().unwrap().read(address, bytes)
+        read_unpoisoned(&self.shared.mem).read(address, bytes)
     }
 
     fn host_span(&mut self, address: u64, len: usize, write: bool) -> Option<*mut u8> {
-        self.shared
-            .mem
-            .read()
-            .unwrap()
-            .host_span(address, len, write)
+        read_unpoisoned(&self.shared.mem).host_span(address, len, write)
     }
 
     fn host_slice(&self, address: u64, len: usize) -> Option<&[u8]> {
         if len == 0 {
             return Some(&[]);
         }
-        let ptr = self
-            .shared
-            .mem
-            .read()
-            .unwrap()
-            .host_span(address, len, false)?;
+        let ptr = read_unpoisoned(&self.shared.mem).host_span(address, len, false)?;
         // SAFETY: as `IcedCpu::host_slice` — the mmap arena outlives the read
         // guard, and the `&self` borrow excludes concurrent unmapping.
         #[expect(unsafe_code)]
@@ -64,12 +56,7 @@ impl CpuEngine for JitCpu {
         if len == 0 {
             return Some(&mut []);
         }
-        let ptr = self
-            .shared
-            .mem
-            .read()
-            .unwrap()
-            .host_span(address, len, true)?;
+        let ptr = read_unpoisoned(&self.shared.mem).host_span(address, len, true)?;
         // SAFETY: as `IcedCpu::host_slice_mut` — `host_span(.., write=true)`
         // denies executable spans, so SMC invalidation is never required for
         // a returned slice.
@@ -78,15 +65,15 @@ impl CpuEngine for JitCpu {
     }
 
     fn mem_copy(&mut self, dst: u64, src: u64, len: usize) -> bool {
-        self.shared.mem.read().unwrap().mem_copy(dst, src, len)
+        read_unpoisoned(&self.shared.mem).mem_copy(dst, src, len)
     }
 
     fn mem_fill(&mut self, address: u64, byte: u8, len: usize) -> bool {
-        self.shared.mem.read().unwrap().mem_fill(address, byte, len)
+        read_unpoisoned(&self.shared.mem).mem_fill(address, byte, len)
     }
 
     fn mem_generation(&self) -> u64 {
-        self.shared.mem.read().unwrap().generation()
+        read_unpoisoned(&self.shared.mem).generation()
     }
 
     fn virtual_alloc(
@@ -96,14 +83,9 @@ impl CpuEngine for JitCpu {
         alloc_type: u32,
         protect: u32,
     ) -> Result<u64, CpuError> {
-        let r = self
-            .shared
-            .mem
-            .write()
-            .unwrap()
-            .virtual_alloc(addr, size, alloc_type, protect);
+        let r = write_unpoisoned(&self.shared.mem).virtual_alloc(addr, size, alloc_type, protect);
         self.shared.mem_gen.store(
-            self.shared.mem.read().unwrap().generation(),
+            read_unpoisoned(&self.shared.mem).generation(),
             Ordering::Release,
         );
         self.invalidate_tlb();
@@ -113,14 +95,9 @@ impl CpuEngine for JitCpu {
     fn virtual_free(&mut self, addr: u64, size: usize, free_type: u32) -> Result<(), CpuError> {
         let inv_span = self.code_inv_span_for_free(addr, size, free_type);
         self.invalidate_tlb();
-        let r = self
-            .shared
-            .mem
-            .write()
-            .unwrap()
-            .virtual_free(addr, size, free_type);
+        let r = write_unpoisoned(&self.shared.mem).virtual_free(addr, size, free_type);
         self.shared.mem_gen.store(
-            self.shared.mem.read().unwrap().generation(),
+            read_unpoisoned(&self.shared.mem).generation(),
             Ordering::Release,
         );
         if r.is_ok()
@@ -137,14 +114,9 @@ impl CpuEngine for JitCpu {
         size: usize,
         new_protect: u32,
     ) -> Result<u32, CpuError> {
-        let r = self
-            .shared
-            .mem
-            .write()
-            .unwrap()
-            .virtual_protect(addr, size, new_protect);
+        let r = write_unpoisoned(&self.shared.mem).virtual_protect(addr, size, new_protect);
         self.shared.mem_gen.store(
-            self.shared.mem.read().unwrap().generation(),
+            read_unpoisoned(&self.shared.mem).generation(),
             Ordering::Release,
         );
         // X-loss: dropping execute permission invalidates any compiled blocks
@@ -161,7 +133,7 @@ impl CpuEngine for JitCpu {
     }
 
     fn virtual_query(&self, addr: u64) -> crate::MemoryBasicInformation {
-        self.shared.mem.read().unwrap().virtual_query(addr)
+        read_unpoisoned(&self.shared.mem).virtual_query(addr)
     }
 
     fn flush_instruction_cache(&mut self, addr: u64, size: usize) -> Result<(), CpuError> {
@@ -183,14 +155,9 @@ impl CpuEngine for JitCpu {
         size: usize,
         perms: RwxPerms,
     ) -> Result<(), CpuError> {
-        let r = self
-            .shared
-            .mem
-            .write()
-            .unwrap()
-            .map_image(address, size, perms);
+        let r = write_unpoisoned(&self.shared.mem).map_image(address, size, perms);
         self.shared.mem_gen.store(
-            self.shared.mem.read().unwrap().generation(),
+            read_unpoisoned(&self.shared.mem).generation(),
             Ordering::Release,
         );
         self.invalidate_tlb();
@@ -202,15 +169,15 @@ impl CpuEngine for JitCpu {
     }
 
     fn mem_backend_name(&self) -> &'static str {
-        self.shared.mem.read().unwrap().backend_name()
+        read_unpoisoned(&self.shared.mem).backend_name()
     }
 
     fn register_region(&mut self, region: crate::mem::GuestRegion) {
-        self.shared.mem.write().unwrap().register_region(region);
+        write_unpoisoned(&self.shared.mem).register_region(region);
     }
 
     fn find_region(&self, va: u64) -> Option<crate::mem::GuestRegion> {
-        self.shared.mem.read().unwrap().find_region(va).cloned()
+        read_unpoisoned(&self.shared.mem).find_region(va).cloned()
     }
 
     fn install_runtime_hooks(
@@ -284,7 +251,7 @@ impl CpuEngine for JitCpu {
         // pre-invalidation bytes.
         let inv_gen = self.shared.invalidate_gen.load(Ordering::Acquire);
         let kind = {
-            let mem = self.shared.mem.read().unwrap();
+            let mem = read_unpoisoned(&self.shared.mem);
             super::block::decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), address)
         };
         // Normal lane: nobody waits on this job — the compile overlaps with
@@ -479,10 +446,7 @@ impl CpuEngine for JitCpu {
         self.thread.shadow_sp = 0;
         let rsp = self.thread.regs.rsp();
         let mut ret_bytes = [0_u8; 8];
-        self.shared
-            .mem
-            .read()
-            .unwrap()
+        read_unpoisoned(&self.shared.mem)
             .read(rsp, &mut ret_bytes)
             .map_err(|e| CpuError::Message(format!("return_from_win64_api stack read: {e}")))?;
         let return_address = u64::from_le_bytes(ret_bytes);

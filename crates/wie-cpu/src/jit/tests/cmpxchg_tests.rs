@@ -20,6 +20,7 @@
 // otherwise a case would silently degrade into re-running the interpreter and
 // prove nothing about the lowering.
 use super::*;
+use crate::IcedCpu;
 use crate::ThreadContext;
 use crate::exec::StepResult as StepResultAlias;
 use crate::regs::Rflags;

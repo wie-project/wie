@@ -2,7 +2,8 @@
 //
 // Split out of `tests/mod.rs` (file-size policy, ADR-002). Uses the shared
 // dual-engine helper from the parent module.
-use super::{SIMD_BASE, assert_same_regs, simd_dual};
+use super::simd_parity_tests::{assert_same_regs, simd_dual};
+use super::*;
 use iced_x86::{Code, Decoder, DecoderOptions, InstructionInfoFactory};
 
 /// `PAUSE` must be architecturally inert, otherwise the JIT no-op lowering

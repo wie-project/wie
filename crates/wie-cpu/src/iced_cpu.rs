@@ -8,11 +8,11 @@ use crate::{CpuEngine, RunUntilHook};
 use std::sync::{Arc, RwLock};
 
 fn lock_rd<T>(m: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    m.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::lock::read_unpoisoned(m)
 }
 
 fn lock_wr<T>(m: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    m.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::lock::write_unpoisoned(m)
 }
 
 const RIP_TRACE_CAP: usize = 32;

@@ -2,6 +2,7 @@
 //! symbols) and the IR-emitting load/store/pin helpers used by block emission.
 
 use super::emit::{HoistedPin, MemEnv, check_fault_after_ucrt};
+use super::err::LowerError;
 use super::flags::iconst_u64;
 use super::gpr::sticky_tlb_probe;
 use super::tlb::{set_fault, tlb_page_ptr};
@@ -382,8 +383,10 @@ pub(super) fn call_load(
     addr: Value,
     size: u32,
     insn_ip: u64,
-) -> Result<Value, String> {
-    let load_ref = mem.load_ref.ok_or("load helper missing")?;
+) -> Result<Value, LowerError> {
+    let load_ref = mem
+        .load_ref
+        .ok_or_else(|| LowerError::verifier("internal: load helper not declared"))?;
     // `WIE_JIT_MEM=slow`: helper only (oracle / bisect).
     if !JitConfig::get().mem_inline_enabled() {
         return Ok(emit_load_helper(
@@ -493,8 +496,10 @@ pub(super) fn call_store(
     size: u32,
     value: Value,
     insn_ip: u64,
-) -> Result<(), String> {
-    let store_ref = mem.store_ref.ok_or("store helper missing")?;
+) -> Result<(), LowerError> {
+    let store_ref = mem
+        .store_ref
+        .ok_or_else(|| LowerError::verifier("internal: store helper not declared"))?;
     if !JitConfig::get().mem_inline_enabled() {
         emit_store_helper(bcx, mem, gpr, rflags, addr, size, value, insn_ip, store_ref);
         return Ok(());

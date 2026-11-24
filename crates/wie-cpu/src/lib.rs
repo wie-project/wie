@@ -14,6 +14,7 @@ mod exec;
 pub mod guest_layout;
 mod iced_cpu;
 mod jit;
+mod lock;
 mod mem;
 mod regs;
 mod simd;

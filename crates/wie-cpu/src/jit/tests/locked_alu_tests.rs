@@ -71,9 +71,9 @@
 // What a `LOCK` prefix on a shift would mean is moot: a guest cannot emit one, so
 // there is nothing to make atomic and nothing to test.
 use super::atomic_tests::{
-    BACKENDS, Backend, DATA_BASE, Engine, LOCK_WORD, UNALIGNED_WORD, ctx, open, open_worker, plant,
-    read_word, write_word,
+    DATA_BASE, LOCK_WORD, UNALIGNED_WORD, ctx, plant, read_word, write_word,
 };
+use super::harness::{BACKENDS, Backend, Engine, open, open_worker};
 use crate::exec::{AccessType, StepResult as StepResultAlias};
 use crate::mem::protect;
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};

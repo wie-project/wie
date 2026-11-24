@@ -2,6 +2,7 @@
 //! deferred-shift/flag state.
 
 use super::emit::MemEnv;
+use super::err::LowerError;
 use super::flags::{
     FlagState, clear_flags, flag_bit, flags_add, flags_logic, flags_sub, flags_zs_pf, iconst_u64,
     lower_inc_dec_lazy, lower_neg_lazy, lower_not, pack_state, replace_flag, select_flag,
@@ -29,12 +30,9 @@ use super::sse_fp::{
 use super::{SseBit, lower_cmov, lower_setcc, lower_shift_lazy};
 
 use crate::exec::{self};
-use crate::jit::config::JitConfig;
-use crate::jit::pipeline::OPCODE_HISTO;
 use crate::regs::Rflags;
 use cranelift::prelude::*;
 use iced_x86::{Instruction, Mnemonic};
-use std::sync::atomic::Ordering;
 
 #[derive(Clone, Copy)]
 pub(super) enum ShiftKind {
@@ -288,7 +286,7 @@ pub(super) fn lower_insn(
     flag_state: &mut Option<FlagState>,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     match instr.mnemonic() {
         // True no-ops: NOP/endbranch, PAUSE and the prefetch cache hints
         // (no arch state). PAUSE (F3 90) is a pipeline hint: iced reports
@@ -644,7 +642,7 @@ pub(super) fn lower_insn(
                 Mnemonic::Subsd | Mnemonic::Subpd => (FloatBinOp::Sub, FloatWidth::F64),
                 Mnemonic::Mulsd | Mnemonic::Mulpd => (FloatBinOp::Mul, FloatWidth::F64),
                 Mnemonic::Divsd | Mnemonic::Divpd => (FloatBinOp::Div, FloatWidth::F64),
-                _ => return Err("fp binop mnemonic".into()),
+                _ => return Err(LowerError::unsupported()),
             };
             let scalar = !matches!(
                 m,
@@ -710,7 +708,7 @@ pub(super) fn lower_insn(
         | Mnemonic::Packssdw
         | Mnemonic::Packuswb
         | Mnemonic::Psadbw => {
-            let op = sse_int_op(instr.mnemonic()).ok_or("sse int op")?;
+            let op = sse_int_op(instr.mnemonic()).ok_or_else(LowerError::unsupported)?;
             lower_sse_int_binop(bcx, instr, gpr, *rflags, mem, xmm, op)
         }
         // Packed shifts (imm8 or variable XMM count).
@@ -722,7 +720,7 @@ pub(super) fn lower_insn(
         | Mnemonic::Psrlq
         | Mnemonic::Psraw
         | Mnemonic::Psrad => {
-            let op = sse_shift_op(instr.mnemonic()).ok_or("sse shift op")?;
+            let op = sse_shift_op(instr.mnemonic()).ok_or_else(LowerError::unsupported)?;
             lower_sse_shift(bcx, instr, gpr, *rflags, mem, xmm, op)
         }
         // Whole-XMM byte shifts (imm8 count).
@@ -845,13 +843,14 @@ pub(super) fn lower_insn(
         // `OPCODE_SAMPLES`: that counter is the 1/64 denominator, and a
         // rejected block is compiled at most once per VA, so sampling here
         // would hide the signal it exists to surface.
-        other => {
-            if JitConfig::get().opcode_hist_enabled()
-                && let Some(bucket) = OPCODE_HISTO.get(other as usize)
-            {
-                bucket.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(format!("not lowerable {other:?}"))
-        }
+        // No arm: the JIT does not implement this instruction. The *reason* is
+        // recorded once, where the failing instruction is still in hand
+        // (`emit::emit_body_and_term` → `err::note_refusal`), because that is
+        // also where an `unsupported operand form` refusal is recorded — the
+        // two must land in the same place to be comparable. `refusal_reason`
+        // keeps the pre-existing split between "the gate never admits this
+        // mnemonic" and "the gate admits it and this dispatch has no arm"
+        // (ADR-0007 drift) without either of them being a formatted string here.
+        _ => Err(LowerError::unsupported()),
     }
 }

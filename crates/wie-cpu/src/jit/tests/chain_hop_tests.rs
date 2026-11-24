@@ -17,10 +17,9 @@
 //! - a chain of distinct blocks reports hops, with a store count that stays
 //!   inside the register file's bounds.
 
+use super::harness::map_code_page;
 use super::*;
 use crate::exec::StepResult;
-use crate::mem::protect;
-use crate::mem::{MEM_COMMIT, MEM_RESERVE};
 
 /// Guest code region for these tests (unique per test-file convention).
 const HOP_BASE: u64 = 0x10a0_0000;
@@ -47,13 +46,7 @@ fn self_loop_retires_instructions_without_chain_hops() {
     const ITERS: u64 = 1 << 22;
 
     let mut cpu = JitCpu::open_x86_64();
-    cpu.virtual_alloc(
-        HOP_BASE,
-        0x1000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc");
+    map_code_page(&mut cpu, HOP_BASE);
     cpu.mem_write(HOP_BASE, &[0xff, 0xc9, 0x75, 0xfc])
         .expect("write loop");
     cpu.thread.regs.set_gpr(1, ITERS);
@@ -127,13 +120,7 @@ fn chained_blocks_report_hops_and_bounded_store_ops() {
     const ITERS: u64 = 20_000;
 
     let mut cpu = JitCpu::open_x86_64();
-    cpu.virtual_alloc(
-        HOP_BASE,
-        0x1000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc");
+    map_code_page(&mut cpu, HOP_BASE);
     cpu.mem_write(HOP_BASE, &RING_CODE).expect("write ring");
     cpu.thread.regs.set_gpr(1, ITERS);
     cpu.thread.regs.set_gpr(3, 1); // rbx
@@ -208,13 +195,7 @@ fn chained_blocks_report_hops_and_bounded_store_ops() {
 #[test]
 fn chain_counters_are_monotonic_across_a_run() {
     let mut cpu = JitCpu::open_x86_64();
-    cpu.virtual_alloc(
-        HOP_BASE,
-        0x1000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc");
+    map_code_page(&mut cpu, HOP_BASE);
     cpu.mem_write(HOP_BASE, &RING_CODE).expect("write ring");
     cpu.thread.regs.set_gpr(1, 50_000);
     cpu.write_rip(HOP_BASE).expect("rip");
@@ -277,13 +258,7 @@ const RING_INSNS_PER_ITER: u64 = 5;
 /// Run [`RING_CODE`] for `iters` iterations on a fresh engine.
 fn run_ring(iters: u64) -> JitCpu {
     let mut cpu = JitCpu::open_x86_64();
-    cpu.virtual_alloc(
-        HOP_BASE,
-        0x1000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc");
+    map_code_page(&mut cpu, HOP_BASE);
     cpu.mem_write(HOP_BASE, &RING_CODE).expect("write ring");
     cpu.thread.regs.set_gpr(1, iters);
     cpu.thread.regs.set_gpr(3, 1); // rbx
@@ -376,13 +351,7 @@ fn stale_generation_exit_still_retires_instructions() {
     const ITERS: u64 = 20_000;
 
     let mut cpu = JitCpu::open_x86_64();
-    cpu.virtual_alloc(
-        HOP_BASE,
-        0x1000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc");
+    map_code_page(&mut cpu, HOP_BASE);
     cpu.mem_write(HOP_BASE, &RING_CODE).expect("write ring");
     cpu.thread.regs.set_gpr(1, ITERS);
     cpu.thread.regs.set_gpr(3, 1);

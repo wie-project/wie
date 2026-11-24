@@ -4,6 +4,7 @@
 use super::super::config::JitConfig;
 use super::analysis::{i8x16_to_pair, pair_to_i8x16, read_xmm_pair, store_xmm_pair, xmm_index};
 use super::emit::MemEnv;
+use super::err::LowerError;
 use super::flags::iconst_u64;
 use super::gpr::{effective_addr, read_gpr, write_gpr};
 use super::mem::{call_load, call_store};
@@ -57,8 +58,7 @@ pub(super) fn read_sse_src_pair(
     mem: &MemEnv,
     xmm: &[Value; 32],
     nbytes: u32,
-    ctx: &str,
-) -> Result<(Value, Value), String> {
+) -> Result<(Value, Value), LowerError> {
     match instr.op1_kind() {
         OpKind::Register if instr.op_register(1).is_xmm() => {
             read_xmm_pair(xmm, instr.op_register(1))
@@ -67,7 +67,7 @@ pub(super) fn read_sse_src_pair(
             let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, nbytes, instr.ip())
         }
-        _ => Err(format!("{ctx} src")),
+        _ => Err(LowerError::form("sse_src")),
     }
 }
 
@@ -80,7 +80,7 @@ pub(super) fn load_sse_mem(
     addr: Value,
     nbytes: u32,
     insn_ip: u64,
-) -> Result<(Value, Value), String> {
+) -> Result<(Value, Value), LowerError> {
     match nbytes {
         4 | 8 => {
             let lo = call_load(bcx, mem, gpr, rflags, addr, nbytes, insn_ip)?;
@@ -93,7 +93,7 @@ pub(super) fn load_sse_mem(
             let hi = call_load(bcx, mem, gpr, rflags, addr_hi, 8, insn_ip)?;
             Ok((lo, hi))
         }
-        _ => Err(format!("sse load width {nbytes}")),
+        _ => Err(LowerError::form("sse_load_width")),
     }
 }
 
@@ -109,7 +109,7 @@ pub(super) fn store_sse_mem(
     hi: Value,
     nbytes: u32,
     insn_ip: u64,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     match nbytes {
         4 | 8 => call_store(bcx, mem, gpr, rflags, addr, nbytes, lo, insn_ip),
         16 => {
@@ -117,7 +117,7 @@ pub(super) fn store_sse_mem(
             let addr_hi = bcx.ins().iadd_imm(addr, 8);
             call_store(bcx, mem, gpr, rflags, addr_hi, 8, hi, insn_ip)
         }
-        _ => Err(format!("sse store width {nbytes}")),
+        _ => Err(LowerError::form("sse_store_width")),
     }
 }
 
@@ -133,9 +133,9 @@ pub(super) fn lower_sse_mov(
     xmm: &mut [Value; 32],
     nbytes: u32,
     scalar_merge: bool,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let ip = instr.ip();
-    let (src_lo, src_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, nbytes, "sse mov")?;
+    let (src_lo, src_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, nbytes)?;
 
     match instr.op0_kind() {
         OpKind::Register if instr.op_register(0).is_xmm() => {
@@ -168,7 +168,7 @@ pub(super) fn lower_sse_mov(
             let addr = effective_addr(bcx, instr, gpr, mem)?;
             store_sse_mem(bcx, mem, gpr, rflags, addr, src_lo, src_hi, nbytes, ip)
         }
-        _ => Err("sse mov dst".into()),
+        _ => Err(LowerError::form("sse_mov_dst")),
     }
 }
 
@@ -180,7 +180,7 @@ pub(super) fn lower_sse_movq(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let ip = instr.ip();
     let r0 = instr.op_register(0);
     let r1 = instr.op_register(1);
@@ -196,7 +196,7 @@ pub(super) fn lower_sse_movq(
                 let addr = effective_addr(bcx, instr, gpr, mem)?;
                 load_sse_mem(bcx, mem, gpr, rflags, addr, 8, ip)?
             }
-            _ => return Err("movq src".into()),
+            _ => return Err(LowerError::form("movq_src")),
         };
         // movq to xmm: zero-extend, high 64 bits are always zeroed.
         let hi_zero = iconst_u64(bcx, 0);
@@ -218,7 +218,7 @@ pub(super) fn lower_sse_movq(
         let addr = effective_addr(bcx, instr, gpr, mem)?;
         return call_store(bcx, mem, gpr, rflags, addr, 8, lo, ip);
     }
-    Err("movq form".into())
+    Err(LowerError::form("movq_form"))
 }
 
 /// Lower `Pmovmskb r32, xmm`: pack the MSB of each of the 16 bytes of the
@@ -231,11 +231,11 @@ pub(super) fn lower_sse_pmovmskb(
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let r0 = instr.op_register(0);
     let r1 = instr.op_register(1);
     if !(r0.is_gpr32() || r0.is_gpr64()) || !r1.is_xmm() {
-        return Err("pmovmskb form".into());
+        return Err(LowerError::form("pmovmskb_form"));
     }
     let (lo, hi) = read_xmm_pair(xmm, r1)?;
     let mut mask = iconst_u64(bcx, 0);
@@ -272,12 +272,12 @@ pub(super) fn lower_sse_movmsk(
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
     double: bool,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let r0 = instr.op_register(0);
     if !(r0.is_gpr32() || r0.is_gpr64()) {
-        return Err("movmsk dst".into());
+        return Err(LowerError::form("movmsk_dst"));
     }
-    let (lo, hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "movmsk")?;
+    let (lo, hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
     let (lanes, esize_bits) = if double {
         (2_u64, 64_u64)
     } else {
@@ -307,7 +307,7 @@ pub(super) fn lower_sse_movd(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let ip = instr.ip();
     let r0 = instr.op_register(0);
     let r1 = instr.op_register(1);
@@ -322,7 +322,7 @@ pub(super) fn lower_sse_movd(
                 let addr = effective_addr(bcx, instr, gpr, mem)?;
                 call_load(bcx, mem, gpr, rflags, addr, 4, ip)?
             }
-            _ => return Err("movd src".into()),
+            _ => return Err(LowerError::form("movd_src")),
         };
         // Zero-extend into XMM.
         let zero = iconst_u64(bcx, 0);
@@ -339,7 +339,7 @@ pub(super) fn lower_sse_movd(
         }
         return write_gpr(bcx, gpr, dirty, r0, v);
     }
-    Err("movd form".into())
+    Err(LowerError::form("movd_form"))
 }
 
 /// `MOVHPS` / `MOVHPD` — move 64 bits between XMM upper half and memory
@@ -352,7 +352,7 @@ pub(super) fn lower_sse_movhps(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let ip = instr.ip();
     let r0 = instr.op_register(0);
     if r0.is_xmm() {
@@ -383,7 +383,7 @@ pub(super) fn lower_sse_movlpd(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let ip = instr.ip();
     let r0 = instr.op_register(0);
     if r0.is_xmm() {
@@ -394,7 +394,7 @@ pub(super) fn lower_sse_movlpd(
                 let addr = effective_addr(bcx, instr, gpr, mem)?;
                 call_load(bcx, mem, gpr, rflags, addr, 8, ip)?
             }
-            _ => return Err("movlpd src".into()),
+            _ => return Err(LowerError::form("movlpd_src")),
         };
         let (_, old_hi) = read_xmm_pair(xmm, r0)?;
         store_xmm_pair(bcx, mem, xmm, xmm_index(r0)?, lo, old_hi);
@@ -413,7 +413,7 @@ pub(super) fn lower_sse_movhlps(
     instr: &Instruction,
     xmm: &mut [Value; 32],
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let r0 = instr.op_register(0);
     let r1 = instr.op_register(1);
     let (lo, hi) = read_xmm_pair(xmm, r0)?;
@@ -432,7 +432,7 @@ pub(super) fn lower_sse_punpck(
     instr: &Instruction,
     xmm: &mut [Value; 32],
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let r0 = instr.op_register(0);
     let r1 = instr.op_register(1);
     let (lo_a, hi_a) = read_xmm_pair(xmm, r0)?;
@@ -458,11 +458,11 @@ pub(super) fn lower_sse_punpck_lanes(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "punpck lanes")?;
+    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
     let (lo, hi) = if JitConfig::get().simd_enabled() {
         let a8 = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
         let b8 = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
@@ -484,14 +484,16 @@ pub(super) fn lower_sse_punpck_lanes(
             Mnemonic::Punpckldq | Mnemonic::Punpckhdq => {
                 (exec::SseIntOp::Punpckldq, exec::SseIntOp::PunpckHiDq)
             }
-            _ => return Err("punpck lanes op".into()),
+            _ => return Err(LowerError::form("punpck_lanes_op")),
         };
         let h_family = matches!(
             instr.mnemonic(),
             Mnemonic::Punpckhbw | Mnemonic::Punpckhwd | Mnemonic::Punpckhdq
         );
         let (x_lo, x_hi) = if h_family { (a_hi, b_hi) } else { (a_lo, b_lo) };
-        let sref = mem.sse_int_ref.ok_or("sse int helper missing")?;
+        let sref = mem
+            .sse_int_ref
+            .ok_or_else(|| LowerError::verifier("internal: sse int helper not declared"))?;
         let l_op_v = iconst_u64(bcx, l_op.to_abi());
         let h_op_v = iconst_u64(bcx, h_op.to_abi());
         let call_lo = bcx.ins().call(sref, &[l_op_v, x_lo, x_hi]);
@@ -580,10 +582,10 @@ pub(super) fn lower_sse_pshufd(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
-    let (s_lo, s_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "pshufd")?;
+    let (s_lo, s_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
     let imm = instr.immediate(2) & 0xff;
     let (lo, hi) = if JitConfig::get().simd_enabled() {
         let a8 = pair_to_i8x16(bcx, mem.flags, s_lo, s_hi);
@@ -624,12 +626,12 @@ pub(super) fn lower_sse_shufpd(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     // The first source is the destination register (read before the store).
     let (s1_lo, s1_hi) = read_xmm_pair(xmm, dst)?;
-    let (s2_lo, s2_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "shufpd")?;
+    let (s2_lo, s2_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
     let imm = instr.immediate(2) & 0xff;
     let lo = if imm & 1 == 0 { s1_lo } else { s2_lo };
     let hi = if imm & 2 == 0 { s1_hi } else { s2_hi };
@@ -645,10 +647,10 @@ pub(super) fn lower_sse_pshuflw_hw(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
-    let (s_lo, s_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "pshuflw/hw")?;
+    let (s_lo, s_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
     let imm = instr.immediate(2) & 0xff;
     let low = instr.mnemonic() == Mnemonic::Pshuflw;
     let (lo, hi) = if JitConfig::get().simd_enabled() {
@@ -866,8 +868,10 @@ pub(super) fn sse_int_binop_helper(
     a_hi: Value,
     b_lo: Value,
     b_hi: Value,
-) -> Result<(Value, Value), String> {
-    let sref = mem.sse_int_ref.ok_or("sse int helper missing")?;
+) -> Result<(Value, Value), LowerError> {
+    let sref = mem
+        .sse_int_ref
+        .ok_or_else(|| LowerError::verifier("internal: sse int helper not declared"))?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let c1 = bcx.ins().call(sref, &[op_v, a_lo, b_lo]);
     let lo = bcx.inst_results(c1)[0];
@@ -885,11 +889,11 @@ pub(super) fn lower_sse_int_binop(
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
     op: exec::SseIntOp,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "sse int binop")?;
+    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
     let (lo, hi) = if JitConfig::get().simd_enabled() {
         match op {
             exec::SseIntOp::Paddb => vec_binop(

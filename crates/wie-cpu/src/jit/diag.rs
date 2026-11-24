@@ -254,13 +254,30 @@ fn dump_opcode_histogram() {
 /// hide the signal. Empty when the gate is off or no samples were taken.
 fn opcode_histogram_lines() -> Vec<String> {
     let samples = pipeline::OPCODE_SAMPLES.load(std::sync::atomic::Ordering::Relaxed);
-    crate::exec::render_mnemonic_histogram(&pipeline::OPCODE_HISTO, true, |total| {
-        format!(
-            "--- jit opcode-residue histogram (iced residue sampled 1/{}, \
+    let mut lines = crate::exec::render_mnemonic_histogram(
+        &pipeline::OPCODE_HISTO,
+        true,
+        |total| {
+            format!(
+                "--- jit opcode-residue histogram (iced residue sampled 1/{}, \
              jit rejections recorded per rejected block, {samples} iced samples, total={total}) ---",
-            pipeline::OPCODE_SAMPLE_EVERY
-        )
-    })
+                pipeline::OPCODE_SAMPLE_EVERY
+            )
+        },
+    );
+    // Rendered beside the histogram because the histogram is mnemonic-keyed and
+    // therefore cannot say *why* a block was refused: `Unsupported` is routine
+    // (an x87 guest runs at interpreter speed by design), whereas `Form` means
+    // the JIT implements that instruction and not that operand shape — the class
+    // that used to be invisible. Pushed even when no samples were taken, so a
+    // session that only refused blocks still reports a reason.
+    let (unsupported, form, verifier) = crate::jit::lower::err::refusal_counts();
+    if unsupported + form + verifier > 0 {
+        lines.push(format!(
+            "[wie] jit_lower_refusals: unsupported={unsupported} form={form} verifier={verifier}"
+        ));
+    }
+    lines
 }
 
 #[cfg(test)]

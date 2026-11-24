@@ -50,7 +50,7 @@ mod code_cache;
 
 #[allow(unused_imports)] // wired up by the JitShared plumbing in a follow-up edit
 pub(crate) use code_cache::{CodeCache, CodeCacheCounts};
-pub(super) use code_cache::{CodeRestoreOutcome, PersistedCode};
+pub(super) use code_cache::{CodeRestoreOutcome, PersistedCode, classify_capture_relocs};
 
 use cranelift_module::{FuncId, Module, ModuleDeclarations, ModuleReloc};
 
@@ -699,6 +699,28 @@ impl IsaEngine {
             .and_then(|(_, decl)| decl.name.as_deref())
     }
 
+    /// Whether `index` names a **block function of this module** rather than a
+    /// host import: at or above the import prefix, declared, not an import, and
+    /// carrying exactly the block signature.
+    ///
+    /// The structural half of the restore check for a direct chain edge — "may
+    /// this id be used as a call target in this module?" — and deliberately not
+    /// the semantic half: that the id is the *recorded* successor is established
+    /// by the caller re-resolving the edge's guest VA through the live chain
+    /// table, and is why no id read from a file ever reaches this path.
+    pub(super) fn is_block_function(&self, index: u32) -> bool {
+        if index < self.import_count() {
+            return false;
+        }
+        cranelift_module::Module::declarations(&self.module)
+            .get_functions()
+            .find(|(id, _)| id.as_u32() == index)
+            .is_some_and(|(_, decl)| {
+                !matches!(decl.linkage, cranelift_module::Linkage::Import)
+                    && decl.signature == self.block_sig
+            })
+    }
+
     /// FNV-1a over the ordered import names: the on-disk code file's identity
     /// check. Reordering or renaming a single helper invalidates every blob,
     /// which is the safe direction.
@@ -724,30 +746,40 @@ impl IsaEngine {
 
     /// Define a block from persisted bytes instead of compiling it.
     ///
+    /// `relocs` is the blob's relocation list **as resolved for this process**
+    /// (`PersistedCode::resolved_relocs`): host imports by index, and direct
+    /// chain edges already turned back into a live `FuncId` from the successor's
+    /// recorded guest VA. Passing the list in, rather than reading
+    /// `code.relocs`, keeps the check and the call on the same data.
+    ///
     /// Returns the finalized entry point. Fails — never panics, never maps
-    /// unvalidated bytes — when any relocation target is not a host import this
-    /// module declares under the same name.
+    /// unvalidated bytes — when any relocation target is not replayable here.
     ///
-    /// Rejects, deliberately and by design (see
-    /// [`crate::jit::cache_persist`]):
-    /// - `FunctionOffset` — a direct `bl` to another compiled block. Those
-    ///   `FuncId`s are allocated in declaration order, so they name a different
-    ///   function (or nothing) in the next process. A blob with any of these is
-    ///   the block-level form of the chain table and is never persisted.
+    /// Admissible targets, and nothing else (see
+    /// [`crate::jit::engine::code_cache`]'s module docs for the total
+    /// enumeration):
+    /// - an index below this module's `import_count`: a host helper, which the
+    ///   file-level import fingerprint and this name check re-identify;
+    /// - an index **at or above** it: a function this module declares with the
+    ///   block signature, i.e. another compiled block reached by a direct chain
+    ///   `bl`. Only the caller can establish that the id belongs to the recorded
+    ///   successor, and it does so by re-resolving through the live chain table
+    ///   (`JitShared::chain_func_for`) — the id never comes from the file.
     /// - `LibCall` / `KnownSymbol` / `User` in a non-zero namespace (a data
-    ///   object) — resolvable only through a linker cranelift-jit does not have.
-    ///
-    /// So a restore *rejects* rather than mis-restores; the caller compiles.
+    ///   object) — resolvable only through a linker cranelift-jit does not have,
+    ///   so a restore *rejects* rather than mis-restores and the caller compiles.
     pub(super) fn define_persisted(
         &mut self,
         code: &PersistedCode,
+        relocs: &[ModuleReloc],
     ) -> Result<(FuncId, *const u8), CodeRestoreOutcome> {
+        use cranelift_codegen::binemit::Reloc;
         use cranelift_module::ModuleRelocTarget as Target;
 
         if code.code.is_empty() || code.align == 0 {
             return Err(CodeRestoreOutcome::Malformed);
         }
-        for r in &code.relocs {
+        for r in relocs {
             let Target::User {
                 namespace: 0,
                 index,
@@ -757,7 +789,16 @@ impl IsaEngine {
             };
             // The name check is what makes "import #7" mean the same thing in
             // this process as it did in the one that wrote the file.
-            if self.import_name_at(index).is_none() {
+            if self.import_name_at(index).is_some() {
+                continue;
+            }
+            // Not an import: admissible only as a direct chain call to a block
+            // of *this* module. `cranelift-jit` resolves such a target through
+            // its own `compiled_functions` table and panics on an anonymous,
+            // undefined one, so the caller's ids must come from an install —
+            // which they do, because `chain_ids` is only written after
+            // `finalize_definitions`.
+            if !matches!(r.kind, Reloc::Arm64Call) || !self.is_block_function(index) {
                 return Err(CodeRestoreOutcome::UnrelocatableTarget);
             }
         }
@@ -768,7 +809,7 @@ impl IsaEngine {
             .declare_anonymous_function(&sig)
             .map_err(|_| CodeRestoreOutcome::Malformed)?;
         self.module
-            .define_function_bytes(func_id, code.align, &code.code, &code.relocs)
+            .define_function_bytes(func_id, code.align, &code.code, relocs)
             .map_err(|_| CodeRestoreOutcome::Malformed)?;
         // Only the function just defined is pending: every compile finalizes
         // before releasing `JitShared::engine`, which this call also holds.

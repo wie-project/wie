@@ -11,6 +11,7 @@
 //! 2. the urgent-before-normal pop discipline holds,
 //! 3. the [`BG_QUEUE_CAP`] depth bound rejects instead of stranding.
 
+use super::harness::map_code_region;
 use super::*;
 use config::BG_QUEUE_CAP;
 
@@ -105,14 +106,7 @@ fn bg_pool_multi_producer_stress_all_blocks_resolve() {
     let total = PRODUCERS * PER_PRODUCER;
     {
         let mut setup = JitCpu::new_shared(Arc::clone(&shared));
-        setup
-            .virtual_alloc(
-                stress_slot_va(0),
-                0x4000,
-                MEM_RESERVE | MEM_COMMIT,
-                protect::PAGE_EXECUTE_READWRITE,
-            )
-            .expect("alloc");
+        map_code_region(&mut setup, stress_slot_va(0), 0x4000);
         for idx in 0..total {
             let mark = u32::try_from(idx).unwrap_or(1) | 0x0100_0000;
             let mut code: Vec<u8> = vec![0xb8];

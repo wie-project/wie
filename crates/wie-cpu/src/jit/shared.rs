@@ -24,9 +24,12 @@ static REJECTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 /// doubling, and bounded inline on deferred (2 per 10 ms token bucket).
 pub(super) const BOOT_MODE_INSNS: u64 = 5_000_000;
 use super::config::{BG_QUEUE_CAP, JitConfig};
-use super::engine::{CodeCache, JitEngine, PersistedCode};
+use super::engine::{
+    CodeCache, CodeRestoreOutcome, JitEngine, PersistedCode, classify_capture_relocs,
+};
 use super::fast_api::{FastApiKind, LargeFreeList};
 use super::gen_tlb::GenTlb;
+use super::lower::err::LowerError;
 use super::lower::{
     self, CHAIN_SLOTS, CompiledBlock, MemPin, PIN_SLOTS, STICKY_WAYS, TLB_EMPTY, TLB_SETS,
     TLB_WAYS_PER_SET, TlbValue, compile_block,
@@ -36,6 +39,7 @@ use super::profile::BgCompileProfile;
 use super::trampolines::match_micro_stub;
 use crate::ConcurrentHashMap;
 use crate::exec::HookWindow;
+use crate::lock::{lock_unpoisoned, read_unpoisoned};
 use crate::mem::GuestMemory;
 use crate::regs::RegFile;
 use ahash::HashMap;
@@ -83,7 +87,7 @@ impl BgWaitCell {
     /// Idempotent: a second call finds the sender taken and does nothing.
     /// `pub(super)` so JIT-module tests can fire tokens directly.
     pub(super) fn notify_all(&self) {
-        if let Some(tx) = self.tx.lock().unwrap().take() {
+        if let Some(tx) = lock_unpoisoned(&self.tx).take() {
             // A missing waiter is fine — the token buffers until recv.
             let _ = tx.send(());
         }
@@ -95,7 +99,7 @@ impl BgWaitCell {
     /// out or another waiter already consumed the receiver (callers must
     /// re-check the cache state either way).
     pub(super) fn wait_timeout(&self, timeout: Duration) -> bool {
-        let Some(rx) = self.rx.lock().unwrap().take() else {
+        let Some(rx) = lock_unpoisoned(&self.rx).take() else {
             return false;
         };
         rx.recv_timeout(timeout).is_ok()
@@ -233,7 +237,7 @@ impl BgPool {
     pub(super) fn push(&self, rip: u64, kind: BlockKind, inv_gen: u64, urgent: bool) -> bool {
         let job = BgJob { rip, kind, inv_gen };
         let accepted = {
-            let mut q = self.q.lock().unwrap();
+            let mut q = lock_unpoisoned(&self.q);
             q.push(job, urgent)
         };
         if accepted {
@@ -386,14 +390,14 @@ impl JitShared {
     /// Append-only by design: each consumer thread keeps its own watermark,
     /// so entries are re-readable and never stolen from another thread.
     pub(crate) fn installs_since(&self, from: usize) -> (Vec<u64>, usize) {
-        let g = self.recent_installs.lock().unwrap();
+        let g = lock_unpoisoned(&self.recent_installs);
         let new_wm = g.len();
         (g[from.min(g.len())..].to_vec(), new_wm)
     }
 
     /// Current install-list length (watermark anchor after a full rebuild).
     pub(crate) fn recent_installs_len(&self) -> usize {
-        self.recent_installs.lock().unwrap().len()
+        lock_unpoisoned(&self.recent_installs).len()
     }
     pub(super) fn new() -> Self {
         let has_engine = match JitEngine::new() {
@@ -472,7 +476,7 @@ impl JitShared {
             let opt = JitConfig::get().opt_level();
             // The import list is a property of the live module, and it is part
             // of the code file's identity, so attach cannot happen without it.
-            let mut guard = self.engine.lock().unwrap();
+            let mut guard = lock_unpoisoned(&self.engine);
             if let Some(eng) = guard.as_mut() {
                 self.code_cache().attach(pe_hash, opt, eng.base_mut());
             }
@@ -541,6 +545,17 @@ impl JitShared {
             return None;
         };
         let tier = code.compiled_at_opt;
+        // Direct chain edges are re-resolved **here**, against this run's chain
+        // table, and a successor this run cannot offer refuses the whole blob:
+        // the recorded target is a guest VA, so honouring it without a live
+        // entry would be exactly the stale re-resolution the format exists to
+        // make impossible (see the `code_cache` module docs). Done before the
+        // engine lock — it only reads `chain_ids`.
+        let Some(relocs) = code.resolved_relocs(|target_va| self.chain_func_for(tier, target_va))
+        else {
+            cache.note(CodeRestoreOutcome::UnrelocatableTarget);
+            return None;
+        };
         let restored = {
             // `try_lock`, NOT `lock`: this runs on the guest thread inside the
             // dispatcher's miss path, and the same mutex is held for the whole
@@ -560,7 +575,7 @@ impl JitShared {
             };
             let eng = guard.as_mut()?;
             let module = eng.module_for(tier)?;
-            module.define_persisted(&code)
+            module.define_persisted(&code, &relocs)
         };
         let (func_id, ptr) = match restored {
             Ok(v) => v,
@@ -609,19 +624,33 @@ impl JitShared {
         let Ok(mut guard) = self.engine.try_lock() else {
             return;
         };
-        let captured = {
+        let (captured, import_count) = {
             let Some(eng) = guard.as_mut() else {
                 return;
             };
             let Some(module) = eng.module_for(compiled.tier) else {
                 return;
             };
-            module.take_captured(func_id)
+            let import_count = module.import_count();
+            let Some(captured) = module.take_captured(func_id) else {
+                return;
+            };
+            (captured, import_count)
         };
-        let Some(captured) = captured else {
+        // Split the capture into the format's two replayable classes, or give the
+        // block up: an import index is re-checked by name on restore, a direct
+        // chain edge is re-resolved from its successor's guest VA, and anything
+        // else has no re-resolution at all (see `code_cache`'s module docs).
+        let tier = compiled.tier;
+        let Some((relocs, chain_relocs)) =
+            classify_capture_relocs(captured.relocs, import_count, |target_id| {
+                self.chain_va_of(tier, target_id)
+            })
+        else {
+            self.code_cache().note_unpersistable();
             return;
         };
-        let mem = self.mem.read().unwrap();
+        let mem = read_unpoisoned(&self.mem);
         let Some(bytes_hash) =
             super::cache_persist::hash_guest_range(&mem, compiled.guest_start, compiled.guest_end)
         else {
@@ -636,7 +665,8 @@ impl JitShared {
             compiled_at_opt: compiled.tier,
             align: captured.align,
             code: captured.bytes,
-            relocs: captured.relocs,
+            relocs,
+            chain_relocs,
         });
     }
 
@@ -679,7 +709,9 @@ impl JitShared {
     /// Test-only: name of host import declaration `index` in the live module.
     #[cfg(test)]
     pub(super) fn code_import_name(&self, index: u32) -> Option<String> {
-        let guard = self.engine.lock().expect("engine lock");
+        // Was `.expect("engine lock")`: that message named the mutex, not a
+        // state invariant, so it survives here rather than in the helper.
+        let guard = lock_unpoisoned(&self.engine);
         let eng = guard.as_ref()?;
         eng.base.import_name_at(index).map(str::to_owned)
     }
@@ -728,7 +760,7 @@ impl JitShared {
     /// Record one Ready install (`inline` and worker paths) into the ledger.
     pub(super) fn persist_record_ready(&self, compiled: &CompiledBlock) {
         self.record_code(compiled);
-        let mem = self.mem.read().unwrap();
+        let mem = read_unpoisoned(&self.mem);
         self.persist.record_ready(
             &mem,
             compiled.guest_start,
@@ -743,7 +775,7 @@ impl JitShared {
         if !self.persist_active() {
             return;
         }
-        let mem = self.mem.read().unwrap();
+        let mem = read_unpoisoned(&self.mem);
         self.persist.record_never(&mem, va);
     }
 
@@ -754,7 +786,11 @@ impl JitShared {
         // The code cache drops overlapping blobs eagerly rather than waiting
         // for the byte-hash guard to catch them: the guard is the correctness
         // net, but keeping a dead blob would make every later probe of that VA
-        // pay a failed hash for the rest of the process.
+        // pay a failed hash for the rest of the process. The flush this triggers
+        // writes the file from the table and discards queued copies of the
+        // dropped blobs, so the on-disk half drops with the in-memory one —
+        // except when the drop empties the table, where no rewrite happens at all
+        // (`CodeCache::invalidate_range` documents that limit).
         self.code_cache().invalidate_range(addr, end);
     }
 
@@ -821,7 +857,7 @@ impl JitShared {
             return false;
         }
         let now = Instant::now();
-        let mut guard = self.boot_inline_window.lock().unwrap();
+        let mut guard = lock_unpoisoned(&self.boot_inline_window);
         if now.duration_since(guard.0) >= Duration::from_millis(10) {
             *guard = (now, 1);
             return true;
@@ -864,7 +900,7 @@ impl JitShared {
                 );
             }
             // Inline installs are visible to other threads' delta-resyncs too.
-            self.recent_installs.lock().unwrap().push(rip);
+            lock_unpoisoned(&self.recent_installs).push(rip);
         }
         self.code_pages_add_range(compiled.guest_start, compiled.guest_end);
         self.cache.pin().insert(rip, CacheEntry::Ready(compiled));
@@ -875,7 +911,7 @@ impl JitShared {
     /// spawn). Callers hold their own `Arc<JitShared>` while using it, so the
     /// pool cannot be torn down mid-push.
     pub(super) fn bg_pool_arc(&self) -> Option<Arc<BgPool>> {
-        self.bg_pool.lock().unwrap().clone()
+        lock_unpoisoned(&self.bg_pool).clone()
     }
 
     /// Spawn the background compiler worker pool exactly once.
@@ -898,7 +934,7 @@ impl JitShared {
         }
         let k = JitConfig::get().jit_workers();
         let pool = Arc::new(BgPool::new());
-        *self.bg_pool.lock().unwrap() = Some(Arc::clone(&pool));
+        *lock_unpoisoned(&self.bg_pool) = Some(Arc::clone(&pool));
         // Live-worker countdown: the last exiting worker clears `bg_alive`
         // so guests stop waiting on a dead pool and inline-compile instead.
         let remaining = Arc::new(AtomicUsize::new(k));
@@ -948,7 +984,7 @@ impl JitShared {
             // Spawn failed entirely (resource limits): revert so callers fall
             // back to inline compilation and a later call can retry.
             self.bg_spawned.store(false, Ordering::Release);
-            self.bg_pool.lock().unwrap().take();
+            lock_unpoisoned(&self.bg_pool).take();
         }
     }
 
@@ -966,7 +1002,7 @@ impl JitShared {
     /// during compilation — so no path holds it across an install and
     /// workers cannot deadlock against producers or each other.
     fn bg_worker_main(shared: &Weak<Self>, pool: &BgPool) {
-        let mut guard = pool.q.lock().unwrap();
+        let mut guard = lock_unpoisoned(&pool.q);
         loop {
             // Block until a job arrives or the pool shuts down. The flag is
             // read under the same mutex `JitShared::drop` writes it under,
@@ -993,7 +1029,7 @@ impl JitShared {
             // Batch-drain: pull every currently-queued item before blocking
             // again so a promotion burst costs one wakeup, not one per block.
             guard = loop {
-                let mut g = pool.q.lock().unwrap();
+                let mut g = lock_unpoisoned(&pool.q);
                 match g.pop_job() {
                     Some(job) => {
                         drop(g);
@@ -1014,7 +1050,7 @@ impl JitShared {
         let BgJob { rip, kind, inv_gen } = job;
         let mem_gen_before = self.mem_gen.load(Ordering::Acquire);
         // Arc clone: refcount bump only (table is built once per engine).
-        let fast_api = self.bg_fast_api.lock().unwrap().clone();
+        let fast_api = lock_unpoisoned(&self.bg_fast_api).clone();
         let start = Instant::now();
         let compiled = self.compile_from_kind_shared(fast_api.as_ref(), rip, kind, inv_gen);
         let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -1086,7 +1122,7 @@ impl JitShared {
                 // Resolve import thunks before mutably borrowing the JIT engine.
                 let call_fast = match term {
                     Some(block::BlockTerm::Call { target, .. }) => {
-                        let mem = self.mem.read().unwrap();
+                        let mem = read_unpoisoned(&self.mem);
                         let final_va = resolve_thunk_va(&mem, target);
                         drop(mem);
                         fast_api
@@ -1098,7 +1134,7 @@ impl JitShared {
                 let chain_on = JitConfig::get().chain_enabled();
                 // Tier decision: pre-compile, from block shape, memoised per VA.
                 let mut tier = self.decide_tier(rip, block::term_is_self_loop(term.as_ref(), rip));
-                let mut eng_guard = self.engine.lock().unwrap();
+                let mut eng_guard = lock_unpoisoned(&self.engine);
                 loop {
                     // Chain-id snapshot for THIS module only (pin guard must not
                     // outlive the snapshot — the engine lock and `compile_block`
@@ -1137,32 +1173,38 @@ impl JitShared {
                             return Some(c);
                         }
                         Err(e) => {
-                            // Verifier/codegen rejection: the block's IR failed a
-                            // lowering or verification pass. Surface it loudly,
-                            // then fall back to interpretation for this block.
-                            // Rate-limited: first REJECT_WARN_MAX rejections at
-                            // WARN (unique enough to triage), the tail at DEBUG.
+                            // A lowering refusal, not necessarily a codegen
+                            // bug: `LowerError::Unsupported` is routine (an x87
+                            // guest) and `Form` means the JIT does the
+                            // instruction but not this operand shape. The old
+                            // message claimed all three were "verifier/codegen",
+                            // which made a design limit look like a defect.
+                            // Rate-limited by count: the first REJECT_WARN_MAX
+                            // at WARN, the tail at DEBUG — except a genuine
+                            // verifier failure, which stays loud because it is
+                            // the one class that means emitted IR was wrong.
                             let n =
                                 REJECTION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let msg_args =
-                                (format_args!("{rip:#x}"), bytes_len, n + 1, e.to_string());
-                            if n < REJECT_WARN_MAX {
+                            let loud = n < REJECT_WARN_MAX || matches!(e, LowerError::Verifier(_));
+                            if loud {
                                 tracing::warn!(
-                                    rip = format_args!("{}", msg_args.0),
-                                    bytes_len = msg_args.1,
-                                    rejection_seq = msg_args.2,
-                                    error = %msg_args.3,
-                                    "jit compile rejected by verifier/codegen — \
-                                     block falls back to the interpreter"
+                                    rip = format_args!("{rip:#x}"),
+                                    bytes_len,
+                                    rejection_seq = n + 1,
+                                    kind = e.kind(),
+                                    error = %e,
+                                    "jit block lowering refused — block falls back to the \
+                                     interpreter"
                                 );
                             } else {
                                 tracing::debug!(
-                                    rip = format_args!("{}", msg_args.0),
-                                    bytes_len = msg_args.1,
-                                    rejection_seq = msg_args.2,
-                                    error = %msg_args.3,
-                                    "jit compile rejected by verifier/codegen — \
-                                     block falls back to the interpreter"
+                                    rip = format_args!("{rip:#x}"),
+                                    bytes_len,
+                                    rejection_seq = n + 1,
+                                    kind = e.kind(),
+                                    error = %e,
+                                    "jit block lowering refused — block falls back to the \
+                                     interpreter"
                                 );
                             }
                             use cranelift_module::Module;
@@ -1233,6 +1275,55 @@ impl JitShared {
             .collect()
     }
 
+    /// Live direct-chain target for `va` in `tier`'s module.
+    ///
+    /// The single-VA form of [`Self::chain_map_for`] — same table, same
+    /// same-tier filter, no snapshot allocated — used to turn a persisted chain
+    /// edge's recorded guest VA back into a `FuncId` of *this* run. `None` means
+    /// this run has no chainable block there (never compiled it, or invalidated
+    /// it since), which refuses the blob rather than chaining into a dead target.
+    ///
+    /// The ids it returns are the load-bearing precondition of
+    /// [`crate::jit::engine::IsaEngine::define_persisted`]: `chain_ids` is only
+    /// written after a block is installed, i.e. after `finalize_definitions`, so
+    /// the id always names code `cranelift-jit` can relocate against.
+    pub(super) fn chain_func_for(
+        &self,
+        tier: OptTier,
+        va: u64,
+    ) -> Option<cranelift_module::FuncId> {
+        let guard = self.chain_ids.pin();
+        guard.get(&va).filter(|t| t.tier == tier).map(|t| t.func_id)
+    }
+
+    /// Guest VA this run compiled `func_id` for, in `tier`'s module.
+    ///
+    /// The reverse of [`Self::chain_func_for`], used only when *persisting* a
+    /// captured block: its direct chain relocation names a `FuncId`, and the
+    /// guest VA is the only form of that reference that survives a process
+    /// boundary.
+    ///
+    /// Reads the authoritative forward table rather than a parallel index, so it
+    /// cannot disagree with what the emitter was offered. Returns `None` when the
+    /// entry is gone (invalidated since the compile) **and** when two entries
+    /// claim the same id: recording refuses in both cases, which is what makes
+    /// this independent of `FuncId`s never being reused — an implementation
+    /// detail of cranelift's declaration table, not a property of ours.
+    fn chain_va_of(&self, tier: OptTier, func_id: cranelift_module::FuncId) -> Option<u64> {
+        let guard = self.chain_ids.pin();
+        let mut found: Option<u64> = None;
+        for (&va, target) in guard.iter() {
+            if target.tier != tier || target.func_id != func_id {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(va);
+        }
+        found
+    }
+
     /// Worker-side install of a successfully compiled block: cache + chaining +
     /// SMC bookkeeping + epoch bump + waiter notification.
     fn bg_install_ready(&self, rip: u64, compiled: CompiledBlock) {
@@ -1265,7 +1356,7 @@ impl JitShared {
         // Record the install for delta-resync BEFORE bumping the epoch: a
         // thread that observes the new epoch is guaranteed to find the VA in
         // its drain (install-order lock discipline).
-        self.recent_installs.lock().unwrap().push(rip);
+        lock_unpoisoned(&self.recent_installs).push(rip);
         self.persist_record_ready(&compiled);
         self.cache_epoch.fetch_add(1, Ordering::Relaxed);
         self.chain_epoch_bumps.fetch_add(1, Ordering::Relaxed);
@@ -1318,7 +1409,7 @@ impl JitShared {
             return false;
         }
         let end = addr.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
-        let pending = self.pending_code_writes.lock().unwrap();
+        let pending = lock_unpoisoned(&self.pending_code_writes);
         let mut page = addr >> 12;
         let last = end.saturating_sub(1) >> 12;
         while page <= last {
@@ -1331,7 +1422,7 @@ impl JitShared {
     }
 
     pub(super) fn code_pages_overlap(&self, addr: u64, len: usize) -> bool {
-        let code_pages = self.code_pages.lock().unwrap();
+        let code_pages = lock_unpoisoned(&self.code_pages);
         if len == 0 || code_pages.is_empty() {
             return false;
         }
@@ -1354,7 +1445,7 @@ impl JitShared {
         if guest_end <= guest_start {
             return;
         }
-        let mut code_pages = self.code_pages.lock().unwrap();
+        let mut code_pages = lock_unpoisoned(&self.code_pages);
         let mut page = guest_start >> 12;
         let last = guest_end.saturating_sub(1) >> 12;
         while page <= last {
@@ -1370,7 +1461,7 @@ impl JitShared {
         if guest_end <= guest_start {
             return;
         }
-        let mut code_pages = self.code_pages.lock().unwrap();
+        let mut code_pages = lock_unpoisoned(&self.code_pages);
         let mut page = guest_start >> 12;
         let last = guest_end.saturating_sub(1) >> 12;
         while page <= last {
@@ -1403,14 +1494,14 @@ impl Drop for JitShared {
     /// strong ref that defers this drop until its batch completes. Workers
     /// clear `bg_alive` themselves as they exit.
     fn drop(&mut self) {
-        let Some(pool) = self.bg_pool.lock().unwrap().take() else {
+        let Some(pool) = lock_unpoisoned(&self.bg_pool).take() else {
             return; // never spawned (or failed-spawn revert already ran)
         };
         {
             // Write the flag under the queue mutex: a worker either reads it
             // before parking (this order) or is woken by the notify below.
             // No lost-wakeup window exists between check and park.
-            let mut q = pool.q.lock().unwrap();
+            let mut q = lock_unpoisoned(&pool.q);
             q.shutdown = true;
         }
         pool.work_available.notify_all();

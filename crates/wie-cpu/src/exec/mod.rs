@@ -139,10 +139,7 @@ pub fn degraded_insn_count() -> u64 {
 type DegradedSeen = ahash::HashSet<u32>;
 
 fn degrade_locked_seen() -> MutexGuard<'static, DegradedSeen> {
-    match DEGRADED_SEEN.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    crate::lock::lock_unpoisoned(&DEGRADED_SEEN)
 }
 
 pub(crate) fn step(
@@ -1318,12 +1315,9 @@ static RMW_FALLBACK_LOCKS: [Mutex<()>; RMW_STRIPES] = [const { Mutex::new(()) };
 static RMW_FALLBACK_OVERFLOW: Mutex<()> = Mutex::new(());
 
 fn lock_unpoisoned(cell: &'static Mutex<()>) -> MutexGuard<'static, ()> {
-    match cell.lock() {
-        Ok(guard) => guard,
-        // A panicked RMW leaves no invariant to protect: the memory word is
-        // still a valid x86 word, so keep going rather than cascade-poison.
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    // A panicked RMW leaves no invariant to protect: the memory word is still
+    // a valid x86 word, so keep going rather than cascade-poison.
+    crate::lock::lock_unpoisoned(cell)
 }
 
 /// The host lock that serialises the non-`host_span` RMW path for `addr`.

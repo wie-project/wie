@@ -30,12 +30,13 @@
 // Split out of `atomic_tests.rs` (file-size policy, ADR-002); it reuses that
 // file's dual-engine harness rather than duplicating it.
 use super::atomic_tests::{
-    BACKENDS, DATA_BASE, Engine, LOCK_WORD, UNALIGNED_WORD, ctx, open, open_worker, plant,
-    read_word, write_word,
+    DATA_BASE, LOCK_WORD, UNALIGNED_WORD, ctx, plant, read_word, write_word,
 };
+use super::harness::map_code_page;
+use super::harness::{BACKENDS, Engine, open, open_worker};
 use crate::ThreadContext;
 use crate::exec::{AccessType, StepResult as StepResultAlias};
-use crate::mem::{MEM_COMMIT, MEM_RESERVE, protect};
+use crate::mem::protect;
 use crate::regs::Rflags;
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
 use std::sync::Barrier;
@@ -1010,14 +1011,7 @@ fn btx_reg_masks_the_index_to_the_operand_width_on_both_backends() {
             let mut gpr = [0_u64; 16];
             gpr[1] = index; // CL — the bit index for the register form
             gpr[2] = seed; // DX — the operand
-            cpu.cpu()
-                .virtual_alloc(
-                    code_base,
-                    0x1000,
-                    MEM_RESERVE | MEM_COMMIT,
-                    protect::PAGE_EXECUTE_READWRITE,
-                )
-                .expect("code alloc");
+            map_code_page(cpu.cpu(), code_base);
             let mut code = op.to_vec();
             code.extend_from_slice(&[0x90, 0x0F, 0x0B]);
             cpu.cpu().mem_write(code_base, &code).expect("code");

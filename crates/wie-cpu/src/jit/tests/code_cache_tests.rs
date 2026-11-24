@@ -17,9 +17,10 @@
 //! suite; these tests inject a directory-scoped [`CodeCache`] through
 //! `JitShared::set_code_cache` instead.
 
+use super::harness::map_code_page;
 use super::*;
 use crate::jit::cache_persist::LedgerProbe;
-use crate::jit::engine::{CodeCache, CodeCacheCounts};
+use crate::jit::engine::{CodeCache, CodeCacheCounts, PersistedCode, classify_capture_relocs};
 use cranelift_module::ModuleRelocTarget;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -72,13 +73,7 @@ fn engine_with_cache(dir: &Path) -> (JitCpu, Arc<CodeCache>) {
 fn new_cpu_with_code() -> JitCpu {
     let mut cpu = JitCpu::open_x86_64();
     cpu.shared.bg_force.store(true, Ordering::Relaxed);
-    cpu.virtual_alloc(
-        CODE_BASE,
-        0x1000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc");
+    map_code_page(&mut cpu, CODE_BASE);
     cpu.mem_write(CODE_BASE, CODE).expect("write code");
     cpu
 }
@@ -232,11 +227,13 @@ fn persisted_code_is_replayed_in_a_fresh_engine_and_matches_the_compile() {
 ///
 /// The whole safety argument for replaying machine code is that the emitted
 /// code's address-bearing references are a *closed, enumerable* set — our own
-/// host-helper imports. This asserts it on a real captured block: every
-/// relocation resolves to a named import of the live module. If a future
-/// lowering change introduced a relocation this test cannot classify (a
-/// Cranelift libcall, a data object, a chain-table call to another block), it
-/// fails here rather than in production on the second launch of a real guest.
+/// host-helper imports, plus direct chain edges recorded as guest VAs. This
+/// asserts the import half on a real captured block: every relocation resolves to
+/// a named import of the live module. If a future lowering change introduced a
+/// relocation this test cannot classify (a Cranelift libcall, a data object), it
+/// fails here rather than in production on the second launch of a real guest. The
+/// chain-edge half of the enumeration is pinned by
+/// `captured_relocations_are_classified_total`.
 #[test]
 fn a_real_block_capture_references_only_named_host_imports() {
     let dir = scratch_dir("reloc-census");
@@ -365,6 +362,62 @@ fn finish_is_idempotent_under_a_double_call() {
     assert_eq!(cache2.counters().snapshot().refused(), 0);
 }
 
+/// An invalidated blob must not come back through the flush the invalidation
+/// itself triggers.
+///
+/// `record` inserts a blob into the table and *then* queues it in
+/// `FlushState::pending`, so a flush racing those two steps can see it in the
+/// table, in the queue, or in neither — which is why the queue exists at all.
+/// `invalidate_range` drops it from the table and immediately flushes, and that
+/// flush used to append every queued record whose VA was missing from its table
+/// snapshot, writing the dead blob straight back to disk. The byte-hash guard
+/// made that harmless (a later probe refuses it), but the file then carried a
+/// block the engine had already invalidated — and the guard here is the file's
+/// contents, not a probe.
+///
+/// `A` and `B` share one page, which does not matter: the code cache's
+/// invalidation takes the byte range it is given, and only `A`'s is invalidated.
+#[test]
+fn an_invalidated_blob_is_not_rewritten_by_the_flush_it_triggers() {
+    let dir = scratch_dir("no-resurrect");
+    let (mut cpu, cache) = engine_with_chain(&dir);
+    // `A` first, so neither block's chain edge is the direct form: this test is
+    // about the flush, not about chaining.
+    cpu.precompile_at(CHAIN_BASE);
+    cpu.precompile_at(CHAIN_BASE + 0x08);
+    assert_eq!(counts(&cache).compiled, 2, "both blocks queued");
+
+    // Nothing is on disk yet — the two records are still pending, which is the
+    // state the invalidation below has to cope with.
+    assert_eq!(
+        std::fs::read_dir(&dir)
+            .expect("read cache dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "code"))
+            .count(),
+        0,
+        "records queue until a flush"
+    );
+
+    // SMC over `A`'s bytes: drops its blob from the table, then flushes.
+    cpu.invalidate_code_range(CHAIN_BASE, 5);
+
+    // Read the file back through the real load path, so "the file still parses"
+    // and "the blob is not on disk" are the same assertion: a resurrected record
+    // shows up as a loaded entry, a corrupt file as an empty table.
+    let (_cpu2, cache2) = engine_with_chain(&dir);
+    let vas = cache2.test_vas();
+    assert!(
+        !vas.contains(&CHAIN_BASE),
+        "an invalidated blob must not be rewritten by the flush it triggers, \
+         loaded VAs: {vas:#x?}"
+    );
+    assert!(
+        vas.contains(&(CHAIN_BASE + 0x08)),
+        "the untouched blob must still be on disk, loaded VAs: {vas:#x?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Refusals — every one of these must fall back to compiling, never to garbage
 // ---------------------------------------------------------------------------
@@ -482,13 +535,7 @@ const CHAIN_STOP: u64 = CHAIN_BASE + 0x0e;
 /// and `rcx`/`rbx` seeded so the ring terminates with a known `rax`.
 fn engine_with_chain(dir: &Path) -> (JitCpu, Arc<CodeCache>) {
     let (mut cpu, cache) = engine_with_cache(dir);
-    cpu.virtual_alloc(
-        CHAIN_BASE,
-        0x1000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc chain region");
+    map_code_page(&mut cpu, CHAIN_BASE);
     cpu.mem_write(CHAIN_BASE, &CHAIN_CODE).expect("write chain");
     cpu.thread.regs.set_gpr(1, CHAIN_ITERS); // rcx
     cpu.thread.regs.set_gpr(3, 1); // rbx
@@ -691,13 +738,7 @@ fn a_stale_frame_bake_after_an_unrelated_invalidation_exits_instead_of_chaining(
     // A second, untouched page — the invalidation cannot overlap the fixture,
     // so no `Ready` entry is dropped and the persisted hashes still match.
     let other = CHAIN_BASE + 0x10_0000;
-    cpu.virtual_alloc(
-        other,
-        0x1000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc unrelated page");
+    map_code_page(&mut cpu, other);
     cpu.mem_write(other, &[0x90, 0x90, 0x90, 0x90, 0x90])
         .expect("write unrelated");
     // Compiled so its address is a known code page: `invalidate_code_range`
@@ -728,6 +769,421 @@ fn a_stale_frame_bake_after_an_unrelated_invalidation_exits_instead_of_chaining(
         cpu.stats().chain.hops,
         0,
         "a stale frame bake must exit at every chain edge, never chain on"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Direct chain edges (format v3): a guest VA crosses, never an address
+// ---------------------------------------------------------------------------
+
+/// Persist the whole ring from **one** engine, so `A`'s `jmp` compiles while `B`
+/// is already chainable and therefore becomes a direct chain `bl` (`Arm64Call`
+/// to `B`'s `FuncId`) rather than a late-bound lookup call.
+///
+/// That is the case the format used to refuse — a block whose relocation names
+/// another block instead of a host import. The successor's guest VA is the only
+/// part of that reference that survives a process boundary.
+fn seed_chained_ring(dir: &Path) -> CodeCacheCounts {
+    let (mut cpu, cache) = engine_with_chain(dir);
+    cpu.precompile_at(CHAIN_BASE + 0x08);
+    cpu.precompile_at(CHAIN_BASE);
+    let c = counts(&cache);
+    assert_eq!(c.compiled, 2, "both blocks recorded: {c:?}");
+    assert_eq!(
+        c.skipped_unpersistable, 0,
+        "a direct chain edge is persistable: {c:?}"
+    );
+    let a = cache.test_blob(CHAIN_BASE).expect("blob at A");
+    assert_eq!(
+        a.chain_relocs.len(),
+        1,
+        "A's `jmp B` must be exactly one chain edge, got {:?}",
+        a.chain_relocs
+    );
+    assert_eq!(
+        a.chain_relocs[0].target_va,
+        CHAIN_BASE + 0x08,
+        "the edge records the successor's guest VA, never a `FuncId`"
+    );
+    for r in &a.relocs {
+        let ModuleRelocTarget::User {
+            namespace: 0,
+            index,
+        } = r.name
+        else {
+            panic!("unexpected relocation target class: {:?}", r.name);
+        };
+        assert!(
+            cpu.shared.code_import_name(index).is_some(),
+            "the import class still names host imports only (#{index})"
+        );
+    }
+    cpu.shared.finish_jit_caches();
+    drop((cpu, cache));
+    c
+}
+
+/// Restore the ring **successors first**: a chain edge is re-resolved against a
+/// successor this run already holds, so restoring one before its target is
+/// (correctly) a refusal.
+fn restore_chained_ring(cpu: &mut JitCpu) -> CodeCacheCounts {
+    for va in [CHAIN_BASE + 0x08, CHAIN_BASE] {
+        let mem = cpu.shared.mem.read().expect("mem lock");
+        assert!(
+            cpu.shared.restore_or_probe(&mem, va).is_some(),
+            "blob at {va:#x} must restore; counts={:?}",
+            counts_via_shared(cpu)
+        );
+    }
+    cpu.resync_chain_table(cpu.shared.cache_epoch.load(Ordering::Relaxed));
+    counts_via_shared(cpu)
+}
+
+/// The `FuncId` this run currently chains `va` to, if any.
+fn chain_id_of(cpu: &JitCpu, va: u64) -> Option<u32> {
+    cpu.shared
+        .chain_ids
+        .pin()
+        .get(&va)
+        .map(|t| t.func_id.as_u32())
+}
+
+/// The headline case: a block carrying a direct chain-table edge persists, is
+/// replayed in a fresh process, and **chains** there.
+///
+/// `hops > 0` is the assertion that matters. Restoring is not the goal — a block
+/// that restores and then bails to the dispatcher at its only chain edge would
+/// satisfy `restored` while giving the warm boot back nothing, which is exactly
+/// the trade the generation gate's removal had to avoid.
+#[test]
+fn a_chained_block_persists_restores_and_chains() {
+    let dir = scratch_dir("chain-persist");
+    seed_chained_ring(&dir);
+
+    let (mut cpu, _cache) = engine_with_chain(&dir);
+    assert!(
+        !cpu.has_ready_at(CHAIN_BASE + 0x08),
+        "sanity: nothing is compiled in the warm process before the restore"
+    );
+    let c = restore_chained_ring(&mut cpu);
+    assert_eq!(c.restored, 2, "both blocks replay: {c:?}");
+    assert_eq!(c.refused(), 0, "no guard fired: {c:?}");
+    assert_eq!(c.compiled, 0, "nothing fell back to compiling: {c:?}");
+
+    run_chain(&mut cpu);
+    assert!(
+        cpu.stats().chain.hops > 0,
+        "a replayed block's direct chain edge must reach the live successor; \
+         hops == 0 means the edge was dropped or aimed at a foreign address"
+    );
+}
+
+/// A chain edge whose successor this run cannot offer must refuse the blob and
+/// let the block be compiled — never honour a target it cannot name.
+#[test]
+fn a_chain_edge_with_no_live_successor_is_refused() {
+    let dir = scratch_dir("chain-absent");
+    seed_chained_ring(&dir);
+
+    let (mut cpu, cache) = engine_with_chain(&dir);
+    {
+        let mem = cpu.shared.mem.read().expect("mem lock");
+        assert!(
+            cpu.shared.restore_or_probe(&mem, CHAIN_BASE).is_none(),
+            "A must not restore while its only successor is absent"
+        );
+    }
+    let c = counts(&cache);
+    assert_eq!(c.restored, 0, "nothing may be replayed: {c:?}");
+    assert_eq!(
+        c.refused_unrelocatable, 1,
+        "the unresolvable edge is the refusal: {c:?}"
+    );
+    assert!(
+        !cpu.has_ready_at(CHAIN_BASE),
+        "a refused blob must not install anything: {c:?}"
+    );
+
+    // The refusal is a compile, not a dead end.
+    cpu.precompile_at(CHAIN_BASE);
+    assert!(
+        cpu.has_ready_at(CHAIN_BASE),
+        "the ordinary compile path still runs"
+    );
+}
+
+/// Guest region for the two-page fixture: `A` and `B` must sit on **different**
+/// pages, because SMC invalidation is page-granular — writing `B`'s code would
+/// otherwise drop `A`'s blob along with it, and the point here is to restore `A`
+/// *after* the live chain table moved.
+const RESOLVE_A: u64 = 0x10d0_0000;
+const RESOLVE_B: u64 = 0x10d0_1000;
+/// `A`: `add rax,rbx ; jmp RESOLVE_B`, then padding the jump must not target.
+const RESOLVE_A_CODE: [u8; 11] = [
+    0x48, 0x01, 0xd8, // +0x00 add rax,rbx
+    0xe9, 0xf8, 0x0f, 0x00, 0x00, // +0x03 jmp rel32 -> RESOLVE_B
+    0x90, 0x90, 0x90, // +0x08 padding
+];
+/// `B`: `dec rcx ; jnz RESOLVE_A ; ud2` — the `ud2` is the harness stop.
+///
+/// The backward branch is the `0f 85` form: a page is `rel8`-unreachable.
+const RESOLVE_B_CODE: [u8; 11] = [
+    0x48, 0xff, 0xc9, // +0x00 dec rcx
+    0x0f, 0x85, 0xf7, 0xef, 0xff, 0xff, // +0x03 jnz rel32 -> RESOLVE_A
+    0x0f, 0x0b, // +0x09 ud2
+];
+const RESOLVE_STOP: u64 = RESOLVE_B + 0x09;
+
+/// An engine with the two-page ring mapped and the code cache attached.
+fn engine_with_two_page_ring(dir: &Path) -> (JitCpu, Arc<CodeCache>) {
+    let (mut cpu, cache) = engine_with_cache(dir);
+    cpu.virtual_alloc(
+        RESOLVE_A,
+        0x2000,
+        MEM_RESERVE | MEM_COMMIT,
+        protect::PAGE_EXECUTE_READWRITE,
+    )
+    .expect("alloc two-page ring");
+    cpu.mem_write(RESOLVE_A, &RESOLVE_A_CODE).expect("write A");
+    cpu.mem_write(RESOLVE_B, &RESOLVE_B_CODE).expect("write B");
+    cpu.thread.regs.set_gpr(1, CHAIN_ITERS); // rcx
+    cpu.thread.regs.set_gpr(3, 1); // rbx
+    (cpu, cache)
+}
+
+/// The recorded edge is re-resolved, so it lands on the successor this run has —
+/// including after the live chain table has *moved*.
+///
+/// `B` is compiled, its bytes are changed, and it is compiled again: the table
+/// then offers a different `FuncId` for the same guest VA, over code that
+/// computes something the recording process never emitted. Restoring `A`
+/// afterwards must chain into that *new* block — one iteration of the ring, not
+/// [`CHAIN_ITERS`]. A baked target could only reach the old one, which belongs to
+/// another process entirely.
+#[test]
+fn a_recorded_chain_target_is_re_resolved_against_the_live_run() {
+    let dir = scratch_dir("chain-resolve");
+
+    // --- cold run: one engine, `B` first so `A` chains directly to it --------
+    {
+        let (mut cpu, cache) = engine_with_two_page_ring(&dir);
+        cpu.precompile_at(RESOLVE_B);
+        cpu.precompile_at(RESOLVE_A);
+        let a = cache.test_blob(RESOLVE_A).expect("blob at A");
+        assert_eq!(a.chain_relocs.len(), 1, "A has one direct chain edge");
+        assert_eq!(a.chain_relocs[0].target_va, RESOLVE_B);
+        assert_eq!(counts(&cache).skipped_unpersistable, 0);
+        cpu.shared.finish_jit_caches();
+    }
+
+    // --- warm run: the live table moves before `A` is restored --------------
+    let (mut cpu, _cache) = engine_with_two_page_ring(&dir);
+    cpu.precompile_at(RESOLVE_B);
+    let before = chain_id_of(&cpu, RESOLVE_B);
+    assert!(before.is_some(), "B is chainable before the change");
+
+    // SMC on `B`'s page only: `dec rcx` -> `sub rcx, rcx`, so the ring now exits
+    // after a single iteration.
+    cpu.mem_write(RESOLVE_B, &[0x48, 0x29, 0xc9])
+        .expect("rewrite B");
+    cpu.invalidate_code_range(RESOLVE_B, 3);
+    cpu.precompile_at(RESOLVE_B);
+    let after = chain_id_of(&cpu, RESOLVE_B);
+    assert_ne!(
+        before, after,
+        "the live chain table must offer a different FuncId for B now"
+    );
+
+    // `A`'s own bytes are untouched, so its blob still restores — and its edge
+    // must be re-resolved to the block that exists now.
+    {
+        let mem = cpu.shared.mem.read().expect("mem lock");
+        assert!(
+            cpu.shared.restore_or_probe(&mem, RESOLVE_A).is_some(),
+            "A must restore: counts={:?}",
+            counts_via_shared(&cpu)
+        );
+    }
+    cpu.resync_chain_table(cpu.shared.cache_epoch.load(Ordering::Relaxed));
+    let c = counts_via_shared(&cpu);
+    assert_eq!(c.restored, 1, "A replays: {c:?}");
+    assert_eq!(c.refused(), 0, "the live successor is enough: {c:?}");
+
+    cpu.run_until_stop(RESOLVE_A, RESOLVE_STOP, 0, 100_000, 0, 0)
+        .expect("run the re-resolved ring");
+    assert_eq!(
+        cpu.thread.regs.rip, RESOLVE_STOP,
+        "execution must reach the harness stop"
+    );
+    assert_eq!(
+        cpu.thread.regs.gpr(0),
+        1,
+        "the edge must run the live successor's semantics (one iteration), not \
+         the bytes that were in memory when the blob was recorded"
+    );
+    assert_eq!(
+        cpu.thread.regs.gpr(1),
+        0,
+        "rcx was zeroed by `sub rcx, rcx`"
+    );
+    assert!(
+        cpu.stats().chain.hops > 0,
+        "the re-resolved edge must chain, got {} hops",
+        cpu.stats().chain.hops
+    );
+}
+
+/// The classification policy is a total function of a captured relocation list.
+///
+/// Pure — no JIT, no guest — because this is the enumeration the module docs'
+/// safety argument rests on: every relocation lands in exactly one replayable
+/// class or takes the whole block out of the cache.
+#[test]
+fn captured_relocations_are_classified_total() {
+    use cranelift_codegen::binemit::Reloc;
+    use cranelift_module::ModuleReloc;
+
+    let reloc = |kind, index: u32, addend: i64| ModuleReloc {
+        offset: 4,
+        kind,
+        name: ModuleRelocTarget::User {
+            namespace: 0,
+            index,
+        },
+        addend,
+    };
+    // `import_count` is the live module's; 14 is arbitrary here.
+    const IMPORTS: u32 = 14;
+
+    // An import: replayable by index, and never re-resolved as a chain edge.
+    let (imports, chain) =
+        classify_capture_relocs(vec![reloc(Reloc::Arm64Call, 3, 0)], IMPORTS, |_| {
+            panic!("an import must not be treated as a chain edge")
+        })
+        .expect("a host import is persistable");
+    assert_eq!(imports.len(), 1, "the import class keeps it");
+    assert!(chain.is_empty(), "and the chain class does not");
+
+    // A direct chain call to a block FuncId: recorded as the successor's VA.
+    let (imports, chain) =
+        classify_capture_relocs(vec![reloc(Reloc::Arm64Call, 22, 0)], IMPORTS, |id| {
+            assert_eq!(id.as_u32(), 22, "the block id is what gets re-resolved");
+            Some(0x1234)
+        })
+        .expect("a direct chain edge is persistable");
+    assert!(imports.is_empty());
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0].target_va, 0x1234);
+
+    // A block id this run cannot name to a VA: refuse the block.
+    assert!(
+        classify_capture_relocs(vec![reloc(Reloc::Arm64Call, 22, 0)], IMPORTS, |_| None).is_none(),
+        "an unnameable successor is a refusal"
+    );
+    // Any non-call reference to a block has no guest-VA-shaped meaning.
+    assert!(
+        classify_capture_relocs(vec![reloc(Reloc::Abs8, 22, 0)], IMPORTS, |_| Some(1)).is_none(),
+        "only a direct call can be re-resolved"
+    );
+    // A `bl` never carries an addend; a non-zero one is not something to guess at.
+    assert!(
+        classify_capture_relocs(vec![reloc(Reloc::Arm64Call, 22, 4)], IMPORTS, |_| Some(1))
+            .is_none(),
+        "a non-zero addend is refused"
+    );
+    // A data object (namespace 1) is not replayable at all.
+    assert!(
+        classify_capture_relocs(
+            vec![ModuleReloc {
+                offset: 4,
+                kind: Reloc::Abs8,
+                name: ModuleRelocTarget::User {
+                    namespace: 1,
+                    index: 0,
+                },
+                addend: 0,
+            }],
+            IMPORTS,
+            |_| Some(1),
+        )
+        .is_none(),
+        "a data object is refused"
+    );
+}
+
+/// Chain-edge structural checks happen before any offset reaches
+/// cranelift-jit's relocation applier, whose own check is a `debug_assert`.
+#[test]
+fn structurally_unsound_chain_edges_are_refused() {
+    use cranelift_codegen::binemit::Reloc;
+    use cranelift_module::ModuleReloc;
+
+    let build = |code_len: usize, offset: u32, target_va: u64| {
+        let (relocs, chain_relocs) = classify_capture_relocs(
+            vec![ModuleReloc {
+                offset: 0,
+                kind: Reloc::Arm64Call,
+                name: ModuleRelocTarget::User {
+                    namespace: 0,
+                    index: 99,
+                },
+                addend: 0,
+            }],
+            1,
+            |_| Some(target_va),
+        )
+        .expect("one direct chain edge");
+        // `classify_capture_relocs` only ever produces a sound offset; moving it
+        // afterwards is what the structural check exists to catch.
+        let mut chain_relocs = chain_relocs;
+        chain_relocs[0].offset = offset;
+        PersistedCode {
+            va: CODE_BASE,
+            guest_end: CODE_BASE + 0x10,
+            bytes_hash: 0,
+            insn_count: 1,
+            inv_gen: 0,
+            compiled_at_opt: OptTier::Base,
+            align: 16,
+            code: vec![0u8; code_len],
+            relocs,
+            chain_relocs,
+        }
+    };
+
+    assert!(
+        build(16, 0, CHAIN_BASE).structurally_sound(),
+        "a chain edge inside the blob is sound"
+    );
+    assert!(
+        !build(4, 2, CHAIN_BASE).structurally_sound(),
+        "an edge whose 4 bytes run past the end is not"
+    );
+    assert!(
+        !build(16, 0, 0).structurally_sound(),
+        "guest VA 0 is not code"
+    );
+    let mut dup = build(16, 0, CHAIN_BASE);
+    let edge = dup.chain_relocs[0];
+    dup.chain_relocs.push(edge);
+    assert!(
+        !dup.structurally_sound(),
+        "two chain edges patching the same bytes are ambiguous"
+    );
+
+    let mut mixed = build(16, 0, CHAIN_BASE);
+    mixed.relocs.push(ModuleReloc {
+        offset: 0,
+        kind: Reloc::Arm64Call,
+        name: ModuleRelocTarget::User {
+            namespace: 0,
+            index: 0,
+        },
+        addend: 0,
+    });
+    assert!(
+        !mixed.structurally_sound(),
+        "an import reloc and a chain edge on one offset are ambiguous"
     );
 }
 

@@ -36,6 +36,7 @@
 //! (memo, budget, rejection downgrade) is covered by the env-independent unit
 //! tests in `jit::tier`.
 
+use super::harness::map_code_region;
 use super::*;
 
 /// Block offsets in [`tier_program`].
@@ -73,13 +74,7 @@ fn tier_program() -> Vec<u8> {
 /// A JIT CPU with the tier program mapped, ready to run from its entry.
 fn tier_cpu() -> JitCpu {
     let mut cpu = JitCpu::open_x86_64();
-    cpu.virtual_alloc(
-        SIMD_BASE,
-        0x2000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc");
+    map_code_region(&mut cpu, SIMD_BASE, 0x2000);
     cpu.mem_write(SIMD_BASE, &tier_program()).expect("code");
     cpu
 }

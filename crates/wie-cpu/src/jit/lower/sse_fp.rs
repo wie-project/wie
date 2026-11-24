@@ -11,6 +11,7 @@ use super::mem::call_load;
 use super::sse::{load_sse_mem, pair_to_vec, read_sse_src_pair, vec_to_pair};
 
 use super::super::block::mem_width_bytes;
+use super::err::LowerError;
 
 use crate::exec::{self};
 use crate::regs::Rflags;
@@ -134,7 +135,7 @@ pub(super) fn lower_sse_shift(
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
     op: exec::SseShiftOp,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
@@ -152,7 +153,7 @@ pub(super) fn lower_sse_shift(
         _ => None,
     };
     let (count_lo, count_hi) = if imm.is_none() {
-        read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "sse shift")?
+        read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?
     } else {
         (iconst_u64(bcx, 0), iconst_u64(bcx, 0))
     };
@@ -173,7 +174,9 @@ pub(super) fn lower_sse_shift(
         } else {
             // Per-lane variable counts are not supported by the AArch64 vector
             // shift rules → per-lane host helper in both modes.
-            let sref = mem.sse_shift_ref.ok_or("sse shift helper missing")?;
+            let sref = mem
+                .sse_shift_ref
+                .ok_or_else(|| LowerError::verifier("internal: sse shift helper not declared"))?;
             let op_v = iconst_u64(bcx, op.to_abi());
             let c1 = bcx.ins().call(sref, &[op_v, a_lo, count_lo]);
             let lo = bcx.inst_results(c1)[0];
@@ -182,7 +185,9 @@ pub(super) fn lower_sse_shift(
             (lo, hi)
         }
     } else {
-        let sref = mem.sse_shift_ref.ok_or("sse shift helper missing")?;
+        let sref = mem
+            .sse_shift_ref
+            .ok_or_else(|| LowerError::verifier("internal: sse shift helper not declared"))?;
         let op_v = iconst_u64(bcx, op.to_abi());
         let (c_lo, c_hi) = match imm {
             Some(c) => {
@@ -245,13 +250,13 @@ pub(super) fn lower_sse_byte_shift(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let _ = (gpr, rflags); // reg-only op: no GPR or flags involvement
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
     if !is_imm_kind(instr.op1_kind()) {
-        return Err("byte shift needs imm8".into());
+        return Err(LowerError::form("byte_shift_immediate"));
     }
     let bytes = (instr.immediate(1) & 0xff) as u32;
     let right = instr.mnemonic() == Mnemonic::Psrldq;
@@ -312,10 +317,10 @@ pub(super) fn lower_sse_cvtdq2pd(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
-    let lo = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 8, "cvtdq2pd")?.0;
+    let lo = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 8)?.0;
     let shift = iconst_u64(bcx, 32);
     let d0 = bcx.ins().ireduce(types::I32, lo);
     let hi32 = bcx.ins().ushr(lo, shift);
@@ -341,10 +346,10 @@ pub(super) fn lower_sse_cvtps2pd(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
-    let lo = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 8, "cvtps2pd")?.0;
+    let lo = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 8)?.0;
     let shift = iconst_u64(bcx, 32);
     let lo32 = bcx.ins().ireduce(types::I32, lo);
     let hi32v = bcx.ins().ushr(lo, shift);
@@ -378,11 +383,13 @@ pub(super) fn lower_sse_cvtpd_packed(
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
     op: exec::SseCvtOp,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
-    let (s_lo, s_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "cvtpd")?;
-    let cref = mem.sse_cvt_ref.ok_or("cvt helper missing")?;
+    let (s_lo, s_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
+    let cref = mem
+        .sse_cvt_ref
+        .ok_or_else(|| LowerError::verifier("internal: cvt helper not declared"))?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let c1 = bcx.ins().call(cref, &[op_v, s_lo]);
     let lo = bcx.inst_results(c1)[0];
@@ -409,13 +416,15 @@ pub(super) fn lower_sse_cvt_scalar_preserve(
     xmm: &mut [Value; 32],
     op: exec::SseCvtOp,
     src_bytes: u64,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let sz = u32::try_from(src_bytes).unwrap_or(8);
-    let lo = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, sz, "cvt scalar")?.0;
+    let lo = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, sz)?.0;
     let (d_lo, d_hi) = read_xmm_pair(xmm, dst)?;
-    let cref = mem.sse_cvt_ref.ok_or("cvt helper missing")?;
+    let cref = mem
+        .sse_cvt_ref
+        .ok_or_else(|| LowerError::verifier("internal: cvt helper not declared"))?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let call = bcx.ins().call(cref, &[op_v, lo]);
     let converted = bcx.inst_results(call)[0];
@@ -441,14 +450,18 @@ pub(super) fn lower_sse_pshufb(
     rflags: Value,
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     // table = op0 (dst), mask = op1 (src).
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "pshufb")?;
-    let lo_ref = mem.sse_pshufb_lo_ref.ok_or("pshufb helper missing")?;
-    let hi_ref = mem.sse_pshufb_hi_ref.ok_or("pshufb helper missing")?;
+    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
+    let lo_ref = mem
+        .sse_pshufb_lo_ref
+        .ok_or_else(|| LowerError::verifier("internal: pshufb helper not declared"))?;
+    let hi_ref = mem
+        .sse_pshufb_hi_ref
+        .ok_or_else(|| LowerError::verifier("internal: pshufb helper not declared"))?;
     let c1 = bcx.ins().call(lo_ref, &[a_lo, a_hi, b_lo, b_hi]);
     let lo = bcx.inst_results(c1)[0];
     let c2 = bcx.ins().call(hi_ref, &[a_lo, a_hi, b_lo, b_hi]);
@@ -466,14 +479,16 @@ pub(super) fn lower_sse_fp_unop_scalar(
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
     op: exec::SseFpUnOp,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let is_double = matches!(op, exec::SseFpUnOp::Sqrtsd);
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (old_lo, old_hi) = read_xmm_pair(xmm, dst)?;
     let w: u32 = if is_double { 8 } else { 4 };
-    let (src_lo, _) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, w, "fp unop scalar")?;
-    let uref = mem.sse_fp_unop_ref.ok_or("fp unop helper missing")?;
+    let (src_lo, _) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, w)?;
+    let uref = mem
+        .sse_fp_unop_ref
+        .ok_or_else(|| LowerError::verifier("internal: fp unop helper not declared"))?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let call = bcx.ins().call(uref, &[op_v, src_lo]);
     let r = bcx.inst_results(call)[0];
@@ -499,7 +514,7 @@ pub(super) fn lower_sse_fp_unop_packed(
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
     op: exec::SseFpUnOp,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (s_lo, s_hi) = match instr.op1_kind() {
@@ -508,9 +523,11 @@ pub(super) fn lower_sse_fp_unop_packed(
             let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
-        _ => return Err("fp unop packed src".into()),
+        _ => return Err(LowerError::form("fp_unop_src")),
     };
-    let uref = mem.sse_fp_unop_ref.ok_or("fp unop helper missing")?;
+    let uref = mem
+        .sse_fp_unop_ref
+        .ok_or_else(|| LowerError::verifier("internal: fp unop helper not declared"))?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let c1 = bcx.ins().call(uref, &[op_v, s_lo]);
     let lo = bcx.inst_results(c1)[0];
@@ -529,14 +546,16 @@ pub(super) fn lower_sse_fp_binop_scalar(
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
     op: exec::SseFpBinOp,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let is_double = matches!(op, exec::SseFpBinOp::Minsd | exec::SseFpBinOp::Maxsd);
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (old_lo, old_hi) = read_xmm_pair(xmm, dst)?;
     let w: u32 = if is_double { 8 } else { 4 };
-    let (b_lo, _) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, w, "fp binop scalar")?;
-    let bref = mem.sse_fp_binop_ref.ok_or("fp binop helper missing")?;
+    let (b_lo, _) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, w)?;
+    let bref = mem
+        .sse_fp_binop_ref
+        .ok_or_else(|| LowerError::verifier("internal: fp binop helper not declared"))?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let call = bcx.ins().call(bref, &[op_v, old_lo, b_lo]);
     let r = bcx.inst_results(call)[0];
@@ -562,12 +581,14 @@ pub(super) fn lower_sse_fp_binop_packed(
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
     op: exec::SseFpBinOp,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "fp binop packed")?;
-    let bref = mem.sse_fp_binop_ref.ok_or("fp binop helper missing")?;
+    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
+    let bref = mem
+        .sse_fp_binop_ref
+        .ok_or_else(|| LowerError::verifier("internal: fp binop helper not declared"))?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let c1 = bcx.ins().call(bref, &[op_v, a_lo, b_lo]);
     let lo = bcx.inst_results(c1)[0];
@@ -589,10 +610,10 @@ pub(super) fn lower_sse_comis(
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
     is_double: bool,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let (a_lo, _) = read_xmm_pair(xmm, instr.op_register(0))?;
     let w: u32 = if is_double { 8 } else { 4 };
-    let (b_lo, _) = read_sse_src_pair(bcx, instr, gpr, *rflags, mem, xmm, w, "comis")?;
+    let (b_lo, _) = read_sse_src_pair(bcx, instr, gpr, *rflags, mem, xmm, w)?;
     let (fa, fb) = if is_double {
         (
             bcx.ins()
@@ -644,13 +665,13 @@ pub(super) fn lower_sse_cvt_gpr_to_fp(
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
     is_double: bool,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let _ = dirty;
     let ip = instr.ip();
     let is64 = match instr.op1_kind() {
         OpKind::Register => instr.op_register(1).size() == 8,
         OpKind::Memory => mem_width_bytes(instr)? == 8,
-        _ => return Err("cvt gpr src".into()),
+        _ => return Err(LowerError::form("cvt_gpr_src")),
     };
     let src = match instr.op1_kind() {
         OpKind::Register => read_gpr(gpr, instr.op_register(1))?,
@@ -659,7 +680,7 @@ pub(super) fn lower_sse_cvt_gpr_to_fp(
             let w = mem_width_bytes(instr)?;
             call_load(bcx, mem, gpr, rflags, addr, w, ip)?
         }
-        _ => return Err("cvt gpr src".into()),
+        _ => return Err(LowerError::form("cvt_gpr_src")),
     };
     let op = match (is_double, is64) {
         (false, false) => exec::SseCvtOp::Cvtsi2ss32,
@@ -667,7 +688,9 @@ pub(super) fn lower_sse_cvt_gpr_to_fp(
         (true, false) => exec::SseCvtOp::Cvtsi2sd32,
         (true, true) => exec::SseCvtOp::Cvtsi2sd64,
     };
-    let cref = mem.sse_cvt_ref.ok_or("cvt helper missing")?;
+    let cref = mem
+        .sse_cvt_ref
+        .ok_or_else(|| LowerError::verifier("internal: cvt helper not declared"))?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let call = bcx.ins().call(cref, &[op_v, src]);
     let bits = bcx.inst_results(call)[0];
@@ -700,10 +723,10 @@ pub(super) fn lower_sse_cvt_fp_to_gpr(
     xmm: &mut [Value; 32],
     is_double: bool,
     trunc: bool,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let is64 = instr.op_register(0).size() == 8;
     let w: u32 = if is_double { 8 } else { 4 };
-    let (lo, _) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, w, "cvt fp")?;
+    let (lo, _) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, w)?;
     let op = match (is_double, is64, trunc) {
         (false, false, true) => exec::SseCvtOp::Cvttss2si32,
         (false, false, false) => exec::SseCvtOp::Cvtss2si32,
@@ -714,7 +737,9 @@ pub(super) fn lower_sse_cvt_fp_to_gpr(
         (true, true, true) => exec::SseCvtOp::Cvttsd2si64,
         (true, true, false) => exec::SseCvtOp::Cvtsd2si64,
     };
-    let cref = mem.sse_cvt_ref.ok_or("cvt helper missing")?;
+    let cref = mem
+        .sse_cvt_ref
+        .ok_or_else(|| LowerError::verifier("internal: cvt helper not declared"))?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let call = bcx.ins().call(cref, &[op_v, lo]);
     let v = bcx.inst_results(call)[0];
@@ -730,7 +755,7 @@ pub(super) fn lower_sse_cvt_packed(
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
     op: exec::SseCvtOp,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (s_lo, s_hi) = match instr.op1_kind() {
@@ -739,9 +764,11 @@ pub(super) fn lower_sse_cvt_packed(
             let addr = effective_addr(bcx, instr, gpr, mem)?;
             load_sse_mem(bcx, mem, gpr, rflags, addr, 16, instr.ip())?
         }
-        _ => return Err("cvt packed src".into()),
+        _ => return Err(LowerError::form("cvt_packed_src")),
     };
-    let cref = mem.sse_cvt_ref.ok_or("cvt helper missing")?;
+    let cref = mem
+        .sse_cvt_ref
+        .ok_or_else(|| LowerError::verifier("internal: cvt helper not declared"))?;
     let op_v = iconst_u64(bcx, op.to_abi());
     let c1 = bcx.ins().call(cref, &[op_v, s_lo]);
     let lo = bcx.inst_results(c1)[0];
@@ -759,11 +786,11 @@ pub(super) fn lower_sse_bitwise(
     mem: &mut MemEnv,
     xmm: &mut [Value; 32],
     op: SseBit,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "sse bitwise")?;
+    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
     let (lo, hi) = if JitConfig::get().simd_enabled() {
         let a = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
         let b = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
@@ -824,13 +851,12 @@ pub(super) fn lower_sse_scalar_fp(
     xmm: &mut [Value; 32],
     op: FloatBinOp,
     width: FloatWidth,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
     let nbytes: u32 = if width == FloatWidth::F64 { 8 } else { 4 };
-    let (b_lo, b_hi) =
-        read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, nbytes, "sse scalar fp")?;
+    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, nbytes)?;
     let _ = b_hi;
     let (new_lo, new_hi) = if JitConfig::get().simd_enabled() {
         if width == FloatWidth::F64 {
@@ -867,12 +893,16 @@ pub(super) fn lower_sse_scalar_fp(
     } else {
         let op_v = iconst_u64(bcx, op.to_abi());
         if width == FloatWidth::F64 {
-            let fref = mem.f64_ref.ok_or("f64 helper missing")?;
+            let fref = mem
+                .f64_ref
+                .ok_or_else(|| LowerError::verifier("internal: f64 helper not declared"))?;
             let call = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
             let r = bcx.inst_results(call)[0];
             (r, a_hi)
         } else {
-            let fref = mem.f32_ref.ok_or("f32 helper missing")?;
+            let fref = mem
+                .f32_ref
+                .ok_or_else(|| LowerError::verifier("internal: f32 helper not declared"))?;
             let call = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
             let r = bcx.inst_results(call)[0];
             let mask = iconst_u64(bcx, 0xffff_ffff);
@@ -898,11 +928,11 @@ pub(super) fn lower_sse_packed_fp(
     xmm: &mut [Value; 32],
     op: FloatBinOp,
     width: FloatWidth,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let dst = instr.op_register(0);
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
-    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16, "sse packed fp")?;
+    let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
     if JitConfig::get().simd_enabled() {
         let a8 = pair_to_i8x16(bcx, mem.flags, a_lo, a_hi);
         let b8 = pair_to_i8x16(bcx, mem.flags, b_lo, b_hi);
@@ -936,17 +966,21 @@ pub(super) fn lower_sse_packed_fp(
     }
     let op_v = iconst_u64(bcx, op.to_abi());
     if width == FloatWidth::F64 {
-        let fref = mem.f64_ref.ok_or("f64 helper missing")?;
+        let fref = mem
+            .f64_ref
+            .ok_or_else(|| LowerError::verifier("internal: f64 helper not declared"))?;
         let call0 = bcx.ins().call(fref, &[op_v, a_lo, b_lo]);
         let r0 = bcx.inst_results(call0)[0];
         let call1 = bcx.ins().call(fref, &[op_v, a_hi, b_hi]);
         let r1 = bcx.inst_results(call1)[0];
         store_xmm_pair(bcx, mem, xmm, di, r0, r1);
     } else {
-        let fref = mem.f32_ref.ok_or("f32 helper missing")?;
+        let fref = mem
+            .f32_ref
+            .ok_or_else(|| LowerError::verifier("internal: f32 helper not declared"))?;
         let mask = iconst_u64(bcx, 0xffff_ffff);
         let sh = iconst_u64(bcx, 32);
-        let mut pack_pair = |half_a: Value, half_b: Value| -> Result<Value, String> {
+        let mut pack_pair = |half_a: Value, half_b: Value| -> Result<Value, LowerError> {
             let a0 = bcx.ins().band(half_a, mask);
             let b0 = bcx.ins().band(half_b, mask);
             let a1 = bcx.ins().ushr(half_a, sh);

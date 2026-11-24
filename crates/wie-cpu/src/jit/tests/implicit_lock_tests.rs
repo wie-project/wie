@@ -28,9 +28,9 @@
 // Split out of `cmpxchg_tests.rs` (file-size policy, ADR-002); it reuses that
 // file's helpers where the shape is the same and adds the memory-operand cases.
 use super::atomic_tests::{
-    BACKENDS, Backend, DATA_BASE, Engine, LOCK_WORD, UNALIGNED_WORD, ctx, open, open_worker, plant,
-    read_word, write_word,
+    DATA_BASE, LOCK_WORD, UNALIGNED_WORD, ctx, plant, read_word, write_word,
 };
+use super::harness::{BACKENDS, Backend, Engine, open, open_worker};
 use super::*;
 use crate::exec::{AccessType, StepResult as StepResultAlias};
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};

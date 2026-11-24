@@ -26,6 +26,7 @@ use super::shared::{BgEnqueueOutcome, BgWaitCell, BgWaitState, JitShared, PerThr
 use super::{CacheEntry, JitCpu};
 use crate::CpuError;
 use crate::exec::{self, StepResult};
+use crate::lock::{lock_unpoisoned, read_unpoisoned};
 use crate::mem::{self, GuestMemory, PAGE_SIZE, PAGE_SIZE_USIZE};
 use crate::regs::Rflags;
 use std::sync::Arc;
@@ -185,7 +186,7 @@ impl JitCpu {
         // Mirror the pairs so the background worker lowers UCRT calls exactly
         // like the inline path (same `call_fast` → same emitted code). The Arc
         // hands the worker a shared immutable table (no per-job Vec clone).
-        *self.shared.bg_fast_api.lock().unwrap() = Arc::from(pairs);
+        *lock_unpoisoned(&self.shared.bg_fast_api) = Arc::from(pairs);
         // Init-time clear: keep the persistent ledger — this runs before any
         // guest execution, so loaded ledger facts stay valid (probes are
         // hash-validated anyway).
@@ -235,7 +236,7 @@ impl JitCpu {
     fn clear_compiled_inner(&mut self, purge_ledger: bool) {
         self.shared.cache.pin().clear();
         self.shared.chain_ids.pin().clear();
-        self.shared.code_pages.lock().unwrap().clear();
+        lock_unpoisoned(&self.shared.code_pages).clear();
         if purge_ledger {
             self.shared.persist_clear(true);
         }
@@ -312,7 +313,7 @@ impl JitCpu {
             .shared
             .pending_code_overflow
             .swap(false, Ordering::Relaxed);
-        let pages = std::mem::take(&mut *self.shared.pending_code_writes.lock().unwrap());
+        let pages = std::mem::take(&mut *lock_unpoisoned(&self.shared.pending_code_writes));
         if overflow {
             if !self.shared.cache.pin().is_empty() {
                 self.clear_compiled();
@@ -338,10 +339,10 @@ impl JitCpu {
             self.shared
                 .pending_code_overflow
                 .store(true, Ordering::Relaxed);
-            self.shared.pending_code_writes.lock().unwrap().clear();
+            lock_unpoisoned(&self.shared.pending_code_writes).clear();
             return;
         }
-        let mut guard = self.shared.pending_code_writes.lock().unwrap();
+        let mut guard = lock_unpoisoned(&self.shared.pending_code_writes);
         let mut page = address >> 12;
         let last = end.saturating_sub(1) >> 12;
         while page <= last {
@@ -366,12 +367,7 @@ impl JitCpu {
         free_type: u32,
     ) -> Option<(u64, usize)> {
         if (free_type & mem::MEM_RELEASE) != 0 {
-            return self
-                .shared
-                .mem
-                .read()
-                .unwrap()
-                .allocation_span_at_base(addr);
+            return read_unpoisoned(&self.shared.mem).allocation_span_at_base(addr);
         }
         if (free_type & mem::MEM_DECOMMIT) != 0 {
             if size == 0 {
@@ -502,7 +498,7 @@ impl JitCpu {
                                     self.stats.bg.inline_fallbacks =
                                         self.stats.bg.inline_fallbacks.saturating_add(1);
                                     let kind = {
-                                        let mem = self.shared.mem.read().unwrap();
+                                        let mem = read_unpoisoned(&self.shared.mem);
                                         block::decode_pure_gpr_block(
                                             &mem,
                                             self.thread.hooks.as_ref(),
@@ -522,7 +518,7 @@ impl JitCpu {
                                 }
                             } else {
                                 let kind = {
-                                    let mem = self.shared.mem.read().unwrap();
+                                    let mem = read_unpoisoned(&self.shared.mem);
                                     block::decode_pure_gpr_block(
                                         &mem,
                                         self.thread.hooks.as_ref(),
@@ -576,7 +572,7 @@ impl JitCpu {
                 // fast-UCRT / self-loop / try_compile. Was three iced-decode passes
                 // over the same up-to-96-insn body before.
                 let kind = {
-                    let mem = self.shared.mem.read().unwrap();
+                    let mem = read_unpoisoned(&self.shared.mem);
                     block::decode_pure_gpr_block(&mem, self.thread.hooks.as_ref(), rip)
                 };
                 // Warm-boot fast path (`WIE_JIT_CACHE`): a byte-validated
@@ -586,7 +582,7 @@ impl JitCpu {
                 let mut persist_eager = false;
                 if self.shared.persist_active() {
                     let probe = {
-                        let mem = self.shared.mem.read().unwrap();
+                        let mem = read_unpoisoned(&self.shared.mem);
                         self.shared.restore_or_probe(&mem, rip)
                     };
                     if probe.is_some() {
@@ -754,7 +750,7 @@ impl JitCpu {
             .is_multiple_of(OPCODE_SAMPLE_EVERY)
             && JitConfig::get().opcode_hist_enabled()
         {
-            let mem = self.shared.mem.read().unwrap();
+            let mem = read_unpoisoned(&self.shared.mem);
             record_opcode_sample(&mem, self.thread.regs.rip);
         }
         // Inline step_once_result: push RIP trace, call exec::step, update counters.
@@ -771,7 +767,7 @@ impl JitCpu {
         }
         let hook = self.thread.hooks.as_ref();
         let result = exec::step(
-            &self.shared.mem.read().unwrap(),
+            &read_unpoisoned(&self.shared.mem),
             &mut self.thread.regs,
             hook,
         )?;
@@ -1079,7 +1075,7 @@ impl JitCpu {
         // the block's bytes are read.
         let inv_gen = self.shared.invalidate_gen.load(Ordering::Acquire);
         let kind = {
-            let mem_guard = self.shared.mem.read().unwrap();
+            let mem_guard = read_unpoisoned(&self.shared.mem);
             decode_pure_gpr_block(&mem_guard, self.thread.hooks.as_ref(), rip)
         };
         self.try_compile_from_kind(rip, kind, inv_gen)
@@ -1174,7 +1170,7 @@ impl JitCpu {
         // Rebuilding VAD-ranked pins every block was measurable on 7za.
         let mem_gen = self.shared.mem_gen.load(Ordering::Acquire);
         if self.thread.pins_gen != mem_gen {
-            let mem = self.shared.mem.read().unwrap();
+            let mem = read_unpoisoned(&self.shared.mem);
             let infos = mem.jit_region_pins();
             self.thread.pins = std::array::from_fn(|i| MemPin::from_info(infos[i]));
             self.thread.pins_gen = mem_gen;
@@ -1217,7 +1213,7 @@ impl JitCpu {
             self.stats.mem.pin_heap_bytes = data_bytes;
             self.stats.mem.pin_allow_bits = bits;
         }
-        let mem_guard = self.shared.mem.read().unwrap();
+        let mem_guard = read_unpoisoned(&self.shared.mem);
         let mem_ptr = (&raw const *mem_guard).cast_mut();
         let regs = &mut self.thread.regs;
         // Full GPR snapshot on entry: late-bound chaining reloads live regs from
@@ -1562,7 +1558,7 @@ fn block_kind_ends_in_fast_ucrt(
         } => *target,
         _ => return false,
     };
-    let mem = shared.mem.read().unwrap();
+    let mem = read_unpoisoned(&shared.mem);
     let final_va = resolve_thunk_va(&mem, target);
     fast_api.iter().any(|&(k, _)| k == final_va)
 }
@@ -1618,6 +1614,7 @@ mod tests {
         select_hot_threshold, work_weighted_threshold,
     };
     use crate::CpuEngine;
+    use crate::lock::read_unpoisoned;
     use crate::mem::protect;
     use crate::mem::{MEM_COMMIT, MEM_RESERVE};
     use std::sync::Arc;
@@ -1814,7 +1811,7 @@ mod tests {
         let before = OPCODE_HISTO[mov_bucket].load(Ordering::Relaxed);
         let samples_before = OPCODE_SAMPLES.load(Ordering::Relaxed);
         {
-            let mem = cpu.shared.mem.read().unwrap();
+            let mem = read_unpoisoned(&cpu.shared.mem);
             record_opcode_sample(&mem, base);
         }
         assert_eq!(
@@ -1831,7 +1828,7 @@ mod tests {
         // Invalid bytes are silently not sampled.
         let bad = OPCODE_SAMPLES.load(Ordering::Relaxed);
         {
-            let mem = cpu.shared.mem.read().unwrap();
+            let mem = read_unpoisoned(&cpu.shared.mem);
             record_opcode_sample(&mem, base.wrapping_add(5)); // ud2 — valid but distinct
         }
         assert!(OPCODE_SAMPLES.load(Ordering::Relaxed) > bad);

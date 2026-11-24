@@ -6,7 +6,9 @@ use super::emit::MemEnv;
 use super::flags::iconst_u64;
 use super::gpr::reg_index;
 
-use super::super::block::{BlockTerm, DecodedInsn, is_string_op};
+use super::super::block::{BlockTerm, DecodedInsn};
+use super::err::LowerError;
+use super::opclass;
 
 use cranelift::prelude::*;
 use cranelift_codegen::ir::MemFlagsData;
@@ -165,19 +167,22 @@ pub(super) fn store_xmm_pair(
     // covers this def, and the host exit path ORs both masks unconditionally.
 }
 
-pub(super) fn xmm_index(reg: Register) -> Result<usize, String> {
+pub(super) fn xmm_index(reg: Register) -> Result<usize, LowerError> {
     if !reg.is_xmm() {
-        return Err(format!("not xmm {reg:?}"));
+        return Err(LowerError::form("xmm_register"));
     }
     let n = reg.number();
     if n < 16 {
         Ok(n)
     } else {
-        Err(format!("xmm OOB {n}"))
+        Err(LowerError::form("xmm_index"))
     }
 }
 
-pub(super) fn read_xmm_pair(xmm: &[Value; 32], reg: Register) -> Result<(Value, Value), String> {
+pub(super) fn read_xmm_pair(
+    xmm: &[Value; 32],
+    reg: Register,
+) -> Result<(Value, Value), LowerError> {
     let i = xmm_index(reg)?;
     Ok((xmm[i * 2], xmm[i * 2 + 1]))
 }
@@ -186,82 +191,12 @@ pub(super) fn block_needs_flags(insns: &[DecodedInsn], term: Option<BlockTerm>) 
     if matches!(term, Some(BlockTerm::Jcc { .. })) {
         return true;
     }
-    insns.iter().any(|d| {
-        if is_string_op(&d.instr) {
-            // SCAS/CMPS write flags; DF is read by all string ops.
-            return true;
-        }
-        matches!(
-            d.instr.mnemonic(),
-            Mnemonic::Add
-                | Mnemonic::Adc
-                | Mnemonic::Sub
-                | Mnemonic::Sbb
-                | Mnemonic::Xor
-                | Mnemonic::And
-                | Mnemonic::Or
-                | Mnemonic::Cmp
-                | Mnemonic::Test
-                | Mnemonic::Inc
-                | Mnemonic::Dec
-                | Mnemonic::Neg
-                | Mnemonic::Imul
-                | Mnemonic::Shl
-                | Mnemonic::Sal
-                | Mnemonic::Shr
-                | Mnemonic::Sar
-                | Mnemonic::Rol
-                | Mnemonic::Ror
-                | Mnemonic::Bt
-                | Mnemonic::Bts
-                | Mnemonic::Btr
-                | Mnemonic::Btc
-                // Bit scans write ZF (and leave the rest undefined).
-                | Mnemonic::Bsr
-                | Mnemonic::Bsf
-                | Mnemonic::Lzcnt
-                | Mnemonic::Cld
-                | Mnemonic::Std
-                | Mnemonic::Pushfq
-                | Mnemonic::Popfq
-                | Mnemonic::Cmove
-                | Mnemonic::Cmovne
-                | Mnemonic::Cmova
-                | Mnemonic::Cmovae
-                | Mnemonic::Cmovb
-                | Mnemonic::Cmovbe
-                | Mnemonic::Cmovg
-                | Mnemonic::Cmovge
-                | Mnemonic::Cmovl
-                | Mnemonic::Cmovle
-                | Mnemonic::Cmovo
-                | Mnemonic::Cmovno
-                | Mnemonic::Cmovs
-                | Mnemonic::Cmovns
-                | Mnemonic::Cmovp
-                | Mnemonic::Cmovnp
-                | Mnemonic::Sete
-                | Mnemonic::Setne
-                | Mnemonic::Seta
-                | Mnemonic::Setae
-                | Mnemonic::Setb
-                | Mnemonic::Setbe
-                | Mnemonic::Setg
-                | Mnemonic::Setge
-                | Mnemonic::Setl
-                | Mnemonic::Setle
-                | Mnemonic::Seto
-                | Mnemonic::Setno
-                | Mnemonic::Sets
-                | Mnemonic::Setns
-                | Mnemonic::Setp
-                | Mnemonic::Setnp
-                | Mnemonic::Comiss
-                | Mnemonic::Comisd
-                | Mnemonic::Ucomiss
-                | Mnemonic::Ucomisd
-        )
-    })
+    // One row per mnemonic in [`opclass`] answers this, including the REP
+    // string ops (SCAS/CMPS write flags and all of them read DF). It used to be
+    // a 66-name list here, plus a second half in
+    // `lower::compile_block`'s implicit-operand pass for `CmpXchg`/`Xadd`;
+    // keeping the two halves in agreement by hand is what ADR-0007 removed.
+    insns.iter().any(|d| opclass::needs_flags(&d.instr))
 }
 
 pub(super) fn block_has_mem(insns: &[DecodedInsn]) -> bool {
@@ -279,7 +214,7 @@ pub(super) fn block_has_mem(insns: &[DecodedInsn]) -> bool {
         ) {
             return true;
         }
-        if is_string_op(&d.instr) {
+        if opclass::is_string_op(&d.instr) {
             return true;
         }
         for i in 0..d.instr.op_count() {
@@ -292,7 +227,7 @@ pub(super) fn block_has_mem(insns: &[DecodedInsn]) -> bool {
 }
 
 pub(super) fn block_has_string(insns: &[DecodedInsn]) -> bool {
-    insns.iter().any(|d| is_string_op(&d.instr))
+    insns.iter().any(|d| opclass::is_string_op(&d.instr))
 }
 
 pub(super) fn block_has_fp(insns: &[DecodedInsn]) -> bool {
@@ -327,40 +262,14 @@ pub(super) fn mark_insn_gprs(instr: &Instruction, live: &mut [bool; 16]) {
             live[idx] = true;
         }
     }
-    // RSP always live for stack ops / call / ret.
-    if matches!(
-        instr.mnemonic(),
-        Mnemonic::Push
-            | Mnemonic::Pop
-            | Mnemonic::Pushfq
-            | Mnemonic::Popfq
-            | Mnemonic::Leave
-            | Mnemonic::Call
-            | Mnemonic::Ret
-    ) {
-        live[4] = true; // RSP
-    }
-    // Leave: RSP←RBP then pop RBP.
-    if matches!(instr.mnemonic(), Mnemonic::Leave) {
-        live[5] = true; // RBP
-    }
-    // Cbw/Cwd/Cwde/Cdqe: implicit accumulator (and DX for Cwd).
-    match instr.mnemonic() {
-        Mnemonic::Cbw | Mnemonic::Cwde | Mnemonic::Cdqe => {
-            live[0] = true; // RAX
-        }
-        Mnemonic::Cwd => {
-            live[0] = true; // RAX (AX)
-            live[2] = true; // RDX (DX)
-        }
-        _ => {}
-    }
-    // String ops touch RAX/RCX/RSI/RDI implicitly (not always in operands).
-    if is_string_op(instr) {
-        live[0] = true; // RAX
-        live[1] = true; // RCX
-        live[6] = true; // RSI
-        live[7] = true; // RDI
+    // Operands the decode does not name: RSP for push/pop/call/ret, RAX/RDX
+    // for the sign-extend family and `div`/`idiv`, RAX for `cmpxchg`, and
+    // RAX/RCX/RSI/RDI for the REP string ops. The table is the single source for
+    // those, and it is the same row the admission gate and the flags analysis
+    // read — so admitting a mnemonic can no longer leave its implicit operands
+    // behind, which is the bug shape `CmpXchg` and `Div`/`Idiv` each shipped.
+    for &idx in opclass::implicit_gprs(instr) {
+        live[idx] = true;
     }
     for i in 0..instr.op_count() {
         if instr.op_kind(i) == OpKind::Memory || instr.mnemonic() == Mnemonic::Lea {

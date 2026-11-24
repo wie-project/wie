@@ -42,12 +42,12 @@
 // name must appear in the table. `every_mnemonic_in_the_table_is_actually_lowered`
 // covers the growth direction, and `the_table_covers_every_admitted_implicit_operand_mnemonic`
 // is the audit-in-a-test for the direction that matters.
+use super::harness::map_code_page;
 use crate::ThreadContext;
 use crate::exec::StepResult as StepResultAlias;
-use crate::mem::{MEM_COMMIT, MEM_RESERVE, protect};
 use iced_x86::{Decoder, DecoderOptions, Mnemonic};
 
-use super::atomic_tests::{BACKENDS, Engine, open};
+use super::harness::{BACKENDS, Engine, open};
 
 /// One code page per distinct byte sequence. The interpreter's decode cache is
 /// process-wide and thread-local, keyed by (rip, mem_generation), and every test
@@ -324,14 +324,7 @@ fn implicit_operands_agree_with_iced_and_the_architecture() {
             // Trailing nop reaches the 2-insn block minimum; ud2 stops linear
             // decode so the zero-filled tail cannot extend the block.
             code.extend_from_slice(&[0x90, 0x0F, 0x0B]);
-            cpu.cpu()
-                .virtual_alloc(
-                    code_base,
-                    0x1000,
-                    MEM_RESERVE | MEM_COMMIT,
-                    protect::PAGE_EXECUTE_READWRITE,
-                )
-                .expect("code alloc");
+            map_code_page(cpu.cpu(), code_base);
             cpu.cpu().mem_write(code_base, &code).expect("code");
             cpu.set_state(&ThreadContext {
                 rip: code_base,

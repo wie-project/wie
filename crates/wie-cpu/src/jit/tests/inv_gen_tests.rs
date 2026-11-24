@@ -13,6 +13,7 @@
 //! chaining is off) — like the chain-table tests, they are only meaningful
 //! with chaining enabled.
 
+use super::harness::map_code_region;
 use super::*;
 
 /// Guest code region base for these tests (unique per test-file convention).
@@ -26,13 +27,7 @@ const INV_BASE: u64 = 0x1060_0000;
 #[test]
 fn inv_guard_hop_exits_to_dispatcher_after_target_invalidation() {
     let mut cpu = JitCpu::open_x86_64();
-    cpu.virtual_alloc(
-        INV_BASE,
-        0x3000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc");
+    map_code_region(&mut cpu, INV_BASE, 0x3000);
     // Put A and B on DIFFERENT pages: range invalidation works page-granular,
     // and a same-page drop would discard A too (making the test vacuous).
     let va_a = INV_BASE;
@@ -123,13 +118,7 @@ fn inv_guard_self_loop_exits_on_foreign_invalidation() {
     let mut a = JitCpu::new_shared(Arc::clone(&shared));
 
     let base = 0x1070_0000_u64;
-    a.virtual_alloc(
-        base,
-        0x2000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("alloc");
+    map_code_region(&mut a, base, 0x2000);
     let loop_va = base;
 
     // Old program: inc eax ; cmp eax, 0 ; jne loop_va — a genuine infinite

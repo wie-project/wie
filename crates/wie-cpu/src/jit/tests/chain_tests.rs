@@ -8,11 +8,13 @@
 //! `rcx = 0`. `trampolines::mark_dirty` now forces a full writeback whenever
 //! a stub runs inside a chain (`chain_depth > 0`).
 
+use super::harness::map_code_region;
 use super::*;
+use crate::IcedCpu;
 
 /// Run `code` at [`SIMD_BASE`] through iced (stepping until `stop_rip`) and
 /// the JIT (chained `step_one` loop until `stop_rip`), then return both
-/// register files. Unlike [`super::simd_dual`], supports loops and calls.
+/// register files. Unlike [`simd_dual`], supports loops and calls.
 pub(super) fn chain_dual(
     code: &[u8],
     stop_rip: u64,
@@ -21,13 +23,7 @@ pub(super) fn chain_dual(
 ) -> (RegFile, RegFile) {
     crate::exec::iced_decode_cache_flush();
     let mut iced = IcedCpu::open_x86_64();
-    iced.virtual_alloc(
-        SIMD_BASE,
-        0x2000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("iced alloc");
+    map_code_region(&mut iced, SIMD_BASE, 0x2000);
     iced.mem_write(SIMD_BASE, code).expect("iced code");
     setup_mem(&mut iced);
     setup(iced.regs_mut());
@@ -43,13 +39,7 @@ pub(super) fn chain_dual(
     }
 
     let mut cpu = JitCpu::open_x86_64();
-    cpu.virtual_alloc(
-        SIMD_BASE,
-        0x2000,
-        MEM_RESERVE | MEM_COMMIT,
-        protect::PAGE_EXECUTE_READWRITE,
-    )
-    .expect("jit alloc");
+    map_code_region(&mut cpu, SIMD_BASE, 0x2000);
     cpu.mem_write(SIMD_BASE, code).expect("jit code");
     setup_mem(&mut cpu);
     setup(&mut cpu.thread.regs);

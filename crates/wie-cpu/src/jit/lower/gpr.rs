@@ -14,6 +14,7 @@ use super::{
 };
 
 use super::super::block::mem_width_bytes;
+use super::err::LowerError;
 
 use crate::mem::PAGE_SIZE;
 use crate::regs::Rflags;
@@ -62,7 +63,7 @@ pub(super) enum Arith {
     Or,
 }
 
-pub(super) fn reg_index(reg: Register) -> Result<usize, String> {
+pub(super) fn reg_index(reg: Register) -> Result<usize, LowerError> {
     let full = match reg.full_register() {
         Register::RAX => 0,
         Register::RCX => 1,
@@ -80,7 +81,7 @@ pub(super) fn reg_index(reg: Register) -> Result<usize, String> {
         Register::R13 => 13,
         Register::R14 => 14,
         Register::R15 => 15,
-        other => return Err(format!("unsupported reg {other:?}")),
+        _ => return Err(LowerError::form("gpr_register")),
     };
     Ok(full)
 }
@@ -94,7 +95,7 @@ pub(super) fn reg_size_bits(reg: Register) -> u32 {
     }
 }
 
-pub(super) fn read_gpr(gpr: &[Value; 16], reg: Register) -> Result<Value, String> {
+pub(super) fn read_gpr(gpr: &[Value; 16], reg: Register) -> Result<Value, LowerError> {
     let i = reg_index(reg)?;
     Ok(gpr[i])
 }
@@ -108,7 +109,7 @@ pub(super) fn read_gpr_logical(
     bcx: &mut FunctionBuilder<'_>,
     reg: Register,
     gpr: &[Value; 16],
-) -> Result<Value, String> {
+) -> Result<Value, LowerError> {
     let v = read_gpr(gpr, reg)?;
     if reg.size() == 1
         && matches!(
@@ -131,7 +132,7 @@ pub(super) fn store_value_from_gpr(
     bcx: &mut FunctionBuilder<'_>,
     reg: Register,
     gpr: &[Value; 16],
-) -> Result<Value, String> {
+) -> Result<Value, LowerError> {
     read_gpr_logical(bcx, reg, gpr)
 }
 
@@ -141,7 +142,7 @@ pub(super) fn write_gpr(
     dirty: &mut [bool; 16],
     reg: Register,
     val: Value,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let i = reg_index(reg)?;
     let bits = reg_size_bits(reg);
     let new_v = if bits == 64 {
@@ -219,7 +220,7 @@ pub(super) fn read_op(
     instr: &Instruction,
     op: u32,
     gpr: &[Value; 16],
-) -> Result<Value, String> {
+) -> Result<Value, LowerError> {
     match instr.op_kind(op) {
         OpKind::Register => {
             let reg = instr.op_register(op);
@@ -236,7 +237,7 @@ pub(super) fn read_op(
         | OpKind::Immediate8to32
         | OpKind::Immediate8to64
         | OpKind::Immediate32to64 => Ok(read_imm(bcx, instr, op)),
-        other => Err(format!("op kind {other:?}")),
+        _ => Err(LowerError::form("operand_kind")),
     }
 }
 
@@ -245,7 +246,7 @@ pub(super) fn effective_addr(
     instr: &Instruction,
     gpr: &[Value; 16],
     mem: &MemEnv,
-) -> Result<Value, String> {
+) -> Result<Value, LowerError> {
     let base = instr.memory_base();
     let disp = instr.memory_displacement64();
     let disp_c = iconst_u64(bcx, disp);
@@ -299,7 +300,7 @@ pub(super) fn effective_addr(
 }
 
 /// Operand size in bits for ALU (from reg or memory width).
-pub(super) fn op_width_bits(instr: &Instruction, op: u32) -> Result<u32, String> {
+pub(super) fn op_width_bits(instr: &Instruction, op: u32) -> Result<u32, LowerError> {
     match instr.op_kind(op) {
         OpKind::Register => Ok(reg_size_bits(instr.op_register(op))),
         OpKind::Memory => Ok(mem_width_bytes(instr)?.saturating_mul(8)),
@@ -323,7 +324,7 @@ pub(super) fn read_op_mem(
     gpr: &[Value; 16],
     rflags: Value,
     mem: &mut MemEnv,
-) -> Result<Value, String> {
+) -> Result<Value, LowerError> {
     match instr.op_kind(op) {
         OpKind::Register => {
             let reg = instr.op_register(op);
@@ -345,7 +346,7 @@ pub(super) fn read_op_mem(
         | OpKind::Immediate8to32
         | OpKind::Immediate8to64
         | OpKind::Immediate32to64 => Ok(read_imm(bcx, instr, op)),
-        other => Err(format!("op kind {other:?}")),
+        _ => Err(LowerError::form("operand_kind")),
     }
 }
 
@@ -441,7 +442,7 @@ pub(super) fn lower_mov(
     dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let k0 = instr.op0_kind();
     let k1 = instr.op1_kind();
     let ip = instr.ip();
@@ -468,7 +469,7 @@ pub(super) fn lower_mov(
             let src = read_op(bcx, instr, 1, gpr)?;
             write_gpr(bcx, gpr, dirty, instr.op_register(0), src)
         }
-        _ => Err("mov form".into()),
+        _ => Err(LowerError::form("mov_form")),
     }
 }
 
@@ -480,7 +481,7 @@ pub(super) fn lower_movx(
     rflags: Value,
     mem: &mut MemEnv,
     signed: bool,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let src_bits = if instr.op1_kind() == OpKind::Memory {
         mem_width_bytes(instr)?.saturating_mul(8)
     } else {
@@ -534,7 +535,7 @@ pub(super) fn lower_cwde_cdqe(
     instr: &Instruction,
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let rax = gpr[0]; // RAX
     let val = if instr.mnemonic() == Mnemonic::Cwde {
         // Cwde: sign-extend AX (bottom 16 bits) to 32-bit EAX (bottom 32 bits).
@@ -562,7 +563,7 @@ pub(super) fn lower_cbw(
     bcx: &mut FunctionBuilder<'_>,
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let rax = gpr[0];
     let al = bcx.ins().ireduce(types::I8, rax);
     let ax = bcx.ins().sextend(types::I16, al);
@@ -575,7 +576,7 @@ pub(super) fn lower_cwd(
     bcx: &mut FunctionBuilder<'_>,
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let rax = gpr[0];
     let ax = bcx.ins().ireduce(types::I16, rax);
     // DX = 0xFFFF if AX < 0, else 0.
@@ -593,7 +594,7 @@ pub(super) fn lower_cqto(
     bcx: &mut FunctionBuilder<'_>,
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let rax = gpr[0];
     // Arithmetic shift by 63 yields all-ones for negative, zero otherwise —
     // exactly the Cqo RDX value, as plain IR (no select/iconst needed).
@@ -607,7 +608,7 @@ pub(super) fn lower_bswap(
     instr: &Instruction,
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let reg = instr.op_register(0);
     let bits = reg_size_bits(reg);
     let val = read_gpr(gpr, reg)?;
@@ -618,7 +619,7 @@ pub(super) fn lower_bswap(
             bcx.ins().uextend(types::I64, s)
         }
         64 => bcx.ins().bswap(val),
-        _ => return Err(format!("bswap size {bits}")),
+        _ => return Err(LowerError::form("bswap_width")),
     };
     write_gpr(bcx, gpr, dirty, reg, swapped)
 }
@@ -631,7 +632,7 @@ pub(super) fn lower_leave(
     rflags: Value,
     mem: &mut MemEnv,
     ip: u64,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     // MOV RSP, RBP
     gpr[4] = gpr[5];
     mark_dirty(dirty, 4);
@@ -654,7 +655,7 @@ pub(super) fn lower_pushfq(
     rflags: Value,
     mem: &mut MemEnv,
     ip: u64,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let rsp = gpr[4];
     let new_rsp = bcx.ins().iadd_imm(rsp, -8);
     call_store(bcx, mem, gpr, rflags, new_rsp, 8, rflags, ip)?;
@@ -671,7 +672,7 @@ pub(super) fn lower_popfq(
     rflags: &mut Value,
     mem: &mut MemEnv,
     ip: u64,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let rsp = gpr[4];
     let val = call_load(bcx, mem, gpr, *rflags, rsp, 8, ip)?;
     let new_rsp = bcx.ins().iadd_imm(rsp, 8);
@@ -690,7 +691,7 @@ pub(super) fn lower_lea(
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
     mem: &MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let addr = effective_addr(bcx, instr, gpr, mem)?;
     write_gpr(bcx, gpr, dirty, instr.op_register(0), addr)
 }
@@ -703,7 +704,7 @@ pub(super) fn lower_push(
     dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let size = 8_u32;
     let val = match instr.op0_kind() {
         OpKind::Register => read_gpr(gpr, instr.op_register(0))?,
@@ -729,7 +730,7 @@ pub(super) fn lower_pop(
     dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let size = 8_u32;
     let rsp = gpr[4];
     let val = call_load(bcx, mem, gpr, rflags, rsp, size, instr.ip())?;
@@ -746,7 +747,7 @@ pub(super) fn lower_pop(
             let width = mem_width_bytes(instr)?;
             call_store(bcx, mem, gpr, rflags, addr, width, val, instr.ip())
         }
-        _ => Err("pop form".into()),
+        _ => Err(LowerError::form("pop_form")),
     }
 }
 
@@ -762,7 +763,7 @@ pub(super) fn lower_arith_lazy(
     pending: &mut PendingFlags,
     mem: &mut MemEnv,
     op: Arith,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let bits = op_width_bits(instr, 0)?;
     let a_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
     let b_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
@@ -774,7 +775,7 @@ pub(super) fn lower_arith_lazy(
         Arith::Xor => bcx.ins().bxor(a, b),
         Arith::And => bcx.ins().band(a, b),
         Arith::Or => bcx.ins().bor(a, b),
-        Arith::Adc | Arith::Sbb => return Err("lazy path only for non-carry ALU".into()),
+        Arith::Adc | Arith::Sbb => return Err(LowerError::form("lazy_arith_op")),
     };
     let res_m = mask_width(bcx, res, bits);
     write_op_mem(bcx, instr, 0, gpr, dirty, *rflags, mem, res_m, bits)?;
@@ -805,7 +806,7 @@ pub(super) fn lower_cmp_test_lazy(
     pending: &mut PendingFlags,
     mem: &mut MemEnv,
     is_cmp: bool,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let bits = op_width_bits(instr, 0)?;
     let a_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
     let b_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
@@ -835,7 +836,7 @@ pub(super) fn lower_arith(
     flag_state: Option<&mut FlagState>,
     mem: &mut MemEnv,
     op: Arith,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let bits = op_width_bits(instr, 0)?;
     let a_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
     let b_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
@@ -969,7 +970,7 @@ pub(super) fn lower_imul(
     dirty: &mut [bool; 16],
     rflags: &mut Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let nops = instr.op_count();
     let bits = op_width_bits(instr, 0)?;
     let (a_raw, b_raw) = match nops {
@@ -981,7 +982,7 @@ pub(super) fn lower_imul(
             read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?,
             read_imm(bcx, instr, 2),
         ),
-        _ => return Err(format!("imul {nops} ops")),
+        _ => return Err(LowerError::form("imul_operand_count")),
     };
     let a_m = mask_width(bcx, a_raw, bits);
     let b_m = mask_width(bcx, b_raw, bits);
@@ -1055,11 +1056,11 @@ pub(super) fn lower_div(
     dirty: &mut [bool; 16],
     rflags: &mut Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let signed = instr.mnemonic() == Mnemonic::Idiv;
     let bits = op_width_bits(instr, 0)?;
     if bits != 32 && bits != 64 {
-        return Err(format!("div: unsupported width {bits}"));
+        return Err(LowerError::form("div_width"));
     }
     if bits == 64 {
         // ── 64-bit path: host helper (dividend = RDX:RAX 128-bit) ──
@@ -1067,7 +1068,9 @@ pub(super) fn lower_div(
         let rdx = read_gpr(gpr, Register::EDX)?;
         let div_op = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?; // I64
         let op_v = iconst_u64(bcx, u64::from(signed));
-        let cref = mem.div64_ref.ok_or("div64 helper missing")?;
+        let cref = mem
+            .div64_ref
+            .ok_or_else(|| LowerError::verifier("internal: div64 helper not declared"))?;
         let call = bcx.ins().call(cref, &[op_v, rdx, rax, div_op]);
         let res = bcx.inst_results(call)[0];
         let mask64 = iconst_u64(bcx, u64::MAX);
@@ -1147,7 +1150,7 @@ pub(super) fn lower_bit_test_op(
     dirty: &mut [bool; 16],
     rflags: &mut Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let bits = op_width_bits(instr, 0)?;
     let val_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
     let val = mask_width(bcx, val_raw, bits);
@@ -1221,7 +1224,7 @@ pub(super) fn lower_xadd(
     dirty: &mut [bool; 16],
     rflags: &mut Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let bits = op_width_bits(instr, 0)?;
     let dst_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
     let src_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
@@ -1253,12 +1256,12 @@ pub(super) fn lower_xadd(
 /// the lowerer has to name the register itself. There is no 8-bit `CMPXCHG` in
 /// the ISA (the sub-word RMWs are `CMPXCHG8B`/`CMPXCHG16B`), which is why this
 /// has no `8` arm: `0F B1 /r` without REX/0x66 decodes as the 32-bit form.
-pub(super) fn accumulator_register(bits: u32) -> Result<Register, String> {
+pub(super) fn accumulator_register(bits: u32) -> Result<Register, LowerError> {
     match bits {
         16 => Ok(Register::AX),
         32 => Ok(Register::EAX),
         64 => Ok(Register::RAX),
-        other => Err(format!("cmpxchg accumulator bits {other}")),
+        _ => Err(LowerError::form("cmpxchg_width")),
     }
 }
 
@@ -1283,7 +1286,7 @@ pub(super) fn lower_cmpxchg(
     dirty: &mut [bool; 16],
     rflags: &mut Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let bits = op_width_bits(instr, 0)?;
     let dst_raw = read_op_mem(bcx, instr, 0, gpr, *rflags, mem)?;
     let dst_val = mask_width(bcx, dst_raw, bits);
@@ -1342,7 +1345,7 @@ pub(super) fn lower_bit_scan(
     rflags: &mut Value,
     mem: &mut MemEnv,
     reverse: bool,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let bits = op_width_bits(instr, 1)?;
     let src_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
     let src_val = mask_width(bcx, src_raw, bits);
@@ -1391,7 +1394,7 @@ pub(super) fn lower_bsr(
     dirty: &mut [bool; 16],
     rflags: &mut Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     lower_bit_scan(bcx, instr, gpr, dirty, rflags, mem, true)
 }
 
@@ -1403,7 +1406,7 @@ pub(super) fn lower_bsf(
     dirty: &mut [bool; 16],
     rflags: &mut Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     lower_bit_scan(bcx, instr, gpr, dirty, rflags, mem, false)
 }
 
@@ -1418,7 +1421,7 @@ pub(super) fn lower_lzcnt(
     dirty: &mut [bool; 16],
     rflags: &mut Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let bits = op_width_bits(instr, 1)?;
     let src_raw = read_op_mem(bcx, instr, 1, gpr, *rflags, mem)?;
     let src_val = mask_width(bcx, src_raw, bits);
@@ -1453,7 +1456,7 @@ pub(super) fn lower_xchg(
     dirty: &mut [bool; 16],
     rflags: Value,
     mem: &mut MemEnv,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     let k0 = instr.op0_kind();
     let k1 = instr.op1_kind();
     match (k0, k1) {
@@ -1477,7 +1480,7 @@ pub(super) fn lower_xchg(
                 16 => 2,
                 32 => 4,
                 64 => 8,
-                other => return Err(format!("xchg bits {other}")),
+                _ => return Err(LowerError::form("xchg_width")),
             };
             let addr = effective_addr(bcx, instr, gpr, mem)?;
             let mem_v = call_load(bcx, mem, gpr, rflags, addr, width, instr.ip())?;
@@ -1485,7 +1488,7 @@ pub(super) fn lower_xchg(
             write_gpr(bcx, gpr, dirty, reg, mem_v)?;
             call_store(bcx, mem, gpr, rflags, addr, width, reg_v, instr.ip())
         }
-        _ => Err("xchg form".into()),
+        _ => Err(LowerError::form("xchg_form")),
     }
 }
 
@@ -1501,7 +1504,7 @@ pub(super) fn write_op_mem(
     mem: &mut MemEnv,
     val: Value,
     bits: u32,
-) -> Result<(), String> {
+) -> Result<(), LowerError> {
     match instr.op_kind(op) {
         OpKind::Register => write_gpr(bcx, gpr, dirty, instr.op_register(op), val),
         OpKind::Memory => {
@@ -1511,10 +1514,10 @@ pub(super) fn write_op_mem(
                 16 => 2,
                 32 => 4,
                 64 => 8,
-                other => return Err(format!("bad store bits {other}")),
+                _ => return Err(LowerError::form("store_width")),
             };
             call_store(bcx, mem, gpr, rflags, addr, width, val, instr.ip())
         }
-        _ => Err("write op form".into()),
+        _ => Err(LowerError::form("store_form")),
     }
 }

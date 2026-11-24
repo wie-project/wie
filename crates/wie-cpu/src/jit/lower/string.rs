@@ -6,7 +6,8 @@ use super::OFF_RFLAGS;
 use super::emit::{MemEnv, check_fault_after_ucrt};
 use super::flags::iconst_u64;
 
-use super::super::block::string_op_size;
+use super::err::LowerError;
+use super::opclass::string_op_size;
 
 use crate::exec::{self, StringOpKind};
 use crate::regs::Rflags;
@@ -418,11 +419,12 @@ pub(super) fn lower_string(
     rflags: &mut Value,
     gpr_loaded: &mut [bool; 16],
     mem: &mut MemEnv,
-) -> Result<Value, String> {
-    let raw_size = string_op_size(instr).ok_or("string size")?;
+) -> Result<Value, LowerError> {
+    let raw_size = string_op_size(instr)
+        .ok_or_else(|| LowerError::verifier("internal: instruction is not a string op"))?;
     let mnemonic = instr.mnemonic();
-    let (kind, size) = StringOpKind::from_mnemonic(mnemonic, raw_size)
-        .ok_or_else(|| format!("string op {mnemonic:?}"))?;
+    let (kind, size) =
+        StringOpKind::from_mnemonic(mnemonic, raw_size).ok_or_else(LowerError::unsupported)?;
 
     // Dual-path inline for small REP MOVS/STOS when helpers available.
     if matches!(kind, StringOpKind::Stos | StringOpKind::Movs)
@@ -434,7 +436,9 @@ pub(super) fn lower_string(
         return Ok(rip);
     }
 
-    let string_ref = mem.string_ref.ok_or("string helper missing")?;
+    let string_ref = mem
+        .string_ref
+        .ok_or_else(|| LowerError::verifier("internal: string helper not declared"))?;
     let flags = exec::RepPrefix::from_instr(instr).to_abi();
 
     // Flush SSA GPRs + flags into JitCtx for the host helper.
