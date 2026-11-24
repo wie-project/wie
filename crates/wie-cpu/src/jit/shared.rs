@@ -387,6 +387,16 @@ pub struct JitShared {
     /// interfere with each other).
     #[cfg(test)]
     pub(super) bg_force: AtomicBool,
+    /// Test-only latch forcing **loop-region** compilation on for this instance.
+    ///
+    /// Same contract and the same reason as [`Self::bg_force`]: `JitConfig` is a
+    /// process-wide `OnceLock` read once per process, so a unit test cannot flip
+    /// `WIE_JIT_REGION` at run time — and must not try, because the whole
+    /// `wie-cpu` suite shares one process and a global flip would silently change
+    /// the shape of other tests' blocks. Per-`JitShared` keeps it local to the
+    /// engine the test opened.
+    #[cfg(test)]
+    pub(super) region_force: AtomicBool,
 }
 
 impl JitShared {
@@ -459,6 +469,8 @@ impl JitShared {
             code_cache_override: RwLock::new(None),
             #[cfg(test)]
             bg_force: AtomicBool::new(false),
+            #[cfg(test)]
+            region_force: AtomicBool::new(false),
         }
     }
 
@@ -832,6 +844,26 @@ impl JitShared {
 
     #[cfg(not(test))]
     fn bg_force_test(&self) -> bool {
+        let _ = self;
+        false
+    }
+
+    /// Whether loop-region compilation is enabled for this instance: the env
+    /// default (`WIE_JIT_REGION=1`, off) or the test latch.
+    ///
+    /// The single place the decision is made, so `pipeline::try_compile` cannot
+    /// disagree with the tests about it.
+    pub(super) fn region_enabled_here(&self) -> bool {
+        JitConfig::get().region_enabled() || self.region_force_test()
+    }
+
+    #[cfg(test)]
+    fn region_force_test(&self) -> bool {
+        self.region_force.load(Ordering::Relaxed)
+    }
+
+    #[cfg(not(test))]
+    fn region_force_test(&self) -> bool {
         let _ = self;
         false
     }

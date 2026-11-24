@@ -11,6 +11,10 @@
 use super::harness::map_code_region;
 use super::*;
 use crate::IcedCpu;
+use lower::{
+    CHAIN_OFFSET_MASK, CHAIN_SLOT_BYTES, CHAIN_SLOT_BYTES_SHIFT, CHAIN_SLOTS, GOLDEN_RATIO_64,
+    chain_slot_offset, chain_slot_offset_next,
+};
 
 /// Run `code` at [`SIMD_BASE`] through iced (stepping until `stop_rip`) and
 /// the JIT (chained `step_one` loop until `stop_rip`), then return both
@@ -214,4 +218,62 @@ fn chain_real_callee_flow_preserves_r12() {
     assert_eq!(jit.gpr(12), obj + 0x460, "jit r12");
     assert_eq!(iced.gpr(15), 0, "iced r15");
     assert_eq!(jit.gpr(15), 0, "jit r15");
+}
+
+// --- The emitted chain-table probe vs the host's table ---------------------
+
+/// The inline probe in `emit_chain_or_exit` addresses a slot as
+/// `chain_slots + chain_slot_offset(va)` and reads `va`/`fn_ptr` at +0 and +8;
+/// the emitted index arithmetic for a *dynamic* chain target (`ret`,
+/// `call r/m`) is `(va * GOLDEN << CHAIN_SLOT_BYTES_SHIFT) & CHAIN_OFFSET_MASK`,
+/// and for a static one it is the same value computed at compile time.
+///
+/// If those three drift apart the probe silently stops matching and every hop
+/// pays the host resolver — a pure performance failure with no wrong answer, so
+/// nothing else in the suite would catch it. This pins them together, the same
+/// way `refill_slot_matches_emitted_index` pins the mem probe.
+#[test]
+fn chain_slot_offsets_match_the_emitted_index() {
+    let mask = u64::try_from(CHAIN_OFFSET_MASK).unwrap_or(0);
+    let slot_bytes = usize::try_from(CHAIN_SLOT_BYTES).unwrap_or(0);
+    // Guest code VAs are the interesting inputs, not `refill_slot`'s page keys:
+    // they cluster in one image range, so a hash that only mixes high bits would
+    // map every block to the same slot.
+    for va in [
+        0_u64,
+        1,
+        0x1000,
+        0x1400_0100,
+        0x1400_013c,
+        0x1400_0143,
+        0x1400_0156,
+        0x1400_0fff,
+        0x7ffe_0001_0000,
+        u64::from(u32::MAX),
+        u64::MAX,
+    ] {
+        let h = va.wrapping_mul(GOLDEN_RATIO_64);
+        let emitted = (h << CHAIN_SLOT_BYTES_SHIFT) & mask;
+        let emitted = usize::try_from(emitted).unwrap_or(usize::MAX);
+        assert_eq!(
+            emitted,
+            usize::try_from(chain_slot_offset(va)).unwrap_or(usize::MAX),
+            "emitted slot-0 offset disagrees with chain_slot_offset for {va:#x}"
+        );
+        // The emitted second probe is `band(iadd_imm(off0, CHAIN_SLOT_BYTES),
+        // CHAIN_OFFSET_MASK)`, i.e. the *next slot* (wrapping), not
+        // `chain_hash` of anything.
+        let next = (emitted.saturating_add(slot_bytes)) & usize::try_from(mask).unwrap_or(0);
+        assert_eq!(
+            next,
+            usize::try_from(chain_slot_offset_next(va)).unwrap_or(usize::MAX),
+            "emitted second-probe offset disagrees with chain_slot_offset_next \
+             for {va:#x}"
+        );
+        // Both probes must land inside the table, on a slot boundary.
+        assert!(emitted / slot_bytes < CHAIN_SLOTS, "slot 0 out of range");
+        assert!(next / slot_bytes < CHAIN_SLOTS, "slot 1 out of range");
+        assert_eq!(emitted % slot_bytes, 0, "slot 0 unaligned");
+        assert_eq!(next % slot_bytes, 0, "slot 1 unaligned");
+    }
 }

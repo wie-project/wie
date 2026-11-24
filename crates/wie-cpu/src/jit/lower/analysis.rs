@@ -348,3 +348,72 @@ pub(super) fn ensure_gprs_loaded(
         }
     }
 }
+
+#[cfg(test)]
+mod flag_gate_tests {
+    use super::*;
+    use iced_x86::{Decoder, DecoderOptions};
+
+    fn decode(bytes: &[u8]) -> Instruction {
+        let mut dec = Decoder::with_ip(64, bytes, 0x1000, DecoderOptions::NONE);
+        let instr = dec.decode();
+        assert!(!instr.is_invalid(), "{bytes:02x?} must decode");
+        instr
+    }
+
+    /// [`block_needs_flags`] is what gates `pass_flags` in `compile_block`, and
+    /// `pass_flags` is what gates the SSA [`super::flags::FlagState`] — so this
+    /// test is the *reason* no second "has a flag consumer" gate is needed, and
+    /// it is written down rather than assumed.
+    ///
+    /// The opclass `flags` column answers true for readers and writers alike, so
+    /// a block whose only flag use is a consumer (a `cmov`/`setcc` in the body,
+    /// an `adc`/`sbb` reading the carry-in) already carries flags, and the entry
+    /// `decompose_packed` is paid once for every consumer in the block rather
+    /// than once per consumer. The terminator is a separate question: a `jcc`
+    /// never appears in `insns` (it ends the block), which is why the `term`
+    /// argument exists.
+    #[test]
+    fn every_flag_consumer_makes_the_block_carry_flags() {
+        const CONSUMERS: [(&str, &[u8]); 8] = [
+            ("cmovne ecx, edx", &[0x0F, 0x45, 0xCA]),
+            ("sete cl", &[0x0F, 0x94, 0xC1]),
+            ("adc edx, ecx", &[0x11, 0xCA]),
+            ("sbb edx, ecx", &[0x19, 0xCA]),
+            ("pushfq", &[0x9C]),
+            ("cmpxchg [rbx], eax", &[0x0F, 0xB1, 0x03]),
+            ("xadd [rbx], eax", &[0x0F, 0xC1, 0x03]),
+            ("comiss xmm0, xmm1", &[0x0F, 0x2F, 0xC1]),
+        ];
+        for (name, bytes) in CONSUMERS {
+            let insns = [DecodedInsn {
+                instr: decode(bytes),
+            }];
+            assert!(
+                block_needs_flags(&insns, None),
+                "{name} reads flags, so the block must carry them"
+            );
+        }
+
+        // A `jcc` terminator is not part of `insns` — it ends the block.
+        let at = 0x1002;
+        assert!(block_needs_flags(
+            &[],
+            Some(BlockTerm::Jcc {
+                mnemonic: Mnemonic::Je,
+                taken: at,
+                not_taken: at,
+            })
+        ));
+
+        // The negative control: a block that touches no flag and has no
+        // flag-reading successor must NOT pay for the carrier.
+        let insns = [DecodedInsn {
+            instr: decode(&[0x89, 0xD8]),
+        }];
+        assert!(
+            !block_needs_flags(&insns, None),
+            "mov is not a flag instruction"
+        );
+    }
+}

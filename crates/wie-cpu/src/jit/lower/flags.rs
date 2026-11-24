@@ -240,6 +240,23 @@ impl FlagState {
         self.of = bcx.ins().icmp_imm(IntCC::Equal, zero, 1); // false
     }
 
+    /// MUL/IMUL flags: CF = OF = "the full product is not the sign extension of
+    /// the low half". ZF/SF/AF/PF are architecturally undefined and keep
+    /// whatever the previous writer left, exactly as the carrier does.
+    ///
+    /// `packed` is the carrier the writer just produced (CF/OF replaced, other
+    /// bits preserved); adopting it keeps [`Self::old`] equal to the
+    /// architectural word, so a later pack preserves DF/IF/reserved bits from
+    /// the right base. Takes the two i1s directly — the previous shape wrote the
+    /// carrier and then called [`Self::resync`], re-deriving all six flags
+    /// (`band` + `icmp` + `iconst` each) from a word whose other four bits it
+    /// had not touched.
+    pub(super) fn assign_mul(&mut self, overflow: Value, packed: Value) {
+        self.cf = overflow;
+        self.of = overflow;
+        self.old = packed;
+    }
+
     /// SBB flags, predicate-direct mirror of `flags_sbb`: full-width borrow CF.
     /// `cf` is the carry-in as a WIDENED I64 0/1 lane (select_flag), never an i1.
     pub(super) fn assign_sbb(

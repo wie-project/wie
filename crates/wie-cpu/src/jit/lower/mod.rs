@@ -559,6 +559,22 @@ pub(super) struct JitCtx {
     /// the quantity the store-predicate narrowing targets, and the denominator
     /// is [`Self::chain_hops`] — GPR slots only; the `rflags` slot is not a GPR.
     pub chain_store_ops: u64,
+    /// Chain hops that had to leave emitted code and call the host resolver
+    /// [`wie_jit_chain_lookup`](super::mem::wie_jit_chain_lookup).
+    ///
+    /// Emitted edges resolve their successor from the edge IC or the chain
+    /// table inline (see `emit_chain_or_exit`'s tier 1/2), so this counts
+    /// exactly the hops the inline probes could not answer: a table slot
+    /// displaced past the second probe step, a target compiled after this
+    /// block and not yet cached, or a cold IC. It is the residual "the Rust
+    /// trampoline is still reached" cost, and the numerator to compare against
+    /// [`Self::chain_hops`].
+    ///
+    /// Host-helper-side only, like the diagnostic counters around it: no `OFF_*`
+    /// constant, because emitted IR never reads or writes it. Not reset per
+    /// dispatch entry — it is cumulative for the engine, so a caller measures a
+    /// window by differencing two reads.
+    pub chain_helper_calls: u64,
     /// Guest heap control-block VA for the session running this block
     /// (`0` disables the UCRT `malloc`/`free` fast path entirely).
     ///
@@ -653,6 +669,7 @@ impl JitCtx {
             insn_acc: 0,
             chain_hops: 0,
             chain_store_ops: 0,
+            chain_helper_calls: 0,
             heap_ctrl_va: 0,
             heap_base: 0,
             heap_end: 0,
@@ -718,6 +735,9 @@ pub(super) const OFF_STICKY_PAGE: i32 = std::mem::offset_of!(JitCtx, sticky_page
 pub(super) const OFF_STICKY_PTR: i32 = std::mem::offset_of!(JitCtx, sticky_ptr) as i32;
 pub(super) const OFF_STICKY_PROT: i32 = std::mem::offset_of!(JitCtx, sticky_prot) as i32;
 pub(super) const OFF_STICKY_GEN: i32 = std::mem::offset_of!(JitCtx, sticky_gen) as i32;
+/// The chain table base pointer — read by the emitted inline probe on every
+/// chain edge ([`super::emit::emit_chain_or_exit`]).
+pub(super) const OFF_CHAIN_SLOTS: i32 = std::mem::offset_of!(JitCtx, chain_slots) as i32;
 pub(super) const OFF_CHAIN_DEPTH: i32 = std::mem::offset_of!(JitCtx, chain_depth) as i32;
 pub(super) const OFF_INV_GEN_PTR: i32 = std::mem::offset_of!(JitCtx, inv_gen_ptr) as i32;
 pub(super) const OFF_INV_GEN_BAKED: i32 = std::mem::offset_of!(JitCtx, inv_gen_baked) as i32;
@@ -760,6 +780,7 @@ const _: () = {
     assert!(std::mem::offset_of!(JitCtx, sticky_ptr) as i32 == OFF_STICKY_PTR);
     assert!(std::mem::offset_of!(JitCtx, sticky_prot) as i32 == OFF_STICKY_PROT);
     assert!(std::mem::offset_of!(JitCtx, sticky_gen) as i32 == OFF_STICKY_GEN);
+    assert!(std::mem::offset_of!(JitCtx, chain_slots) as i32 == OFF_CHAIN_SLOTS);
     assert!(std::mem::offset_of!(JitCtx, chain_depth) as i32 == OFF_CHAIN_DEPTH);
     assert!(std::mem::offset_of!(JitCtx, inv_gen_ptr) as i32 == OFF_INV_GEN_PTR);
     assert!(std::mem::offset_of!(JitCtx, inv_gen_baked) as i32 == OFF_INV_GEN_BAKED);
@@ -797,6 +818,18 @@ const _: () = {
     assert!(TLB_SETS.is_power_of_two());
     assert!(CHAIN_SLOTS.is_power_of_two());
     assert!(EDGE_IC_SLOTS > 0);
+    // Chain-table probe ABI. The emitted inline probe addresses a slot as
+    // `chain_slots + chain_slot_offset(va)` and loads `va` at +0 / `fn_ptr` at
+    // +8, so the slot must be exactly `CHAIN_SLOT_BYTES` wide with those two
+    // fields at those displacements.
+    assert!(std::mem::size_of::<ChainSlot>() as i64 == CHAIN_SLOT_BYTES);
+    assert!(std::mem::offset_of!(ChainSlot, va) == 0);
+    assert!(std::mem::offset_of!(ChainSlot, fn_ptr) == 8);
+    assert!(CHAIN_SLOT_BYTES == 1 << CHAIN_SLOT_BYTES_SHIFT);
+    // The emitted slot-0 offset is `(va * GOLDEN) & CHAIN_OFFSET_MASK`, so the
+    // mask must cover `CHAIN_SLOTS * CHAIN_SLOT_BYTES` bytes exactly.
+    assert!(CHAIN_OFFSET_MASK == ((CHAIN_SLOTS as i64 - 1) << CHAIN_SLOT_BYTES_SHIFT));
+    assert!(CHAIN_OFFSET_MASK >= CHAIN_SLOT_BYTES);
 };
 
 /// Finalized block ready to run.
@@ -833,6 +866,60 @@ pub(super) const GOLDEN_RATIO_64: u64 = 0x9E37_79B9_7F4A_7C15;
 pub(super) fn chain_hash(va: u64) -> usize {
     let h = va.wrapping_mul(GOLDEN_RATIO_64);
     (h as usize) & (CHAIN_SLOTS - 1)
+}
+
+/// Bytes per [`ChainSlot`] — the stride of both the host linear probe and the
+/// emitted inline probe.
+pub(super) const CHAIN_SLOT_BYTES: i64 = 16;
+
+/// log2([`CHAIN_SLOT_BYTES`]) — the shift folding the slot stride into the
+/// emitted index arithmetic.
+pub(super) const CHAIN_SLOT_BYTES_SHIFT: u32 = 4;
+
+/// Byte-offset mask the emitted probe applies to `va * GOLDEN`:
+/// `((CHAIN_SLOTS - 1) << CHAIN_SLOT_BYTES_SHIFT)`.
+///
+/// [`chain_hash`] keeps the **low** `log2(CHAIN_SLOTS)` bits of the
+/// golden-ratio product (unlike [`refill_slot`], which harvests the high bits),
+/// so the emitted index is a left shift by [`CHAIN_SLOT_BYTES_SHIFT`] whose
+/// discarded overflow is exactly what the mask removes: `band_imm(ishl_imm(h,
+/// 4), CHAIN_OFFSET_MASK)` is `chain_hash(va) * CHAIN_SLOT_BYTES`.
+pub(super) const CHAIN_OFFSET_MASK: i64 = ((CHAIN_SLOTS as i64) - 1) << CHAIN_SLOT_BYTES_SHIFT;
+
+/// Byte offset of `va`'s **first** chain-table slot, relative to
+/// `JitCtx::chain_slots`.
+///
+/// A chain site's target VA is a compile-time constant (a static edge's
+/// `BlockTerm` carries a literal), so the hash collapses at compile time and the
+/// emitted hop bakes this offset as an immediate. That is what makes the inline
+/// probe two loads and two compares with **no hash arithmetic in emitted code**:
+/// the multiply, shift and mask that [`chain_hash`] performs are paid once, by
+/// the compiler, and the offset reaches the probe as an `iadd` immediate.
+///
+/// The identity `chain_slot_offset(va) / CHAIN_SLOT_BYTES == chain_hash(va)`
+/// is what keeps the emitted probe and the host insert/lookup
+/// ([`chain_table_insert`], `wie_jit_chain_lookup`, `trampolines::chain_lookup`)
+/// agreeing forever; `chain_slot_offsets_match_chain_hash` in
+/// `tests/chain_tests.rs` pins it.
+#[inline]
+pub(super) fn chain_slot_offset(va: u64) -> i64 {
+    i64::try_from(chain_hash(va))
+        .unwrap_or(0)
+        .saturating_mul(CHAIN_SLOT_BYTES)
+}
+
+/// Byte offset of the **second** slot `va`'s linear probe would visit — the
+/// emitted probe's last inline step before the host helper.
+///
+/// `(i + 1) & (CHAIN_SLOTS - 1)` is exactly the step
+/// [`chain_table_insert`] / `wie_jit_chain_lookup` take, so the two inline
+/// probes cover probe lengths 1 and 2 of the same walk rather than probing
+/// unrelated slots.
+#[inline]
+pub(super) fn chain_slot_offset_next(va: u64) -> i64 {
+    i64::try_from((chain_hash(va) + 1) & (CHAIN_SLOTS - 1))
+        .unwrap_or(0)
+        .saturating_mul(CHAIN_SLOT_BYTES)
 }
 
 /// Host-side index of `page_key`'s [`RefillSlot`] — the arithmetic the emitted
@@ -919,6 +1006,8 @@ mod gpr;
 mod insn;
 mod mem;
 pub(crate) mod opclass;
+mod region;
+mod region_emit;
 mod sse;
 mod sse_fp;
 mod string;
@@ -930,6 +1019,8 @@ mod dyn_call_tests;
 mod opclass_tests;
 #[cfg(test)]
 mod poison_tests;
+#[cfg(test)]
+mod region_tests;
 
 use analysis::{
     analyze_def_xmm, analyze_live_gprs, analyze_live_xmm, block_has_fp, block_has_mem,
@@ -951,6 +1042,12 @@ pub(super) use gpr::wie_div64;
 pub(super) use mem::{
     wie_jit_chain_lookup, wie_jit_host_span, wie_jit_load, wie_jit_store, wie_jit_string,
 };
+/// Region compilation's entry point — the one thing `jit::pipeline` calls.
+///
+/// `region::form_loop_region` and `region_emit::compile_region` stay private to
+/// this module tree: the caller gets a `CompiledBlock` or a `None` that means
+/// "compile a single block as before", and never sees a `LoopRegion`.
+pub(super) use region_emit::try_compile_region;
 pub(super) use sse::{wie_sse_int_binop, wie_sse_pshufb_hi, wie_sse_pshufb_lo, wie_sse_shift};
 pub(super) use sse_fp::{
     wie_f32_binop, wie_f64_binop, wie_sse_cvt, wie_sse_fp_binop, wie_sse_fp_unop,
@@ -1005,6 +1102,24 @@ impl<F: Fn(u64) -> Option<FuncId>> ChainLookup for F {
 /// valid in.
 ///
 /// The wide signature is a load-bearing JIT lowering entry point carrying the whole lowering env.
+//
+// REGION-COMPILE: landed.
+//
+// Region compilation attaches *next to* this function, not inside it:
+// [`region_emit::compile_region`] takes the description from
+// `region::form_loop_region` and emits one CLIF function for the whole region
+// (entry block loads the guest file once, each `region.blocks()[i]` becomes a CLIF
+// block whose guest GPRs are SSA block parameters, the back edge is a native
+// `jump`, and each `region.exits()` entry becomes an exit block that writes the
+// file back into `JitCtx`, sets `rip` and takes the ordinary chain edge). Nothing
+// in *this* function changed: the per-block path stays the fallback for every
+// block that is not a region entry, and it still lowers a region's blocks when a
+// region is refused.
+//
+// The call site is one level up, in `jit::pipeline::try_compile`, right where it
+// calls `decode_pure_gpr_block`: it tries [`try_compile_region`] for a hot RIP
+// *before* decoding a single block, and falls back to this path on `None`. Behind
+// `WIE_JIT_REGION=1` (default off — see `JitConfig::region_enabled`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compile_block(
     eng: &mut IsaEngine,
@@ -1687,7 +1802,7 @@ pub(super) fn compile_block(
         bcx.finalize();
     }
 
-    dump_ir_if_requested(start_rip, insns.len(), &eng.ctx.func);
+    dump_ir_if_requested("block", start_rip, insns.len(), &eng.ctx.func);
 
     eng.module
         .define_function(func_id, &mut eng.ctx)
@@ -1772,13 +1887,26 @@ fn ir_dump_rip_filter() -> Option<(u64, u64)> {
     })
 }
 
-/// Append one block's CLIF to `WIE_JIT_DUMP_IR`, if that knob names a file.
+/// Append one compiled unit's CLIF to `WIE_JIT_DUMP_IR`, if that knob names a
+/// file.
 ///
 /// Best effort by design: a dump that cannot be written must never fail a
 /// compile, so every error here is swallowed after being surfaced once through
 /// the counter. `opt_level = none` makes the emitter the optimiser, so CLIF is
 /// the only place a redundant-mask question can be answered directly.
-fn dump_ir_if_requested(start_rip: u64, insn_count: usize, func: &cranelift_codegen::ir::Function) {
+///
+/// `tag` names what was compiled — `block` for the per-block path, `region` for
+/// [`region_emit::compile_region`]'s one-function-per-loop shape. It is in the
+/// header rather than inferred from the op count because the whole point of a
+/// region dump is to be able to tell, at a glance and from the file alone, that
+/// `rip=0x…` is now *one* function with a native back edge instead of two chained
+/// ones.
+pub(super) fn dump_ir_if_requested(
+    tag: &str,
+    start_rip: u64,
+    insn_count: usize,
+    func: &cranelift_codegen::ir::Function,
+) {
     static WRITTEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let Some(path) = crate::jit::config::JitConfig::get().ir_dump_path() else {
@@ -1808,7 +1936,7 @@ fn dump_ir_if_requested(start_rip: u64, insn_count: usize, func: &cranelift_code
     } else {
         WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     };
-    let header = format!("; block {n} rip={start_rip:#x} insns={insn_count}\n");
+    let header = format!("; {tag} {n} rip={start_rip:#x} insns={insn_count}\n");
     let body = func.display().to_string();
     let mut text = String::with_capacity(header.len() + body.len() + 2);
     text.push_str(&header);
@@ -1830,7 +1958,12 @@ fn dump_ir_if_requested(start_rip: u64, insn_count: usize, func: &cranelift_code
 /// hit to a guest block and therefore to guest code. Best effort like
 /// [`dump_ir_if_requested`]: a map that cannot be written must never fail a
 /// compile.
-fn dump_map_if_requested(host_addr: usize, guest_start: u64, insns: usize, tier: OptTier) {
+pub(super) fn dump_map_if_requested(
+    host_addr: usize,
+    guest_start: u64,
+    insns: usize,
+    tier: OptTier,
+) {
     let Some(path) = crate::jit::config::JitConfig::get().jit_map_path() else {
         return;
     };
@@ -1858,27 +1991,20 @@ pub(super) fn lower_term(
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
     rflags: Value,
-    flag_state: Option<&FlagState>,
     mem: &mut MemEnv,
     term_ip: u64,
     term_instr: Option<&Instruction>,
 ) -> Result<Value, LowerError> {
     match term {
         BlockTerm::Jmp { target } => Ok(iconst_u64(bcx, target)),
-        BlockTerm::Jcc {
-            mnemonic,
-            taken,
-            not_taken,
-        } => {
-            // Flags already flushed before terminator when pending/jcc.
-            let cond = match flag_state {
-                Some(fs) => flag_cond_fs(bcx, fs, mnemonic)?,
-                None => flag_cond(bcx, rflags, mnemonic)?,
-            };
-            let t = iconst_u64(bcx, taken);
-            let n = iconst_u64(bcx, not_taken);
-            Ok(bcx.ins().select(cond, t, n))
-        }
+        // Deliberately not lowered here. `emit_body_and_term`'s jcc arm ignores
+        // this function's result and calls `lower_jcc_chain`, which builds the
+        // two exit edges and derives the condition once; returning
+        // `select(cond, taken, not_taken)` here as well meant deriving the
+        // condition a second time for a RIP that nothing read.
+        BlockTerm::Jcc { .. } => Err(LowerError::verifier(
+            "internal: a jcc terminator's rip is built by `lower_jcc_chain`",
+        )),
         BlockTerm::Call { target, return_ip } => {
             // push return_ip; exit at target (RSP updated).
             let ret = iconst_u64(bcx, return_ip);
@@ -1934,18 +2060,77 @@ pub(super) fn flag_cond(
     cond_from_bits(bcx, m, zf1, cf1, sf1, of1, pf1)
 }
 
-/// SSA path: same condition computed directly from the FlagState i1s.
+/// SSA path: the condition for `jcc`/`cmov`/`setcc` read straight off the
+/// [`FlagState`] i1 lanes.
+///
+/// **Only the flags the mnemonic names are read, and every op stays on i1.**
+/// It used to widen all five flags to 0/1 I64 lanes (`bool_to_i64` is a `select`
+/// each), negate all five (`bxor` with 1), evaluate the condition, and re-narrow
+/// it with `icmp ne 0`: ~26 CLIF ops per consumer, of which at most three are
+/// read. At `opt_level = none` every one of those is a real host instruction —
+/// which is why it was counted rather than assumed. DOOM Retro's hottest block
+/// (`0x140066570`, 25 instructions, `je` terminator) paid for that condition
+/// *twice*: once here via `lower_term`, which built an exit RIP the jcc arm then
+/// discarded, and once in `lower_jcc_chain` for the actual branch.
+///
+/// The boolean is identical to [`cond_from_bits`]: same truth table, one written
+/// over widened I64 lanes (the packed path that `WIE_JIT_SSA_FLAGS=0` selects,
+/// via [`flag_cond`]) and this one over the raw i1s.
 pub(super) fn flag_cond_fs(
     bcx: &mut FunctionBuilder<'_>,
     fs: &FlagState,
     m: Mnemonic,
 ) -> Result<Value, LowerError> {
-    let zf = bool_to_i64(bcx, fs.zf);
-    let cf = bool_to_i64(bcx, fs.cf);
-    let sf = bool_to_i64(bcx, fs.sf);
-    let of = bool_to_i64(bcx, fs.of);
-    let pf = bool_to_i64(bcx, fs.pf);
-    cond_from_bits(bcx, m, zf, cf, sf, of, pf)
+    Ok(match m {
+        // ZF alone, and its complement. Note `not_i1`, not `bnot`: Cranelift's
+        // `bnot` is a *bitwise* NOT, so `bnot(1i8)` is `0xFE`, which is still
+        // non-zero and therefore still "true" as a select/brif condition.
+        Mnemonic::Je | Mnemonic::Cmove | Mnemonic::Sete => fs.zf,
+        Mnemonic::Jne | Mnemonic::Cmovne | Mnemonic::Setne => not_i1(bcx, fs.zf),
+        // CF alone, and its complement.
+        Mnemonic::Jb | Mnemonic::Cmovb | Mnemonic::Setb => fs.cf,
+        Mnemonic::Jae | Mnemonic::Cmovae | Mnemonic::Setae => not_i1(bcx, fs.cf),
+        // CF | ZF, and its complement !CF & !ZF.
+        Mnemonic::Jbe | Mnemonic::Cmovbe | Mnemonic::Setbe => bcx.ins().bor(fs.cf, fs.zf),
+        Mnemonic::Ja | Mnemonic::Cmova | Mnemonic::Seta => {
+            let ncf = not_i1(bcx, fs.cf);
+            let nzf = not_i1(bcx, fs.zf);
+            bcx.ins().band(ncf, nzf)
+        }
+        // SF != OF is "less than" for a signed compare; ZF decides equality.
+        Mnemonic::Jg | Mnemonic::Cmovg | Mnemonic::Setg => {
+            let eq = bcx.ins().icmp(IntCC::Equal, fs.sf, fs.of);
+            let nzf = not_i1(bcx, fs.zf);
+            bcx.ins().band(nzf, eq)
+        }
+        Mnemonic::Jge | Mnemonic::Cmovge | Mnemonic::Setge => {
+            bcx.ins().icmp(IntCC::Equal, fs.sf, fs.of)
+        }
+        Mnemonic::Jl | Mnemonic::Cmovl | Mnemonic::Setl => {
+            bcx.ins().icmp(IntCC::NotEqual, fs.sf, fs.of)
+        }
+        Mnemonic::Jle | Mnemonic::Cmovle | Mnemonic::Setle => {
+            let ne = bcx.ins().icmp(IntCC::NotEqual, fs.sf, fs.of);
+            bcx.ins().bor(fs.zf, ne)
+        }
+        // OF / SF / PF, each with its negation.
+        Mnemonic::Jo | Mnemonic::Cmovo | Mnemonic::Seto => fs.of,
+        Mnemonic::Jno | Mnemonic::Cmovno | Mnemonic::Setno => not_i1(bcx, fs.of),
+        Mnemonic::Js | Mnemonic::Cmovs | Mnemonic::Sets => fs.sf,
+        Mnemonic::Jns | Mnemonic::Cmovns | Mnemonic::Setns => not_i1(bcx, fs.sf),
+        Mnemonic::Jp | Mnemonic::Cmovp | Mnemonic::Setp => fs.pf,
+        Mnemonic::Jnp | Mnemonic::Cmovnp | Mnemonic::Setnp => not_i1(bcx, fs.pf),
+        _ => return Err(LowerError::form("condition_mnemonic")),
+    })
+}
+
+/// Boolean NOT of a Cranelift `i1`/`I8` flag lane: `0` → `1`, `1` → `0`.
+///
+/// `bnot` is the wrong tool here — it is a *bitwise* complement, so `bnot(1i8)`
+/// is `0xFE`, which a `select`/`brif` condition still reads as true. `x == 0`
+/// is one instruction and is exactly the boolean negation.
+fn not_i1(bcx: &mut FunctionBuilder<'_>, v: Value) -> Value {
+    bcx.ins().icmp_imm(IntCC::Equal, v, 0)
 }
 
 /// Shared jcc/cmov/setcc condition over the five flag bits as I64 values.

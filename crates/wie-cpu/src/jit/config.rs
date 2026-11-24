@@ -124,6 +124,12 @@ pub(super) struct JitConfig {
     /// question about CLIF, and this is how it gets answered — by counting ops
     /// in the dump rather than reasoning about them.
     ir_dump_path: Option<std::path::PathBuf>,
+    /// `WIE_JIT_REGION=1` — compile a hot RIP that is a **loop header** as one
+    /// Cranelift function for the whole loop region, with the back edge as a
+    /// native `jump`, instead of one function per basic block chained by hops
+    /// (`jit/lower/region.rs`, `jit/lower/region_emit.rs`). Off by default; see
+    /// [`Self::region_enabled`] for why.
+    region_enabled: bool,
     /// `WIE_JIT_MAP=<path>` — append `host_addr guest_start insns` for every
     /// compiled block, so an OS-level sample of this process can be attributed
     /// to guest code. Off by default.
@@ -345,6 +351,20 @@ impl JitConfig {
             code_cache_enabled: code_cache_enabled_from_env(
                 std::env::var("WIE_JIT_CODE_CACHE").ok(),
             ),
+            // Loop-region compilation (`WIE_JIT_REGION=1`). Parsed as a plain
+            // opt-in, NOT forced off under `cfg(test)`: the unit tests that
+            // exercise the region emitter need it on, and they flip the
+            // per-`JitShared` latch (`JitShared::region_force`) rather than this
+            // process-wide value, because `JitConfig` is a `OnceLock` read once
+            // per process (see `region_enabled`).
+            region_enabled: matches!(
+                std::env::var("WIE_JIT_REGION"),
+                Ok(v)
+                    if v == "1"
+                        || v.eq_ignore_ascii_case("true")
+                        || v.eq_ignore_ascii_case("on")
+                        || v.eq_ignore_ascii_case("yes")
+            ),
             ir_dump_path: std::env::var_os("WIE_JIT_DUMP_IR")
                 .filter(|p| !p.is_empty())
                 .map(std::path::PathBuf::from),
@@ -361,6 +381,36 @@ impl JitConfig {
     #[must_use]
     pub(super) fn code_cache_enabled(&self) -> bool {
         self.code_cache_enabled
+    }
+
+    /// Whether a hot loop header compiles as a **loop region** — one Cranelift
+    /// function for the whole loop, with the back edge as a native `jump`
+    /// (`WIE_JIT_REGION=1`).
+    ///
+    /// # Why the default is off
+    ///
+    /// Not for want of a reason to turn it on, but because of what a default
+    /// *means* here: every other default in this file was chosen by a paired
+    /// measurement on the calibrated corpus (`scripts/real-guest-perf.sh`), and a
+    /// region changes the shape of emitted code for whole loops rather than
+    /// adding a probe to one path. The measured evidence for it is one loop in
+    /// one guest (DOOM Retro's 2-block, 36-instruction inner loop — the
+    /// `frames_published` arm in `docs/RUNBOOK.md`), on the one host that could
+    /// run it; and the emitter's exit-store set is deliberately conservative
+    /// (see `lower::region_emit`) in a way that a wider corpus might want
+    /// tightened before it is everybody's default. Anything that can silently
+    /// miscompile instead of slowing down stays behind a knob until a corpus says
+    /// otherwise — the same rule `WIE_JIT_CODE_CACHE` follows, and the opposite
+    /// of how `WIE_JIT_MEM`'s default was justified (that one had 6/6 paired
+    /// runs behind it).
+    ///
+    /// The other half: a region is *one* compilation unit for up to
+    /// `RegionLimits::max_blocks` blocks, so its compile cost is paid up front
+    /// against a visit threshold calibrated for a single block. That trade is
+    /// what a default would be asserting, and one guest is not a corpus.
+    #[must_use]
+    pub(super) fn region_enabled(&self) -> bool {
+        self.region_enabled
     }
 
     /// Fingerprint of everything that changes the *emitted code* for the same
@@ -425,6 +475,16 @@ impl JitConfig {
         h = mix(h, u64::from(self.simd_enabled));
         h = mix(h, u64::from(self.string_inline_enabled));
         h = mix(h, u64::from(self.verifier_enabled));
+        // Loop-region compilation. It belongs in the *emitter* fingerprint and
+        // not in `FRAME_LAYOUT_VERSION`, because it changes neither `JitCtx` nor
+        // the frame ABI: it changes which guest range one function covers. A
+        // region compiled at VA V is a different function (different
+        // `insn_count`, different `guest_end`, a native back edge) than the
+        // per-block translation of V, so a blob recorded under one mode must not
+        // be restored under the other. Keying the `.code` file on this bit — the
+        // same treatment `chain_enabled` gets — makes the two modes separate
+        // files instead of one file with two meanings per key.
+        h = mix(h, u64::from(self.region_enabled));
         // Build + host shape. `cfg!` keeps this a compile-time constant, so a
         // debug-built test process can never accept a release blob.
         h = mix(h, u64::from(cfg!(debug_assertions)));

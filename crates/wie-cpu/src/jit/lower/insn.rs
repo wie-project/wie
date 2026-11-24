@@ -449,12 +449,9 @@ pub(super) fn lower_insn(
         }
         Mnemonic::Imul => {
             flush_pending(bcx, rflags, pending, flag_state);
-            lower_imul(bcx, instr, gpr, dirty, rflags, mem)?;
-            // Eager writer: re-derive fs from the freshly packed carrier.
-            if let Some(fs) = flag_state {
-                fs.resync(bcx, *rflags);
-            }
-            Ok(())
+            // IMUL defines CF/OF only; `lower_imul` mirrors those two into the
+            // SSA state, so no re-derivation of the other four is needed.
+            lower_imul(bcx, instr, gpr, dirty, rflags, flag_state.as_mut(), mem)
         }
         Mnemonic::Div | Mnemonic::Idiv => {
             flush_pending(bcx, rflags, pending, flag_state);

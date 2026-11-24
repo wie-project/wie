@@ -907,6 +907,7 @@ pub(super) fn lower_imul(
     gpr: &mut [Value; 16],
     dirty: &mut [bool; 16],
     rflags: &mut Value,
+    flag_state: Option<&mut FlagState>,
     mem: &mut MemEnv,
 ) -> Result<(), LowerError> {
     let nops = instr.op_count();
@@ -944,7 +945,15 @@ pub(super) fn lower_imul(
     let cf_on = select_flag(bcx, overflow, Rflags::CF);
     let of_on = select_flag(bcx, overflow, Rflags::OF);
     let f = replace_flag(bcx, *rflags, Rflags::CF, cf_on);
-    *rflags = replace_flag(bcx, f, Rflags::OF, of_on);
+    let packed = replace_flag(bcx, f, Rflags::OF, of_on);
+    *rflags = packed;
+    // Keep the SSA state authoritative by mirroring the two flags IMUL defines
+    // instead of making the caller re-derive all six from `packed` (see
+    // `FlagState::assign_mul`). The carrier is still updated bit-wise, because
+    // it is what a faulting exit edge and a chained successor read.
+    if let Some(fs) = flag_state {
+        fs.assign_mul(overflow, packed);
+    }
     Ok(())
 }
 

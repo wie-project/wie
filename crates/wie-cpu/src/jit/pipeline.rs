@@ -23,6 +23,7 @@ use super::lower::{
     chain_table_clear, chain_table_insert, refill_clear,
 };
 use super::shared::{BgEnqueueOutcome, BgWaitCell, BgWaitState, JitShared, PerThreadJitState};
+use super::tier::OptTier;
 use super::{CacheEntry, JitCpu};
 use crate::CpuError;
 use crate::exec::{self, StepResult};
@@ -856,6 +857,38 @@ impl JitCpu {
         inv_gen: u64,
         urgent: bool,
     ) -> BgEnqueueOutcome {
+        // `WIE_JIT_REGION=1`: a hot loop header compiles as **one function for the
+        // whole loop**, not one per block.
+        //
+        // This is the hook that makes the knob mean anything on a real guest. The
+        // `Hot`-threshold branch and the eager branch both decide a promotion by
+        // calling here, so without this the *dominant* promotion path (compile on
+        // the background worker) would never form a region and only the inline
+        // fallbacks would — measured: `long_loop` and DOOM Retro formed none.
+        //
+        // Three reasons it belongs here rather than inside the worker:
+        //
+        // * **The hook window lives on the guest thread.** Region formation decodes
+        //   up to `RegionLimits::max_explore_blocks` blocks to prove the loop has no
+        //   other entry, and `decode_pure_gpr_block` needs `hooks` to refuse an
+        //   address the guest asked to stop at. A pool thread has no hooks, so
+        //   forming a region there would compile over a host-stop address — the
+        //   region would then run the hooked instruction natively and the stop would
+        //   never fire.
+        // * **One attempt per promotion.** `urgent` is `false` only for the
+        //   speculative boot-mode prefetch, which must stay a plain block compile.
+        // * **The region is the thing that costs more to compile**, so it should be
+        //   attempted where the block's compile was about to happen anyway.
+        //
+        // `Ready` is the outcome that already means "the cache holds this entry":
+        // both callers' `Ready` arms look it up and run (or defer to) it, which is
+        // exactly right. The one counter whose reading shifts is `promo.hit_ready`
+        // ("the worker beat us to it"), which now also counts a promotion resolved
+        // on the spot — it is a diagnostic, and the knob is off by default.
+        if urgent && let Some(compiled) = self.try_compile_region(rip, inv_gen) {
+            self.insert_ready(rip, compiled);
+            return BgEnqueueOutcome::Ready;
+        }
         if !self.shared.bg_enabled_here() || !self.shared.engine_ready.load(Ordering::Relaxed) {
             return BgEnqueueOutcome::Unavailable;
         }
@@ -1129,11 +1162,87 @@ impl JitCpu {
         // Bake-before-decode (see `step_one`): snapshot the generation before
         // the block's bytes are read.
         let inv_gen = self.shared.invalidate_gen.load(Ordering::Acquire);
+        // A hot RIP may be a **loop header**: try the whole loop as one function
+        // before decoding a single block (`WIE_JIT_REGION=1`). `None` — not a
+        // loop, refused at formation, or refused at lower time — falls through to
+        // the per-block path below, which is the same code this function ran
+        // before regions existed.
+        if let Some(compiled) = self.try_compile_region(rip, inv_gen) {
+            return Some(compiled);
+        }
         let kind = {
             let mem_guard = read_unpoisoned(&self.shared.mem);
             decode_pure_gpr_block(&mem_guard, self.thread.hooks.as_ref(), rip)
         };
         self.try_compile_from_kind(rip, kind, inv_gen)
+    }
+
+    /// Attempt loop-region compilation for `rip` (`WIE_JIT_REGION=1`).
+    ///
+    /// Returns `None` — leaving every counter untouched — when the knob is off,
+    /// when `rip` is not a loop header, when the region is refused at formation,
+    /// or when an instruction in it is refused at lower time. That last case is
+    /// the reason this is a `None` and not a `Result`: a refusal here is routine
+    /// and its only effect is that the per-block path compiles the same RIP, so
+    /// it must not change what the *caller* does with the RIP.
+    ///
+    /// # Why a region does not consume the tier-up budget
+    ///
+    /// It compiles at [`OptTier::Base`], the same tier the per-block path would
+    /// pick for this RIP (a non-self-loop block earns no tier), so the decision
+    /// is unchanged — this only removes `decide_tier`'s memoisation from the path.
+    /// A region that *did* earn a tier would need its own budget rule ("is one
+    /// region worth four blocks' worth of compile?"), and inventing that here
+    /// would silently starve the self-loops the budget was sized for.
+    ///
+    /// # Locks
+    ///
+    /// Held at once: the guest-memory read guard and the engine mutex. See
+    /// [`lower::try_compile_region`]'s doc for why that order cannot cycle (no
+    /// path in this crate holds a `mem` guard across another lock acquisition).
+    fn try_compile_region(&mut self, rip: u64, inv_gen: u64) -> Option<CompiledBlock> {
+        if !self.shared.region_enabled_here() {
+            return None;
+        }
+        let tier = OptTier::Base;
+        let start = Instant::now();
+        let compiled = {
+            let mem_guard = read_unpoisoned(&self.shared.mem);
+            let mut eng_guard = lock_unpoisoned(&self.shared.engine);
+            let chain = |va: u64| self.shared.chain_func_for(tier, va);
+            eng_guard
+                .as_mut()
+                .and_then(|eng| eng.module_for(tier))
+                .and_then(|eng| {
+                    lower::try_compile_region(
+                        eng,
+                        &mem_guard,
+                        self.thread.hooks.as_ref(),
+                        rip,
+                        &chain,
+                        inv_gen,
+                        tier,
+                    )
+                })
+        };
+        let compiled = compiled?;
+        // Same per-thread bookkeeping `try_compile_from_kind` performs for a
+        // block: a region compile is an inline compile, and its `insn_count` is
+        // the whole loop, so `compile_by_insns` records the region's real size.
+        let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.stats.compile.compiles = self.stats.compile.compiles.saturating_add(1);
+        self.stats.profile.inline_compiles = self.stats.profile.inline_compiles.saturating_add(1);
+        self.stats.profile.compile_us = self.stats.profile.compile_us.saturating_add(us);
+        self.stats
+            .profile
+            .compile_by_insns
+            .record(u64::from(compiled.insn_count), us);
+        if JitConfig::get().chain_enabled() {
+            let fn_ptr = compiled.func as usize as u64;
+            chain_table_insert(self.thread.chain_slots.as_mut(), rip, fn_ptr);
+            self.stats.chain.inline_inserts = self.stats.chain.inline_inserts.saturating_add(1);
+        }
+        Some(compiled)
     }
 
     /// Compile a block from an already-decoded [`BlockKind`], skipping the

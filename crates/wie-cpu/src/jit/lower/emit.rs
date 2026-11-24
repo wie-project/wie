@@ -8,9 +8,11 @@ use super::insn::{PendingFlags, flush_pending, lower_insn};
 use super::mem::call_load;
 use super::string::lower_string;
 use super::{
-    EDGE_IC_SLOTS, MAX_CHAIN_DEPTH, OFF_CHAIN_DEPTH, OFF_CHAIN_HOPS, OFF_CHAIN_STORE_OPS,
+    CHAIN_OFFSET_MASK, CHAIN_SLOT_BYTES, CHAIN_SLOT_BYTES_SHIFT, EDGE_IC_SLOTS, GOLDEN_RATIO_64,
+    MAX_CHAIN_DEPTH, OFF_CHAIN_DEPTH, OFF_CHAIN_HOPS, OFF_CHAIN_SLOTS, OFF_CHAIN_STORE_OPS,
     OFF_EDGE_IC_FN, OFF_EDGE_IC_VA, OFF_FAULT, OFF_INSN_ACC, OFF_INV_GEN_BAKED, OFF_INV_GEN_PTR,
-    OFF_RIP, TLB_PROT_R, TLB_PROT_W, flag_cond, flag_cond_fs, lower_term,
+    OFF_RIP, TLB_PROT_R, TLB_PROT_W, chain_slot_offset, chain_slot_offset_next, flag_cond,
+    flag_cond_fs, lower_term,
 };
 
 use super::super::block::{BlockStackPinPlan, BlockTerm, DecodedInsn};
@@ -19,7 +21,7 @@ use super::err::{LowerError, noted};
 use super::opclass::is_string_op;
 
 use ahash::HashMap;
-use cranelift::codegen::ir::{BlockArg, FuncRef, SigRef};
+use cranelift::codegen::ir::{BlockArg, FuncRef, InstructionData, SigRef, ValueDef};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::MemFlagsData;
 use iced_x86::Mnemonic;
@@ -308,6 +310,32 @@ fn emit_inv_gen_check(
     cont_blk
 }
 
+/// The guest VA a chain edge transfers to, **if it is a compile-time
+/// constant**.
+///
+/// `emit_chain_or_exit` receives the exit RIP as an SSA value and nothing else,
+/// because the terminator lowering that produces it is shared by static edges
+/// (`jmp` / `jcc` / direct `call` — `lower_term` emits `iconst_u64(target)`)
+/// and dynamic ones (`ret`, `call r/m`, a string op's
+/// `select(stay, cur, next)`). The inline chain-table probe bakes the target's
+/// hash as an immediate, and that is only possible for the static shape, so this
+/// reads the immediate back out of the value definition.
+///
+/// **Why this cannot cost correctness:** the probe still compares the slot's
+/// full 64-bit `va` against the runtime `exit_rip` before using the fn pointer
+/// (see tier 2 in [`emit_chain_or_exit`]). A wrong or missing constant therefore
+/// degrades to "probe misses, host helper resolves it" — the same path a dynamic
+/// edge takes — never to a wrong successor.
+fn static_rip(bcx: &FunctionBuilder<'_>, v: Value) -> Option<u64> {
+    let ValueDef::Result(inst, 0) = bcx.func.dfg.value_def(v) else {
+        return None;
+    };
+    match bcx.func.dfg.insts[inst] {
+        InstructionData::UnaryImm { imm, .. } => Some(imm.bits().cast_unsigned()),
+        _ => None,
+    }
+}
+
 /// Writeback + set RIP + chain to the successor (nested host call).
 ///
 /// Blocks remain callable from Rust through the host C ABI. Past
@@ -380,6 +408,14 @@ pub(super) fn emit_chain_or_exit(
     // a compiled successor: charge the hop + this edge's GPR stores.
     let store_ops = chain_store_count(gpr_loaded, gpr_dirty);
 
+    // Successor resolution, from cheapest to last resort. Tier 0 is a direct
+    // `call`; tiers 1–2 are inline probes that transfer with a plain
+    // `call_indirect` from emitted code; the Rust helper
+    // (`wie_jit_chain_lookup`) is reached only when neither inline tier
+    // resolves the target.
+    //
+    // Tier 0 — a direct `call` to a successor compiled into this very module
+    // (same tier, earlier compile). No lookup at all.
     if let Some(f) = href {
         emit_chain_hop_accounting(bcx, ctx_ptr, flags, store_ops);
         bcx.ins().call(f, &[ctx_ptr]);
@@ -389,60 +425,112 @@ pub(super) fn emit_chain_or_exit(
         emit_block_exit_return(bcx, ctx_ptr, flags, trip);
         return;
     }
-    // Monomorphic edge IC (data plane) before full chain-table helper.
-    // On hit: call_indirect without `wie_jit_chain_lookup`. Miss → helper (which
-    // also consults IC + table and may install a new IC entry).
-    let mut ic_ok = bcx.ins().iconst(types::I8, 0);
-    let zero = iconst_u64(bcx, 0);
-    let mut ic_fn = zero;
+
+    // One shared transfer block: every tier below that resolves a fn pointer
+    // passes it here as a block parameter, so the hop accounting, the depth
+    // restore, the trip flush and the indirect call are emitted ONCE per chain
+    // site instead of once per tier (this used to be three near-identical
+    // copies).
+    let hit_blk = bcx.create_block();
+    bcx.append_block_param(hit_blk, types::I64);
+
+    // Tier 1 — monomorphic edge IC (`JitCtx::edge_ic_{va,fn}`), one branch per
+    // slot. A hit in slot 0 costs two loads, two compares, one `band` and a
+    // branch, and the first match wins structurally, so no per-slot
+    // `icmp/band/select/bor` bookkeeping is emitted on the *hit* path.
     for slot in 0..EDGE_IC_SLOTS {
-        let off_va = i64::from(OFF_EDGE_IC_VA) + i64::try_from(slot.saturating_mul(8)).unwrap_or(0);
-        let off_fn = i64::from(OFF_EDGE_IC_FN) + i64::try_from(slot.saturating_mul(8)).unwrap_or(0);
-        let va_p = bcx.ins().iadd_imm(ctx_ptr, off_va);
-        let fn_p = bcx.ins().iadd_imm(ctx_ptr, off_fn);
+        let step = i64::try_from(slot.saturating_mul(8)).unwrap_or(0);
+        let va_p = bcx
+            .ins()
+            .iadd_imm(ctx_ptr, i64::from(OFF_EDGE_IC_VA) + step);
+        let fn_p = bcx
+            .ins()
+            .iadd_imm(ctx_ptr, i64::from(OFF_EDGE_IC_FN) + step);
         let slot_va = bcx.ins().load(types::I64, flags, va_p, 0);
         let slot_fn = bcx.ins().load(types::I64, flags, fn_p, 0);
         let va_ok = bcx.ins().icmp(IntCC::Equal, slot_va, exit_rip);
         let fn_nz = bcx.ins().icmp_imm(IntCC::NotEqual, slot_fn, 0);
-        let hit_i = bcx.ins().band(va_ok, fn_nz);
-        let first = bcx.ins().icmp_imm(IntCC::Equal, ic_ok, 0);
-        let take = bcx.ins().band(hit_i, first);
-        ic_fn = bcx.ins().select(take, slot_fn, ic_fn);
-        ic_ok = bcx.ins().bor(ic_ok, hit_i);
+        let hit = bcx.ins().band(va_ok, fn_nz);
+        let after = bcx.create_block();
+        bcx.ins()
+            .brif(hit, hit_blk, &[BlockArg::Value(slot_fn)], after, &[]);
+        bcx.switch_to_block(after);
+        bcx.seal_block(after);
     }
-    let ic_hit_blk = bcx.create_block();
-    let ic_miss_blk = bcx.create_block();
-    bcx.ins().brif(ic_ok, ic_hit_blk, &[], ic_miss_blk, &[]);
 
-    bcx.switch_to_block(ic_hit_blk);
-    bcx.seal_block(ic_hit_blk);
-    emit_chain_hop_accounting(bcx, ctx_ptr, flags, store_ops);
-    bcx.ins().call_indirect(block_sig_ref, ic_fn, &[ctx_ptr]);
-    bcx.ins().store(flags, depth, depth_ptr, 0);
-    // The callee wrote back the authoritative GPRs and charged its own
-    // count into `insn_acc`; only THIS block's count is still outstanding.
-    emit_block_exit_return(bcx, ctx_ptr, flags, trip);
+    // Tier 2 — the chain table's first two probe slots, inline.
+    //
+    // For a static chain target (every `jmp`/`jcc`/direct-`call` edge)
+    // `static_rip` recovers the VA, so `chain_slot_offset` has already done the
+    // hashing on this thread: the probe is `load chain_slots`, one address add,
+    // two loads, two compares, and the offsets are baked immediates. A dynamic
+    // target (`ret` / `call r/m` / a string op) folds the same arithmetic into
+    // the emitted code instead: golden-ratio multiply, shift, mask — exactly
+    // `chain_hash`, evaluated per hop.
+    //
+    // Either way the two slots probed are the two the host linear probe would
+    // visit first, so a target inserted into its home slot — or displaced by one
+    // earlier occupant — resolves without leaving emitted code. That case used
+    // to pay a host call into `wie_jit_chain_lookup` on every hop.
+    let slots_p = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_CHAIN_SLOTS));
+    let slots_base = bcx.ins().load(types::I64, flags, slots_p, 0);
+    let slot_addrs: [Value; 2] = match static_rip(bcx, exit_rip) {
+        Some(va) => [
+            bcx.ins().iadd_imm(slots_base, chain_slot_offset(va)),
+            bcx.ins().iadd_imm(slots_base, chain_slot_offset_next(va)),
+        ],
+        None => {
+            let golden = iconst_u64(bcx, GOLDEN_RATIO_64);
+            let h = bcx.ins().imul(exit_rip, golden);
+            // `chain_hash` keeps the product's low 9 bits; the slot stride folds
+            // in as a left shift whose overflow the mask discards.
+            let off0 = bcx.ins().ishl_imm(h, i64::from(CHAIN_SLOT_BYTES_SHIFT));
+            let off0 = bcx.ins().band_imm(off0, CHAIN_OFFSET_MASK);
+            let off1 = bcx.ins().iadd_imm(off0, CHAIN_SLOT_BYTES);
+            let off1 = bcx.ins().band_imm(off1, CHAIN_OFFSET_MASK);
+            [
+                bcx.ins().iadd(slots_base, off0),
+                bcx.ins().iadd(slots_base, off1),
+            ]
+        }
+    };
+    for slot_p in slot_addrs {
+        let slot_va = bcx.ins().load(types::I64, flags, slot_p, 0);
+        let slot_fn = bcx.ins().load(types::I64, flags, slot_p, 8);
+        let va_ok = bcx.ins().icmp(IntCC::Equal, slot_va, exit_rip);
+        let fn_nz = bcx.ins().icmp_imm(IntCC::NotEqual, slot_fn, 0);
+        let hit = bcx.ins().band(va_ok, fn_nz);
+        let after = bcx.create_block();
+        bcx.ins()
+            .brif(hit, hit_blk, &[BlockArg::Value(slot_fn)], after, &[]);
+        bcx.switch_to_block(after);
+        bcx.seal_block(after);
+    }
 
-    bcx.switch_to_block(ic_miss_blk);
-    bcx.seal_block(ic_miss_blk);
-    // Late-bound: open-addressing chain table (successors compiled after us).
+    // Tier 3 — late-bound: open-addressing chain table (successors compiled
+    // after us), including the rest of the linear probe and the edge-IC
+    // install.
     let call = bcx.ins().call(lookup_ref, &[ctx_ptr, exit_rip]);
     let fn_ptr = bcx.inst_results(call)[0];
     let hit = bcx.ins().icmp_imm(IntCC::NotEqual, fn_ptr, 0);
-    let hit_blk = bcx.create_block();
     let miss_blk = bcx.create_block();
-    bcx.ins().brif(hit, hit_blk, &[], miss_blk, &[]);
+    bcx.ins()
+        .brif(hit, hit_blk, &[BlockArg::Value(fn_ptr)], miss_blk, &[]);
+
     bcx.switch_to_block(hit_blk);
     bcx.seal_block(hit_blk);
+    let target = bcx.block_params(hit_blk)[0];
     emit_chain_hop_accounting(bcx, ctx_ptr, flags, store_ops);
-    bcx.ins().call_indirect(block_sig_ref, fn_ptr, &[ctx_ptr]);
+    bcx.ins().call_indirect(block_sig_ref, target, &[ctx_ptr]);
     bcx.ins().store(flags, depth, depth_ptr, 0);
     // The callee wrote back the authoritative GPRs and charged its own
     // count into `insn_acc`; only THIS block's count is still outstanding.
     emit_block_exit_return(bcx, ctx_ptr, flags, trip);
+
     bcx.switch_to_block(miss_blk);
     bcx.seal_block(miss_blk);
-    // No nested call — restore depth before the ordinary exit path.
+    // No successor resolved: no nested call, so restore depth before the
+    // ordinary exit path and let the dispatcher (or iced) take it from RIP.
     bcx.ins().store(flags, depth, depth_ptr, 0);
     jump_exit(bcx, exit, gpr, rflags);
 }
@@ -960,8 +1048,20 @@ pub(super) fn emit_body_and_term(
         || needs_flags
         || !matches!(pending, PendingFlags::None)
     {
+        // Assign the deferred ALU flags to the SSA state and pack the carrier.
+        //
+        // No `resync_state` here. `FlagState` is the authority while it exists,
+        // and every writer in the body either assigns its i1s directly
+        // (`assign_arith`/`assign_logic`/`assign_shift`/`assign_adc`/
+        // `assign_sbb`/`assign_mul`, and the pending path above) or re-derives
+        // them from the carrier it just rewrote (`popfq`, `cld`, `std`, the
+        // bit-test/xadd/cmpxchg/bsr/bsf/lzcnt/imul/div/string/eager paths each
+        // call `FlagState::resync`). So re-deriving all six flags from the
+        // packed word here — six `band`, six `icmp`, six `iconst` — rebuilt
+        // values the state already held. It is conditional on `fs` being
+        // `Some`, and `WIE_JIT_SSA_FLAGS=0` makes it a no-op anyway, so
+        // deleting the call cannot change behaviour on either path.
         flush_pending(bcx, rflags_val, &mut pending, &mut flag_state);
-        resync_state(bcx, &mut flag_state, *rflags_val);
     }
 
     if let Some(t) = term {
@@ -1040,23 +1140,19 @@ pub(super) fn emit_body_and_term(
                 trip,
             )?;
         } else {
-            let exit_rip = lower_term(
-                bcx,
-                t,
-                gpr_vals,
-                gpr_dirty,
-                *rflags_val,
-                flag_state.as_ref(),
-                mem_env,
-                term_ip,
-                term_insn.map(|ti| &ti.instr),
-            )?;
             match t {
                 BlockTerm::Jcc {
                     mnemonic,
                     taken,
                     not_taken,
                 } => {
+                    // The condition is derived ONCE, inside `lower_jcc_chain`,
+                    // and only the two exit edges consume it. `lower_term` used
+                    // to be called first to build a `select(cond, taken,
+                    // not_taken)` exit RIP that this arm then dropped on the
+                    // floor — a whole second condition derivation (and, before
+                    // `flag_cond_fs` learned to read only the named flags, ~26
+                    // ops) that no instruction ever read.
                     let t_ref = chain_refs.get(&taken).copied();
                     let n_ref = chain_refs.get(&not_taken).copied();
                     let _ = lower_jcc_chain(
@@ -1083,6 +1179,16 @@ pub(super) fn emit_body_and_term(
                     )?;
                 }
                 BlockTerm::Jmp { target } | BlockTerm::Call { target, .. } => {
+                    let exit_rip = lower_term(
+                        bcx,
+                        t,
+                        gpr_vals,
+                        gpr_dirty,
+                        *rflags_val,
+                        mem_env,
+                        term_ip,
+                        term_insn.map(|ti| &ti.instr),
+                    )?;
                     emit_chain_or_exit(
                         bcx,
                         ctx_ptr,
@@ -1105,6 +1211,16 @@ pub(super) fn emit_body_and_term(
                 // `call r/m64`: the exit RIP is a runtime value, so there is
                 // no direct chain edge — exactly like `ret`.
                 BlockTerm::CallDyn { .. } | BlockTerm::Ret => {
+                    let exit_rip = lower_term(
+                        bcx,
+                        t,
+                        gpr_vals,
+                        gpr_dirty,
+                        *rflags_val,
+                        mem_env,
+                        term_ip,
+                        term_insn.map(|ti| &ti.instr),
+                    )?;
                     emit_chain_or_exit(
                         bcx,
                         ctx_ptr,
