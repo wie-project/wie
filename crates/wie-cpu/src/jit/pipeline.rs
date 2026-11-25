@@ -102,6 +102,29 @@ pub(crate) struct RegionProbe {
 /// hysteresis and keep interpreting instead of blocking the guest thread.
 const BG_WAIT_SKIP_DEPTH: u64 = 4;
 
+/// Visits a block may spend interpreted while its background compile is in
+/// flight before the dispatch path insists on the bounded wait.
+///
+/// This is a **liveness backstop, not the policy**. The policy is "never block
+/// the guest thread on a compile that is already queued" — a queued compile
+/// finishes at the same wall-clock moment whether the guest sleeps or works, so
+/// sleeping is pure loss. What is not guaranteed is that a queued job is always
+/// *processed*: a worker that panics mid-compile leaves its job unprocessed
+/// while its peers keep `bg_alive` true, and that entry would stay `Queued`
+/// forever. Past the cap the wait path is reached, its timeout inline-compiles
+/// the block, and the entry resolves.
+///
+/// Counted in interpreted visits rather than elapsed time because the failure
+/// mode this must *not* trigger on is a deep queue: at session init the runtime
+/// queues one speculative compile per planted guest stub (124 on `crt_hello`),
+/// so a job can be tens of ms old on a perfectly healthy pool. 1 024 visits is
+/// far past any healthy resolution (a ≤96-insn block compiles in ~½ ms, during
+/// which a guest reaches a given entry a handful of times) and still bounds a
+/// lost job to about a millisecond of extra interpretation. Not a knob: a
+/// per-run tuning value for a pathology nobody has observed is a knob nobody
+/// would ever learn to turn.
+pub(super) const NO_STALL_SKIP_CAP: u32 = 1_024;
+
 /// Decode the instruction at `rip` and bucket its mnemonic. Runs on the
 /// sampling seam only (every [`OPCODE_SAMPLE_EVERY`]th iced step).
 fn record_opcode_sample(mem: &GuestMemory, rip: u64) {
@@ -500,17 +523,28 @@ impl JitCpu {
                     }
                     CacheEntry::Never => { /* fall through to iced */ }
                     CacheEntry::Queued(notify) => {
-                        // About to execute the entry the worker is compiling:
-                        // block only for this entry, and only briefly. On
-                        // timeout the wait attempts an inline compile on the
-                        // guest thread (installing Ready on success or Never
-                        // on failure) — the queued Bg job still races but
-                        // last-writer-wins on the cache. Inline fallback here
-                        // is only for a dead worker that never timed out.
-                        if let Some(compiled) = self.wait_bg_ready(rip, &notify) {
-                            let meta = CompiledRunMeta::from(&compiled);
-                            return Ok(self.finish_compiled(rip, meta));
-                        }
+                        // **No-stall rule** (see [`NO_STALL_SKIP_CAP`]): the
+                        // compile is already queued and its completion time
+                        // does not depend on whether this thread blocks, so
+                        // blocking converts guest progress into nothing.
+                        // Interpret this visit and re-check the cache on the
+                        // next dispatch instead.
+                        //
+                        // Safe by construction rather than by argument:
+                        // `enqueue_bg` inserts `Queued` only **after**
+                        // `BgPool::push` accepted the job, and every resolution
+                        // of a queued job replaces or removes the entry
+                        // (`bg_install_ready` → `Ready`, `bg_install_never` →
+                        // `Never`, `bg_install_drop` → *absent*, so a dropped
+                        // job re-enters the ordinary miss path). The `iced`
+                        // fall-through this takes is the same one the old code
+                        // already took when a wait resolved to nothing, so no
+                        // new dispatch shape is being introduced.
+                        //
+                        // Dead worker first: a `Queued` entry whose pool is
+                        // gone can only be resolved by compiling it here, and
+                        // nothing is gained by interpreting up to the bound
+                        // first.
                         if !self.shared.bg_alive.load(Ordering::Relaxed) {
                             self.stats.bg.inline_fallbacks =
                                 self.stats.bg.inline_fallbacks.saturating_add(1);
@@ -520,11 +554,29 @@ impl JitCpu {
                                 return Ok(self.finish_compiled(rip, meta));
                             }
                             self.mark_never(rip);
+                        } else if notify.note_skip() {
+                            // Skip budget spent on a live pool: the job was
+                            // lost, not slow. Take the bounded wait, whose
+                            // timeout inline-compiles and resolves the entry.
+                            // This is the *only* path that still stalls.
+                            if let Some(compiled) = self.wait_bg_ready(rip, &notify) {
+                                let meta = CompiledRunMeta::from(&compiled);
+                                return Ok(self.finish_compiled(rip, meta));
+                            }
+                            if !self.shared.bg_alive.load(Ordering::Relaxed) {
+                                self.stats.bg.inline_fallbacks =
+                                    self.stats.bg.inline_fallbacks.saturating_add(1);
+                                if let Some(compiled) = self.try_compile(rip) {
+                                    let meta = CompiledRunMeta::from(&compiled);
+                                    self.insert_ready(rip, compiled);
+                                    return Ok(self.finish_compiled(rip, meta));
+                                }
+                                self.mark_never(rip);
+                            }
                         }
-                        // Worker alive: either inline compile succeeded and we
-                        // already returned, or it failed and we marked Never,
-                        // or the entry resolved/re-decided mid-wait — fall
-                        // through to iced this visit.
+                        // Fall through to iced this visit: the block is either
+                        // in flight on a live pool (interpret, re-check next
+                        // dispatch), or resolved to Never/absent above.
                     }
                     CacheEntry::Hot { visits, thr } => {
                         let next = visits.saturating_add(1);
@@ -684,16 +736,36 @@ impl JitCpu {
                 // On next execution the Ready entry will be patched to tier-1.
                 // Ledger-known-good blocks skip it: they get one direct
                 // compile, not tier-0 + tier-1 double work.
+                // **No synchronous first-sight compile** (this is the second
+                // half of the `crt_hello` startup cost, see the no-stall rule in
+                // this function's `Queued` arm). The branch below used to call
+                // `baseline::try_compile_baseline` on the *first* sighting of
+                // every `Pure` block, which is the eager-by-size rule the
+                // RUNBOOK records as deleted: a one-shot 96-instruction block
+                // costs ~9 µs interpreted against ~1 ms compiled, so paying to
+                // compile one that never revisits is a ~100x loss. Measured on
+                // `micro-exes/out/crt_hello.exe`, which retires ~450 guest
+                // instructions: 105 synchronous Cranelift compiles at ~0.85 ms
+                // each dominated an ~80 ms emulation phase once the stalls were
+                // gone. The arithmetic in the RUNBOOK row is the whole argument
+                // — break-even for a *single* visit needs ~900 block
+                // instructions and `decode_pure_gpr_block` caps out at 96 — so
+                // the only block shape a first-sight compile can pay for is one
+                // where a single entry runs the block many times: a self-loop.
+                //
+                // Those keep the synchronous compile (they are also exactly the
+                // blocks `earns_tier` promotes to `Speed`, so the
+                // `long_loop` tier parity this file pins is unchanged).
+                // Everything else falls through to the ordinary work-weighted
+                // promotion: interpret to the threshold, compile on the worker,
+                // keep interpreting while it lands.
+                //
+                // The region hook stays here and that is deliberate: a `Ready`
+                // entry is never re-compiled, so the first sighting of a latch
+                // is the only chance to fold its loop header (`WIE_JIT_REGION`).
                 if self.shared.is_boot_mode()
                     && !persist_eager
-                    && matches!(kind, BlockKind::Pure { .. })
-                    && let Some(baseline) = baseline::try_compile_baseline(
-                        &self.shared,
-                        &self.fast_api,
-                        rip,
-                        kind.clone(),
-                        inv_gen,
-                    )
+                    && baseline::is_baseline_eligible(&kind)
                 {
                     // Enqueue a background tier-1 job only for a block that can
                     // actually tier up. `earns_tier` (`jit/tier.rs`) returns
@@ -742,14 +814,22 @@ impl JitCpu {
                             self.stats.profile.eager_compiles.saturating_add(1);
                         return Ok(self.finish_compiled(rip, meta));
                     }
-                    if is_loop {
+                    if is_loop
+                        && let Some(baseline) = baseline::try_compile_baseline(
+                            &self.shared,
+                            &self.fast_api,
+                            rip,
+                            kind.clone(),
+                            inv_gen,
+                        )
+                    {
                         drop(self.enqueue_bg(rip, &kind, inv_gen, false));
+                        let meta = CompiledRunMeta::from(&baseline);
+                        self.insert_ready(rip, baseline);
+                        self.stats.profile.eager_compiles =
+                            self.stats.profile.eager_compiles.saturating_add(1);
+                        return Ok(self.finish_compiled(rip, meta));
                     }
-                    let meta = CompiledRunMeta::from(&baseline);
-                    self.insert_ready(rip, baseline);
-                    self.stats.profile.eager_compiles =
-                        self.stats.profile.eager_compiles.saturating_add(1);
-                    return Ok(self.finish_compiled(rip, meta));
                 }
                 if eager || persist_eager {
                     // Eager compile: the entry is required NOW (there may be no
@@ -777,17 +857,27 @@ impl JitCpu {
                         }
                     } else {
                         self.thread.pending_promote_thr = thr;
-                        // Urgent lane: the caller blocks on this job's cell
-                        // immediately below (`wait_bg_ready`).
+                        // Urgent lane: this job is wanted *now*, so it is
+                        // queued ahead of every normal job. What it is **not**
+                        // is worth blocking on — see the no-stall rule
+                        // ([`NO_STALL_SKIP_CAP`]) and the identical decision in
+                        // the `Queued` arm of [`Self::step_one`].
+                        //
+                        // This is the site that made `crt_hello` slow, and it
+                        // is the *only* one that mattered: boot mode reaches it
+                        // for every fast-UCRT block (`select_hot_threshold`
+                        // returns `eager` for those), so a 433-instruction
+                        // hello-world queued and then slept on 105 compiles —
+                        // `stalled_ok=105`, 45-63 ms of a 47-68 ms emulation
+                        // phase, with `hit_ready=0`. Fixing the `Queued` arm
+                        // alone changed nothing on that fixture (0 iced
+                        // fall-throughs still), which is how this site was
+                        // found.
                         match self.enqueue_bg(rip, &kind, inv_gen, true) {
                             BgEnqueueOutcome::Queued(notify) => {
-                                if let Some(compiled) = self.wait_bg_ready(rip, &notify) {
-                                    let meta = CompiledRunMeta::from(&compiled);
-                                    return Ok(self.finish_compiled(rip, meta));
-                                }
+                                // Dead worker: nothing to wait for and nothing
+                                // will ever resolve the entry but us.
                                 if !self.shared.bg_alive.load(Ordering::Relaxed) {
-                                    // Deadline missed AND worker gone: inline
-                                    // compile replaces the Queued entry.
                                     self.stats.bg.inline_fallbacks =
                                         self.stats.bg.inline_fallbacks.saturating_add(1);
                                     if let Some(compiled) =
@@ -798,11 +888,30 @@ impl JitCpu {
                                         return Ok(self.finish_compiled(rip, meta));
                                     }
                                     self.mark_never(rip);
+                                } else if notify.note_skip() {
+                                    // Skip budget spent on a live pool: the job
+                                    // is lost rather than slow. Take the bounded
+                                    // wait, whose timeout inline-compiles.
+                                    if let Some(compiled) = self.wait_bg_ready(rip, &notify) {
+                                        let meta = CompiledRunMeta::from(&compiled);
+                                        return Ok(self.finish_compiled(rip, meta));
+                                    }
+                                    if !self.shared.bg_alive.load(Ordering::Relaxed) {
+                                        self.stats.bg.inline_fallbacks =
+                                            self.stats.bg.inline_fallbacks.saturating_add(1);
+                                        if let Some(compiled) =
+                                            self.try_compile_from_kind(rip, kind, inv_gen)
+                                        {
+                                            let meta = CompiledRunMeta::from(&compiled);
+                                            self.insert_ready(rip, compiled);
+                                            return Ok(self.finish_compiled(rip, meta));
+                                        }
+                                        self.mark_never(rip);
+                                    }
                                 }
-                                // Worker alive: timeout already attempted an
-                                // inline compile (installed Ready/Never) or the
-                                // entry resolved/vanished mid-wait — fall
-                                // through to iced this visit if not Ready.
+                                // Live pool, budget left: interpret this visit
+                                // and let the worker's install resolve the
+                                // entry for the next one.
                             }
                             BgEnqueueOutcome::Ready => {
                                 // Worker beat us: the cache already holds Ready.

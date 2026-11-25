@@ -30,7 +30,7 @@ use super::engine::{
 use super::fast_api::{FastApiKind, LargeFreeList};
 use super::lower::err::LowerError;
 use super::lower::{self, CHAIN_SLOTS, CompiledBlock, JitCtx, compile_block};
-use super::pipeline::resolve_thunk_va;
+use super::pipeline::{NO_STALL_SKIP_CAP, resolve_thunk_va};
 use super::profile::BgCompileProfile;
 use super::trampolines::match_micro_stub;
 use crate::exec::HookWindow;
@@ -66,6 +66,27 @@ pub(super) struct BgWaitCell {
     rx: Mutex<Option<mpsc::Receiver<()>>>,
     /// Visit threshold that governed this promotion (cooldown doubling base).
     thr: AtomicU32,
+    /// Visits this thread has spent interpreting this block while its compile
+    /// was in flight (see the dispatch path's **no-stall rule**,
+    /// [`JitCpu::step_one`](super::pipeline)).
+    ///
+    /// This is the liveness bound, and it is deliberately *work*, not elapsed
+    /// time. An earlier version bounded the skip by the job's age and it was
+    /// wrong for the exact case the rule exists for: at session init the
+    /// runtime queues one speculative compile per planted guest stub (124 of
+    /// them on `crt_hello`), so by the time the guest reaches stub #100 its
+    /// job is 40 ms old — an age bound reads that as "the job is lost" when it
+    /// is only *queued behind 99 peers*. Counting interpreted visits measures
+    /// the thing we actually want to cap: how much work we are willing to do
+    /// before insisting the pool answer.
+    ///
+    /// Every resolution of a queued job replaces or removes the entry
+    /// (`bg_install_ready` → `Ready`, `bg_install_never` → `Never`,
+    /// `bg_install_drop` → *absent*), so a healthy pool resolves long before
+    /// the cap. The cap only fires for a job the pool lost — a worker that
+    /// panicked mid-compile while its peers kept `bg_alive` true — and then
+    /// the wait path's timeout inline-compiles the block, resolving the entry.
+    skips: AtomicU32,
 }
 
 impl BgWaitCell {
@@ -75,7 +96,14 @@ impl BgWaitCell {
             tx: Mutex::new(Some(tx)),
             rx: Mutex::new(Some(rx)),
             thr: AtomicU32::new(thr),
+            skips: AtomicU32::new(0),
         })
+    }
+
+    /// Record one visit interpreted instead of waiting; `true` when the skip
+    /// budget is spent and the caller should take the bounded wait instead.
+    pub(super) fn note_skip(&self) -> bool {
+        self.skips.fetch_add(1, Ordering::Relaxed) >= NO_STALL_SKIP_CAP
     }
 
     /// Fire the one-shot completion token (worker install/fail/drop paths).

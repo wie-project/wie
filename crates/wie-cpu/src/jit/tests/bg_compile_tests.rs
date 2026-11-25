@@ -1,5 +1,6 @@
 use super::harness::alloc_code;
 use super::*;
+use crate::jit::pipeline::NO_STALL_SKIP_CAP;
 
 /// `mov eax, 0x2a; nop` then `ud2` — a 2-insn pure fallthrough block. The
 /// trailing `ud2` stops the linear decode (a zero-filled page would otherwise
@@ -219,13 +220,27 @@ fn hot_threshold_crossing_compiles_and_invalidates() {
     );
 }
 
-// --- Timeout → Cooldown (never inline while the worker lives) ---
+// --- No-stall rule → bounded wait as the last resort ---
 
-/// Simulated stalled worker: an alive `bg_alive` flag with nobody draining
-/// the queue. The wait must time out and then make progress via an inline
-/// compile on the guest thread instead of cooling down.
+/// Simulated stalled worker: an alive `bg_alive` flag with nobody draining the
+/// queue.
+///
+/// This test pins **both halves** of the no-stall contract, and the first half
+/// is the one that is easy to get wrong. It used to assert the opposite policy:
+/// a `Queued` entry with a live pool made the guest thread block, time out and
+/// inline-compile ("never inline while the worker lives" was the timeout
+/// behaviour). That policy cost `crt_hello` 45-63 ms of a 47-68 ms emulation
+/// phase across 105 compiles it did not need to wait for, because a queued
+/// compile finishes at the same wall-clock moment whether the guest sleeps or
+/// works — so blocking it is pure loss, not a trade.
+///
+/// Half 1: a live pool means "interpret this visit", not "block on it".
+/// Half 2: a job the pool *lost* must still resolve, which is what
+/// [`NO_STALL_SKIP_CAP`] bounds: past the cap the bounded wait runs, its timeout
+/// inline-compiles, and the entry resolves instead of the guest interpreting
+/// forever.
 #[test]
-fn bg_timeout_arms_cooldown_never_inline_compiles() {
+fn bg_no_stall_interprets_then_resolves_a_lost_job_past_the_skip_budget() {
     let mut cpu = JitCpu::open_x86_64();
     let base = alloc_code(&mut cpu, &MOV_EAX_2A);
     // Alive-but-stalled worker: no thread will ever resolve this entry.
@@ -236,24 +251,45 @@ fn bg_timeout_arms_cooldown_never_inline_compiles() {
         .pin()
         .insert(base, CacheEntry::Queued(Arc::clone(&cell)));
 
+    // --- Half 1: the guest must not block on a live pool -------------------
     cpu.write_rip(base).expect("rip");
     let (result, retired) = cpu.step_one().expect("step");
     assert!(matches!(result, StepResult::Continue));
-    // Timeout inline-compiles the block (2 insns) instead of running one iced step.
-    assert!(
-        retired >= 2,
-        "timeout must inline-compile, not run one iced insn"
+    assert_eq!(
+        retired, 1,
+        "a live pool must interpret the visit, not block and inline-compile"
     );
     assert!(
-        cpu.has_ready_at(base),
-        "timeout must install Ready via inline compile"
+        !cpu.has_ready_at(base),
+        "the entry stays Queued: nobody has resolved it"
     );
     let s = cpu.stats();
-    assert_eq!(
-        s.bg.inline_fallbacks, 1,
-        "inline fallback must fire on timeout"
+    assert_eq!(s.bg.waits, 0, "no stall while the pool is alive");
+    assert_eq!(s.bg.wait_us, 0, "and therefore no stalled microseconds");
+    assert_eq!(s.promo.timed_out, 0);
+    assert_eq!(s.bg.inline_fallbacks, 0);
+
+    // --- Half 2: the skip budget is finite --------------------------------
+    // Re-point at the same entry and interpret it once per skip. One visit was
+    // already spent above, and `skip_count >= NO_STALL_SKIP_CAP` is what makes
+    // the *next* call wait — so exactly `CAP - 1` more visits still interpret.
+    for _ in 0..(NO_STALL_SKIP_CAP - 1) {
+        cpu.write_rip(base).expect("rip");
+        let _ = cpu.step_one().expect("step");
+    }
+    assert!(
+        !cpu.has_ready_at(base),
+        "the budget is only spent by visits, never by time"
     );
-    assert_eq!(s.promo.timed_out, 1);
+    cpu.write_rip(base).expect("rip");
+    let _ = cpu.step_one().expect("step");
+    assert!(
+        cpu.has_ready_at(base),
+        "past the skip budget the bounded wait must inline-compile the block"
+    );
+    let s = cpu.stats();
+    assert_eq!(s.promo.timed_out, 1, "the bounded wait must have timed out");
+    assert_eq!(s.bg.inline_fallbacks, 1);
     assert_eq!(s.promo.cooled_down, 0, "timeout must not arm cooldown");
     assert_eq!(s.promo.stalled_ok, 0);
 

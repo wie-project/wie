@@ -83,6 +83,20 @@ fn new_cpu_with_code() -> JitCpu {
 /// Tolerates a step ending on the harness `ud2`, exactly as the rest of the
 /// suite does: the terminator is the intended stop, not a failure.
 fn run_to_stop(cpu: &mut JitCpu) -> RegFile {
+    // Compile + persist the entry block on the guest thread **before** the
+    // guest reaches it.
+    //
+    // The background lane is forced on in this file (production default), and
+    // its installs land asynchronously. With the no-stall dispatch policy
+    // (`JitCpu::step_one`) an interpreted step never waits for an install, so a
+    // walk over these 10 bytes queues one block per instruction and several
+    // installs are in flight at once — and the ledger row that survives the
+    // flush is then whichever overlapping block landed first, not necessarily
+    // `CODE_BASE`. That is install order, which none of these tests are about:
+    // they pin the *round trip* (a compiled block persisted, replayed in a
+    // different engine, producing the same guest state). Compiling the entry
+    // block here pins the order without weakening a single assertion.
+    cpu.precompile_at(CODE_BASE);
     cpu.write_rip(CODE_BASE).expect("rip");
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -331,6 +345,7 @@ fn finish_flushes_while_the_cache_is_still_referenced() {
 fn finish_is_idempotent_under_a_double_call() {
     let dir = scratch_dir("finish-twice");
     let (mut cpu, cache) = engine_with_cache(&dir);
+    cpu.precompile_at(CODE_BASE);
     let _ = run_to_stop(&mut cpu);
     await_ready(&cpu);
 
