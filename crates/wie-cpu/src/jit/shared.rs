@@ -1558,6 +1558,7 @@ impl JitShared {
                                     rejection_seq = n + 1,
                                     kind = e.kind(),
                                     error = %e,
+                                    culprit = %crate::jit::lower::err::refusal_culprit(&insns),
                                     "jit block lowering refused — block falls back to the \
                                      interpreter"
                                 );
@@ -1568,6 +1569,7 @@ impl JitShared {
                                     rejection_seq = n + 1,
                                     kind = e.kind(),
                                     error = %e,
+                                    culprit = %crate::jit::lower::err::refusal_culprit(&insns),
                                     "jit block lowering refused — block falls back to the \
                                      interpreter"
                                 );

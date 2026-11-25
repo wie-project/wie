@@ -1038,3 +1038,61 @@ fn movsd_is_two_instructions() {
     assert!(!needs_flags(&sse));
     assert!(admits(&sse));
 }
+
+/// The 48-byte SSE2 loop at `0x140001b96` in `real_exes/2048.exe`
+/// (`gameEnded`), instruction by instruction, must be admissible.
+///
+/// This is a real-game regression, not a synthetic case: the block was refused at
+/// lowering time with `unsupported-instruction`, which sent the whole loop back to
+/// the iced interpreter for the rest of the run (two refusals in one session, one
+/// per `gameEnded` call site). The bytes are copied from `objdump` output so the
+/// exact operand forms that real compiler output produces are the ones pinned —
+/// note that `movd` appears in **four** forms here (register↔xmm, memory→xmm, and a
+/// RIP-relative memory operand), and the gate cases nearby only covered the
+/// register forms.
+#[test]
+fn the_2048_gameended_simd_loop_is_fully_lowerable() {
+    // objdump -d --start-address=0x140001b96 --stop-address=0x140001bc6
+    let block: &[(&[u8], &str)] = &[
+        (&[0x66, 0x0F, 0x6E, 0x02], "movd xmm0,dword [rdx]"),
+        (
+            &[0x66, 0x0F, 0x6E, 0x1D, 0xD6, 0x38, 0x00, 0x00],
+            "movd xmm3,dword [rip+0x38d6]",
+        ),
+        (&[0x48, 0x83, 0xC2, 0x04], "add rdx,4"),
+        (&[0x66, 0x0F, 0x74, 0xC2], "pcmpeqb xmm0,xmm2"),
+        (&[0x66, 0x0F, 0xDB, 0xC3], "pand xmm0,xmm3"),
+        (&[0x66, 0x0F, 0x7E, 0xC0], "movd eax,xmm0"),
+        (&[0x66, 0x0F, 0x6E, 0xC0], "movd xmm0,eax"),
+        (&[0x66, 0x0F, 0xF6, 0xC1], "psadbw xmm0,xmm1"),
+        (&[0x66, 0x0F, 0x7E, 0xC0], "movd eax,xmm0"),
+        (&[0x41, 0x01, 0xC0], "add r8d,eax"),
+        (&[0x4C, 0x39, 0xDA], "cmp rdx,r11"),
+        (&[0x75, 0xD0], "jne 0x140001b96"),
+    ];
+    let mut refused: Vec<String> = Vec::new();
+    for (bytes, text) in block {
+        let instr = decode_ok(bytes);
+        // `jne` and `cmp` leave the block through the term form, not the emitter
+        // dispatch, so asking `EMITTED` about them would blame the wrong thing —
+        // the same false culprit `err::refusal_culprit` avoids by skipping them.
+        if term_of(&instr).is_some() {
+            continue;
+        }
+        if !admits(&instr) {
+            refused.push(format!("{text} — not admitted by the gate"));
+            continue;
+        }
+        // `admits` is the gate; an admitted mnemonic with no emitter is the drift
+        // `every_admitted_mnemonic_still_has_a_lowering` also guards against, so
+        // check the dispatch actually names it.
+        let name = format!("{:?}", instr.mnemonic());
+        if !EMITTED.contains(&name.as_str()) {
+            refused.push(format!("{text} — admitted but no emitter ({name})"));
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "the 2048 `gameEnded` loop must lower as one block; refused: {refused:#?}"
+    );
+}

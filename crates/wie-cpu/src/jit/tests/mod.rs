@@ -23,6 +23,7 @@ mod inv_gen_tests;
 mod locked_alu_tests;
 mod param_liveness_tests;
 mod pause_tests;
+mod real_guest_blocks;
 mod refill_tlb_tests;
 mod region_emit_tests;
 mod simd_parity_tests;

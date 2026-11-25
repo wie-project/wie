@@ -800,6 +800,13 @@ pub(super) fn sse_int_op(m: Mnemonic) -> Option<exec::SseIntOp> {
         Mnemonic::Packsswb => exec::SseIntOp::Packsswb,
         Mnemonic::Packssdw => exec::SseIntOp::Packssdw,
         Mnemonic::Packuswb => exec::SseIntOp::Packuswb,
+        // The ABI opcode and the `exec` table both had `Psadbw`; this table did
+        // not, so `insn.rs`'s dispatch arm asked for it, got `None`, and turned
+        // the whole block into `LowerError::Unsupported` — which reads in a guest
+        // log as "the JIT does not implement this instruction". Found by
+        // `tests::real_guest_blocks`: 2048's `gameEnded` scoring loop is exactly
+        // this instruction, and it fell back to the interpreter on every call.
+        Mnemonic::Psadbw => exec::SseIntOp::Psadbw,
         _ => return None,
     })
 }

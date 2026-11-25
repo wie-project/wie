@@ -836,7 +836,14 @@ pub(super) fn lower_insn(
         | Mnemonic::Packssdw
         | Mnemonic::Packuswb
         | Mnemonic::Psadbw => {
-            let op = sse_int_op(instr.mnemonic()).ok_or_else(LowerError::unsupported)?;
+            // Every mnemonic in the arm above has a `sse_int_op` row; a miss here
+            // is not "the JIT does not do this instruction", it is this table and
+            // that one having drifted apart (`Psadbw` was: 2048's `gameEnded`
+            // loop refused for months because of it). Report it as the internal
+            // invariant break it is — `Verifier` stays at WARN and names a bug,
+            // where `Unsupported` reads as a design limit.
+            let op = sse_int_op(instr.mnemonic())
+                .ok_or_else(|| LowerError::verifier("sse_int_op has no row for this mnemonic"))?;
             lower_sse_int_binop(bcx, instr, gpr, *rflags, mem, xmm, op)
         }
         // Packed shifts (imm8 or variable XMM count).

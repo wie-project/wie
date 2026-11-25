@@ -146,6 +146,31 @@ pub(super) fn refusal_reason(instr: &Instruction, err: &LowerError) -> String {
     }
 }
 
+/// Which instruction in a refused block the refusal most likely came from.
+///
+/// The block-level log line used to carry only `kind` and a sentence, so
+/// `kind="unsupported-instruction"` on a 48-byte block named nothing an operator
+/// could act on — the first question ("which instruction?") needed a debugger.
+/// A terminator is skipped: `jne` is not in the emitter dispatch by design, it
+/// goes through the term form, so naming it would be a false culprit.
+pub(crate) fn refusal_culprit(insns: &[crate::jit::block::DecodedInsn]) -> String {
+    if let Some(i) = insns
+        .iter()
+        .map(|i| &i.instr)
+        .find(|i| opclass::term_of(i).is_none() && !opclass::admits(i))
+    {
+        return refusal_reason(i, &LowerError::Unsupported);
+    }
+    // Every instruction is admitted, so the refusal is an operand form or a
+    // verifier failure: print the block's mnemonics so one run is enough to see
+    // which of them to test by hand.
+    let names: Vec<String> = insns
+        .iter()
+        .map(|i| format!("{:?}", i.instr.mnemonic()))
+        .collect();
+    format!("every instruction is admitted by the gate: {names:?}")
+}
+
 /// Record one refusal: per-variant counter, the mnemonic's histogram bucket,
 /// and a debug line naming the reason.
 ///

@@ -151,6 +151,30 @@ pub(super) fn alloc_code(cpu: &mut dyn CpuEngine, bytes: &[u8]) -> u64 {
     base
 }
 
+/// Map a fresh *multi-page* executable region and return its guest VA.
+///
+/// [`alloc_code_page`] for a fixture longer than a page, or one that reads a
+/// RIP-relative constant past the code: the whole slot is reserved in a single
+/// call, because a second `MEM_RESERVE` inside an existing reservation is
+/// "reserve over non-free page". `size` is rounded up to the 64 KiB granularity,
+/// so the region and the next [`alloc_code_page`] slot cannot overlap.
+pub(super) fn alloc_code_region(cpu: &mut dyn CpuEngine, size: usize) -> u64 {
+    assert!(
+        size as u64 <= FRESH_CODE_STRIDE,
+        "a region must fit in one slot ({FRESH_CODE_STRIDE:#x} bytes)"
+    );
+    let slot = NEXT_CODE_PAGE.fetch_add(1, Ordering::Relaxed);
+    let base = FRESH_CODE_BASE + slot * FRESH_CODE_STRIDE;
+    cpu.virtual_alloc(
+        base,
+        size,
+        MEM_RESERVE | MEM_COMMIT,
+        protect::PAGE_EXECUTE_READWRITE,
+    )
+    .expect("alloc code region");
+    base
+}
+
 /// Map one executable page at a caller-chosen `base`.
 ///
 /// For the call sites that keep a `const` base because their assertions and
