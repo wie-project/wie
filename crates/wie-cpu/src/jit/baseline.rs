@@ -28,6 +28,53 @@
 //! distribution. Keep the two apart: 374 µs is the cost of the work, 690/4 225 is
 //! how much of it a run does at boot.
 //!
+//! **374 µs is an uncontended, single-threaded figure**, and that qualifier is
+//! what makes it usable. `compile_us` and every `jit_compile_cost` bucket are
+//! timed around the compile call, which acquires the engine mutex inside it
+//! (`shared.rs`), so in a multi-worker run they contain lock *queueing* as well
+//! as work: measured on DOOM Retro over a fixed 40 s window with compile counts
+//! within 8 %, the per-compile mean is 849 µs (median of three runs) at
+//! `WIE_JIT_WORKERS=1` and 2 952 µs at 4 — a **3.48x inflation of the metric for
+//! the same work**. So this figure agrees with an uncontended measurement and
+//! disagrees with every `compile_us`-derived number by roughly that factor.
+//!
+//! The split (`jit_compile_lock`, `WIE_RUNTIME_PROFILE`) measures the two halves
+//! directly, **keyed per engine** (`JitShared::split_id`) because a process can
+//! hold more than one engine while `compile_us` is primary-engine only. On DOOM,
+//! one engine, one rep per arm: wait share **10.3 % at one worker** (55 µs per
+//! acquisition) against **74.8 % at four** (1 452 µs), while **hold is 486 µs at
+//! one worker and 488 µs at four** — i.e. a worker count changes how long a
+//! worker queues and not how long the compile itself runs. An earlier
+//! single sample showed 949 vs 506 µs hold and did not survive this pairing; the
+//! difference was host noise in one arm, not a property of the split.
+//!
+//! The `jit_compile_cost` inversion (32+ insn blocks appearing *cheaper* per
+//! block than 16) is the same effect, not a size model: ~20 compiles land in
+//! 32+ across a whole run, so they rarely overlap and escape the queueing tax,
+//! while bucket 16 has ~200 that do queue. In the one-worker arm the buckets
+//! are monotone — 188 / 332 / 493 / 857 / 1 694 / 1 924 µs at
+//! 1 / 2 / 4 / 8 / 16 / 32+ instructions — which is the uncontended model this
+//! file should be read against: **≈88 µs fixed + ≈100 µs per instruction** (an
+//! estimate from those bucket means, not a fit experiment).
+//!
+//! **Still open, and asserted on every run:** the per-engine row prints
+//! `subset_of_compile_us`, and on DOOM it reads `NO` — `wait + hold` comes out
+//! 2–14 % *larger* than that same engine's `bg_compile.compile_us`, with exactly
+//! one engine in the process. A single compile does not do this: the test
+//! `shared::lock_split_tests::one_compile_hold_is_inside_compile_us` drives one
+//! `bg_process_one` on a five-instruction block, single-threaded, and asserts
+//! `wait + hold <= compile_us` (it passes in dev and release, so the two spans
+//! do not structurally over-measure). The guest excess is therefore a **set
+//! difference** — some acquisitions belong to compiles the printed figure does
+//! not include — and the candidate, not yet verified, is the guest thread's
+//! inline compiles: the printed `compile_us` equals the sum of the
+//! `jit_compile_cost` buckets exactly, and those buckets are fed only by
+//! `bg_process_one`. Until that set difference is closed, the **wait share
+//! inside the split is the claim** (both halves from one clock, one run) and the
+//! sentence "N % of `compile_us` is queueing" must not be used. The one number
+//! that does not depend on which reading is right: a worker count moves the wait
+//! and leaves the hold alone.
+//!
 //! A hand emitter therefore has to beat **374 µs**, and 185 µs is the floor it
 //! must clear to be worth anything at all. The current implementation is a
 //! structural stub that satisfies the tier-0 wiring and

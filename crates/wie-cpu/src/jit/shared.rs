@@ -32,6 +32,7 @@ use super::lower::err::LowerError;
 use super::lower::{self, CHAIN_SLOTS, CompiledBlock, JitCtx, compile_block};
 use super::pipeline::{NO_STALL_SKIP_CAP, resolve_thunk_va};
 use super::profile::BgCompileProfile;
+use super::profile::{PROFILE_BUCKETS, TimeBuckets};
 use super::trampolines::match_micro_stub;
 use crate::exec::HookWindow;
 use crate::lock::{lock_unpoisoned, read_unpoisoned};
@@ -43,7 +44,7 @@ use ahash::HashMapExt;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 /// Per-entry completion token for background compiles.
@@ -277,6 +278,11 @@ impl BgPool {
 /// One instance per process, shared via Arc across all per-thread engines.
 #[doc(hidden)]
 pub struct JitShared {
+    /// Stable per-instance id, assigned at construction (`0` for the first
+    /// engine in the process). Diagnostic only: the engine-lock split keys its
+    /// tally by it so a multi-engine run stays attributable instead of being
+    /// summed into one number that no `compile_us` can be compared against.
+    pub(super) split_id: u64,
     /// Cranelift JIT module (behind Mutex: compiled blocks are serialized anyway).
     #[doc(hidden)]
     pub engine: Mutex<Option<JitEngine>>,
@@ -435,6 +441,213 @@ pub struct JitShared {
     pub(super) region_self_loop_force: AtomicBool,
 }
 
+// ---------------------------------------------------------------------------
+// Engine-lock wait vs hold, keyed per engine (`WIE_RUNTIME_PROFILE`).
+//
+// `compile_us` and every `jit_compile_cost` bucket are timed *around* the
+// compile call, which acquires `self.engine` inside it — so a worker that
+// queues behind others bills its queueing as compile work. Measured on DOOM
+// Retro over a fixed 40 s window (compile counts within 8 %): the per-compile
+// mean is 849 us (median of three) at `WIE_JIT_WORKERS=1` and 2 952 us at 4, a
+// 3.48x inflation of the metric for the same work, and the uncontended figure
+// agrees with the isolated single-threaded floor for a five-instruction block
+// (447 us, `pipeline::tests::compile_cost_floor_split`).
+//
+// `wait_us` is time waiting to acquire the engine mutex; `hold_us` is time
+// holding it. Each is recorded against the owning engine's `split_id`, because a
+// process can hold more than one `JitShared` (the `open_x86_64` fixtures do, and
+// any second VM does) while the profile's `compile_us` is primary-engine only —
+// summing engines would produce a total nothing can be compared against. The
+// report pairs every engine's `wait + hold` with that same engine's own
+// `bg_compile.compile_us`, so "these add up to more than the compile time they
+// are supposed to be part of" is visible per row instead of being hidden by the
+// sum.
+// ---------------------------------------------------------------------------
+
+/// Which `JitShared` instance was created first in this process.
+static NEXT_SPLIT_ID: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Default, Clone)]
+struct EngineSplit {
+    acquisitions: u64,
+    wait_us: u64,
+    hold_us: u64,
+    /// This engine's own `bg_compile.compile_us`, sampled at the last record.
+    compile_us: u64,
+    bucket_wait_us: [u64; PROFILE_BUCKETS],
+    bucket_hold_us: [u64; PROFILE_BUCKETS],
+    bucket_count: [u64; PROFILE_BUCKETS],
+}
+
+static LOCK_SPLIT: OnceLock<Mutex<HashMap<u64, EngineSplit>>> = OnceLock::new();
+
+fn lock_split_on() -> bool {
+    super::diag::profile_gate_on()
+}
+
+fn lock_split_tally() -> &'static Mutex<HashMap<u64, EngineSplit>> {
+    LOCK_SPLIT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record one acquisition of `engine`'s compile lock: `wait` before it was
+/// granted, `compile_us` as that engine's running bg-compile total.
+fn lock_split_note_wait(engine: u64, compile_us: u64, insns: u64, wait: Duration) {
+    if !lock_split_on() {
+        return;
+    }
+    let us = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX);
+    let i = TimeBuckets::bucket_for(insns);
+    if let Ok(mut g) = lock_split_tally().lock() {
+        let e = g.entry(engine).or_default();
+        e.acquisitions = e.acquisitions.saturating_add(1);
+        e.wait_us = e.wait_us.saturating_add(us);
+        e.compile_us = compile_us;
+        if let Some(b) = e.bucket_wait_us.get_mut(i) {
+            *b = b.saturating_add(us);
+        }
+        if let Some(c) = e.bucket_count.get_mut(i) {
+            *c = c.saturating_add(1);
+        }
+    }
+}
+
+/// Record one release of `engine`'s compile lock.
+fn lock_split_note_hold(engine: u64, compile_us: u64, insns: u64, hold: Duration) {
+    if !lock_split_on() {
+        return;
+    }
+    let us = u64::try_from(hold.as_micros()).unwrap_or(u64::MAX);
+    let i = TimeBuckets::bucket_for(insns);
+    if let Ok(mut g) = lock_split_tally().lock() {
+        let e = g.entry(engine).or_default();
+        e.hold_us = e.hold_us.saturating_add(us);
+        e.compile_us = compile_us;
+        if let Some(b) = e.bucket_hold_us.get_mut(i) {
+            *b = b.saturating_add(us);
+        }
+    }
+}
+
+/// RAII: charges the engine-lock hold from construction to drop, so every exit
+/// path from the compile — including the early `return None` — is accounted.
+struct LockHold<'a> {
+    shared: &'a JitShared,
+    insns: u64,
+    start: Instant,
+}
+
+impl<'a> LockHold<'a> {
+    fn new(shared: &'a JitShared, insns: u64) -> Self {
+        Self {
+            shared,
+            insns,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for LockHold<'_> {
+    fn drop(&mut self) {
+        let compile_us = self.shared.bg_compile.compile_us.load(Ordering::Relaxed);
+        lock_split_note_hold(
+            self.shared.split_id,
+            compile_us,
+            self.insns,
+            self.start.elapsed(),
+        );
+    }
+}
+
+/// One engine's row, plus the aggregate buckets, for rendering.
+#[derive(Default)]
+struct LockSplitSnapshot {
+    engines: Vec<(u64, u64, u64, u64, u64)>,
+    buckets: Vec<(u64, u64, u64, u64)>,
+}
+
+/// Render: one row per engine, then the aggregate per-bucket means.
+fn lock_split_lines(snap: &LockSplitSnapshot) -> Vec<String> {
+    if snap.engines.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for &(id, acq, wait, hold, compile_us) in &snap.engines {
+        let share = if wait.saturating_add(hold) == 0 {
+            0.0
+        } else {
+            #[expect(clippy::cast_precision_loss, reason = "report percentage only")]
+            {
+                100.0 * (wait as f64) / (wait.saturating_add(hold) as f64)
+            }
+        };
+        // The self-check: `wait + hold` is a subset of this engine's own
+        // `compile_us` (which also contains the pre-lock work), so anything
+        // else means the two are measuring different sets and the row must
+        // say so rather than be quietly compared.
+        let span = wait.saturating_add(hold);
+        let consistent = if compile_us == 0 {
+            "n/a"
+        } else if span <= compile_us {
+            "yes"
+        } else {
+            "NO"
+        };
+        out.push(format!(
+            "[wie] jit_compile_lock: engine {id}: acquisitions={acq} wait_us={wait} \
+             hold_us={hold} (per acquisition wait={} us hold={} us, wait_share={share:.1}%) \
+             engine_compile_us={compile_us} subset_of_compile_us={consistent}",
+            wait.checked_div(acq).unwrap_or(0),
+            hold.checked_div(acq).unwrap_or(0)
+        ));
+    }
+    let mut rows: Vec<String> = snap
+        .buckets
+        .iter()
+        .filter(|(_, _, _, count)| *count > 0)
+        .map(|(lo, bw, bh, count)| {
+            format!(
+                "[wie] jit_compile_lock:   insns>={lo}: wait={bw} us hold={bh} us n={count} \
+                 (mean wait={} hold={})",
+                bw.checked_div(*count).unwrap_or(0),
+                bh.checked_div(*count).unwrap_or(0)
+            )
+        })
+        .collect();
+    out.append(&mut rows);
+    out
+}
+
+/// The engine-lock split as report lines; empty when nothing was recorded.
+pub(super) fn lock_split_report_lines() -> Vec<String> {
+    if !lock_split_on() {
+        return Vec::new();
+    }
+    let Some(tally) = LOCK_SPLIT.get() else {
+        return Vec::new();
+    };
+    let Ok(g) = tally.lock() else {
+        return Vec::new();
+    };
+    let mut engines: Vec<(u64, u64, u64, u64, u64)> = g
+        .iter()
+        .map(|(id, e)| (*id, e.acquisitions, e.wait_us, e.hold_us, e.compile_us))
+        .collect();
+    engines.sort_unstable_by_key(|r| r.0);
+    let mut buckets = Vec::new();
+    for i in 0..PROFILE_BUCKETS {
+        let mut wait = 0_u64;
+        let mut hold = 0_u64;
+        let mut count = 0_u64;
+        for e in g.values() {
+            wait = wait.saturating_add(e.bucket_wait_us.get(i).copied().unwrap_or(0));
+            hold = hold.saturating_add(e.bucket_hold_us.get(i).copied().unwrap_or(0));
+            count = count.saturating_add(e.bucket_count.get(i).copied().unwrap_or(0));
+        }
+        buckets.push((1_u64 << i, wait, hold, count));
+    }
+    lock_split_lines(&LockSplitSnapshot { engines, buckets })
+}
+
 impl JitShared {
     /// Copy of installs at index `from..len` plus the new watermark (`len`).
     ///
@@ -473,6 +686,7 @@ impl JitShared {
             JitConfig::get().tier_budget(),
         );
         Self {
+            split_id: NEXT_SPLIT_ID.fetch_add(1, Ordering::Relaxed),
             engine: Mutex::new(has_engine),
             mem: RwLock::new(GuestMemory::new()),
             cache: new_concurrent_map(),
@@ -800,7 +1014,6 @@ impl JitShared {
     /// have been joined: a worker that records a blob after the flush will have
     /// it written by the next flush, never lost.
     pub fn finish_jit_caches(&self) {
-        let __t0 = std::time::Instant::now();
         self.code_cache().finish();
         // And the *ledger*, which used to be flushed only by `Drop for
         // PersistentJitCache` — a hook that, as the paragraph above documents,
@@ -809,10 +1022,7 @@ impl JitShared {
         // (`APPEND_FLUSH_CAP` records, `FLUSH_MIN_INTERVAL`) are out of reach, so
         // its warm boot was permanently cold while the RUNBOOK claimed
         // otherwise.
-        eprintln!("[probe] code_cache finish {:?}", __t0.elapsed());
-        let __t1 = std::time::Instant::now();
         self.persist.finish();
-        eprintln!("[probe] persist finish {:?}", __t1.elapsed());
     }
 
     /// Test-only: the code-cache handle itself, so a test can hold a second
@@ -1254,7 +1464,23 @@ impl JitShared {
                 let chain_on = JitConfig::get().chain_enabled();
                 // Tier decision: pre-compile, from block shape, memoised per VA.
                 let mut tier = self.decide_tier(rip, block::term_is_self_loop(term.as_ref(), rip));
+                // Engine-lock split (`WIE_RUNTIME_PROFILE`). Off by default and
+                // free when off: an `Option` that stays `None` costs a branch,
+                // and `_lock_hold` is never constructed. When on, the wait is
+                // measured on this side of the acquisition and the hold by an
+                // RAII timer, so the early `return None` below is charged too.
+                let split_insns = u64::try_from(insns.len()).unwrap_or(u64::MAX);
+                let lock_wait_start = lock_split_on().then(Instant::now);
                 let mut eng_guard = lock_unpoisoned(&self.engine);
+                let _lock_hold = lock_wait_start.map(|t| {
+                    lock_split_note_wait(
+                        self.split_id,
+                        self.bg_compile.compile_us.load(Ordering::Relaxed),
+                        split_insns,
+                        t.elapsed(),
+                    );
+                    LockHold::new(self, split_insns)
+                });
                 loop {
                     // Chain targets are resolved one VA at a time, from inside
                     // the lowering, against the live `chain_ids` table filtered
@@ -1878,5 +2104,142 @@ impl PerThreadJitState {
         if level != 0 {
             shared.persist.count_entry(rip, level);
         }
+    }
+}
+
+#[cfg(test)]
+mod lock_split_tests {
+    use super::{LockSplitSnapshot, lock_split_lines};
+    use crate::CpuEngine;
+    use std::sync::atomic::Ordering;
+
+    /// The pairing the guest report flags (`subset_of_compile_us=NO`): for a
+    /// single compile, `wait + hold` must be a subset of that engine's own
+    /// `compile_us`, because the timer in `bg_process_one` wraps the very call
+    /// that takes the lock. Single-threaded and one call, so neither cross-thread
+    /// overlap nor a second engine can move the answer.
+    ///
+    /// Goes through `bg_process_one` on purpose: `compile_us` is recorded there,
+    /// not in `compile_from_kind_shared`, so a direct call would pair my spans
+    /// against a zero.
+    #[test]
+    fn one_compile_hold_is_inside_compile_us() {
+        // SAFETY: this test owns its process (nextest runs one per test), so no
+        // other thread observes the environment and the gate is read once.
+        #[expect(unsafe_code, reason = "setting an env var is unsafe in edition 2024")]
+        unsafe {
+            std::env::set_var("WIE_RUNTIME_PROFILE", "1");
+        }
+        let mut cpu = super::super::JitCpu::open_x86_64();
+        const BASE: u64 = 0x10d0_0000;
+        cpu.virtual_alloc(
+            BASE,
+            0x1000,
+            crate::mem::MEM_RESERVE | crate::mem::MEM_COMMIT,
+            crate::mem::protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc floor page");
+        // mov rax,rbx ; mov rax,rcx ; add rax,rcx ; inc rax ; ret
+        cpu.mem_write(
+            BASE,
+            &[
+                0x48, 0x89, 0xd8, 0x48, 0x89, 0xc8, 0x48, 0x01, 0xc8, 0x48, 0xff, 0xc0, 0xc3,
+            ],
+        )
+        .expect("write code");
+        let kind = {
+            let mem = super::read_unpoisoned(&cpu.shared.mem);
+            super::block::decode_pure_gpr_block(&mem, None, BASE)
+        };
+        let inv_gen = cpu.shared.invalidate_gen.load(Ordering::Acquire);
+        cpu.shared.bg_queue_depth.fetch_add(1, Ordering::Relaxed);
+        cpu.shared.bg_process_one(super::BgJob {
+            rip: BASE,
+            kind,
+            inv_gen,
+        });
+
+        let compile_us = cpu.shared.bg_compile.compile_us.load(Ordering::Relaxed);
+        let (acq, wait, hold) = {
+            let g = super::lock_split_tally().lock().expect("tally");
+            let e = g.get(&cpu.shared.split_id).expect("engine row");
+            (e.acquisitions, e.wait_us, e.hold_us)
+        };
+        assert_eq!(acq, 1, "exactly one lock acquisition for one compile");
+        assert!(
+            compile_us > 0,
+            "the compile must land in `compile_us` at all"
+        );
+        // Each span is truncated to whole microseconds, so two truncated spans
+        // may exceed one by up to 2 us. Anything larger is a real inconsistency.
+        let span = wait.saturating_add(hold);
+        eprintln!(
+            "one compile: wait={wait} us hold={hold} us (span={span} us) \
+             compile_us={compile_us} us subset={}",
+            if span <= compile_us { "yes" } else { "NO" }
+        );
+        assert!(
+            span <= compile_us + 2,
+            "wait+hold={span} us exceeds compile_us={compile_us} us for one compile \
+             (wait={wait} hold={hold})"
+        );
+    }
+
+    /// The per-engine rows and the self-check that makes the numbers usable.
+    /// Shape from the measured DOOM pair: 4 workers spend most of the lock span
+    /// queueing, 1 worker spends most of it holding.
+    #[test]
+    fn wait_and_hold_are_reported_per_engine() {
+        let snap = LockSplitSnapshot {
+            engines: vec![
+                (0, 4_750, 7_077_843, 2_406_750, 9_600_000),
+                (1, 10, 1_000, 900, 500),
+            ],
+            buckets: vec![
+                (2, 5_000_000, 900_000, 1_800),
+                (4, 3_000_000, 600_000, 1_200),
+            ],
+        };
+        let lines = lock_split_lines(&snap);
+        assert_eq!(
+            lines.len(),
+            4,
+            "two engine rows plus two buckets: {lines:?}"
+        );
+        // Engine 0: queueing dominates, and it is a subset of its compile_us.
+        assert!(lines[0].contains("engine 0"), "{}", lines[0]);
+        assert!(lines[0].contains("wait_share=74.6%"), "{}", lines[0]);
+        assert!(
+            lines[0].contains("per acquisition wait=1490 us hold=506 us"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("engine_compile_us=9600000"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("subset_of_compile_us=yes"),
+            "{}",
+            lines[0]
+        );
+        // Engine 1 contradicts its own compile_us, and the row must say NO
+        // rather than let a reader compare numbers from different sets.
+        assert!(lines[1].contains("engine 1"), "{}", lines[1]);
+        assert!(lines[1].contains("subset_of_compile_us=NO"), "{}", lines[1]);
+        // Per-bucket means, so a bucket can be read as queueing or as work.
+        assert!(
+            lines[2].contains("mean wait=2777 hold=500"),
+            "{:?}",
+            lines[2]
+        );
+        assert!(
+            lines[3].contains("mean wait=2500 hold=500"),
+            "{:?}",
+            lines[3]
+        );
+        // Nothing recorded prints nothing, not a zero line.
+        assert!(lock_split_lines(&LockSplitSnapshot::default()).is_empty());
     }
 }

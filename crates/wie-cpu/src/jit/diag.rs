@@ -396,6 +396,7 @@ pub fn jit_profile_report_lines(s: &JitStats) -> Vec<String> {
     }
     out.extend(block_entry_report_lines(s));
     out.extend(eager_site_report_lines(s));
+    out.extend(super::shared::lock_split_report_lines());
     out
 }
 
