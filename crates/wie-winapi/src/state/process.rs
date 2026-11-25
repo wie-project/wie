@@ -402,6 +402,16 @@ pub struct OpenGuestFile {
     /// Set when buffered `bytes` changed since the last guest-I/O mirror, so
     /// `sync_slot_from_host` re-mirrors the arena only on writes, never on reads.
     pub guest_dirty: bool,
+
+    /// Set when buffered `bytes` changed since the last **host** write-back, so
+    /// `persist_open_file_to_host` skips the O(size) rewrite on a close that has
+    /// nothing to persist.
+    ///
+    /// Distinct from [`Self::guest_dirty`], which the mirror clears whenever it
+    /// syncs the arena — a read clears one and not the other, and reusing a
+    /// single flag would either lose a guest write-back or start rewriting
+    /// every read-only file again.
+    pub host_dirty: bool,
 }
 
 impl OpenGuestFile {

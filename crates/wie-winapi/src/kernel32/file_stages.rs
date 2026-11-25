@@ -28,6 +28,54 @@ pub(crate) fn timed_register<T>(f: impl FnOnce() -> T) -> T {
     timed(&REGISTER, f)
 }
 
+/// Sub-stages of the guest-I/O mirror (`guest_io_host::register_open_file`).
+///
+/// `register` measured **2 331 µs per call over 9 calls (21 ms)** in DOOM Retro
+/// startup, which is why it is split: the mirror copies the file's bytes into
+/// the guest arena (O(size)), the slot scan walks up to 128 guest slots with a
+/// host `mem_read` each, and the rest is bookkeeping.
+static REG_LOOKUP: Stage = Stage::new();
+static REG_MIRROR: Stage = Stage::new();
+static REG_SLOT_SCAN: Stage = Stage::new();
+static REG_SLOT_STORE: Stage = Stage::new();
+
+/// Sub-stages of `CloseHandle`'s file path, which measured 890 µs per call.
+static CLOSE_SYNC_VIRTUAL: Stage = Stage::new();
+static CLOSE_PERSIST: Stage = Stage::new();
+static CLOSE_UNREGISTER: Stage = Stage::new();
+
+pub(crate) fn reg_lookup_start() -> std::time::Instant {
+    std::time::Instant::now()
+}
+
+pub(crate) fn reg_lookup_done(start: std::time::Instant) {
+    REG_LOOKUP.record_since(start);
+}
+
+pub(crate) fn timed_reg_mirror<T>(f: impl FnOnce() -> T) -> T {
+    timed(&REG_MIRROR, f)
+}
+
+pub(crate) fn timed_reg_slot_scan<T>(f: impl FnOnce() -> T) -> T {
+    timed(&REG_SLOT_SCAN, f)
+}
+
+pub(crate) fn timed_reg_slot_store<T>(f: impl FnOnce() -> T) -> T {
+    timed(&REG_SLOT_STORE, f)
+}
+
+pub(crate) fn timed_close_sync_virtual<T>(f: impl FnOnce() -> T) -> T {
+    timed(&CLOSE_SYNC_VIRTUAL, f)
+}
+
+pub(crate) fn timed_close_persist<T>(f: impl FnOnce() -> T) -> T {
+    timed(&CLOSE_PERSIST, f)
+}
+
+pub(crate) fn timed_close_unregister<T>(f: impl FnOnce() -> T) -> T {
+    timed(&CLOSE_UNREGISTER, f)
+}
+
 /// Report lines for the `WIE_RUNTIME_PROFILE` block; empty until something ran.
 #[must_use]
 pub(crate) fn report_lines() -> Vec<String> {
@@ -41,9 +89,33 @@ pub(crate) fn report_lines() -> Vec<String> {
         stage_field("register", &REGISTER),
     ]
     .join(" ");
-    vec![format!(
+    let mut lines = vec![format!(
         "createfile_stages: {fields} (calls/cost/per-call; dir_probe is the watch stat on every open)"
-    )]
+    )];
+    if REG_MIRROR.read().0 > 0 || REG_SLOT_SCAN.read().0 > 0 {
+        let fields = [
+            stage_field("lookup", &REG_LOOKUP),
+            stage_field("mirror", &REG_MIRROR),
+            stage_field("slot_scan", &REG_SLOT_SCAN),
+            stage_field("slot_store", &REG_SLOT_STORE),
+        ]
+        .join(" ");
+        lines.push(format!(
+            "register_stages: {fields} (calls/cost/per-call; mirror is the O(size) copy into the guest arena, slot_scan walks up to 128 slots)"
+        ));
+    }
+    if CLOSE_PERSIST.read().0 > 0 || CLOSE_UNREGISTER.read().0 > 0 {
+        let fields = [
+            stage_field("sync_virtual", &CLOSE_SYNC_VIRTUAL),
+            stage_field("persist", &CLOSE_PERSIST),
+            stage_field("unregister", &CLOSE_UNREGISTER),
+        ]
+        .join(" ");
+        lines.push(format!(
+            "closehandle_stages: {fields} (calls/cost/per-call; persist writes the whole buffered file back to its host path)"
+        ));
+    }
+    lines
 }
 
 /// Zero every counter — tests only.

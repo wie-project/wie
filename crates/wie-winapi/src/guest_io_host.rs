@@ -23,17 +23,27 @@ pub fn register_open_file(
     state: &mut WinApiState,
     handle: u64,
 ) -> Result<()> {
+    let lookup_start = crate::kernel32::file_stages::reg_lookup_start();
     let Some(cfg) = state.file_io.guest_io.clone() else {
+        crate::kernel32::file_stages::reg_lookup_done(lookup_start);
         return Ok(());
     };
 
     let size = match state.file_io.open_files.get(&handle) {
-        Some(f) if f.streaming => return Ok(()), // large host streams stay on host path
+        Some(f) if f.streaming => {
+            // Large host streams stay on the host path.
+            crate::kernel32::file_stages::reg_lookup_done(lookup_start);
+            return Ok(());
+        }
         Some(f) => f.bytes.len(),
-        None => return Ok(()),
+        None => {
+            crate::kernel32::file_stages::reg_lookup_done(lookup_start);
+            return Ok(());
+        }
     };
 
     if size == 0 {
+        crate::kernel32::file_stages::reg_lookup_done(lookup_start);
         return Ok(());
     }
 
@@ -49,50 +59,55 @@ pub fn register_open_file(
     };
     if new_next > file_end {
         tracing::debug!(handle, "guest I/O file arena full; host path only");
+        crate::kernel32::file_stages::reg_lookup_done(lookup_start);
         return Ok(());
     }
+    crate::kernel32::file_stages::reg_lookup_done(lookup_start);
 
     if let Some(file) = state.file_io.open_files.get(&handle) {
-        engine
-            .mem_write(data_va, &file.bytes)
+        let bytes = &file.bytes;
+        crate::kernel32::file_stages::timed_reg_mirror(|| engine.mem_write(data_va, bytes))
             .context("failed to mirror file bytes into guest I/O arena")?;
     }
 
-    let mut slot_index: Option<usize> = None;
-    for i in 0..GUEST_IO_MAX_SLOTS {
-        let Some(slot_va) = slot_va_at(cfg.table_va, i) else {
-            continue;
-        };
-        let mut handle_bytes = [0_u8; 8];
-        engine.mem_read(slot_va, &mut handle_bytes)?;
-        let existing = u64::from_le_bytes(handle_bytes);
-        if existing == 0 || existing == handle {
-            slot_index = Some(i);
-            break;
-        }
-    }
+    let slot_index =
+        crate::kernel32::file_stages::timed_reg_slot_scan(|| -> Result<Option<usize>> {
+            for i in 0..GUEST_IO_MAX_SLOTS {
+                let Some(slot_va) = slot_va_at(cfg.table_va, i) else {
+                    continue;
+                };
+                let mut handle_bytes = [0_u8; 8];
+                engine.mem_read(slot_va, &mut handle_bytes)?;
+                let existing = u64::from_le_bytes(handle_bytes);
+                if existing == 0 || existing == handle {
+                    return Ok(Some(i));
+                }
+            }
+            Ok(None)
+        })?;
     let Some(i) = slot_index else {
         tracing::debug!(handle, "guest I/O handle table full; host path only");
         return Ok(());
     };
 
-    let Some(slot_va) = slot_va_at(cfg.table_va, i) else {
-        return Ok(());
-    };
-    write_u64(engine, slot_va, handle)?;
-    write_u64(engine, slot_va.wrapping_add(8), data_va)?;
-    write_u64(engine, slot_va.wrapping_add(16), size_u64)?;
-    write_u64(engine, slot_va.wrapping_add(24), 0)?;
-    write_u64(engine, slot_va.wrapping_add(32), GUEST_IO_FLAG_VALID)?;
+    crate::kernel32::file_stages::timed_reg_slot_store(|| -> Result<()> {
+        let Some(slot_va) = slot_va_at(cfg.table_va, i) else {
+            return Ok(());
+        };
+        write_u64(engine, slot_va, handle)?;
+        write_u64(engine, slot_va.wrapping_add(8), data_va)?;
+        write_u64(engine, slot_va.wrapping_add(16), size_u64)?;
+        write_u64(engine, slot_va.wrapping_add(24), 0)?;
+        write_u64(engine, slot_va.wrapping_add(32), GUEST_IO_FLAG_VALID)?;
 
-    state.file_io.guest_file_data_next = new_next;
+        state.file_io.guest_file_data_next = new_next;
 
-    if let Some(file) = state.file_io.open_files.get_mut(&handle) {
-        file.guest_data_va = Some(data_va);
-        file.guest_slot_index = Some(u32::try_from(i).unwrap_or(u32::MAX));
-    }
-
-    Ok(())
+        if let Some(file) = state.file_io.open_files.get_mut(&handle) {
+            file.guest_data_va = Some(data_va);
+            file.guest_slot_index = Some(u32::try_from(i).unwrap_or(u32::MAX));
+        }
+        Ok(())
+    })
 }
 
 /// Clears a handle from the guest table.
@@ -183,7 +198,9 @@ pub fn sync_host_cursor_from_guest(
     state: &mut WinApiState,
     handle: u64,
 ) -> Result<()> {
+    let lookup_start = crate::kernel32::file_stages::reg_lookup_start();
     let Some(cfg) = state.file_io.guest_io.clone() else {
+        crate::kernel32::file_stages::reg_lookup_done(lookup_start);
         return Ok(());
     };
     let Some(file) = state.file_io.open_files.get_mut(&handle) else {

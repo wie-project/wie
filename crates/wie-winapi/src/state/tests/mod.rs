@@ -730,6 +730,7 @@ mod menu;
 mod message_box;
 mod modal_frame;
 mod ole_auto;
+mod persist_dirty;
 mod phase2_stubs;
 mod phase3_stubs;
 mod registry;

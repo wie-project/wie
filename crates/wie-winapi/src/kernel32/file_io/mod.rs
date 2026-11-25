@@ -28,7 +28,7 @@ pub use vol::*;
 pub use watch::*;
 
 mod dir;
-mod open;
+pub(crate) mod open;
 mod path;
 mod rw;
 mod time;
@@ -242,11 +242,17 @@ pub fn handle_close_handle(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
         // Flush written bytes to virtual store and/or bottle host path.
         if let Some(open_file) = find_open_file(state, handle) {
             let path = open_file.path.clone();
-            sync_open_bytes_to_virtual(state, &path, handle);
+            crate::kernel32::file_stages::timed_close_sync_virtual(|| {
+                sync_open_bytes_to_virtual(state, &path, handle);
+            });
         }
-        persist_open_file_to_host(state, handle);
+        crate::kernel32::file_stages::timed_close_persist(|| {
+            persist_open_file_to_host(state, handle);
+        });
         // Best-effort teardown: failure to sync is not fatal.
-        let _ = crate::guest_io_host::unregister_open_file(engine, state, handle).ok();
+        let _ = crate::kernel32::file_stages::timed_close_unregister(|| {
+            crate::guest_io_host::unregister_open_file(engine, state, handle).ok()
+        });
         state.file_io.open_files.remove(&handle);
         // Drop any directory-watch anchor for this handle (stops the watcher).
         if let Some(watch) = state.kernel.sync.watch_handles.remove(&handle) {
@@ -461,8 +467,10 @@ pub fn handle_set_end_of_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
             if let Some(f) = find_open_file_mut(state, handle) {
                 let len = usize::try_from(cursor).unwrap_or(0);
                 f.bytes.resize(len, 0);
-                // Buffered bytes mutated: the guest-I/O arena mirror is stale.
+                // Buffered bytes mutated: the guest-I/O arena mirror is stale,
+                // and the host file no longer matches the buffered bytes.
                 f.guest_dirty = true;
+                f.host_dirty = true;
             }
             sync_open_bytes_to_virtual(state, &path, handle);
             persist_open_file_to_host(state, handle);

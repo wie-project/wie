@@ -50,6 +50,7 @@ fn register_buffered_file(
             guest_data_va: None,
             guest_slot_index: None,
             guest_dirty: false,
+            host_dirty: false,
         },
     );
     guest_io_host::register_open_file(engine, state, handle)?;

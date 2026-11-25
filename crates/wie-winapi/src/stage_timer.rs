@@ -35,6 +35,14 @@ impl Stage {
         let _time = self.ns.fetch_add(elapsed, Ordering::Relaxed);
     }
 
+    /// Record one completed call whose elapsed time the caller measured itself.
+    ///
+    /// For a stage that is a *region* of a handler (with early returns inside)
+    /// rather than a closure call.
+    pub(crate) fn record_since(&self, start: Instant) {
+        self.record(start);
+    }
+
     /// `(calls, ns)`.
     pub(crate) fn read(&self) -> (u64, u128) {
         (

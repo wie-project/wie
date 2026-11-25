@@ -409,6 +409,9 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
             // Buffered bytes mutated: the guest-I/O arena mirror is now stale.
             // `sync_slot_from_host` re-mirrors (and clears) this before any guest read.
             open_file.guest_dirty = true;
+            // ...and the host file no longer matches the buffered bytes, so the
+            // close-time write-back must actually run for this handle.
+            open_file.host_dirty = true;
 
             let write_len_u64 =
                 u64::try_from(write_len).context("WriteFile byte count does not fit u64")?;
@@ -579,8 +582,10 @@ pub fn handle_backup_write(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
             {
                 dst.copy_from_slice(&chunk);
             }
-            // Buffered bytes mutated: mark the guest-I/O arena mirror stale.
+            // Buffered bytes mutated: mark the guest-I/O arena mirror stale and
+            // the close-time host write-back required.
             file.guest_dirty = true;
+            file.host_dirty = true;
             file.cursor = file.cursor.saturating_add(to_write);
             if written_va != 0 {
                 write_guest_u32(engine, written_va, u32::try_from(to_write).unwrap_or(0))?;
