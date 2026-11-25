@@ -404,6 +404,11 @@ impl super::RuntimeSession {
         layout: RuntimeMemoryLayout,
         options: SessionOptions,
     ) -> Result<Self> {
+        // Faults are per run: a second guest in the same process must not inherit
+        // the first one's verdict. `run_until_stop` turns a would-be-successful exit
+        // that has a recorded worker fault into a `RuntimeStop`, so a stale record
+        // would fail an innocent run.
+        crate::mt_runtime::reset_worker_faults();
         let t_init = Instant::now();
         // Per-phase wall times, reported as one `init_phases:` line under
         // `WIE_RUNTIME_PROFILE` (the `debug!` alone is invisible in a normal

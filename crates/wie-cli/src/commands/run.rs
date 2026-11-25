@@ -576,9 +576,16 @@ pub fn run_until_yield(path: &Path, max_api: usize, bottle_root: Option<&Path>) 
     ) {
         std::process::exit(130);
     }
+    // A diagnostic stop is a failed run: the summary above already says why, and
+    // returning `Ok(())` here made `wie run --persistent` exit 0 on a guest whose
+    // worker died — the same false green the runtime now refuses to report. The
+    // guest's own exit code is not surfaced on this entry (it is a long-running
+    // app entry), so only the stop needs a status.
+    if let wie_runtime::EntryTraceTermination::RuntimeStop(detail) = &summary.termination {
+        bail!("run: guest stopped early: {detail}");
+    }
     Ok(())
 }
-
 /// Owns raw-mode entry so the terminal is restored on *every* exit path —
 /// normal return, `?` error propagation, and panics.
 ///

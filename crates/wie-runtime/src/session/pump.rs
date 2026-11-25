@@ -1342,6 +1342,42 @@ impl QuantumHooks for SessionPumpHooks<'_> {
     }
 }
 
+/// A run that reports success while a worker it created was killed by an invalid
+/// guest access must not read as success.
+///
+/// This lives at the run boundary rather than in each caller because that is where
+/// it was missed: `run_micro` masked the fault first, and `wie run --persistent` and
+/// `wie run --console` kept exiting 0 on the same binary — `--console` never even
+/// consulted the record, because it drives a session directly instead of going
+/// through `trace.rs`. One rule, applied where every entry point converges.
+///
+/// The shape it defends: a faulted worker marks the process dying, but the guest
+/// usually does not notice and reaches `ExitProcess(0)` anyway (`mt_contention
+/// 4 64 40` did so in 12 of 14 faulting runs), so the guest's own success line is
+/// **not** evidence that the run was clean. Only a would-be-successful exit is
+/// rewritten — a guest that exits non-zero keeps its code, because the fault must
+/// not mask the guest's verdict any more than the guest masks the fault.
+///
+/// `micro-exes/out/mt_worker_fault.exe` is the witness: its worker dies at
+/// `0x7e5700000` and the primary still calls `ExitProcess(0)`.
+fn mask_a_silent_worker_fault(termination: &mut EntryTraceTermination) {
+    if !matches!(termination, EntryTraceTermination::ExitProcess { code: 0 }) {
+        return;
+    }
+    let Some(detail) = crate::mt_runtime::worker_fault_first() else {
+        return;
+    };
+    tracing::error!(
+        target: "wiegui",
+        "a guest worker died on an invalid guest memory access ({detail}); \
+         the guest reached ExitProcess(0), which would have reported success"
+    );
+    *termination = EntryTraceTermination::RuntimeStop(format!(
+        "a guest worker died on an invalid guest memory access ({detail}); \
+         ExitProcess would have reported success"
+    ));
+}
+
 impl super::RuntimeSession {
     /// Runs the guest until it yields, terminates, reaches an unsupported API,
     /// or processes `max_api` additional API calls.
@@ -1756,6 +1792,8 @@ impl super::RuntimeSession {
         if matches!(termination, EntryTraceTermination::ExitProcess { .. }) {
             self.process.join_workers();
         }
+
+        mask_a_silent_worker_fault(&mut termination);
 
         match &termination {
             EntryTraceTermination::ExitProcess { code } => {
