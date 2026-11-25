@@ -1246,6 +1246,24 @@ fn engine_memory_generation_follows_protection_changes() {
 /// The reader uses the same shape the JIT stubs use: a `&GuestMemory` taken once
 /// and used without the outer lock. A read guard, or re-locking per access, would
 /// let the writer serialise against the reader and the test would pass vacuously.
+///
+/// # Two causes, counted apart
+///
+/// This used to be one assertion over one `Vec<String>`, which made a red run
+/// unreadable: the failures name two *different* defects and only one of them is
+/// tuning.
+///
+/// * `mem_read generation changed at 0x30000000 (concurrent map/free, N attempts)`
+///   — the bounded re-resolve ran out of attempts. Curable by the bound (raising it
+///   was tried and reverted; see `mem/rw.rs`), so this one is a tuning question.
+/// * `mem_read unmapped 0x30000000` with **no** generation change in the string —
+///   the refusal came from a resolve that saw the map unmoved. **No attempt count
+///   can cure that**; it is the incoherent-resolve shape (`ArenaSet`'s, see
+///   docs/architecture/continuation.md §2.5) and it is the one worth a slice.
+///
+/// Keeping them in separate buckets is what makes the failure fraction mean
+/// something: `generation changed` counts the bound's headroom, `generation
+/// unmoved` counts the real tear.
 #[test]
 fn a_peer_churn_of_another_region_never_faults_a_stable_access() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1278,7 +1296,9 @@ fn a_peer_churn_of_another_region_never_faults_a_stable_access() {
 
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let churn_cycles = std::sync::Arc::new(AtomicU64::new(0));
-    let mut faults: Vec<String> = Vec::new();
+    // Bucketed by cause, not lumped: see the doc comment above.
+    let mut exhausted: Vec<String> = Vec::new();
+    let mut unmoved: Vec<String> = Vec::new();
     let mut unmapped_still_faults = false;
 
     std::thread::scope(|scope| {
@@ -1314,12 +1334,20 @@ fn a_peer_churn_of_another_region_never_faults_a_stable_access() {
         // Let the churn thread reach its loop before the first access.
         std::thread::yield_now();
         let mut buf = [0_u8; 8];
+        let mut record = |kind: &str, e: &dyn std::fmt::Display| {
+            let text = format!("{kind}: {e}");
+            if text.contains("generation changed") {
+                exhausted.push(text);
+            } else {
+                unmoved.push(text);
+            }
+        };
         for _ in 0..ACCESSES {
             if let Err(e) = reader.read(STABLE, &mut buf) {
-                faults.push(format!("read: {e}"));
+                record("read", &e);
             }
             if let Err(e) = reader.write(STABLE + 8, &[0xA5; 8]) {
-                faults.push(format!("write: {e}"));
+                record("write", &e);
             }
         }
         // The retry must not swallow a real fault: a page the map was never told
@@ -1338,10 +1366,19 @@ fn a_peer_churn_of_another_region_never_faults_a_stable_access() {
         "an unmapped page must still fault; the re-resolve must not become a silent success"
     );
     assert!(
-        faults.is_empty(),
-        "{} of {} accesses faulted on a stable page under churn; first: {:?}",
-        faults.len(),
+        exhausted.is_empty(),
+        "{} of {} accesses exhausted the re-resolve bound (generation churn, the \
+         tuning class — raise the bound or widen the window); first: {:?}",
+        exhausted.len(),
         ACCESSES * 2,
-        faults.first()
+        exhausted.first()
+    );
+    assert!(
+        unmoved.is_empty(),
+        "{} of {} accesses faulted with NO generation change — the incoherent-resolve \
+         class, which no attempt count can cure; first: {:?}",
+        unmoved.len(),
+        ACCESSES * 2,
+        unmoved.first()
     );
 }

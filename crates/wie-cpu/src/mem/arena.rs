@@ -12,6 +12,8 @@
     unsafe_code // libc mmap/munmap + forming page slices from raw mapping
 )]
 
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
 use super::backend::{PAGE_SIZE, PAGE_SIZE_USIZE};
 use super::vad::align_down;
 use crate::CpuError;
@@ -130,31 +132,6 @@ impl MmapArena {
         self.guest_base == address && self.size == size
     }
 
-    /// Host base of the 4 KiB page containing `page_key` if covered.
-    pub(super) fn page_data_ptr(&self, pkey: u64) -> Option<*mut u8> {
-        let va = pkey.saturating_mul(PAGE_SIZE);
-        // Page must start inside the arena (whole page is inside if start is
-        // and arena is page-aligned, which map always guarantees).
-        if self.host.is_null() || !self.contains_va(va) {
-            return None;
-        }
-        let off = va.saturating_sub(self.guest_base);
-        let off_usize = usize::try_from(off).ok()?;
-        if off_usize >= self.size {
-            return None;
-        }
-        // SAFETY: offset is within the live mmap of `size` bytes.
-        Some(unsafe { self.host.add(off_usize) })
-    }
-
-    /// Shared slice of the whole arena.
-    ///
-    /// # Safety
-    /// Caller holds a shared borrow of the arena for the slice lifetime.
-    pub(super) unsafe fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.host, self.size) }
-    }
-
     /// Mutable slice of the whole arena.
     ///
     /// # Safety
@@ -168,33 +145,95 @@ impl MmapArena {
 #[derive(Default)]
 pub(super) struct ArenaSet {
     /// Sorted ascending by `guest_base`.
-    arenas: Vec<MmapArena>,
+    ///
+    /// Behind an [`RwLock`] for the same reason as `PageMap::runs`: the data path
+    /// reaches this set through `&self` while VM mutators rebuild it through
+    /// `&mut self` on another thread. A plain `Vec` is then read while it is being
+    /// reallocated — the reader walks freed memory and reports a page that is
+    /// still mapped as `unmapped`, with no generation change to retry on. That is
+    /// the measured class in
+    /// `mem::tests::a_peer_churn_of_another_region_never_faults_a_stable_access`:
+    /// 5 of 20 runs, every one of them `generation unmoved` and none from the
+    /// re-resolve bound.
+    arenas: RwLock<Vec<MmapArena>>,
+}
+
+/// What the data path needs from the arena containing a VA, copied out under the
+/// read guard so the borrow cannot outlive it.
+#[derive(Clone, Copy)]
+pub(super) struct ArenaView {
+    guest_base: u64,
+    size: usize,
+    host: *mut u8,
+}
+
+impl ArenaView {
+    #[must_use]
+    pub(super) fn guest_base(self) -> u64 {
+        self.guest_base
+    }
+
+    #[must_use]
+    pub(super) fn size(self) -> usize {
+        self.size
+    }
+
+    #[must_use]
+    pub(super) fn host(self) -> *mut u8 {
+        self.host
+    }
+
+    #[must_use]
+    pub(super) fn guest_end(self) -> u64 {
+        self.guest_base
+            .saturating_add(u64::try_from(self.size).unwrap_or(u64::MAX))
+    }
 }
 
 impl std::fmt::Debug for ArenaSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArenaSet")
-            .field("arenas", &self.arenas.len())
+            .field("arenas", &self.read_arenas().len())
             .finish_non_exhaustive()
     }
 }
 
 impl ArenaSet {
     #[must_use]
+    /// Number of live arenas. Test-only: the production surface asks whether a
+    /// VA resolves, never how many mappings back it.
+    #[cfg(test)]
+    pub(super) fn arena_count(&self) -> usize {
+        self.read_arenas().len()
+    }
+
     pub(super) fn new() -> Self {
-        Self { arenas: Vec::new() }
+        Self {
+            arenas: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Read guard, recovering from poison: a panic elsewhere must not turn every
+    /// later guest access into a fault (the map is the guest's memory, not the
+    /// panicking thread's).
+    fn read_arenas(&self) -> RwLockReadGuard<'_, Vec<MmapArena>> {
+        self.arenas.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write_arenas(&mut self) -> RwLockWriteGuard<'_, Vec<MmapArena>> {
+        self.arenas.write().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Binary-search index of the arena that may contain `va` (largest base ≤ va).
-    fn candidate_index(&self, va: u64) -> Option<usize> {
-        if self.arenas.is_empty() {
+    fn candidate_index(arenas: &[MmapArena], va: u64) -> Option<usize> {
+        if arenas.is_empty() {
             return None;
         }
         let mut lo = 0_usize;
-        let mut hi = self.arenas.len();
+        let mut hi = arenas.len();
         while lo < hi {
             let mid = lo.saturating_add(hi.saturating_sub(lo) >> 1);
-            let Some(a) = self.arenas.get(mid) else {
+            let Some(a) = arenas.get(mid) else {
                 break;
             };
             if a.guest_base() <= va {
@@ -206,52 +245,56 @@ impl ArenaSet {
         lo.checked_sub(1)
     }
 
-    /// Arena containing `va`.
-    pub(super) fn find_va(&self, va: u64) -> Option<&MmapArena> {
-        let i = self.candidate_index(va)?;
-        let a = self.arenas.get(i)?;
-        if a.contains_va(va) { Some(a) } else { None }
-    }
-
-    pub(super) fn find_va_mut(&mut self, va: u64) -> Option<&mut MmapArena> {
-        let i = self.candidate_index(va)?;
-        let a = self.arenas.get_mut(i)?;
-        if a.contains_va(va) { Some(a) } else { None }
+    /// Arena containing `va`, copied out under the read guard.
+    pub(super) fn find_va(&self, va: u64) -> Option<ArenaView> {
+        let arenas = self.read_arenas();
+        let i = Self::candidate_index(&arenas, va)?;
+        let a = arenas.get(i)?;
+        if !a.contains_va(va) {
+            return None;
+        }
+        Some(ArenaView {
+            guest_base: a.guest_base(),
+            size: a.size(),
+            host: a.host(),
+        })
     }
 
     /// Whether any arena overlaps `[address, end)`.
     pub(super) fn any_overlap(&self, address: u64, end: u64) -> bool {
-        for a in &self.arenas {
-            if a.guest_base() < end && a.guest_end() > address {
-                return true;
-            }
-        }
-        false
+        let arenas = self.read_arenas();
+        arenas
+            .iter()
+            .any(|a| a.guest_base() < end && a.guest_end() > address)
     }
 
     /// Exact-range arena for rematch, if present.
-    pub(super) fn find_exact(&mut self, address: u64, size: usize) -> Option<&mut MmapArena> {
-        self.arenas
-            .iter_mut()
-            .find(|a| a.is_exact_range(address, size))
+    pub(super) fn has_exact(&self, address: u64, size: usize) -> bool {
+        let arenas = self.read_arenas();
+        arenas.iter().any(|a| a.is_exact_range(address, size))
     }
 
     /// Insert a newly mapped arena (no overlap). Keeps sort order.
     pub(super) fn insert(&mut self, arena: MmapArena) -> Result<(), CpuError> {
         let base = arena.guest_base();
         let end = arena.guest_end();
-        if self.any_overlap(base, end) {
+        let mut arenas = self.write_arenas();
+        // The overlap test is inlined rather than `self.any_overlap`: an `RwLock`
+        // is not reentrant, so taking the read guard here would deadlock.
+        if arenas
+            .iter()
+            .any(|a| a.guest_base() < end && a.guest_end() > base)
+        {
             return Err(CpuError::Message(format!(
                 "mmap arena overlap at {base:#x}+{:#x}",
                 arena.size()
             )));
         }
-        let pos = self
-            .arenas
+        let pos = arenas
             .iter()
             .position(|a| a.guest_base() > base)
-            .unwrap_or(self.arenas.len());
-        self.arenas.insert(pos, arena);
+            .unwrap_or(arenas.len());
+        arenas.insert(pos, arena);
         Ok(())
     }
 
@@ -267,8 +310,13 @@ impl ArenaSet {
     /// Not keyed by an arena: the frame must lie inside one, so the arena is
     /// looked up from `frame_guest`.
     pub(super) fn frame_host_prot(&self, frame_guest: u64) -> Option<i32> {
-        let arena = self.find_va(frame_guest)?;
-        arena.host_prot.get(&frame_guest).copied()
+        let arenas = self.read_arenas();
+        let i = Self::candidate_index(&arenas, frame_guest)?;
+        let a = arenas.get(i)?;
+        if !a.contains_va(frame_guest) {
+            return None;
+        }
+        a.host_prot.get(&frame_guest).copied()
     }
 
     /// True when every host frame in `[address, end)` is at the `mmap` default
@@ -301,10 +349,7 @@ impl ArenaSet {
             };
             let off = va.saturating_sub(arena_base);
             let frame_guest = arena_base.saturating_add(align_down(off, host_ps));
-            let Some(arena) = self.find_va(frame_guest) else {
-                return false;
-            };
-            if arena.host_prot.get(&frame_guest).copied().unwrap_or(rw) != rw {
+            if self.frame_host_prot(frame_guest).unwrap_or(rw) != rw {
                 return false;
             }
             let next = frame_guest.saturating_add(host_ps);
@@ -319,7 +364,15 @@ impl ArenaSet {
     /// Host base of page `page_key` if mapped in some arena.
     pub(super) fn page_data_ptr(&self, pkey: u64) -> Option<*mut u8> {
         let va = pkey.saturating_mul(PAGE_SIZE);
-        self.find_va(va)?.page_data_ptr(pkey)
+        let arena = self.find_va(va)?;
+        if arena.host().is_null() {
+            return None;
+        }
+        let off = usize::try_from(va.saturating_sub(arena.guest_base())).ok()?;
+        if off >= arena.size() {
+            return None;
+        }
+        Some(unsafe { arena.host().add(off) })
     }
 
     /// Host base of the arena that contains `va` (arena start), if any.
@@ -375,8 +428,11 @@ impl ArenaSet {
             let arena = self
                 .find_va(va)
                 .ok_or_else(|| CpuError::Message(format!("mem_read unmapped {va:#x}")))?;
-            // SAFETY: exclusive to read path; shared borrow of arena set.
-            let slice = unsafe { arena.as_slice() };
+            // SAFETY: the mapping outlives the copy below — a `munmap` needs the
+            // writer's exclusive borrow, which the generation re-check in
+            // `read_attempt` guards (`DataAccess::Retry`), and the length is the
+            // arena's own size.
+            let slice = unsafe { std::slice::from_raw_parts(arena.host(), arena.size()) };
             let arena_off = usize::try_from(va.saturating_sub(arena.guest_base()))
                 .map_err(|_| CpuError::Message("arena offset does not fit usize".into()))?;
             let room_in_page = PAGE_SIZE_USIZE.saturating_sub(page_off);
@@ -409,12 +465,13 @@ impl ArenaSet {
         while offset < bytes.len() {
             let page_off = usize::try_from(va & (PAGE_SIZE - 1))
                 .map_err(|_| CpuError::Message("page offset does not fit usize".into()))?;
-            // Split borrow: locate index then mutably borrow.
-            let i = self
-                .candidate_index(va)
+            // Split borrow: locate index then mutably borrow. The guard is
+            // re-taken per page (not held across the call) so a long write never
+            // blocks the data path of another guest thread for its whole span.
+            let mut arenas = self.write_arenas();
+            let i = Self::candidate_index(&arenas, va)
                 .ok_or_else(|| CpuError::Message(format!("mem_write unmapped {va:#x}")))?;
-            let arena = self
-                .arenas
+            let arena = arenas
                 .get_mut(i)
                 .ok_or_else(|| CpuError::Message(format!("mem_write unmapped {va:#x}")))?;
             if !arena.contains_va(va) {
@@ -465,7 +522,7 @@ impl ArenaSet {
         if address == end {
             return Ok(());
         }
-        if self.find_exact(address, size).is_some() {
+        if self.has_exact(address, size) {
             return Ok(());
         }
 
@@ -514,13 +571,10 @@ impl ArenaSet {
     ///
     /// No-op if no exact match (partial ranges must not munmap sibling pages).
     pub(super) fn unmap_exact(&mut self, address: u64, size: usize) {
-        if let Some(i) = self
-            .arenas
-            .iter()
-            .position(|a| a.is_exact_range(address, size))
-        {
+        let mut arenas = self.write_arenas();
+        if let Some(i) = arenas.iter().position(|a| a.is_exact_range(address, size)) {
             // Drop runs munmap via `MmapArena::Drop`.
-            self.arenas.remove(i);
+            arenas.remove(i);
         }
     }
 
@@ -538,9 +592,18 @@ impl ArenaSet {
         if size == 0 {
             return Ok(());
         }
-        let Some(arena) = self.find_va_mut(address) else {
+        // One guard for the whole body: it reads the arena bounds and writes the
+        // per-frame `host_prot` cache, and holding it keeps the two consistent.
+        let mut arenas = self.write_arenas();
+        let Some(i) = Self::candidate_index(&arenas, address) else {
             return Ok(());
         };
+        let Some(arena) = arenas.get_mut(i) else {
+            return Ok(());
+        };
+        if !arena.contains_va(address) {
+            return Ok(());
+        }
         let end = address.saturating_add(u64::try_from(size).unwrap_or(0));
         if end > arena.guest_end() || address < arena.guest_base() {
             // Span not fully inside this arena — leave host mapping alone.
@@ -720,7 +783,7 @@ mod tests {
         set.map_range(addr, end, 0x1000, 7).expect("map");
         set.write(0x20_0010, &[0x22, 0x33]).expect("write");
         set.map_range(addr, end, 0x1000, 5).expect("remap");
-        assert_eq!(set.arenas.len(), 1);
+        assert_eq!(set.arena_count(), 1);
         let mut buf = [0_u8; 2];
         set.read(0x20_0010, &mut buf).expect("read");
         assert_eq!(buf, [0x22, 0x33]);
