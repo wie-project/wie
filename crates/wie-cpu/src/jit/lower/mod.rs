@@ -1406,8 +1406,29 @@ pub(super) fn compile_block(
             None => empty_chain_refs(),
         };
 
-        // Live GPRs: only load what the block uses. Self-loops keep a full set in
-        // block params so back-edges pass SSA values (no JitCtx store/reload).
+        // Live GPRs: only load what the block uses — **including self-loops**.
+        //
+        // A self-loop used to widen this to all 16 (`live_eff.fill(true)`) so the
+        // back edge could pass every guest register as an SSA block param. That
+        // widened set is what the entry and the exit pay for, and it is dead
+        // weight in both places:
+        //
+        // * the entry loads the register from `JitCtx` and spills it to the
+        //   header's home slot for a value the body never reads, and
+        // * the shared exit block stored it back to `JitCtx` unchanged.
+        //
+        // `analyze_live_gprs` is the right set even for a loop-carried value: it
+        // marks a register if the block mentions it at all (any operand, any
+        // memory base/index, any `opclass::implicit_gprs` row), so every read —
+        // including one that consumes the previous iteration's write — is a
+        // param. A register that is only *written* needs no incoming value, and
+        // `gpr_dirty` already forces its store at every exit (see
+        // `gpr_store_predicate`).
+        //
+        // Measured on the three SDL2 blocks (docs/architecture/prologue-epilogue-census.md):
+        // `0x1800d8fb0` reads 5 of 16 GPRs, `0x1800a1c60` 3, `0x1800cef0b` 3, and
+        // the 35/16/13 never-read params were 33/39/40 of each block's 54/52/49
+        // entry+exit parameter-materialisation instructions.
         let mut live_eff = live;
         if has_fast_call {
             live_eff[0] = true; // RAX result
@@ -1415,9 +1436,6 @@ pub(super) fn compile_block(
             live_eff[2] = true; // RDX
             live_eff[8] = true; // R8
             live_eff[9] = true; // R9
-        }
-        if self_loop {
-            live_eff.fill(true);
         }
 
         let mut gpr_vals = [bcx.ins().iconst(types::I64, 0); 16];
@@ -1807,13 +1825,21 @@ pub(super) fn compile_block(
         };
         for i in 0..16 {
             // Fault/exit path: store only GPRs that were actually loaded/defined.
-            // Self-loops load the full set at entry (`live_eff.fill(true)`).
             //
-            // Important: do **not** force all-16 stores for dual_super. Non-loop
-            // super blocks only load live-ins; unloaded slots are SSA `iconst 0`.
-            // Writing them back zeroed callee-saved regs (R12–R15, RBX, RBP, …)
-            // and corrupted guests such as 7za (`i` → null base → VA 0x1000).
-            if exit_gpr_loaded[i] || self_loop {
+            // `exit_gpr_loaded` is a superset of "defined": a register the body
+            // writes is named by the instruction that writes it, so
+            // `analyze_live_gprs` marks it live, so the entry loaded it. That is
+            // the invariant that makes the loaded mask sufficient here — every
+            // writer is also a mention. It is *not* true that every loaded
+            // register is written, which is why the mask is the loaded one and
+            // not a dirty one.
+            //
+            // A self-loop is no exception (it used to be `|| self_loop`): its
+            // header carries only the live-in params, so the remaining slots are
+            // SSA `iconst 0` and storing them would zero live guest registers —
+            // the 7za failure this comment used to describe for `dual_super`
+            // (`i` → null base → VA 0x1000). Both arms are the same guard now.
+            if exit_gpr_loaded[i] {
                 let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
                 let p = bcx.ins().iadd_imm(ctx_ptr, off);
                 bcx.ins().store(flags, exit_gpr[i], p, 0);
@@ -2399,7 +2425,6 @@ pub(super) fn lower_shift_lazy(
     };
     Ok(())
 }
-
 
 #[cfg(test)]
 mod mem_fault_race_tests;

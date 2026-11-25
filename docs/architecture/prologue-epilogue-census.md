@@ -217,3 +217,137 @@ iteration) rather than the 337:
 Both are larger in the *executed* denominator than anything inside the 337, and
 neither is a flag or epilogue change. Quoting 45 per iteration keeps pointing
 slices at cold layout; quoting 26.2 points at block-parameter materialisation.
+
+---
+
+# 8. The parameter-materialisation breakdown (what §7's item 1 was made of)
+
+The 49–60 is the block-parameter round trip: the entry loads a guest register out
+of `JitCtx`, spills it to the header's home slot, and the shared exit block
+stores it back. §8 asks *why each value is there*, from the CLIF (which register
+each param is, whether the loop reads it, whether the loop writes it) and the
+emitted AArch64 (which of those values actually gets a load, a spill, a store and
+a reload). Instrumented on one release build of this tree, one bounded DOOM
+Retro run per side (`WIE_JIT_MAP` + `WIE_JIT_DUMP_IR` + `WIE_JIT_REGION=0`),
+blocks disassembled with `lldb -p`.
+
+## Counting rule
+
+Per guest register slot (16 GPRs + rflags), four instruction kinds belong to the
+parameter round trip: one entry load, one entry spill (if regalloc gives it a
+home), one exit store, one exit reload (if the stored value has to be re-read out
+of its home). The whole **unit** also contains frame setup, probe-hoist
+arithmetic, the pack, RIP, trip flush and teardown; those are §2's rows 1, 5, 6,
+7, 13, 14 and are excluded here.
+
+A "read" is a use of the header param in the loop body that is not merely a
+`store` of that value straight back into `JitCtx`. That distinction is what makes
+the census honest: the *cold* writeback arms (inv-gen stale, chain-depth cap,
+dispatcher return) touch every param, and counting those as reads would hide the
+whole class.
+
+| | #1 0x1800d8fb0 | #2 0x1800a1c60 | #3 0x1800cef0b |
+|---|---|---|---|
+| entry loads (16 GPR + rflags) | 17 | 17 | 17 |
+| entry spills | 15 | 14 | 14 |
+| entry register shuffles | 1 | 1 | 0 |
+| exit stores (16 GPR + rflags) | 17 | 17 | 17 |
+| exit reloads | 4 | 3 | 1 |
+| **total** | **54** | **52** | **49** |
+
+Weighted by leaf share (0.563 / 0.285 / 0.152): **52.6** — the 49–60 range, at
+its low end.
+
+## The five classes
+
+| class | why the value is there | #1 | #2 | #3 | weighted | share |
+|---|---|---|---|---|---|---|
+| **(i)** | the loop never reads it — dead on entry | 33 | 39 | 40 | **35.8** | **68 %** |
+| (ii) | the loop reads it, but it is never written, so `JitCtx` already holds it | 2 | 0 | 1 | 1.3 | 2 % |
+| (iii) | spill → reload of the same slot with nothing writing it in between | 4 | 0 | 0 | 2.3 | 4 % |
+| (iv) | the flag word, carried only to satisfy the param list | 1 | 1 | 1 | 1.0 | 2 % |
+| (v) | read **and** written in the loop — genuinely loop-carried | 14 | 12 | 7 | 12.4 | 24 % |
+
+Class (i) decomposes into two sub-shapes, and only the first is free to delete:
+
+* **never read, never written** — 10 / 12 / 13 registers (`rbx, rsp, rbp, rsi,
+  rdi, r11..r15` on #1; `rcx, rbx, rsp, rbp, rsi, rdi, r10..r15` on #2;
+  `rcx, rdx, rbx, rsp, rbp, rsi, rdi, r9, r10, r12..r15` on #3). Their load,
+  spill, store and reload are all removable.
+* **written but never read** — `rcx` on #1, `rax` on #2. The load is dead; the
+  *store* is required, and `gpr_dirty` keeps it even when the register is not a
+  param.
+
+What the loop actually reads: #1 five GPRs (`rax, rdx, r8, r9, r10`), #2 three
+(`rdx, r8, r9`), #3 three (`rax, r8, r11`). Sixteen guest registers are carried
+for five, three and three.
+
+(iv) is one instruction per block — the `rflags` load. It is *not* the flag
+construction (that is the pack, §2 row 6, which is per-exit and stays): the word
+is loaded once so `FlagState` keeps the bits it does not track. The flag lane is
+untouched here.
+
+## 9. What was removed
+
+The widening itself, and the store that existed only to match it. Two hunks, both
+in `lower/mod.rs`:
+
+* `live_eff.fill(true)` for self-loops is gone: the header carries the live-in set
+  (`analyze_live_gprs` + the fast-call extras + the stack-guard base), which is
+  the same set every non-self-loop block already used.
+* the shared exit block's store predicate loses `|| self_loop`, so a self-loop
+  writes back exactly what it loaded, like every other block.
+
+**Why the live set is enough for a loop-carried value.** `analyze_live_gprs` marks
+a register when the block *mentions* it — any operand, any memory base or index,
+any `opclass::implicit_gprs` row — so a register read before it is written in the
+pass is always a param, which is exactly the loop-carried case. A register written
+before it is read does not need the incoming value.
+
+**Why the loaded mask is enough for the store.** Every writer mentions its
+destination, so "written ⇒ mentioned ⇒ live ⇒ loaded at entry". The mask is
+therefore a superset of "defined", and a register that is neither is not stored —
+which is what keeps the `iconst 0` placeholder from zeroing live guest
+registers (the 7za failure the old comment described for `dual_super`).
+
+**No pessimism trade.** For `self_loop == false` both edits are no-ops: `live_eff`
+was already `live`, and the removed disjunct was false. No block gains a param,
+so no block that took the leaf path can need a frame now. The three blocks above
+are the only ones this changes in the measured set.
+
+## 10. Acceptance, in the census's own unit
+
+Same instrument, same three blocks, one release build per side, one bounded run
+each. "Param traffic" is §8's total; "latch" is the back edge's frame stores +
+loads (the phi materialisation §12.3 described); "hot path" is the executed
+loop-body instruction count (head ∩ co-reachable-to-the-back-edge).
+
+| | #1 before → after | #2 before → after | #3 before → after | weighted |
+|---|---|---|---|---|
+| entry | 112 → 94 | 109 → 81 | 88 → 54 | |
+| param traffic per entry+exit | **54 → 19** | **52 → 10** | **49 → 9** | **52.6 → 14.9** |
+| — of which per iteration (÷ 7.546) | 7.2 → 2.5 | 6.9 → 1.3 | 6.5 → 1.2 | **7.0 → 2.0** |
+| latch frame traffic per iteration | 16 → 6 | 15 → 3 | 15 → 2 | **15.6 → 4.5** |
+| hot path per iteration | 238 → 228 | 211 → 109 | 333 → 288 | **244.7 → 203.3** |
+| unit | 787 → 608 | 668 → 528 | 757 → 613 | |
+
+**−37.7 host instructions per entry+exit (−72 %), −5.0 of that per iteration at
+hops/entries = 7.546, and −11.1 more per iteration in the latch.** The executed
+loop body itself fell by 41.4 weighted instructions per iteration (−16.9 %): with
+four to seven live params instead of seventeen, the body no longer spills guest
+values to the frame at all (#2: 21 frame stores → 0, 44 frame reloads → 15).
+
+That the drop is *only* materialisation is checked at the CLIF level: between the
+before and after dump of the same block, every guest-visible opcode count is
+identical (`icmp` 50/50 on #2, `band`, `bxor`, `ishl`, `ushr`, `isub`,
+`select`, `imul`, `call`, `uextend`, `bor`, `brif` and `return` all unchanged)
+and only `iconst`, `iadd`, `load` and `store` move — the ctx-address
+materialisation and the parameter loads/stores. #1: 905 → 785 CLIF ops; #3: 986 →
+830, same signature.
+
+Residual, deliberately not taken: a register that is written and never read still
+gets an entry load, because `analyze_live_gprs` cannot tell reads from writes
+(`rcx` on #1, `rax` on #2 — one instruction each per entry). Splitting the
+analysis would remove it; it is not worth a new liveness notion for two
+instructions.
+

@@ -21,6 +21,7 @@ mod implicit_operands;
 mod interp_edge_tests;
 mod inv_gen_tests;
 mod locked_alu_tests;
+mod param_liveness_tests;
 mod pause_tests;
 mod refill_tlb_tests;
 mod region_emit_tests;
