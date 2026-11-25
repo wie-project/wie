@@ -719,6 +719,18 @@ fn from_disk(b: DiskBlob) -> Option<PersistedCode> {
 /// indistinguishable from the outside.
 #[derive(Debug, Default)]
 pub(crate) struct CodeCacheCounters {
+    /// Times the cache was **consulted** with a guest VA — one per
+    /// [`CodeCache::probe`], whatever came back: a hit, a refusal, or no blob at
+    /// all.
+    ///
+    /// This exists because `restored=0 refused=0` was unreadable: without a
+    /// consultation count, "nobody asked the cache" and "the cache was asked and
+    /// had nothing to offer" print the same two zeros, and the difference
+    /// decides whether a startup cost is a miss or a missing call site. A
+    /// counter that only fired on a hit would reproduce exactly that blindness,
+    /// so this one is incremented *before* the table lookup and cannot be
+    /// short-circuited by a miss, an unattached cache, or a `?`.
+    pub probes: AtomicU64,
     pub restored: AtomicU64,
     pub compiled: AtomicU64,
     /// Blobs successfully replayed (one per `restored`; kept separate so the
@@ -763,6 +775,7 @@ impl CodeCacheCounters {
     pub(crate) fn snapshot(&self) -> CodeCacheCounts {
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
         CodeCacheCounts {
+            probes: g(&self.probes),
             restored: g(&self.restored),
             compiled: g(&self.compiled),
             blocks_replayed: g(&self.blocks_replayed),
@@ -798,6 +811,10 @@ impl CodeCacheCounters {
 /// Plain snapshot of [`CodeCacheCounters`]; every field documented there.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CodeCacheCounts {
+    /// Consultations; see [`CodeCacheCounters::probes`]. Always `>= restored +
+    /// refused() + missing + restore_deferred`, and equal to that sum once the
+    /// deferred case is included: every probe resolves into exactly one of them.
+    pub probes: u64,
     pub restored: u64,
     pub compiled: u64,
     pub blocks_replayed: u64,
@@ -1141,6 +1158,10 @@ impl CodeCache {
     /// on the no-per-process-value invariant). A generation gate here would only
     /// have re-imposed the chainability filter that invariant removed.
     pub(crate) fn probe(&self, mem: &GuestMemory, va: u64) -> Option<PersistedCode> {
+        // First statement on purpose: a consultation that finds no table, no
+        // blob or unreadable bytes is still a consultation, and that is the
+        // distinction `restored=0 refused=0` could not express.
+        self.counters.probes.fetch_add(1, Ordering::Relaxed);
         let p = self.table()?.pin().get(&va).cloned()?;
         let hash = super::super::cache_persist::hash_guest_range(mem, va, p.guest_end)?;
         (hash == p.bytes_hash).then_some(p)
@@ -1387,9 +1408,10 @@ impl CodeCache {
         let c = &self.counters;
         let g = |a: &AtomicU64| a.load(Ordering::Relaxed);
         Some(format!(
-            "restored={} compiled={} unpersistable={} \
+            "probes={} restored={} compiled={} unpersistable={} \
              refused(bytes={} file={} target={} malformed={}) missing={} \
              replayed={}",
+            g(&c.probes),
             g(&c.restored),
             g(&c.compiled),
             g(&c.skipped_unpersistable),
@@ -1471,4 +1493,90 @@ fn write_file(path: &Path, body: &FileCodeBody) -> Result<(), String> {
         f.write_all(&payload).map_err(|e| e.to_string())?;
     }
     fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod probe_counter_tests {
+    use super::*;
+
+    fn mem_with(va: u64, bytes: &[u8]) -> GuestMemory {
+        let mut mem = GuestMemory::new();
+        let base = va & !0xFFF;
+        let size = usize::try_from((bytes.len() as u64) + 0x2000).expect("size") & !0xFFF;
+        mem.map(base, size, crate::RwxPerms::ALL).expect("map");
+        mem.write(va, bytes).expect("write");
+        mem
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("wie-cc-probe-counter-{tag}-{}", std::process::id()));
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) | Err(_) => {}
+        }
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    /// The counter must fire on **misses**, not only on hits.
+    ///
+    /// The reading that started this slice was `restored=0 refused=0`, which is
+    /// what *both* "nobody consulted the cache" and "it was consulted and had
+    /// nothing to offer" print. A counter incremented on a hit — or on a
+    /// `record` — would pass a hit-shaped test and stay blind to the case that
+    /// mattered, so this asserts the miss, and the assertion is that `probes`
+    /// exceeds every resolved outcome put together.
+    #[test]
+    fn a_miss_is_a_consultation() {
+        let cache = CodeCache::enabled_in(scratch("miss"), JitConfig::get().opt_level());
+        let mem = mem_with(0x4000_0000, &[0x90, 0x90, 0x90, 0x90]);
+
+        // No PE attached, no blob, nothing to find: a miss, twice.
+        assert!(cache.probe(&mem, 0x4000_0000).is_none());
+        assert_eq!(cache.counters().snapshot().probes, 1, "a miss is a probe");
+        assert!(cache.probe(&mem, 0x4000_0000).is_none());
+        assert_eq!(cache.counters().snapshot().probes, 2, "every miss counts");
+
+        let after = cache.counters().snapshot();
+        assert_eq!(after.restored, 0, "nothing was restored, and that is fine");
+        assert_eq!(after.refused(), 0, "and nothing was refused");
+        assert!(
+            after.probes > after.restored.saturating_add(after.refused()),
+            "consulted with nothing to offer must be visible: {after:?}"
+        );
+    }
+
+    /// Writing a blob is not a consultation; asking for one is.
+    #[test]
+    fn a_written_blob_is_not_a_consultation_but_the_lookup_is() {
+        let cache = CodeCache::enabled_in(scratch("record"), JitConfig::get().opt_level());
+        let mem = mem_with(0x4000_0000, &[0x90, 0x90, 0x90, 0x90]);
+        let va = 0x4000_0000;
+        let bytes_hash =
+            super::super::super::cache_persist::hash_guest_range(&mem, va, va + 4).expect("hash");
+        cache.record(PersistedCode {
+            va,
+            guest_end: va + 4,
+            bytes_hash,
+            insn_count: 2,
+            inv_gen: 0,
+            compiled_at_opt: OptTier::Base,
+            align: 16,
+            code: vec![0x1f, 0x20, 0x03, 0xd5],
+            relocs: Vec::new(),
+            chain_relocs: Vec::new(),
+        });
+        assert_eq!(
+            cache.counters().snapshot().probes,
+            0,
+            "recording is a write, not a consultation"
+        );
+        drop(cache.probe(&mem, va));
+        assert_eq!(
+            cache.counters().snapshot().probes,
+            1,
+            "and the lookup counts even when no table is attached"
+        );
+    }
 }

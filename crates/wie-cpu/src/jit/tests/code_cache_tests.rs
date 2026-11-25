@@ -696,6 +696,12 @@ fn a_corpus_of_mixed_generation_blobs_restores_and_chains_completely() {
         let (mut cpu, cache) = engine_with_chain(&dir);
         // Re-open the file written above and add B under a bumped generation.
         cpu.shared.invalidate_gen.fetch_add(7, Ordering::Release);
+        // `precompile_at` now offers the block to the code cache before
+        // compiling it, so the blob `seed_chain` wrote for B at generation 0
+        // would be *replayed* here and this arm would record nothing new. The
+        // arm's whole point is a file holding two generations, so drop the older
+        // blob first: this is the "nothing to replay, therefore compile" case.
+        cache.invalidate_range(CHAIN_BASE + 0x08, CHAIN_BASE + 0x0a);
         cpu.precompile_at(CHAIN_BASE + 0x08);
         let c = counts(&cache);
         assert_eq!(c.skipped_unpersistable, 0, "got {c:?}");
@@ -1011,6 +1017,7 @@ fn a_recorded_chain_target_is_re_resolved_against_the_live_run() {
 
     // `A`'s own bytes are untouched, so its blob still restores — and its edge
     // must be re-resolved to the block that exists now.
+    let restored_before_a = counts_via_shared(&cpu).restored;
     {
         let mem = cpu.shared.mem.read().expect("mem lock");
         assert!(
@@ -1021,7 +1028,10 @@ fn a_recorded_chain_target_is_re_resolved_against_the_live_run() {
     }
     cpu.resync_chain_table(cpu.shared.cache_epoch.load(Ordering::Relaxed));
     let c = counts_via_shared(&cpu);
-    assert_eq!(c.restored, 1, "A replays: {c:?}");
+    // A delta, not an absolute: `precompile_at(RESOLVE_B)` above now offers B to
+    // the code cache and B's blob is replayed there, so the absolute count also
+    // carries that restore. What this test is about is A's.
+    assert_eq!(c.restored, restored_before_a + 1, "A replays: {c:?}");
     assert_eq!(c.refused(), 0, "the live successor is enough: {c:?}");
 
     cpu.run_until_stop(RESOLVE_A, RESOLVE_STOP, 0, 100_000, 0, 0)

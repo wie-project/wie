@@ -221,6 +221,31 @@ impl CpuEngine for JitCpu {
         {
             return;
         }
+        // Offer the code cache the block before compiling it.
+        //
+        // This is the one block whose compile is entirely on the critical path —
+        // it runs before the guest does, so nothing overlaps it — and it was the
+        // one block the cache was never asked about: `try_compile` does not probe
+        // (`pipeline.rs`), and the dispatcher cannot make up for it, because the
+        // `insert_ready` below installs this address `Ready` and a `Ready` entry
+        // never reaches the miss path where `restore_or_probe` lives. Measured on
+        // `crt_hello`: the blob for the entry VA was written on run 1 and restored
+        // never, while a second block in the same guest restored from run 2 on —
+        // so the zero was a missing call site, not an empty cache.
+        //
+        // `restore_or_probe` installs what it replays, so returning here is the
+        // whole action: the guest's first dispatch finds it `Ready`. It is also
+        // the ledger's probe (a metadata hit returns `restored == false`), which
+        // costs one byte-hash of this block and changes nothing the compile path
+        // does.
+        {
+            let mem = read_unpoisoned(&self.shared.mem);
+            if let Some(probe) = self.shared.restore_or_probe(&mem, address)
+                && probe.restored
+            {
+                return;
+            }
+        }
         if let Some(compiled) = self.try_compile(address) {
             self.insert_ready(address, compiled);
         } else {
