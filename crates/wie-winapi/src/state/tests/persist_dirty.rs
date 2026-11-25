@@ -37,9 +37,7 @@ fn handle_for(
             cursor: 0,
             host_path: Some(Arc::from(host_path)),
             streaming: false,
-            guest_data_va: None,
             guest_slot_index: None,
-            guest_dirty: false,
             host_dirty: dirty,
         },
     );

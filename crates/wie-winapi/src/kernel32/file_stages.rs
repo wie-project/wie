@@ -32,14 +32,15 @@ pub(crate) fn timed_register<T>(f: impl FnOnce() -> T) -> T {
     timed(&REGISTER, f)
 }
 
-/// Sub-stages of the guest-I/O mirror (`guest_io_host::register_open_file`).
+/// Sub-stages of guest-handle registration (`guest_io_host::register_open_file`).
 ///
 /// `register` measured **2 331 µs per call over 9 calls (21 ms)** in DOOM Retro
-/// startup, which is why it is split: the mirror copies the file's bytes into
-/// the guest arena (O(size)), the slot scan walks up to 128 guest slots with a
-/// host `mem_read` each, and the rest is bookkeeping.
+/// startup, which is why it is split. The `mirror` stage that split found is
+/// **gone**: it timed the O(size) copy of the file's bytes into the guest
+/// arena, at 5 199.62 µs per call over 3 calls, and the copy served nothing
+/// (see `register_open_file`). What is left is the slot scan — up to 128 guest
+/// slots with a host `mem_read` each — plus the slot store and the lookup.
 static REG_LOOKUP: Stage = Stage::new();
-static REG_MIRROR: Stage = Stage::new();
 static REG_SLOT_SCAN: Stage = Stage::new();
 static REG_SLOT_STORE: Stage = Stage::new();
 
@@ -54,10 +55,6 @@ pub(crate) fn reg_lookup_start() -> std::time::Instant {
 
 pub(crate) fn reg_lookup_done(start: std::time::Instant) {
     REG_LOOKUP.record_since(start);
-}
-
-pub(crate) fn timed_reg_mirror<T>(f: impl FnOnce() -> T) -> T {
-    timed(&REG_MIRROR, f)
 }
 
 pub(crate) fn timed_reg_slot_scan<T>(f: impl FnOnce() -> T) -> T {
@@ -78,24 +75,30 @@ pub(crate) fn timed_close_persist<T>(f: impl FnOnce() -> T) -> T {
 
 /// `ReadFile` calls split by whether the handle owns a guest-I/O arena mirror.
 ///
-/// The mirror costs an O(size) copy (usually dominated by first-touch page
-/// faults in guest memory) at open time; it only pays for itself if reads of
-/// that file are then served *inside* the guest, without crossing the host
-/// boundary. `mirrored` counts the reads that crossed anyway — for those the
-/// copy bought nothing.
+/// A handle with a slot publishes length and cursor so the guest can answer
+/// seeks and sizes without a host stop. `slotted` counts the `ReadFile` calls
+/// that reached this handler anyway; since the byte mirror was removed there is
+/// no read fast path left, so that split now measures how often the slot bought
+/// the call nothing — which is every read.
 static READFILE_CALLS: Counter = Counter::new();
-static READFILE_MIRRORED: Counter = Counter::new();
-static READFILE_MIRRORED_BYTES: Counter = Counter::new();
-static READFILE_HOST_BYTES: Counter = Counter::new();
+static READFILE_SLOTTED: Counter = Counter::new();
+static READFILE_SLOTTED_BYTES: Counter = Counter::new();
+static READFILE_UNSLOTTED_BYTES: Counter = Counter::new();
 
 /// Record one `ReadFile` handler call.
-pub(crate) fn count_read(mirrored: bool, bytes: u64) {
+///
+/// `slotted` means the handle holds a guest I/O handle-table slot. It used to
+/// mean "owns a mirror of its bytes in the arena"; there is no mirror any more,
+/// so what the split now answers is whether the published length/cursor bought
+/// the call anything — and the answer for every read is no, because the read
+/// itself always comes here.
+pub(crate) fn count_read(slotted: bool, bytes: u64) {
     READFILE_CALLS.add(1);
-    if mirrored {
-        READFILE_MIRRORED.add(1);
-        READFILE_MIRRORED_BYTES.add(bytes);
+    if slotted {
+        READFILE_SLOTTED.add(1);
+        READFILE_SLOTTED_BYTES.add(bytes);
     } else {
-        READFILE_HOST_BYTES.add(bytes);
+        READFILE_UNSLOTTED_BYTES.add(bytes);
     }
 }
 
@@ -119,16 +122,15 @@ pub(crate) fn report_lines() -> Vec<String> {
     let mut lines = vec![format!(
         "createfile_stages: {fields} (calls/cost/per-call; dir_probe is the watch stat on every open)"
     )];
-    if REG_MIRROR.read().0 > 0 || REG_SLOT_SCAN.read().0 > 0 {
+    if REG_SLOT_SCAN.read().0 > 0 {
         let fields = [
             stage_field("lookup", &REG_LOOKUP),
-            stage_field("mirror", &REG_MIRROR),
             stage_field("slot_scan", &REG_SLOT_SCAN),
             stage_field("slot_store", &REG_SLOT_STORE),
         ]
         .join(" ");
         lines.push(format!(
-            "register_stages: {fields} (calls/cost/per-call; mirror is the O(size) copy into the guest arena, slot_scan walks up to 128 slots)"
+            "register_stages: {fields} (calls/cost/per-call; no byte mirror any more, slot_scan walks up to 128 slots)"
         ));
     }
     if CLOSE_PERSIST.read().0 > 0 || CLOSE_UNREGISTER.read().0 > 0 {
@@ -144,17 +146,17 @@ pub(crate) fn report_lines() -> Vec<String> {
     }
     if READFILE_CALLS.get() > 0 {
         let calls = READFILE_CALLS.get();
-        let mirrored = READFILE_MIRRORED.get();
+        let slotted = READFILE_SLOTTED.get();
         let pct = if calls == 0 {
             0.0
         } else {
-            100.0 * f64::from(u32::try_from(mirrored).unwrap_or(u32::MAX))
+            100.0 * f64::from(u32::try_from(slotted).unwrap_or(u32::MAX))
                 / f64::from(u32::try_from(calls).unwrap_or(u32::MAX))
         };
         lines.push(format!(
-            "readfile_mirror: calls={calls} mirrored={mirrored} ({pct:.1}%) mirrored_bytes={} host_bytes={} (a read of a handle that owns a guest-I/O arena mirror still crossed the host boundary; the O(size) copy bought nothing for that call)",
-            READFILE_MIRRORED_BYTES.get(),
-            READFILE_HOST_BYTES.get()
+            "readfile_slots: calls={calls} slotted={slotted} ({pct:.1}%) slotted_bytes={} unslotted_bytes={} (a read of a handle that holds a guest handle-table slot still crossed the host boundary; the slot carries length and cursor only — the byte mirror was removed, so every read is served by the host)",
+            READFILE_SLOTTED_BYTES.get(),
+            READFILE_UNSLOTTED_BYTES.get()
         ));
     }
     lines

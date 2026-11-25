@@ -98,36 +98,32 @@ impl GuestIoConfig {
 /// Override with `WIE_GUEST_IO=0` to force host path (debug A/B).
 #[derive(Clone, Copy, Debug)]
 struct GuestIoRewire {
-    read: bool,
     seek: bool,
     size: bool,
 }
 
 fn guest_io_rewire() -> GuestIoRewire {
-    // Wall/CPU default: host ReadFile; guest Seek+GetFileSize.
-    // WIE_GUEST_IO=all|1 → guest Read too (hybrid large→host); =0 → all host.
+    // Wall/CPU default: host ReadFile; guest Seek+GetFileSize. `=0` → all host.
+    //
+    // There is no read option any more. The guest ReadFile helper served reads
+    // out of the file-data arena, and the arena only ever held a copy made at
+    // open time; that copy was measured to serve nothing (3 640 of 3 872 calls —
+    // 94.0 % — were on handles with no mirror, and the 232 that owned one still
+    // crossed to the host, with byte-identical counters under
+    // `WIE_GUEST_IO=all`), so
+    // the copy and this arm were removed together — either alone would have
+    // left a read path that serves stale bytes. `all`/`1` are still accepted
+    // and now mean exactly what the default means.
     match crate::knobs::guest_io_mode() {
         Some(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => GuestIoRewire {
-            read: false,
             seek: false,
             size: false,
         },
-        Some(v) if matches!(v.as_str(), "1" | "true" | "on" | "yes" | "all") => GuestIoRewire {
-            read: true,
+        Some(_) => GuestIoRewire {
             seek: true,
             size: true,
         },
-        Some(v) => {
-            let lower = v.to_ascii_lowercase();
-            let parts: Vec<_> = lower.split([',', '+']).map(str::trim).collect();
-            GuestIoRewire {
-                read: parts.iter().any(|p| *p == "read" || *p == "readfile"),
-                seek: parts.iter().any(|p| *p == "seek" || *p == "setfilepointer"),
-                size: parts.iter().any(|p| *p == "size" || *p == "getfilesize"),
-            }
-        }
         None => GuestIoRewire {
-            read: false,
             seek: true,
             size: true,
         },
@@ -164,9 +160,6 @@ pub(crate) fn install_guest_io(
         fake_api_base: layout.fake_api.base,
         fake_api_size: layout.fake_api.size,
     };
-    if rewire.read {
-        api.rewire("KERNEL32.dll", "ReadFile", config.readfile_impl_va)?;
-    }
     if rewire.seek {
         api.rewire("KERNEL32.dll", "SetFilePointer", config.setfp_impl_va)?;
     }

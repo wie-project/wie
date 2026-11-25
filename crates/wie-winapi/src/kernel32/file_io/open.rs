@@ -325,9 +325,7 @@ pub(crate) fn allocate_open_file_ex(
             cursor: 0,
             host_path: host_path.map(|p| std::sync::Arc::from(p.as_path())),
             streaming,
-            guest_data_va: None,
             guest_slot_index: None,
-            guest_dirty: false,
             host_dirty: false,
         },
     );

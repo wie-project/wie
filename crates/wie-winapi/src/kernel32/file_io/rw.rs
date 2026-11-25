@@ -123,7 +123,7 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
     // Single classification lookup: existence + streaming flag (replaces the
     // separate `is_open_file_handle` probe).
-    let (streaming, mirrored) = match find_open_file(state, handle) {
+    let (streaming, slotted) = match find_open_file(state, handle) {
         Some(f) => (f.streaming, f.guest_slot_index.is_some()),
         None => {
             state.process.last_error = ERROR_INVALID_HANDLE;
@@ -135,10 +135,11 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     let _ = crate::guest_io_host::sync_host_cursor_from_guest(engine, state, handle).ok();
     let requested =
         usize::try_from(bytes_to_read).context("ReadFile byte count does not fit usize")?;
-    // Did this read of a handle the guest-I/O accelerator mirrored still reach
-    // the host handler? Then the open-time copy of its bytes bought this call
-    // nothing (see the `readfile_mirror` profile line).
-    crate::kernel32::file_stages::count_read(mirrored, bytes_to_read);
+    // Does this handle hold a guest-I/O handle-table slot (published length +
+    // cursor, which serves the guest seek/size acceleration) and still reach
+    // the host handler? Then the slot bought *this* call nothing — every read is
+    // a host read since the byte mirror was removed. See `readfile_slots`.
+    crate::kernel32::file_stages::count_read(slotted, bytes_to_read);
 
     if streaming {
         let (host_path, cursor_before, path) = {
@@ -410,11 +411,10 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
                 .context("WriteFile slice out of range")?
                 .copy_from_slice(&data);
 
-            // Buffered bytes mutated: the guest-I/O arena mirror is now stale.
-            // `sync_slot_from_host` re-mirrors (and clears) this before any guest read.
-            open_file.guest_dirty = true;
-            // ...and the host file no longer matches the buffered bytes, so the
-            // close-time write-back must actually run for this handle.
+            // The host file no longer matches the buffered bytes, so the
+            // close-time write-back must actually run for this handle. (There
+            // is no arena mirror to stale any more: `sync_slot_from_host`
+            // publishes cursor/size only.)
             open_file.host_dirty = true;
 
             let write_len_u64 =
@@ -438,9 +438,8 @@ pub fn handle_write_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRe
             maybe_promote_open_file_to_streaming(engine, state, handle);
         }
 
-        // Push the updated buffered bytes + cursor/size into the guest-I/O arena
-        // so a following guest fast-path read (WIE_GUEST_IO=all) sees them. Gated
-        // by `guest_dirty`: this re-mirrors only on a real write, never on reads.
+        // Publish the new cursor/size into the guest handle table, so the
+        // guest-side seek/size acceleration sees this write.
         if !streaming {
             let _ = crate::guest_io_host::sync_slot_from_host(engine, state, handle).ok();
         }
@@ -586,9 +585,8 @@ pub fn handle_backup_write(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandler
             {
                 dst.copy_from_slice(&chunk);
             }
-            // Buffered bytes mutated: mark the guest-I/O arena mirror stale and
-            // the close-time host write-back required.
-            file.guest_dirty = true;
+            // Buffered bytes mutated: the close-time host write-back is
+            // required for this handle.
             file.host_dirty = true;
             file.cursor = file.cursor.saturating_add(to_write);
             if written_va != 0 {

@@ -151,9 +151,8 @@ pub(crate) use state::{
 // nothing here ships, and nothing outside the crate can see it.
 #[cfg(test)]
 pub(crate) use state::{
-    DEFAULT_ENVIRONMENT, DllStateMap, FileDialogBridge, FileIoState, GuestIoRuntimeConfig,
-    HeapState, KernelState, ModuleState, PageSetupDialogBridge, PrintDialogBridge, PrintJobBridge,
-    ProcessState,
+    DEFAULT_ENVIRONMENT, DllStateMap, FileDialogBridge, FileIoState, HeapState, KernelState,
+    ModuleState, PageSetupDialogBridge, PrintDialogBridge, PrintJobBridge, ProcessState,
 };
 
 mod dispatch_table;

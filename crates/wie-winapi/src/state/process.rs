@@ -393,24 +393,16 @@ pub struct OpenGuestFile {
     /// Large host file: I/O via `host_path` seek/read/write without full buffer.
     pub streaming: bool,
 
-    /// Guest VA of mirrored file bytes for in-guest ReadFile (if registered).
-    pub guest_data_va: Option<u64>,
-
     /// Index into the guest I/O handle table (if registered).
     pub guest_slot_index: Option<u32>,
-
-    /// Set when buffered `bytes` changed since the last guest-I/O mirror, so
-    /// `sync_slot_from_host` re-mirrors the arena only on writes, never on reads.
-    pub guest_dirty: bool,
 
     /// Set when buffered `bytes` changed since the last **host** write-back, so
     /// `persist_open_file_to_host` skips the O(size) rewrite on a close that has
     /// nothing to persist.
     ///
-    /// Distinct from [`Self::guest_dirty`], which the mirror clears whenever it
-    /// syncs the arena — a read clears one and not the other, and reusing a
-    /// single flag would either lose a guest write-back or start rewriting
-    /// every read-only file again.
+    /// It was once distinct from a `guest_dirty` flag that the arena mirror
+    /// cleared when it synced bytes into guest memory; that mirror is gone, so
+    /// this is the only dirty flag on the record.
     pub host_dirty: bool,
 }
 

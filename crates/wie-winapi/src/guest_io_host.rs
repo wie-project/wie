@@ -1,34 +1,14 @@
-//! Host-side maintenance of the guest I/O handle table and file mirrors.
+//! Host-side maintenance of the guest I/O handle table.
 //!
 //! Paired with the guest helpers installed by `wie-runtime::guest_io`.
+//!
+//! The table publishes a handle's **length and cursor** so the guest-side
+//! SetFilePointer/GetFileSize acceleration can answer without a host stop. It
+//! does *not* publish the file's bytes: that mirror was removed once it was
+//! measured to serve nothing (see `register_open_file`).
 
 use crate::WinApiState;
 use anyhow::{Context, Result};
-
-/// `WIE_GUEST_IO_MIRROR=0` turns the guest-I/O arena mirror off.
-///
-/// An experiment device, not a second supported mode. It exists to answer one
-/// question with a measurement: does the mirror — the O(filesize) `mem_write`
-/// of a file's bytes into the guest arena at open time — earn the ~9.5 ms per
-/// file it costs (first-touch page faults, not memcpy)?
-///
-/// The counters that make the question well-posed say it probably does not:
-/// 94 % of `ReadFile` calls are for handles that own **no** mirror at all, and
-/// the mirrored ones still cross the host boundary 232 times carrying 8.08 MB
-/// of 36.96 MB. Worse, `wie-runtime`'s `install_guest_io` runs unconditionally,
-/// so with `WIE_GUEST_IO=0` (every file API on the host path) the arena is
-/// still built and every open still pays this cost for a copy nothing reads.
-///
-/// Off is expected to be behaviour-neutral: a guest without the accelerator
-/// takes the host `ReadFile` path that already serves every other handle. Any
-/// guest-visible difference between the arms is a finding, which is why the
-/// deletion this prepares for is gated on the micro suite and a guest
-/// write-then-read-back check, never on the counter alone.
-fn mirror_disabled() -> bool {
-    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *DISABLED
-        .get_or_init(|| std::env::var_os("WIE_GUEST_IO_MIRROR").is_some_and(|value| value == "0"))
-}
 
 /// Maximum simultaneously accelerated open files (must match guest helper).
 pub const GUEST_IO_MAX_SLOTS: usize = 128;
@@ -48,9 +28,6 @@ pub fn register_open_file(
     state: &mut WinApiState,
     handle: u64,
 ) -> Result<()> {
-    if mirror_disabled() {
-        return Ok(());
-    }
     let lookup_start = crate::kernel32::file_stages::reg_lookup_start();
     let Some(cfg) = state.file_io.guest_io.clone() else {
         crate::kernel32::file_stages::reg_lookup_done(lookup_start);
@@ -76,27 +53,20 @@ pub fn register_open_file(
     }
 
     let size_u64 = u64::try_from(size).context("file size does not fit u64")?;
-    let aligned_size = size_u64.wrapping_add(15) & !15_u64;
-    let data_va = state.file_io.guest_file_data_next;
-    let file_end = cfg
-        .file_data_base
-        .checked_add(u64::try_from(cfg.file_data_size).unwrap_or(u64::MAX))
-        .context("guest file arena end overflow")?;
-    let Some(new_next) = data_va.checked_add(aligned_size.max(16)) else {
-        return Ok(());
-    };
-    if new_next > file_end {
-        tracing::debug!(handle, "guest I/O file arena full; host path only");
-        crate::kernel32::file_stages::reg_lookup_done(lookup_start);
-        return Ok(());
-    }
+    // No bytes are copied into the guest file arena. It used to hold a mirror of
+    // the file, which only the short-read branch of the guest ReadFile helper
+    // could ever serve (`cmp r8d, 64` -> `jae` host fallback for anything
+    // larger), and that branch is no longer reachable: `guest_io_rewire` never
+    // rewires ReadFile. Measured before removing it, straight off the profile line
+    // `readfile_mirror calls=3872 mirrored=232 (6.0%)`: 3 640 of 3 872 calls
+    // (94.0 %) were on handles with **no** mirror, and the 232 that did own one
+    // crossed into the host anyway. Under `WIE_GUEST_IO=all` those counters came
+    // back byte-identical (`calls=3872 mirrored=232 mirrored_bytes=8083968
+    // host_bytes=28876800` in both arms), i.e. zero reads were served from the
+    // arena even in the configuration built to use it. The copy cost 5 199.62 us
+    // per call over 3 calls (first-touch page faults, not memcpy) for bytes
+    // nothing read.
     crate::kernel32::file_stages::reg_lookup_done(lookup_start);
-
-    if let Some(file) = state.file_io.open_files.get(&handle) {
-        let bytes = &file.bytes;
-        crate::kernel32::file_stages::timed_reg_mirror(|| engine.mem_write(data_va, bytes))
-            .context("failed to mirror file bytes into guest I/O arena")?;
-    }
 
     let slot_index =
         crate::kernel32::file_stages::timed_reg_slot_scan(|| -> Result<Option<usize>> {
@@ -123,15 +93,15 @@ pub fn register_open_file(
             return Ok(());
         };
         write_u64(engine, slot_va, handle)?;
-        write_u64(engine, slot_va.wrapping_add(8), data_va)?;
+        // +8 is the data pointer the (now unreachable) short-read branch would
+        // load with `mov rsi, [rbp+8]`. Written as 0 rather than left stale, so
+        // a slot can never point at arena memory that holds no file any more.
+        write_u64(engine, slot_va.wrapping_add(8), 0)?;
         write_u64(engine, slot_va.wrapping_add(16), size_u64)?;
         write_u64(engine, slot_va.wrapping_add(24), 0)?;
         write_u64(engine, slot_va.wrapping_add(32), GUEST_IO_FLAG_VALID)?;
 
-        state.file_io.guest_file_data_next = new_next;
-
         if let Some(file) = state.file_io.open_files.get_mut(&handle) {
-            file.guest_data_va = Some(data_va);
             file.guest_slot_index = Some(u32::try_from(i).unwrap_or(u32::MAX));
         }
         Ok(())
@@ -160,19 +130,17 @@ pub fn unregister_open_file(
         }
     }
     if let Some(file) = state.file_io.open_files.get_mut(&handle) {
-        file.guest_data_va = None;
         file.guest_slot_index = None;
     }
     Ok(())
 }
 
-/// Syncs guest table cursor/size (and, only when dirty, mirror bytes) from host state.
+/// Syncs the guest table's cursor/size for a handle from host state.
 ///
-/// The cheap cursor/size u64 writes always run (SetFilePointerEx / ReadFile cursor
-/// sync depends on them). The O(filesize) byte mirror runs only when the file's
-/// buffered bytes changed since the last mirror (`guest_dirty`), so a pure read —
-/// which leaves `bytes` untouched — never re-copies the file into the arena and
-/// never trips the JIT's code-write cache flush.
+/// These two u64 writes are the whole payload: the guest-side SetFilePointer /
+/// GetFileSize acceleration reads them and answers without a host stop. No file
+/// bytes are copied — that mirror was removed once it was measured to serve
+/// nothing (see `register_open_file`).
 pub fn sync_slot_from_host(
     engine: &mut dyn wie_cpu::CpuEngine,
     state: &mut WinApiState,
@@ -184,7 +152,6 @@ pub fn sync_slot_from_host(
     let Some(slot_i) = file.guest_slot_index else {
         return Ok(());
     };
-    let guest_dirty = file.guest_dirty;
     let Some(cfg) = state.file_io.guest_io.as_ref() else {
         return Ok(());
     };
@@ -197,14 +164,6 @@ pub fn sync_slot_from_host(
     let size = u64::try_from(file.bytes.len()).unwrap_or(0);
     write_u64(engine, slot_va.wrapping_add(16), size)?;
     write_u64(engine, slot_va.wrapping_add(24), file.cursor)?;
-    if guest_dirty {
-        if let Some(data_va) = file.guest_data_va
-            && !file.bytes.is_empty()
-        {
-            engine.mem_write(data_va, &file.bytes)?;
-        }
-        file.guest_dirty = false;
-    }
     Ok(())
 }
 

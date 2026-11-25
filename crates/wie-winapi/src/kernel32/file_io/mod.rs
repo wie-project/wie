@@ -467,14 +467,12 @@ pub fn handle_set_end_of_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHand
             if let Some(f) = find_open_file_mut(state, handle) {
                 let len = usize::try_from(cursor).unwrap_or(0);
                 f.bytes.resize(len, 0);
-                // Buffered bytes mutated: the guest-I/O arena mirror is stale,
-                // and the host file no longer matches the buffered bytes.
-                f.guest_dirty = true;
+                // Buffered bytes mutated: the host file no longer matches them.
                 f.host_dirty = true;
             }
             sync_open_bytes_to_virtual(state, &path, handle);
             persist_open_file_to_host(state, handle);
-            // Push the resized bytes/size into the guest-I/O arena before any guest read.
+            // Publish the resized size into the guest handle table.
             let _ = crate::guest_io_host::sync_slot_from_host(engine, state, handle).ok();
         }
         state.process.last_error = 0;
