@@ -38,14 +38,27 @@ on the sharp mask `mt_contention.exe 4 64 40`:
 
 **Still open, four things, none of them understood:**
 
-1. **The new churn test is not deterministic.** `mem::tests::a_peer_churn_of_another_region_never_faults_a_stable_access`
-   alternated pass / fail / fail / pass across **identical isolated runs** (seen by
-   the `flags_ssa` lane, not by the lane that wrote it). That is a sensor whose
-   sensitivity depends on scheduling — the assertions themselves (`churn_cycles > 0`,
-   the unmapped address that must fault) are sound, but the 100 000-pair window is
-   not long enough to make a failure certain, or the reader thread is outrun by the
-   writer. **Fix the test's determinism before trusting a green run of it**, and do
-   not read one pass as evidence.
+1. **The new churn test has two distinct flake causes, and only one of them is
+   tuning.** `mem::tests::a_peer_churn_of_another_region_never_faults_a_stable_access`
+   fails intermittently (seen by the `flags_ssa` lane as pass/fail/fail/pass across
+   identical isolated runs, and by the author in the gate worktree). Measured, from
+   the failure strings themselves:
+
+   * `read: mem_read generation changed at 0x30000000 (concurrent map/free, 3 attempts)`
+     — **attempt exhaustion, curable.** Raising `DATA_ACCESS_ATTEMPTS` from 3 to 8
+     was tried for the experiment and reverted; it is one-line with the arithmetic in
+     the doc comment rather than a guess.
+   * `read: mem_read unmapped 0x30000000` — **no generation change in the string at
+     all**, i.e. the refusal came from a resolve that saw the map unmoved. **No
+     attempt count can cure that**, and it is the incoherent-resolve /
+     `ArenaSet::arenas` shape. This is the one that matters.
+
+   Which of the two appears depends on scheduling, so one assertion conflating them
+   makes a green run unreadable. **Split the sensor before trusting it:** one counter
+   for `generation changed` refusals (must be zero at the justified bound), a second
+   for refusals with the generation unmoved. Then measure the failure fraction at the
+   parent over n=20 and report it as a fraction. The earlier "1.7 % per attempt" is
+   **inferred from one sample** and should be treated as a hypothesis, not a rate.
 2. **One `rc=1` with no fault line** in the `4 64 c0` arm (rep 14 of 30). A
    different class from the faults; unattributed.
 2. **`ArenaSet::arenas`** (`crates/wie-cpu/src/mem/arena.rs`) is a plain
@@ -141,6 +154,32 @@ None of it is gated. Gate it in a worktree of `99d11e3` with its own
 `CARGO_TARGET_DIR` before committing, and expect `nextest -p wie-cpu` to be
 **538 dev / 540 release** depending on which lane's tests are present — the
 count moves with the tree, so state it rather than assuming it.
+
+**Read this before committing `perf`'s set.** Four of the five files are
+instrumentation and one is a behaviour change:
+
+* `access=`, `value=` and `reprobe=` on the worker-fault line, plus an
+  `mt_worker_faults=<n> first: <detail>` profile line emitted only when a fault
+  happened. Measured on `4 64 40` n=20: 14 runs carried at least one verdict, 21
+  fault lines, and **21/21 printed `reprobe=ok`, 0 `reprobe=err`** — the page was
+  mapped at the fault site every time, which is the mechanism this whole class
+  rests on (a live page reported unmapped), now measured at the fault point rather
+  than inferred. Dominant class: the return-address push of a `call`
+  (`rip=0x140001373`, write, size 8, worker stack, `value=0x140001376`), 14 of 21.
+  **12 of those 14 faulting runs exited 0**, which is the exit-code blindness
+  described in §2.1.
+* `EventObject::wait`'s timeout branch is now a deadline loop that re-checks
+  `signaled`, so a spurious condvar wake cannot return `WAIT_OBJECT_0`. Three new
+  tests, and they were proven to fail against the old code by temporarily
+  reintroducing the wrong-wake (`left: Some(true), right: None`) and restoring the
+  file byte-identically. `nextest -p wie-winapi` **1401 passed** with it.
+* **`crates/wie-runtime/src/trace.rs` is the least verified thing in the tree.**
+  It turns `ExitProcess { code: 0 }` *plus* a recorded worker fault into
+  `RuntimeStop("<detail>; ExitProcess would have reported success")`. That is the
+  right behaviour and it changes what a micro run reports, but it is **unmeasured**:
+  no `-p wie-runtime` suite run and no `mt_contention 4 64 40` n=10 acceptance was
+  taken after it. If an existing runtime test asserts exit 0 on a faulting guest,
+  that test is the first thing to reconcile.
 
 ---
 
