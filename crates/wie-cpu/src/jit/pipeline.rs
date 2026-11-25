@@ -2486,4 +2486,207 @@ mod tests {
         }
         assert!(OPCODE_SAMPLES.load(Ordering::Relaxed) > bad);
     }
+
+    // --- Compile-cost floor (`--run-ignored`) --------------------------------
+    //
+    // The DOOM warm-up's compile histogram puts a one-instruction block at
+    // 2 061 us (547 of them, 1.13 s of aggregate compile CPU), and a two-point
+    // fit over the bucket means puts ~1.65 ms of every compile in a
+    // block-size-independent constant — the bucket means are the facts, the fit
+    // is an estimate. This harness splits that constant into the parts a change
+    // could actually touch: `JITModule` construction, the first function in a
+    // fresh module, the functions after it in the same module, the CLIF verifier,
+    // and the tier-0 baseline path for the identical block.
+    //
+    // A benchmark, not an assertion, so it is ignored by default. Run it with:
+    //   cargo nextest run -p wie-cpu -E 'test(compile_cost_floor)' \
+    //       --run-ignored --no-capture
+    // and repeat with `--release`, and with `WIE_JIT_VERIFIER=0` / `=1` pinned to
+    // isolate the verifier. Each nextest test runs in its own process, so the
+    // configuration is read exactly once per run and the arms do not contaminate
+    // each other.
+
+    /// The block every arm compiles — `mov rax,rbx; mov rax,rcx; add rax,rcx;
+    /// inc rax; ret`. Five instructions, i.e. the histogram's dominant 4-8
+    /// bucket, a `Ret` terminator so the decode is unambiguous, and above the
+    /// 1-3 instruction shape that `match_micro_stub` turns into hand-written
+    /// code without ever reaching Cranelift.
+    const FLOOR_CODE: [u8; 13] = [
+        0x48, 0x89, 0xd8, // mov rax, rbx
+        0x48, 0x89, 0xc8, // mov rax, rcx
+        0x48, 0x01, 0xc8, // add rax, rcx
+        0x48, 0xff, 0xc0, // inc rax
+        0xc3, // ret
+    ];
+    const FLOOR_BASE: u64 = 0x4000_0000;
+
+    fn floor_median(v: &mut Vec<f64>) -> f64 {
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).expect("timings are finite"));
+        v[v.len() / 2]
+    }
+
+    /// Map, write and expose the floor block at `FLOOR_BASE`.
+    fn floor_map(cpu: &mut JitCpu) {
+        cpu.virtual_alloc(
+            FLOOR_BASE,
+            0x1000,
+            MEM_RESERVE | MEM_COMMIT,
+            protect::PAGE_EXECUTE_READWRITE,
+        )
+        .expect("alloc floor page");
+        cpu.mem_write(FLOOR_BASE, &FLOOR_CODE).expect("write code");
+    }
+
+    fn floor_decode(cpu: &JitCpu) -> crate::jit::block::BlockKind {
+        let mem = read_unpoisoned(&cpu.shared.mem);
+        crate::jit::block::decode_pure_gpr_block(&mem, None, FLOOR_BASE)
+    }
+
+    /// Print the compile-cost floor, split by factor. See the note above.
+    #[test]
+    #[ignore = "benchmark: measures the compile-cost floor; assertions live in the report, not here"]
+    fn compile_cost_floor_split() {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "compile_cost_floor: profile={} verifier={}",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            super::JitConfig::get().verifier_enabled()
+        );
+
+        // (a) A whole fresh shared engine: both modules are built inside
+        // `JitShared::new`, so this is the per-module cost end to end.
+        let mut module_us = Vec::new();
+        for _ in 0..5 {
+            let t = Instant::now();
+            let cpu = JitCpu::open_x86_64();
+            module_us.push(t.elapsed().as_secs_f64() * 1e6);
+            drop(cpu);
+        }
+        let _ = writeln!(
+            out,
+            "compile_cost_floor: (a) fresh JitShared (all modules)      median={:8.1} us",
+            floor_median(&mut module_us)
+        );
+
+        // (b) First function in a fresh module vs (c) the functions after it in
+        // the same module. If the constant is per-module, (b) >> (c) and the
+        // saving is amortisation; if (b) ~= (c), it is per-function and the only
+        // lever is fewer functions.
+        let mut first_us = Vec::new();
+        let mut second_us = Vec::new();
+        let mut rest_us = Vec::new();
+        let mut trend: Vec<f64> = Vec::new();
+        let mut insn_count = 0_u32;
+        let mut shape_kind = crate::jit::block::BlockKind::NotPure;
+        for _ in 0..3 {
+            let mut cpu = JitCpu::open_x86_64();
+            floor_map(&mut cpu);
+            let kind = floor_decode(&cpu);
+            shape_kind = kind.clone();
+            let inv_gen = cpu.shared.invalidate_gen.load(Ordering::Acquire);
+            let t = Instant::now();
+            let compiled = cpu.shared.compile_from_kind_shared(
+                &cpu.fast_api,
+                FLOOR_BASE,
+                kind.clone(),
+                inv_gen,
+            );
+            first_us.push(t.elapsed().as_secs_f64() * 1e6);
+            if let Some(c) = compiled {
+                insn_count = c.insn_count;
+            }
+            for i in 1..32_u64 {
+                let t = Instant::now();
+                let r = cpu.shared.compile_from_kind_shared(
+                    &cpu.fast_api,
+                    FLOOR_BASE + i * 64,
+                    kind.clone(),
+                    inv_gen,
+                );
+                let dt = t.elapsed().as_secs_f64() * 1e6;
+                if i == 1 {
+                    second_us.push(dt);
+                }
+                if i < 7 {
+                    trend.push(dt);
+                }
+                if r.is_some() && i > 1 {
+                    rest_us.push(dt);
+                }
+            }
+        }
+        let shape = match &shape_kind {
+            crate::jit::block::BlockKind::Pure { insns, term, .. } => {
+                format!("Pure insns={} term={term:?}", insns.len())
+            }
+            crate::jit::block::BlockKind::NotPure => "NotPure".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "compile_cost_floor: decoded {shape} compiled_instrs={insn_count}"
+        );
+        let _ = writeln!(
+            out,
+            "compile_cost_floor: (b) 1st function, fresh module          median={:8.1} us  n={}",
+            floor_median(&mut first_us),
+            first_us.len()
+        );
+        let _ = writeln!(
+            out,
+            "compile_cost_floor: (c) 2nd function, same module           median={:8.1} us  n={}",
+            floor_median(&mut second_us),
+            second_us.len()
+        );
+        let _ = writeln!(
+            out,
+            "compile_cost_floor: (d) 3rd..32nd function, same module     median={:8.1} us  n={}",
+            floor_median(&mut rest_us),
+            rest_us.len()
+        );
+        let shown: Vec<String> = trend.iter().map(|v| format!("{v:.0}")).collect();
+        let _ = writeln!(
+            out,
+            "compile_cost_floor: (e) first 18 functions in order, us: {}",
+            shown.join(" ")
+        );
+
+        // (f) The tier-0 baseline path for the identical block: the cheapest
+        // compile the engine has, and the floor below which no Cranelift change
+        // can go without changing what runs.
+        let mut cpu = JitCpu::open_x86_64();
+        floor_map(&mut cpu);
+        let kind = floor_decode(&cpu);
+        let inv_gen = cpu.shared.invalidate_gen.load(Ordering::Acquire);
+        let mut baseline_us = Vec::new();
+        for i in 0..16_u64 {
+            let t = Instant::now();
+            let r = super::baseline::try_compile_baseline(
+                &cpu.shared,
+                &cpu.fast_api,
+                FLOOR_BASE + i * 64,
+                kind.clone(),
+                inv_gen,
+            );
+            let dt = t.elapsed().as_secs_f64() * 1e6;
+            if r.is_some() {
+                baseline_us.push(dt);
+            }
+        }
+        let _ = writeln!(
+            out,
+            "compile_cost_floor: (f) tier-0 baseline, same block         median={:8.1} us  n={}",
+            floor_median(&mut baseline_us),
+            baseline_us.len()
+        );
+        print!("{out}");
+    }
 }
