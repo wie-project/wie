@@ -124,6 +124,38 @@ WIE_RUNTIME_PROFILE=1 WIE_EXEC_TRACE=1 ./target/release/wie run micro-exes/out/c
 # --- iced-interp mnemonic counts (total=187) ---   ← must match
 ```
 
+## The inner loop: test what you touched
+
+`./scripts/check.sh` is the pre-PR gate and it is meant to be slow. For the edit
+loop, `scripts/gate.sh` derives the work from the working-tree diff: each changed
+path maps to a package (`crates/<dir>` → its manifest `name`), a test filter (its
+module path, `::`-joined) and a cargo **target** (`--lib`, or `--test <binary>`).
+
+```bash
+./scripts/gate.sh --check      # compile only: the rename/refactor loop
+./scripts/gate.sh              # touched packages, touched modules only
+./scripts/gate.sh --list       # print the plan, run nothing
+./scripts/gate.sh --release     # add the release profile (codegen changes only)
+./scripts/gate.sh --smoke       # build the CLI and run one micro guest
+./scripts/gate.sh --workspace   # everything, CI shape — before pushing
+```
+
+Measured on a warm target dir, which is why the defaults are what they are:
+
+| command | wall | note |
+|---|---|---|
+| `cargo check -p wie-cpu --all-targets` | ~1.4 s | compile feedback without linking a test binary |
+| `nextest -p wie-cpu` (544 tests) | ~4.3 s | filtering saves nothing here — the suite is already cheap |
+| `nextest -p wie-cpu --release` | +30-60 s | rebuilds everything; only for codegen-sensitive changes |
+| `nextest -p wie-runtime` (whole package) | ~120 s | builds 52 GUI **and** 45 micro test binaries, each linked against the full runtime |
+| `nextest -p wie-runtime --lib -E 'test(module)'` | ~20-30 s build, 0.03 s test | one lib binary instead of 97 |
+
+The lesson is in the last two rows: the cost is **linking test binaries**, not
+running tests, so the target selector matters more than the filter. Two guards keep
+the gate honest — a filter that matches nothing is refused (nextest exits 4 today,
+but a `--no-tests=pass` config would silently green it), and `--list` prints the plan
+so a surprising mapping is visible before anything compiles.
+
 ## Benchmarks & regression gate
 
 Criterion suites live in `crates/wie-cpu/benches/jit_hot_paths.rs`
