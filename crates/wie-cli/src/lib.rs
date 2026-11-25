@@ -38,6 +38,6 @@ pub mod gui;
 mod test_support;
 
 pub use cli::{
-    BottleCommand, Cli, Command, RunArgs, reject_micro_only_flags, resolve_run_root, run_command,
-    run_entry,
+    BottleCommand, Cli, Command, RunArgs, VERSION_TEXT, reject_micro_only_flags, resolve_run_root,
+    run_command, run_entry, version_text_if_requested,
 };

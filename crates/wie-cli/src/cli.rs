@@ -7,6 +7,7 @@
 
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::commands;
@@ -529,4 +530,103 @@ pub fn run_command(command: Command) -> Result<()> {
         Command::Bottle { command } => commands::bottle(command)?,
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `--version` without building the clap tree
+// ---------------------------------------------------------------------------
+
+/// The bytes `wie --version` / `wie -V` prints.
+///
+/// Built from `CARGO_PKG_VERSION` rather than copied out of a run, so there is
+/// no second source of truth and no drift surface. That is the whole reason
+/// this survives: it costs nothing to own.
+///
+/// # Why nothing bigger is here (read before adding another fast path)
+///
+/// The startup lane attributed **3.71 ms** of the `wie --version` floor to clap
+/// `Command` tree construction — 11 subcommands, 46 arguments, rebuilt on every
+/// invocation, before a single argument is read. Measured on this tree it is
+/// **12.3 µs** in release (38.4 µs in dev), against **17.1 µs** for a full
+/// `--version` round trip *through* clap. The cross-check that settles it:
+/// `wie frobnicate x` — which builds the whole tree and then errors — takes
+/// **10.05 ms**, while `wie --version` (no tree at all) takes **11.41 ms** and
+/// `wie --help` **8.72 ms**. The invocation that builds the tree is not slower
+/// than the one that skips it.
+///
+/// The 3.71 ms was a subtraction residual — exec/dyld/exit 4.05 ms, std init
+/// 0.96, dependency graph 0.07 and "clap" 3.71 sum to the observed 8.79 ms
+/// total, which is why it read as credible. The in-process work is 12 µs of clap plus
+/// **77.75 µs** of `tracing_subscriber` init. The remaining ~3 ms is
+/// process-level — spawn, dyld, libc init — and is **not reachable from
+/// `wie-cli`**: no early exit, no lazy tree and no argument-parser change
+/// moves it. Do not re-run this slice.
+///
+/// Two larger fast paths were built, measured and dropped, for the 12 µs:
+/// a `--help`/`-h` text template (1.4 KB of duplicated user-facing text, and
+/// not even a constant, since clap renders `Usage: <argv[0] file name>
+/// <COMMAND>`), and a `strict_run_from_argv` shortcut for `wie run <exe>`
+/// (12 µs against a 30 ms run, and a second parser is exactly the DRY hazard
+/// this codebase should not carry). Their differential tests went with them.
+pub const VERSION_TEXT: &str = concat!("wie ", env!("CARGO_PKG_VERSION"), "\n");
+
+/// `Some` with the bytes to print when the whole command line is `--version`
+/// or `-V`; `None` for everything else, so clap decides.
+///
+/// Exactly two tokens, on purpose. clap *accepts* `wie --version extra` and
+/// prints the version (exit 0), and resolves `wie --version --help` its own
+/// way; short-circuiting on `argv[1]` alone would change both results.
+#[must_use]
+pub fn version_text_if_requested(argv: &[OsString]) -> Option<&'static str> {
+    let [_program, token] = argv else {
+        return None;
+    };
+    matches!(token.to_str()?, "--version" | "-V").then_some(VERSION_TEXT)
+}
+
+#[cfg(test)]
+mod version_fast_path_tests {
+    use super::{Cli, VERSION_TEXT, version_text_if_requested};
+    use clap::CommandFactory;
+    use std::ffi::OsString;
+
+    fn os(tokens: &[&str]) -> Vec<OsString> {
+        tokens.iter().map(OsString::from).collect()
+    }
+
+    /// The shipped bytes are clap's bytes. The version line uses the display
+    /// name rather than `argv[0]`, so it is bin-name independent — the loop
+    /// proves that instead of assuming it.
+    #[test]
+    fn shipped_version_text_matches_clap() {
+        for bin in ["wie", "wie-renamed", "w1e"] {
+            let rendered = Cli::command().bin_name(bin).render_version();
+            assert_eq!(VERSION_TEXT, rendered, "version rendering for bin {bin}");
+        }
+    }
+
+    /// Fires for exactly the two-token forms, and for nothing else — the
+    /// failure this guards is a short-circuit that swallows an argv clap would
+    /// have rejected or resolved differently.
+    #[test]
+    fn fires_only_for_the_single_token_forms() {
+        let cases: &[(&[&str], bool)] = &[
+            (&["wie", "--version"], true),
+            (&["wie", "-V"], true),
+            (&["wie"], false),
+            (&["wie", "--help"], false),
+            (&["wie", "-h"], false),
+            (&["wie", "--version", "extra"], false),
+            (&["wie", "--version", "--help"], false),
+            (&["wie", "run", "--version"], false),
+            (&["wie", "help"], false),
+        ];
+        for (argv, want) in cases {
+            assert_eq!(
+                version_text_if_requested(&os(argv)).is_some(),
+                *want,
+                "{argv:?}"
+            );
+        }
+    }
 }

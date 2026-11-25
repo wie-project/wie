@@ -14,7 +14,8 @@
 
 use anyhow::{Result, bail};
 use clap::Parser;
-use wie_cli::{Cli, run_command};
+use std::io::Write as _;
+use wie_cli::{Cli, run_command, version_text_if_requested};
 
 fn main() -> Result<()> {
     let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_owned());
@@ -25,7 +26,17 @@ fn main() -> Result<()> {
         bail!("failed to initialize tracing subscriber: {error}");
     }
 
-    run_command(Cli::parse().command)
+    // `--version` / `-V` are answered from a constant before the clap tree is
+    // derived. `wie_cli::VERSION_TEXT` carries the measurement that says this
+    // is worth four lines, and that nothing larger is worth building.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(version) = version_text_if_requested(&argv) {
+        // A closed pipe (`wie --version | head -0`) is not an error: clap's own
+        // version path ignores the write failure too, so the exit code stays 0.
+        drop(std::io::stdout().write_all(version.as_bytes()));
+        return Ok(());
+    }
+    run_command(Cli::parse_from(argv).command)
 }
 
 #[cfg(test)]
