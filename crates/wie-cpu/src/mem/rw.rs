@@ -17,7 +17,20 @@ use crate::CpuError;
 /// wrong. The retry is bounded and always re-checks the access against the page
 /// map, which is the authority: if the page is gone or now denies the access, the
 /// retry terminates in a fault on its first iteration.
-const DATA_ACCESS_ATTEMPTS: u32 = 3;
+///
+/// **Why 64 and not 3.** At 3, a continuous churn (one thread freeing and
+/// re-allocating another region in a tight loop) exhausted the bound on its own:
+/// measured **1 of 200 000 accesses**, ~5e-6, in the churn sensor
+/// (`mem::tests::a_peer_churn_of_another_region_never_faults_a_stable_access`),
+/// which showed up as a red release-suite run roughly every 6-8 suites. Each
+/// attempt already yields to the mapping thread, so the bound is not a
+/// responsiveness control — it is the line between "the map was busy" and "the map
+/// is pathological". A retry costs a page-map lookup plus a yield, and only an
+/// access that lands in a bump window reaches it at all, so 64 of them is still a
+/// sub-millisecond worst case on a path that is already the slow one. Exhaustion
+/// still reports the count, so a churn that never settles is a named fault rather
+/// than a silent success — which is the property the bound exists to protect.
+const DATA_ACCESS_ATTEMPTS: u32 = 64;
 
 /// Why a single data-access attempt did not complete.
 enum DataAccess {
