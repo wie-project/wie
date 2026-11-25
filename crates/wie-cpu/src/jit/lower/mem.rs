@@ -109,6 +109,15 @@ pub(crate) unsafe extern "C" fn wie_jit_chain_lookup(ctx: *mut JitCtx, va: u64) 
     0
 }
 
+/// `WIE_MT_DEBUG=1` prints the exact reason a JIT load/store stub faults.
+///
+/// The emitted fast path (`tlb_page_ptr`) cannot fault; every stub fault is the
+/// slow path's `GuestMemory` access failing, and until this line existed the
+/// reason was discarded — which is why two rounds of attribution could not tell a
+/// generation race from a permission denial from an unmapped page.
+static STUB_DEBUG: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("WIE_MT_DEBUG").is_ok_and(|v| v == "1"));
+
 /// `extern "C" fn(ctx, addr, size, insn_ip) -> value`
 pub(crate) unsafe extern "C" fn wie_jit_load(
     ctx: *mut JitCtx,
@@ -148,7 +157,12 @@ pub(crate) unsafe extern "C" fn wie_jit_load(
     // SAFETY: `mem` set by `run_compiled`.
     let mem = unsafe { &*ctx.mem };
     let mut buf = [0_u8; 8];
-    if mem.read(addr, &mut buf[..size_usize]).is_err() {
+    if let Err(e) = mem.read(addr, &mut buf[..size_usize]) {
+        if *STUB_DEBUG {
+            eprintln!(
+                "[stub] read addr={addr:#x} size={size} rip={insn_ip:#x} access=0 fault: {e}"
+            );
+        }
         set_fault(ctx, insn_ip, addr, size, 0);
         return 0;
     }
@@ -191,7 +205,12 @@ pub(crate) unsafe extern "C" fn wie_jit_store(
     }
     // SAFETY: `mem` set by `run_compiled`.
     let mem = unsafe { &*ctx.mem };
-    if mem.write(addr, &bytes[..size_usize]).is_err() {
+    if let Err(e) = mem.write(addr, &bytes[..size_usize]) {
+        if *STUB_DEBUG {
+            eprintln!(
+                "[stub] write addr={addr:#x} size={size} rip={insn_ip:#x} access=1 fault: {e}"
+            );
+        }
         set_fault(ctx, insn_ip, addr, size, 1);
     }
 }

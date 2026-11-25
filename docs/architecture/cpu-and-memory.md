@@ -102,3 +102,131 @@ Two protection encodings exist on purpose: `RwxPerms` (rwx bits) and `PageProtec
 - **`host_span(write)` denies executable spans** — JIT code pages never get a direct writable host pointer; SMC invalidation never depends on a returned slice.
 - **Background-compiled blocks are validated at install** — if `mem_gen` moved or a code page was written while the worker compiled, the result is dropped.
 - **`exec::step` stubs**: `Cpuid` returns 0, `Rdtsc` reads host monotonic time — honest minimal answers, documented per instruction.
+
+## Retryable conditions versus guest faults
+
+**The rule: a lost race is never a guest-visible fault, and a guest fault is never retried.** Both
+halves are load-bearing and this campaign has now paid for each of them separately.
+
+A **retryable condition** is one where the emulator's own bookkeeping was momentarily inconsistent
+while the guest's view of memory was not. The canonical instance is the mapping generation: every
+structural mutation (`VirtualAlloc`/`VirtualFree`/`VirtualProtect`/`mem_map_image`) bumps one
+counter, and the check "did the generation move since I resolved this pointer?" cannot tell which
+mutation happened. A **guest fault** is one where the guest's own access is illegal: the page is
+absent, or the permission bits deny the width and direction of the access.
+
+### Why a generation bump cannot be retried on its own
+
+A protection change *is* a generation bump. `guest_store_observes_protection_change_jit`
+(`mem::tests`) is the discriminating row: a store runs, the page is then made read-only by the guest
+itself, and the next store **must** fault. A generic "generation changed, so try again" retry
+re-resolves the page, finds it present, and lets the store through — turning a protection violation
+into a silent write. That retry was implemented, measured, and **reverted**.
+
+The red tests in the tree at the time were *not* its doing, and the distinction is worth keeping: 17
+fault-path rows were failing because a scripted edit to the stub fault arms had deleted `set_fault`,
+so the stubs logged a refusal and then returned as if the access had succeeded. Toggling each edit
+separately proved it — stub reverted, the rows pass; stub restored, 17 fail; `set_fault` put back,
+534/534. The retry was reverted on its own merits (a protection change is a generation bump), and the
+swallowed fault was an independent defect in the same window. Two defects, one count, and the count
+did not say which.
+
+So the only admissible shape is narrower than a retry on the generation:
+
+1. re-resolve the page;
+2. if the generation is unchanged, the answer is already exact;
+3. if it changed, **re-check the access against the current protection** — if the current protection
+   *permits* the access and the page is still present, the refusal was a race and the access may
+   proceed; if it denies or the page is gone, that is a guest fault and must be reported as one;
+4. a bounded attempt count, and on exhaustion report the fault, never a silent success.
+
+Rule 3 is the whole content: a generation bump is only retryable when the *post-bump permission
+state still permits the access*. Without that check there is no distinction to make.
+
+### The test shape that discriminates them
+
+A retry can only be trusted if both rows exist and both are mutation-tested:
+
+* **The race row.** The same access, retried across a bump that leaves the page present and
+  permitting, must **succeed**; delete the retry and this row must fail.
+* **The fault row.** The same access after a protection change that now **denies** it must **fault**,
+  with the right address, size and direction; widen the retry to "any generation change" and this
+  row must fail. `guest_store_observes_protection_change_jit` already pins this for the store case;
+  a load/no-read row belongs beside it.
+* **The real-fault rows stay untouched** either way: unmapped, and present-but-denied, must fault on
+  the first attempt with no retry — assert the attempt count, not just the error, because a retry
+  that happens to fail again looks identical from outside.
+
+### Two confirmed instances, and one counter-instance
+
+Recorded with what was actually measured, at the standard this campaign now holds:
+
+* **Decode fetch (fixed, mechanism confirmed).** `decode_at` collapsed *every* `fetch_into` error
+  into "no decode", and `exec::step` then reported `invalid instruction at …` on bytes that were
+  valid and merely unreadable for an instant. Split into `Decoded | InvalidEncoding | FetchFailed`;
+  a `generation changed` fetch is retried (bounded, `WIE_DECODE_RETRY=0` to disable) and only a
+  decoded-and-rejected encoding now reads as a bad instruction. Confirmed from a run:
+  `[decode] rip=0x1400012be mgen=60 attempts=1 fetch-failed: instruction fetch generation changed at
+  0x1400012be (concurrent map/free)` followed by `n=15 mgen=66 attempts=2 reason=retried-after: …`,
+  twice in one 60-run arm. The field fault it was aimed at (`0x140001481`) did not reproduce in 120
+  runs, so that one remains **unattributed**; the conflation fix stands on its own.
+* **Data access (attributed, not confirmed).** `mem_read`/`mem_write` refuse an access whose
+  generation moved mid-validation, and every caller turns that into a guest `0xc0000005`. Four
+  spurious-looking violations were attributed to this (`addr=0x1000a0fff exc=0xc0000005 size=1
+  rip=0x14000138d` on the fixture's own 4096-byte allocation — in-bounds by construction, from
+  `mt_contention.c:395`). **60 runs with the retry disabled produced zero `[mem]` events**, so the
+  attribution is code-shape, not measurement. The instrument that can settle it is the `[stub]` line
+  in `lower/mem.rs`, which prints the verbatim `GuestMemory` refusal from the JIT load/store slow
+  path under `WIE_MT_DEBUG=1`.
+* **Counter-instance (guard added, mutation-proven).** The truncated-fetch guard: a decode from a
+  buffer that was short because the *mapping* ended is a whole instruction, but a decode from a
+  buffer that was short while more bytes were readable is a **prefix**, and a decoder handed a prefix
+  returns some other instruction — silent execution of bytes the guest never wrote.
+  `exec::cache::shortfall_unexplained` refuses the second case; forcing it to `false` makes
+  `a_truncated_fetch_with_more_bytes_readable_is_not_decoded` fail.
+
+### The third category: `unmapped` on a page that is committed and stays committed
+
+There are three outcomes for an access, not two, and the middle one is the worst:
+
+| outcome | meaning | correct handling |
+|---|---|---|
+| generation moved, page present and permitting | emulator bookkeeping raced; guest's view unchanged | retry (after the protection re-check above) |
+| page absent or denied | the guest's access is illegal | **guest fault**, no retry |
+| **`unmapped` for a page that is committed and stays committed** | **the emulator lost a page the guest owns** | **a bookkeeping-visibility bug — neither retry nor fault** |
+
+The third is not a delivery decision at all: no retry policy can make a lost page appear, and
+reporting it as a fault is a lie the guest will act on. A real program that reads its own committed
+memory and is told it is unmapped corrupts data while nothing crashes, which is why this category
+outranks every optimisation in this file.
+
+The `[stub]` line has caught one instance. `micro-exes/mt_contention.exe`, 300 runs,
+`WIE_MT_DEBUG=1`:
+
+```
+[stub] read addr=0x10008b000 size=1 rip=0x1400013e0 access=0 fault: mem_read unmapped 0x10008b000
+```
+
+`rip=0x1400013e0` is `movzbl (%rax), %ecx` with `addq $0x100, %rax` — `phase_readers`
+(`main.c:365`), reading `g_shared_read`, which is `VirtualAlloc`'d once at startup (`main.c:534`,
+256 KiB) and has **no free site anywhere in the fixture** (the only `VirtualFree` is `main.c:396`,
+inside `va_churn`, on that thread's own 4 KiB region). The page is committed for the process
+lifetime, and the read must succeed. The fixture contains no `__try`, so a delivered `0xc0000005`
+there is unconditionally a dead thread — which is what the four fatal deaths were, at the same rip
+family.
+
+The one mutation in flight is a peer thread's `VirtualFree(p, 0, MEM_RELEASE)` of *its own* region,
+while the JIT's stub reads guest memory through a raw pointer with no lock. The candidates are a
+shared arena whose free rebuilds a structure non-atomically against a concurrent walk, a generation
+bump that invalidates a lookup for the wrong region, and a free that unlinks by range rather than by
+identity. The discriminating test is in `mem::tests`.
+
+### Two process rules this cost us
+
+* **After any scripted multi-site edit in a fault path, read the resulting hunk with `sed` before
+  compiling.** A regex written to wrap the two stub fault arms matched through `set_fault(…)` and
+  deleted it, so every stub fault became a silent success and 17 fault-path tests went red. The
+  count was the only thing that showed it.
+* **Never say "my edit is not implicated" without a toggle.** Revert your edit, run the failing
+  rows, restore, run them again. Measured attribution beats a plausible one, and both directions of
+  a toggle are cheap compared with a night of the wrong theory.
