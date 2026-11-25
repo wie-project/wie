@@ -1,9 +1,17 @@
 # Continuation: where the campaign stands, and the next slice for each open item
 
 Date: 2026-11-25. Branch `feat/dll-coverage`. HEAD at the time of writing:
-`99d11e3`. This file exists so the next session starts from measurements rather
-than from a conversation. Everything below is either a number that was measured
-or an instruction that names the file and the acceptance test.
+**`66a5fe6`**, pushed, working tree clean. Since the first draft of this file
+(`99d11e3`) the session landed the startup-latency record (`2afc82f`), the guest-I/O
+arena mirror removal (`7ffc1f6`), the `PageMap::runs` lock (`7aba5e7`), four docs
+records (`4b72ae7`), the probe counter and cache-before-compile path (`e809d3b`), the
+fault-record RUNBOOK correction (`ca91223`), the bounded re-resolve in `mem/rw.rs`
+(`420c395`), the profile-line probe count (`99d11e3`), this record (`c577135`,
+`c2ad72f`), and the two slices §2.3 and §2.5 describe (`399161c`, `66a5fe6`).
+
+This file exists so the next session starts from measurements rather than from a
+conversation. Everything below is either a number that was measured or an
+instruction that names the file and the acceptance test.
 
 **Read `docs/RUNBOOK.md` before touching a knob**, and `cpu-and-memory.md` before
 touching `crates/wie-cpu/src/mem/`. Both carry correctness records that were paid
@@ -83,10 +91,12 @@ one `SetEvent` (the primary's own `g_start`) and no worker ever pings, because
 two workers are already dead. `EventObject::set` holds the lock across
 mutate-and-notify and the registry token travels through a buffered channel, so
 there is no gap to close. The one real defect found there is in passing:
-`EventObject::wait`'s timeout branch returns `true` when `wait_timeout` returns
-spuriously (`sync_obj.rs`, `if timed_out { false } else { true }` without
-re-checking `signaled`) — a `WAIT_OBJECT_0` the guest did not earn. That is
-`perf`'s, and it wants a four-line loop plus a test.
+`EventObject::wait`'s timeout branch returned `true` whenever `wait_timeout`
+returned spuriously (`if timed_out { false } else { true }`, never re-reading
+`signaled`) — a `WAIT_OBJECT_0` the guest did not earn. That was a real bug and it
+is fixed (`66a5fe6`, deadline loop + three tests), but **it was never the cause of
+this fault class** — do not read that commit as re-opening the hypothesis. The
+faults are invalid *guest* accesses (§2.5), not missed wakes.
 
 ### 2.3 Block-parameter materialisation — the largest remaining emission lever
 
@@ -97,24 +107,30 @@ wording said "once per exit *or on a probe miss*". Executed entry+exit is
 **197.6**, and over `hops/entries = 955 156 362 / 127 786 895 = 7.47` that is
 **26.2 host instructions per iteration (11 %)**, not 45 (21 %).
 
-**The classification is done** (the same doc's §8-§10, uncommitted at handover):
+**The classification is done** (the same doc's §8-§10, committed with the fix):
 of the 52.6 materialisation instructions per entry+exit, **68 % (35.8) are dead on
 entry** — the block loads a GPR it never reads, because the self-loop path filled
 `live_eff` with `true` instead of carrying the real live-in set. 24 % (12.4) are
 genuinely loop-carried, 4 % are pure spill→reload pairs, 2 % a flag word, 2 %
 read-but-never-written.
 
-A two-hunk change already implements the fix and is **uncommitted**: delete
-`live_eff.fill(true)` for self-loops, and drop `|| self_loop` from the shared exit
-block's GPR store predicate so a self-loop writes back exactly what it loaded.
-Measured acceptance in the census's own unit: **52.6 → 14.9 host instructions per
-entry+exit (−72 %, −5.0 per iteration), latch frame traffic 15.6 → 4.5 per
-iteration, executed loop body 244.7 → 203.3 (−16.9 %)**, with same-block CLIF
-opcode counts identical for every guest-visible op (`icmp` 50/50, `band`, `bxor`,
-`ishl`, `ushr`, `isub`, `select`, `imul`, `call`, `uextend`, `bor`, `brif`,
-`return`) and only `iconst`/`iadd`/`load`/`store` falling. It reports 541/541 dev
-and the release CLI linking clean, and **owes `clippy` and `fmt`** — that is the
-first gate to run before committing it.
+The fix is **`399161c`** — delete `live_eff.fill(true)` for self-loops, and drop
+`|| self_loop` from the shared exit block's GPR store predicate so a self-loop
+writes back exactly what it loaded. Measured acceptance in the census's own unit:
+**52.6 → 14.9 host instructions per entry+exit (−72 %, −5.0 per iteration), latch
+frame traffic 15.6 → 4.5 per iteration, executed loop body 244.7 → 203.3
+(−16.9 %)**, with same-block CLIF opcode counts identical for every guest-visible
+op (`icmp` 50/50, `band`, `bxor`, `ishl`, `ushr`, `isub`, `select`, `imul`, `call`,
+`uextend`, `bor`, `brif`, `return`) and only `iconst`/`iadd`/`load`/`store`
+falling. It gated clean on its own tree: `clippy --workspace --all-targets`, `fmt`,
+`check --workspace --all-targets`, `wie-cpu` **544 release** (543 of 544 dev, the
+one failure the churn sensor in §2.5), and three new dual-engine tests that compare
+the whole register file, RFLAGS and RIP against iced.
+
+What that leaves on the table is the other 32 % of the 52.6 — the genuinely
+loop-carried 12.4 plus 4 % of pure spill→reload — which is now visible per block
+rather than buried under the dead 35.8, and is the next thing to look at with the
+self-loop path no longer hiding it.
 
 ### 2.4 Instrumentation gaps that are still gaps
 
@@ -133,55 +149,80 @@ first gate to run before committing it.
   it needs an engine whose tier module was never created, which the install path
   cannot produce without manufacturing engine state. Recorded as a claim.
 
-### 2.5 Uncommitted work in the tree at the time of writing
+### 2.5 Landed, and what only looks done
 
-The tree was handed over dirty on purpose rather than reverted. Per-file sha256,
-so the next session can tell whether the file moved:
+The two slices that were dirty at `c577135` are committed, each gated on its own
+tree with its own `CARGO_TARGET_DIR`:
+
+* **`399161c`** — `flags_ssa`. A self-loop's header carries only the GPRs the body
+  reads; the exit stores back only those it loaded. Measured over the three SDL2
+  blocks: **52.6 → 14.9 host instructions per entry+exit (−72 %, −5.0 per
+  iteration)**, latch frame traffic 15.6 → 4.5, executed loop body 244.7 → 203.3.
+  CLIF opcode counts identical for every guest-visible op.
+* **`66a5fe6`** — `perf`. `EventObject::wait` is a deadline loop that re-checks
+  `signaled` (a wake is not a signal), plus per-run worker-fault bookkeeping and a
+  `RuntimeStop` when `ExitProcess{code:0}` would have masked a dead worker.
+
+Nothing is left uncommitted as of `66a5fe6`; `git status` is clean. Gate counts on
+those trees: `wie-cpu` **544 release / 543 of 544 dev**, `wie-winapi` **1401**,
+`wie-runtime` **191**, clippy clean, fmt clean. `trace.rs` and `mt_runtime.rs` had
+to travel together — with `trace.rs` left out, clippy reports
+`reset_worker_faults is never used`, which is how the pairing was discovered rather
+than assumed.
+
+**The `RuntimeStop` branch has no witness yet.** `mt_contention.exe 4 64 40` is
+10/10 exit 0 with no fault line, and 6 further runs under `WIE_JIT_MEM=slow`
+produced **0 fault lines**, so the branch that turns a faulting run into a failure
+has never run for real. It is verified by construction and by the suites staying
+green. The next slice should be a guest that faults a worker on purpose, so the
+behaviour has a test that fails when the branch is deleted — the acceptance for
+`perf`'s work, still owed. The earlier evidence for the mechanism it defends stands
+and is worth keeping: on n=20 at `4 64 40`, 14 runs carried a verdict, **21 of 21
+fault lines printed `reprobe=ok`** (page mapped at the fault site), dominant class
+the return-address push of a `call` (`rip=0x140001373`, write, size 8, `value=0x140001376`),
+14 of 21 — and **12 of those 14 faulting runs exited 0**, the exit-code blindness
+this branch closes.
+
+**The churn sensor now has a measured failure rate instead of a reputation.**
+`mem::tests::a_peer_churn_of_another_region_never_faults_a_stable_access` passes
+4 of 8 isolated runs on the pre-slice tree (`c577135`) and 2 of 8 on `399161c`,
+Fisher p ≈ 0.31 — so it fails on its own account, not because of nearby edits. It is
+one assertion over **two independent causes**, and the failure string distinguishes
+them:
 
 ```
-3e64ab9d…  crates/wie-cpu/src/jit/lower/mod.rs                  flags_ssa  (the two-hunk fix, §2.3)
-53595e01…  crates/wie-cpu/src/jit/tests/mod.rs                  flags_ssa  (one `mod` line)
-38843ab5…  crates/wie-cpu/src/jit/tests/param_liveness_tests.rs flags_ssa  (new, 3 dual-engine tests)
-76cdfedb…  docs/architecture/prologue-epilogue-census.md        flags_ssa  (§8-§10: the breakdown, the invariants, the acceptance)
-f30aa180…  crates/wie-runtime/src/mt_runtime.rs                 perf       (loud fault + 2 fields)
-941da142…  crates/wie-winapi/src/sync_obj.rs                    perf       (wrong wake)
-7237bdde…  crates/wie-winapi/src/kernel32/sync.rs               perf       (WIE_MT_DEBUG SetEvent trace)
-3027a3e3…  crates/wie-runtime/src/session/profile.rs            perf       (access_type surface)
-53ec03ff…  crates/wie-runtime/src/trace.rs                      perf
+read: mem_read generation changed at 0x30000000 (concurrent map/free, 3 attempts)
+read: mem_read unmapped 0x30000000
 ```
 
-None of it is gated. Gate it in a worktree of `99d11e3` with its own
-`CARGO_TARGET_DIR` before committing, and expect `nextest -p wie-cpu` to be
-**538 dev / 540 release** depending on which lane's tests are present — the
-count moves with the tree, so state it rather than assuming it.
+The first is attempt exhaustion: the bound is tuning, and 3→8 was tried and
+reverted. The second string carries **no generation change at all**, so no attempt
+count can cure it — that is the incoherent-resolve / `ArenaSet` shape, and it is the
+one worth a slice. Observed failure this session: `6 of 200000 accesses faulted`,
+`read: mem_read unmapped 0x30000000`.
 
-**Read this before committing `perf`'s set.** Four of the five files are
-instrumentation and one is a behaviour change:
+### 2.6 The order to take them in
 
-* `access=`, `value=` and `reprobe=` on the worker-fault line, plus an
-  `mt_worker_faults=<n> first: <detail>` profile line emitted only when a fault
-  happened. Measured on `4 64 40` n=20: 14 runs carried at least one verdict, 21
-  fault lines, and **21/21 printed `reprobe=ok`, 0 `reprobe=err`** — the page was
-  mapped at the fault site every time, which is the mechanism this whole class
-  rests on (a live page reported unmapped), now measured at the fault point rather
-  than inferred. Dominant class: the return-address push of a `call`
-  (`rip=0x140001373`, write, size 8, worker stack, `value=0x140001376`), 14 of 21.
-  **12 of those 14 faulting runs exited 0**, which is the exit-code blindness
-  described in §2.1.
-* `EventObject::wait`'s timeout branch is now a deadline loop that re-checks
-  `signaled`, so a spurious condvar wake cannot return `WAIT_OBJECT_0`. Three new
-  tests, and they were proven to fail against the old code by temporarily
-  reintroducing the wrong-wake (`left: Some(true), right: None`) and restoring the
-  file byte-identically. `nextest -p wie-winapi` **1401 passed** with it.
-* **`crates/wie-runtime/src/trace.rs` is the least verified thing in the tree.**
-  It turns `ExitProcess { code: 0 }` *plus* a recorded worker fault into
-  `RuntimeStop("<detail>; ExitProcess would have reported success")`. That is the
-  right behaviour and it changes what a micro run reports, but it is **unmeasured**:
-  no `-p wie-runtime` suite run and no `mt_contention 4 64 40` n=10 acceptance was
-  taken after it. If an existing runtime test asserts exit 0 on a faulting guest,
-  that test is the first thing to reconcile.
+Each line names the item, the file it lives in, and the thing that has to be true
+before it can be called done. No item is done until its acceptance has been run.
 
----
+1. **A guest that faults a worker on purpose** — new file under `micro-exes/src`,
+   plus a harness case. Acceptance: the run reports non-zero and names the fault,
+   and the test fails if `trace.rs`'s `RuntimeStop` branch is deleted. This is the
+   only owed acceptance from `66a5fe6` (§2.5).
+2. **The churn sensor's two causes, split** — `crates/wie-cpu/src/mem/tests.rs`.
+   Acceptance: two counters instead of one assertion, and the failure fraction at
+   the parent stated as a fraction over n=20. Then re-point the `generation unmoved`
+   counter at `ArenaSet` (§2.5).
+3. **`ArenaSet::arenas` under the same tear as `PageMap`** —
+   `crates/wie-cpu/src/mem/arena.rs`. **Do not lock blind**: the test that fails at
+   HEAD first, as `pagemap.rs:202` did, or stop and record why.
+4. **`regions=` beside `jit: compiles`** — `pipeline.rs`, then the remaining
+   instrumentation gaps in §2.4. Cheap, and it makes the region path's frame effect
+   measurable rather than inferred.
+5. **The remaining 32 % of block-parameter materialisation** — `lower/mod.rs`. It is
+   visible now that the dead 68 % is gone; the census's unit (host instructions per
+   entry+exit) is the measurement (§2.3).
 
 ## 3. Discipline that was paid for
 
@@ -218,6 +259,10 @@ cargo nextest run -p wie-cpu -E 'test(a_peer_churn_of_another_region)' --no-capt
 # the fault class, sharp arm first (it fails ~2x as often as the full mask)
 ./target/release/wie run micro-exes/out/mt_contention.exe 4 64 40 < /dev/null
 ./target/release/wie run micro-exes/out/mt_contention.exe 4 64 c0 < /dev/null
+
+# the arm that used to fault oftenest; use it to try to make the RuntimeStop
+# branch fire, because 4 64 40 no longer faults at all (10/10 clean, 0 fault lines)
+WIE_JIT_MEM=slow ./target/release/wie run micro-exes/out/mt_contention.exe 4 64 40 < /dev/null
 
 # console startup, process wall and phases
 WIE_RUNTIME_PROFILE=1 ./target/release/wie run micro-exes/out/crt_hello.exe
