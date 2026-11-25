@@ -25,7 +25,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use cache::{ICED_COUNTERS, ICED_TRACE_ENABLED, decode_at};
+use cache::{DecodeOutcome, ICED_COUNTERS, ICED_TRACE_ENABLED, decode_at, decode_at_detail};
 use gpr::{
     exec_arith, exec_bit, exec_bswap, exec_cmov, exec_div, exec_imul, exec_lea, exec_mov,
     exec_movzx, exec_mul, exec_pop, exec_push, exec_setcc,
@@ -186,12 +186,23 @@ pub(crate) fn step(
         return Ok(StepResult::HostStop { address: rip, size });
     }
 
-    let Some((instr, _len)) = decode_at(mem, rip) else {
-        // Distinguish "unmapped fetch" from "invalid encoding" by re-probing
-        // `fetch_into` so callers see the same InvalidMem vs error split as
-        // before the cache was introduced.
-        let mut probe = [0_u8; 1];
-        if mem.fetch_into(rip, &mut probe).is_err() {
+    // A failed fetch is a **fetch** condition, never a decode failure: the bytes
+    // may be perfectly valid and momentarily unreadable because another thread is
+    // mapping/protecting this page. Reporting that as "invalid instruction" is how
+    // a lost race became a fatal worker death on `mt_contention.exe`.
+    let (instr, _len) = match decode_at_detail(mem, rip) {
+        DecodeOutcome::Decoded(instr, len) => (instr, len),
+        DecodeOutcome::InvalidEncoding => {
+            return Err(CpuError::Message(format!(
+                "invalid instruction at {rip:#x}"
+            )));
+        }
+        DecodeOutcome::FetchFailed(e) => {
+            if crate::exec::cache::mt_debug_enabled() {
+                eprintln!(
+                    "[decode] rip={rip:#x} fetch failed, reporting InvalidMemory(Fetch): {e}"
+                );
+            }
             return Ok(StepResult::InvalidMemory(InvalidMem {
                 access_type: AccessType::Fetch,
                 address: rip,
@@ -199,9 +210,6 @@ pub(crate) fn step(
                 value: 0,
             }));
         }
-        return Err(CpuError::Message(format!(
-            "invalid instruction at {rip:#x}"
-        )));
     };
 
     // Tracer: count how many times each mnemonic hits the interpreter.
