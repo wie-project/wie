@@ -14,6 +14,7 @@
 | [Runtime](runtime.md) | RuntimeSession, PE loading, API hooks, run loop, threading |
 | [C++ Exceptions](cpp-exceptions.md) | Exception handling across the translation boundary |
 | [Performance Ceiling](performance-ceiling.md) | Where the remaining time is, per real workload, with a ranked lever table and the dead ends |
+| [Startup Latency](startup-latency.md) | What a console hello-world costs end to end (8.79 ms min / 9.13 ms median process wall), the phase table, why the WAD-staging win is not on the `wie run` path, and the measured cold-page-cache case behind the "sometimes 500 ms" |
 | [L1: persistent frame](l1-persistent-frame.md) | The landed L1 lever: one `JitCtx` per engine instead of a 3.7 KB struct copy per dispatcher entry — invariant, ABI rules, measurement |
 | [JIT code memory on Darwin](code-memory-on-darwin.md) | What the OS allows for code memory (no huge pages, no superpages, `MAP_JIT` vs entitlements), the measured per-block cost of the `mmap`/`mprotect`/`ic ivau` path, the `JITMemoryKind` non-re-export blocker, the measured code working set, and the L1I aliasing defect of page-aligned block starts |
 | [Dispatcher entry, attributed](dispatcher-entry-attribution.md) | What a dispatcher entry still costs, piece by piece, after L1 — and which pieces can and cannot be removed |
