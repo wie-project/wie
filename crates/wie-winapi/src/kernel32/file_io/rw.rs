@@ -123,8 +123,8 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
 
     // Single classification lookup: existence + streaming flag (replaces the
     // separate `is_open_file_handle` probe).
-    let streaming = match find_open_file(state, handle) {
-        Some(f) => f.streaming,
+    let (streaming, mirrored) = match find_open_file(state, handle) {
+        Some(f) => (f.streaming, f.guest_slot_index.is_some()),
         None => {
             state.process.last_error = ERROR_INVALID_HANDLE;
             return ctx.finish(0);
@@ -135,6 +135,10 @@ pub fn handle_read_file(ctx: &mut HandlerContext<'_>) -> Result<WinApiHandlerRes
     let _ = crate::guest_io_host::sync_host_cursor_from_guest(engine, state, handle).ok();
     let requested =
         usize::try_from(bytes_to_read).context("ReadFile byte count does not fit usize")?;
+    // Did this read of a handle the guest-I/O accelerator mirrored still reach
+    // the host handler? Then the open-time copy of its bytes bought this call
+    // nothing (see the `readfile_mirror` profile line).
+    crate::kernel32::file_stages::count_read(mirrored, bytes_to_read);
 
     if streaming {
         let (host_path, cursor_before, path) = {

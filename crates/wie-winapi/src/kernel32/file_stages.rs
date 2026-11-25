@@ -6,8 +6,12 @@
 //! count for a guest that loads nine files. These three stages split it: the
 //! directory-watch probe that runs before every open, the open itself, and the
 //! guest-I/O mirror registration that follows it.
+//!
+//! Read the totals in the report with one rule: aggregate handler time
+//! (`handler_ms`) varies ~2x run to run on a loaded host and is not evidence of
+//! anything. An isolated stage cost that moves by more than that band is.
 
-use crate::stage_timer::{Stage, field as stage_field, timed};
+use crate::stage_timer::{Counter, Stage, field as stage_field, timed};
 
 /// `open_directory_for_watch`: the `stat` probe on every `CreateFile`.
 static DIR_PROBE: Stage = Stage::new();
@@ -72,6 +76,29 @@ pub(crate) fn timed_close_persist<T>(f: impl FnOnce() -> T) -> T {
     timed(&CLOSE_PERSIST, f)
 }
 
+/// `ReadFile` calls split by whether the handle owns a guest-I/O arena mirror.
+///
+/// The mirror costs an O(size) copy (usually dominated by first-touch page
+/// faults in guest memory) at open time; it only pays for itself if reads of
+/// that file are then served *inside* the guest, without crossing the host
+/// boundary. `mirrored` counts the reads that crossed anyway — for those the
+/// copy bought nothing.
+static READFILE_CALLS: Counter = Counter::new();
+static READFILE_MIRRORED: Counter = Counter::new();
+static READFILE_MIRRORED_BYTES: Counter = Counter::new();
+static READFILE_HOST_BYTES: Counter = Counter::new();
+
+/// Record one `ReadFile` handler call.
+pub(crate) fn count_read(mirrored: bool, bytes: u64) {
+    READFILE_CALLS.add(1);
+    if mirrored {
+        READFILE_MIRRORED.add(1);
+        READFILE_MIRRORED_BYTES.add(bytes);
+    } else {
+        READFILE_HOST_BYTES.add(bytes);
+    }
+}
+
 pub(crate) fn timed_close_unregister<T>(f: impl FnOnce() -> T) -> T {
     timed(&CLOSE_UNREGISTER, f)
 }
@@ -113,6 +140,21 @@ pub(crate) fn report_lines() -> Vec<String> {
         .join(" ");
         lines.push(format!(
             "closehandle_stages: {fields} (calls/cost/per-call; persist writes the whole buffered file back to its host path)"
+        ));
+    }
+    if READFILE_CALLS.get() > 0 {
+        let calls = READFILE_CALLS.get();
+        let mirrored = READFILE_MIRRORED.get();
+        let pct = if calls == 0 {
+            0.0
+        } else {
+            100.0 * f64::from(u32::try_from(mirrored).unwrap_or(u32::MAX))
+                / f64::from(u32::try_from(calls).unwrap_or(u32::MAX))
+        };
+        lines.push(format!(
+            "readfile_mirror: calls={calls} mirrored={mirrored} ({pct:.1}%) mirrored_bytes={} host_bytes={} (a read of a handle that owns a guest-I/O arena mirror still crossed the host boundary; the O(size) copy bought nothing for that call)",
+            READFILE_MIRRORED_BYTES.get(),
+            READFILE_HOST_BYTES.get()
         ));
     }
     lines

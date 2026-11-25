@@ -77,6 +77,28 @@
 //! clip, the source and destination rectangles are equal, and the caller is the
 //! only writer of that DIB for this frame.** Everything else keeps the copy and
 //! the row loop stays as it is.
+//!
+//! # Measured: it is a tie, and 0.39 % of wall
+//!
+//! A frame-reaching run (`frames_published=733`) settled the split:
+//!
+//! ```text
+//! bitblt         731 calls  488.17 ms   667 us/call
+//! bitblt_stages  resolve_src 0.69us  resolve_dst 0.14us  publish 0.48us
+//!                ensure_surface 326.95us   rows 336.67us
+//! ```
+//!
+//! So the two copies cost the same, 488 ms is **0.39 % of a 124 s wall**, and the
+//! aliasing slice above would remove at most half of that. It is deferred on that
+//! number, not on its difficulty. Start from the tie: there is no single stage to
+//! attack here, so a slice that shaves `rows` alone buys ~1.7 ms per 1 000 calls.
+//!
+//! # Aggregate handler totals are not evidence
+//!
+//! `handler_ms` in the profile report varies by roughly 2x between runs on this
+//! host, so a total moving from 90 ms to 60 ms means nothing. Per-call costs of
+//! an *isolated* stage (the `persist` fix: 1 499 us -> 17.7 us) are outside that
+//! band and are the only numbers from this family that may be quoted as a win.
 
 use crate::stage_timer::{Stage, field as stage_field, timed};
 use std::sync::Mutex;

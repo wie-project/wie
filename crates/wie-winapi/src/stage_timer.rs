@@ -59,6 +59,29 @@ impl Stage {
     }
 }
 
+/// A bare counter for questions that are about *how often*, not how long.
+///
+/// `Stage` always accumulates nanoseconds; asking "were these reads served from
+/// the mirrored arena or from the host path" wants counts and byte totals, and a
+/// duration there would be noise around zero.
+#[derive(Debug, Default)]
+pub(crate) struct Counter(AtomicU64);
+
+impl Counter {
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    pub(crate) fn add(&self, n: u64) {
+        let _previous = self.0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub(crate) fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// Time `f` against `stage`.
 pub(crate) fn timed<T>(stage: &Stage, f: impl FnOnce() -> T) -> T {
     let start = Instant::now();
