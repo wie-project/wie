@@ -22,6 +22,14 @@ fn guest_id_to_menu_id(id: u32) -> MenuId {
     MenuId::new(id.to_string())
 }
 
+/// Menu id of the host's own **Quit** item — the app-menu slot's Cmd+Q.
+///
+/// Deliberately non-numeric: [`menu_id_to_guest_id`] decodes digits only and
+/// yields 0 for anything else, so the guest command space cannot collide with it,
+/// and the event handler can tell the two apart by identity rather than by a
+/// reserved number the guest might also use.
+pub const QUIT_MENU_ID: &str = "wie:quit";
+
 /// Decodes a [`MenuId`] back into the guest menu item id.
 ///
 /// Non-numeric ids (defensive — we only ever create numeric ones) decode to 0.
@@ -258,9 +266,26 @@ impl MacMenuBar {
         }
 
         let menu = Menu::new();
-        // App-menu slot: macOS shows the app name here, never our title, so
-        // an empty placeholder keeps the guest's own menus titled correctly.
+        // App-menu slot: macOS shows the app name here, never our title. It holds
+        // the host's own Quit item — without one, Cmd+Q is not bound at all and a
+        // quit does nothing, so the app kept running until the guest quit on its
+        // own ("sometimes it stops after a while"). The item is a plain command
+        // rather than `PredefinedMenuItem::quit` because that one calls
+        // `NSApp terminate:`, which takes the process down before the guest
+        // session can unwind (the same teardown the capture path needs).
         let app_menu = Submenu::new("App", true);
+        let quit = MenuItem::with_id(
+            QUIT_MENU_ID,
+            "Quit",
+            true,
+            Some(Accelerator::new(
+                Some(muda::accelerator::Modifiers::META),
+                muda::accelerator::Code::KeyQ,
+            )),
+        );
+        if let Err(error) = app_menu.append(&quit) {
+            tracing::warn!(error = %error, "muda: failed to append the Quit item");
+        }
         if let Err(error) = menu.append(&app_menu) {
             tracing::warn!(error = %error, "muda: failed to append app menu");
         }
@@ -330,6 +355,27 @@ fn append_children(submenu: &Submenu, nodes: &[MenuNode], leaves: &mut Vec<LeafI
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// The host's Quit item must be distinguishable from every guest command.
+    ///
+    /// `menu_id_to_guest_id` decodes digits only, so a non-numeric id is the one
+    /// form the guest cannot occupy — a reserved number would collide with a guest
+    /// item the first time an app happened to use it.
+    #[test]
+    fn quit_id_is_not_a_guest_command() {
+        assert_eq!(
+            menu_id_to_guest_id(&MenuId::new(QUIT_MENU_ID)),
+            0,
+            "the host Quit id must not decode to a guest command"
+        );
+        assert!(
+            QUIT_MENU_ID.parse::<u32>().is_err(),
+            "the id stays non-numeric so the guest id space cannot collide with it"
+        );
+        // And a real guest command still round-trips, so the check above is not
+        // passing because the decoder is broken for everything.
+        assert_eq!(menu_id_to_guest_id(&MenuId::new("264")), 264);
+    }
 
     fn leaf(id: u32, title: &str, enabled: bool, checked: bool) -> MenuNode {
         MenuNode {

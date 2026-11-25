@@ -43,6 +43,14 @@ impl GuestHandle {
     pub fn request_profile_stop(&self) {
         wie_winapi::port::request_profile_stop();
     }
+
+    /// Ask the session to end because the host is closing the run (the app or the
+    /// window it is showing was quit). Unlike [`Self::request_profile_stop`] this
+    /// works with no diagnostics knob armed, and it unwinds the pump within one
+    /// API-stop boundary instead of waiting for the GUI loop to regain control.
+    pub fn request_host_stop(&self) {
+        wie_winapi::port::request_host_stop();
+    }
 }
 
 /// Descend the child hierarchy of `root` with z-order hit-testing: at each

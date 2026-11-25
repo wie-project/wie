@@ -130,12 +130,18 @@ impl WieApp {
             return;
         };
         let items = handle.window_menu_items();
-        if items == self.last_menu_items {
+        // The FIRST sync must install the bar even when the guest has no menus at
+        // all (an empty list compares equal to the empty cache): the host's own
+        // Quit item lives in that bar, and without it Cmd+Q is unbound — the app
+        // then runs until the guest quits by itself, which is the "sometimes it
+        // stops after a while" this fixes.
+        if !should_rebuild_menu_bar(self.menu_bar_installed, &items, &self.last_menu_items) {
             return;
         }
         tracing::debug!("menu items: {:?}", items);
         self.menu_bar.rebuild(items.as_slice());
         self.last_menu_items = items;
+        self.menu_bar_installed = true;
     }
 
     /// Mirror the guest's top-level z-order into the host NSWindows.
@@ -638,6 +644,11 @@ struct WieApp {
     /// Menu items the menu bar was last rebuilt with (cheap change check).
     #[cfg(target_os = "macos")]
     last_menu_items: Arc<Vec<MenuNode>>,
+    /// `false` until the bar has been installed once. The first install happens
+    /// even when the focused guest window has no menu, because the host's Quit
+    /// item (Cmd+Q) lives there and must not depend on the guest having menus.
+    #[cfg(target_os = "macos")]
+    menu_bar_installed: bool,
     /// The executable's own identity (name from its version resource, icon
     /// from its `RT_GROUP_ICON`). The main window's title is prefixed with
     /// the name; the Dock tile is set from the icon in `run_gui_windowed`.
@@ -646,8 +657,25 @@ struct WieApp {
     /// ([`WieEvent::HostInterrupt`]); read after `run_app` returns to exit
     /// with status 130.
     host_interrupt_exit: bool,
+    /// Set when the host's own **Quit** item (Cmd+Q) ended the run. The session
+    /// stop it requests also arrives as [`WieEvent::HostInterrupt`], so this is
+    /// what tells a user quit (a normal exit, status 0) from a profiling Ctrl+C
+    /// (status 130).
+    quit_requested: bool,
     /// `--screenshot-on-frame`: dump the Nth published frame and stop.
     capture: Option<crate::gui::capture::FrameCapture>,
+}
+
+/// Whether the menu bar needs rebuilding for the focused window's menu.
+///
+/// The rule that matters: the **first** sync always installs the bar, even when the
+/// guest has no menus. An empty list compares equal to the initial empty cache, so
+/// "only rebuild on change" skipped the first install for exactly the guests that
+/// need it most (a game with no menu bar) — and the host's own Quit item (Cmd+Q)
+/// lives in that bar, so Cmd+Q stayed unbound and the app ran until the guest quit.
+#[cfg(target_os = "macos")]
+fn should_rebuild_menu_bar(installed: bool, items: &[MenuNode], last: &[MenuNode]) -> bool {
+    !installed || items != last
 }
 
 impl ApplicationHandler<WieEvent> for WieApp {
@@ -815,6 +843,19 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 // deliver WM_COMMAND with wParam = MAKEWPARAM(id, 0). The menu
                 // bar mirrors the primary window's menu (menu polish is L4's
                 // lane), so the command goes to the primary window's hwnd.
+                // The host's own Quit item (Cmd+Q) is not a guest command: stop
+                // the session from the inside and let the loop end when the guest
+                // thread reports it. Posting WM_CLOSE instead would be polite but
+                // not instant — that is the behaviour this replaces: an unbounded
+                // wait for a guest that may never return to its message loop.
+                if menu_event.id().0 == menu_bar::QUIT_MENU_ID {
+                    tracing::info!(target: "wiegui", "Quit (Cmd+Q): stopping the session");
+                    self.quit_requested = true;
+                    if let Some(handle) = self.handle.as_ref() {
+                        handle.request_host_stop();
+                    }
+                    return;
+                }
                 let id = menu_bar::menu_id_to_guest_id(menu_event.id());
                 tracing::debug!(
                     target: "wiegui",
@@ -838,7 +879,7 @@ impl ApplicationHandler<WieEvent> for WieApp {
                 // The guest thread already printed the profile report; record
                 // WHY the loop ended so `run_gui_windowed` exits 130 — unless
                 // the stop was a capture, which is a normal end (exit 0).
-                self.host_interrupt_exit = !self.capture_stop;
+                self.host_interrupt_exit = !self.capture_stop && !self.quit_requested;
                 event_loop.exit();
             }
         }
@@ -1229,8 +1270,11 @@ pub fn run_gui_windowed(
         menu_bar: crate::gui::menu_bar::MacMenuBar::new(proxy.clone()),
         #[cfg(target_os = "macos")]
         last_menu_items: Arc::new(Vec::new()),
+        #[cfg(target_os = "macos")]
+        menu_bar_installed: false,
         identity,
         host_interrupt_exit: false,
+        quit_requested: false,
         capture,
     };
 
@@ -1257,8 +1301,38 @@ mod tests {
 
     use super::{
         OCCLUDED_RETRY_MAX, OCCLUDED_RETRY_MS, PARKED_RETRY_MS, map_alert_result,
-        map_message_box_buttons, retry_delay, wheel_notches, window_attributes,
+        map_message_box_buttons, retry_delay, should_rebuild_menu_bar, wheel_notches,
+        window_attributes,
     };
+
+    /// The first sync must install the bar **even with no guest menu**: the host's
+    /// Quit item (Cmd+Q) lives there. An empty list equals the initial empty cache,
+    /// so a plain "rebuild on change" skipped the install and left Cmd+Q unbound.
+    #[test]
+    fn the_first_menu_sync_installs_the_bar_even_with_no_guest_menu() {
+        let empty: Vec<super::MenuNode> = Vec::new();
+        assert!(
+            should_rebuild_menu_bar(false, &empty, &empty),
+            "first sync must install the bar so Cmd+Q exists"
+        );
+        assert!(
+            !should_rebuild_menu_bar(true, &empty, &empty),
+            "an unchanged menu must not rebuild the AppKit menu every frame"
+        );
+        let one = vec![super::MenuNode {
+            id: 0x101,
+            title: "File".to_owned(),
+            enabled: true,
+            checked: false,
+            separator: false,
+            accelerator: None,
+            children: Vec::new(),
+        }];
+        assert!(
+            should_rebuild_menu_bar(true, &one, &empty),
+            "a guest menu appearing later still rebuilds"
+        );
+    }
 
     /// A physical wheel notch (LineDelta ±1 → ±120) emits exactly one notch
     /// per event and leaves no residue.

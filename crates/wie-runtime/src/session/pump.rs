@@ -1454,6 +1454,20 @@ impl super::RuntimeSession {
                 break 'outer;
             }
 
+            // Host-initiated stop: the presenter is closing the run (app/window
+            // quit). Same boundary and same unwind as the profiling Ctrl+C, but
+            // NOT gated on a diagnostics knob — a quit must work on a plain run,
+            // and it must unwind *inside* the pump, because a CPU-busy guest
+            // never returns to its message loop for the GUI loop to notice a
+            // between-quanta flag. `HostInterrupt` is the right termination: the
+            // document's meaning is "the HOST stopped the session", not "a guest
+            // exit code".
+            if wie_winapi::port::take_host_stop() {
+                tracing::info!(target: "wiegui", "host stop requested; unwinding the session");
+                termination = EntryTraceTermination::HostInterrupt;
+                break 'outer;
+            }
+
             // Start any CreateThread workers before the next quantum.
             self.process.drain_spawns()?;
 

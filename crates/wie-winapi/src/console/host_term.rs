@@ -393,6 +393,29 @@ pub(crate) fn take_ctrlc_for_profile_stop() -> bool {
     pending
 }
 
+/// A host-initiated stop of the session: the **presenter** asked for the run to
+/// end (the app/window quit), as opposed to a signal arriving on the terminal.
+///
+/// Separate from [`CTRLC_PENDING`] on purpose. That flag is consumed only while
+/// [`profile_sigint_armed`], so a quit request routed through it would be dropped
+/// on a normal run — which is exactly how Cmd+Q ended up doing nothing at all:
+/// the request went nowhere, and the app kept running until the guest quit on its
+/// own. This flag is unconditional and is taken by the pump at every API-stop
+/// boundary, so the run unwinds inside the pump instead of waiting for the GUI
+/// loop to regain control (a guest that never returns to its message loop never
+/// gives it back — measured on DOOM Retro).
+static HOST_STOP: AtomicBool = AtomicBool::new(false);
+
+/// Ask the session to end because the host is closing it.
+pub(crate) fn request_host_stop() {
+    HOST_STOP.store(true, Ordering::Release);
+}
+
+/// Take the pending host-stop request, clearing it.
+pub(crate) fn take_host_stop() -> bool {
+    HOST_STOP.swap(false, Ordering::Acquire)
+}
+
 /// Request the same stop a Ctrl+C produces, for a **host-initiated** end of
 /// the run (`--screenshot-on-frame` reaching its frame).
 ///

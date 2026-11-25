@@ -573,6 +573,18 @@ pub fn request_profile_stop() {
     host_term::request_profile_stop();
 }
 
+/// Ask the running session to end because the host is closing it (a window or
+/// application quit), independent of any diagnostics knob.
+pub fn request_host_stop() {
+    host_term::request_host_stop();
+}
+
+/// Take a pending host-stop request. Called by the runtime pump once per API-stop
+/// boundary; one consumer, exactly like the Ctrl+C flag.
+pub fn take_host_stop() -> bool {
+    host_term::take_host_stop()
+}
+
 pub fn take_ctrlc_for_profile_stop() -> bool {
     host_term::take_ctrlc_for_profile_stop()
 }
