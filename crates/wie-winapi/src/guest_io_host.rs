@@ -5,6 +5,31 @@
 use crate::WinApiState;
 use anyhow::{Context, Result};
 
+/// `WIE_GUEST_IO_MIRROR=0` turns the guest-I/O arena mirror off.
+///
+/// An experiment device, not a second supported mode. It exists to answer one
+/// question with a measurement: does the mirror — the O(filesize) `mem_write`
+/// of a file's bytes into the guest arena at open time — earn the ~9.5 ms per
+/// file it costs (first-touch page faults, not memcpy)?
+///
+/// The counters that make the question well-posed say it probably does not:
+/// 94 % of `ReadFile` calls are for handles that own **no** mirror at all, and
+/// the mirrored ones still cross the host boundary 232 times carrying 8.08 MB
+/// of 36.96 MB. Worse, `wie-runtime`'s `install_guest_io` runs unconditionally,
+/// so with `WIE_GUEST_IO=0` (every file API on the host path) the arena is
+/// still built and every open still pays this cost for a copy nothing reads.
+///
+/// Off is expected to be behaviour-neutral: a guest without the accelerator
+/// takes the host `ReadFile` path that already serves every other handle. Any
+/// guest-visible difference between the arms is a finding, which is why the
+/// deletion this prepares for is gated on the micro suite and a guest
+/// write-then-read-back check, never on the counter alone.
+fn mirror_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED
+        .get_or_init(|| std::env::var_os("WIE_GUEST_IO_MIRROR").is_some_and(|value| value == "0"))
+}
+
 /// Maximum simultaneously accelerated open files (must match guest helper).
 pub const GUEST_IO_MAX_SLOTS: usize = 128;
 
@@ -23,6 +48,9 @@ pub fn register_open_file(
     state: &mut WinApiState,
     handle: u64,
 ) -> Result<()> {
+    if mirror_disabled() {
+        return Ok(());
+    }
     let lookup_start = crate::kernel32::file_stages::reg_lookup_start();
     let Some(cfg) = state.file_io.guest_io.clone() else {
         crate::kernel32::file_stages::reg_lookup_done(lookup_start);
