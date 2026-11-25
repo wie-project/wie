@@ -20,7 +20,9 @@
 use super::harness::map_code_page;
 use super::*;
 use crate::jit::cache_persist::LedgerProbe;
-use crate::jit::engine::{CodeCache, CodeCacheCounts, PersistedCode, classify_capture_relocs};
+use crate::jit::engine::{
+    CodeCache, CodeCacheCounts, PersistedCode, SilentReason, classify_capture_relocs,
+};
 use cranelift_module::ModuleRelocTarget;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1325,5 +1327,113 @@ fn entry_block_ledger_row_survives_an_unordered_walk() {
         cache_persist::PersistentJitCache::test_disk_row_never(dir, PE_HASH, CODE_BASE)
             == Some(false),
         "the reloaded ledger serves a Never verdict for the entry block"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Silent give-ups inside `record_code`
+// ---------------------------------------------------------------------------
+
+/// The five `return`s in `JitShared::record_code` used to leave no trace: a
+/// block could be dropped before it ever became a `PersistedCode` and the run
+/// would still report `unpersistable=0`, which means "this format refuses that
+/// code", not "there was no code to offer". These are the reasons that are
+/// actually reachable from a test, each driven through the real install path
+/// (`persist_record_ready`) rather than by poking the counters.
+#[test]
+fn record_code_counts_its_silent_give_ups_by_reason() {
+    let dir = scratch_dir("silent-reasons");
+    let (mut cpu, cache) = engine_with_cache(&dir);
+    let nofunc = SilentReason::NoFunc.index();
+    let lock = SilentReason::Lock.index();
+    let capture = SilentReason::Capture.index();
+    let hash = SilentReason::Hash.index();
+
+    // --- compile once with the cache off, so the capture stays in the module
+    // A real `record_code` would consume it, and the phases below need one
+    // capture each in the order they are written.
+    cpu.shared.set_code_cache(None);
+    cpu.precompile_at(CODE_BASE);
+    cpu.shared.set_code_cache(Some(Arc::clone(&cache)));
+    let compiled = ready_block(&cpu);
+
+    // --- lock: another thread holds the engine ---------------------------
+    // The block is dropped on purpose rather than blocking a disk concern on
+    // the install path, so this is expected and benign — and now visible.
+    {
+        let _held = cpu.shared.engine.lock().expect("engine lock");
+        cpu.shared.persist_record_ready(&ready_block(&cpu));
+    }
+
+    // The engine was free this time, so the lock give-up above is the only one
+    // counted so far.
+    let c = counts(&cache);
+    assert_eq!(c.silent[lock], 1, "held engine is a counted give-up: {c:?}");
+    assert_eq!(
+        c.skipped_unpersistable, 0,
+        "a lock give-up is not the format refusing the code: {c:?}"
+    );
+
+    // --- nofunc: a block with no Cranelift id ----------------------------
+    let mut no_id = compiled;
+    no_id.func_id = None;
+    cpu.shared.persist_record_ready(&no_id);
+    assert_eq!(
+        counts(&cache).silent[nofunc],
+        1,
+        "a FuncId-less install is a counted give-up"
+    );
+
+    // --- hash: the block's guest bytes cannot be read back ---------------
+    // Real capture, unmapped guest range: this is the case where the blob
+    // could not be keyed to what will run next time, so persisting it would be
+    // worse than recompiling.
+    let mut unmapped = compiled;
+    unmapped.guest_start = 0x5000_0000;
+    unmapped.guest_end = 0x5000_0004;
+    cpu.shared.persist_record_ready(&unmapped);
+    assert_eq!(
+        counts(&cache).silent[hash],
+        1,
+        "an unhashable guest range is a counted give-up"
+    );
+
+    // --- capture: the capture was already consumed -----------------------
+    // The failed `hash` attempt above took it, which is exactly the shape a
+    // second install of the same block sees.
+    cpu.shared.persist_record_ready(&compiled);
+    let c = counts(&cache);
+    assert_eq!(c.silent[capture], 1, "a consumed capture is counted: {c:?}");
+
+    // Every reason kept its own slot: no cross-counting, and `compiled` (the
+    // blob counter) never moved because no blob was ever offered.
+    assert_eq!(c.compiled, 0, "no give-up may count as a persist: {c:?}");
+    assert_eq!(
+        c.skipped_unpersistable, 0,
+        "and none of them is the format's refusal: {c:?}"
+    );
+    assert!(
+        c.silent.iter().sum::<u64>() == 4,
+        "one give-up per phase and no more: {c:?}"
+    );
+}
+
+/// The breakdown in the exit summary must name every reason, zeros included:
+/// a field that only appears when non-zero is how `restored=0 refused=0` stayed
+/// unreadable for the whole of the previous slice.
+#[test]
+fn the_summary_names_every_silent_reason() {
+    let dir = scratch_dir("silent-summary");
+    let (_cpu, cache) = engine_with_cache(&dir);
+    let line = cache.summary().expect("enabled cache has a summary");
+    for label in ["nofunc", "lock", "nomod", "capture", "hash"] {
+        assert!(
+            line.contains(&format!("{label}=0")),
+            "summary omits {label}: {line}"
+        );
+    }
+    assert!(
+        line.contains("unpersistable_silent("),
+        "the breakdown needs a name that is not `unpersistable`: {line}"
     );
 }

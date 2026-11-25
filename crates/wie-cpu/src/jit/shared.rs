@@ -25,7 +25,7 @@ static REJECTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 pub(super) const BOOT_MODE_INSNS: u64 = 5_000_000;
 use super::config::{BG_QUEUE_CAP, JitConfig};
 use super::engine::{
-    CodeCache, CodeRestoreOutcome, JitEngine, PersistedCode, classify_capture_relocs,
+    CodeCache, CodeRestoreOutcome, JitEngine, PersistedCode, SilentReason, classify_capture_relocs,
 };
 use super::fast_api::{FastApiKind, LargeFreeList};
 use super::lower::err::LowerError;
@@ -892,24 +892,34 @@ impl JitShared {
     /// is a pure perf loss (the next run recompiles one block); blocking would
     /// put a disk-format concern on the critical path of every block install.
     fn record_code(&self, compiled: &CompiledBlock) {
-        if !self.code_cache().enabled() {
+        let cc = self.code_cache();
+        if !cc.enabled() {
             return;
         }
+        // The five give-ups below are counted, not silent: each one is a block
+        // that will be recompiled next run, and none of them is the format's
+        // `unpersistable` (which means the capture existed and could not be
+        // replayed). See [`SilentReason`].
         let Some(func_id) = compiled.func_id else {
+            cc.note_silent(SilentReason::NoFunc);
             return;
         };
         let Ok(mut guard) = self.engine.try_lock() else {
+            cc.note_silent(SilentReason::Lock);
             return;
         };
         let (captured, import_count) = {
             let Some(eng) = guard.as_mut() else {
+                cc.note_silent(SilentReason::NoMod);
                 return;
             };
             let Some(module) = eng.module_for(compiled.tier) else {
+                cc.note_silent(SilentReason::NoMod);
                 return;
             };
             let import_count = module.import_count();
             let Some(captured) = module.take_captured(func_id) else {
+                cc.note_silent(SilentReason::Capture);
                 return;
             };
             (captured, import_count)
@@ -924,16 +934,17 @@ impl JitShared {
                 self.chain_va_of(tier, target_id)
             })
         else {
-            self.code_cache().note_unpersistable();
+            cc.note_unpersistable();
             return;
         };
         let mem = read_unpoisoned(&self.mem);
         let Some(bytes_hash) =
             super::cache_persist::hash_guest_range(&mem, compiled.guest_start, compiled.guest_end)
         else {
+            cc.note_silent(SilentReason::Hash);
             return;
         };
-        self.code_cache().record(PersistedCode {
+        cc.record(PersistedCode {
             va: compiled.guest_start,
             guest_end: compiled.guest_end,
             bytes_hash,

@@ -717,6 +717,76 @@ fn from_disk(b: DiskBlob) -> Option<PersistedCode> {
 /// Counters for the profile dump. The whole point of the feature is that it is
 /// measurable: without a hit rate, "persist the code" and "persist nothing" are
 /// indistinguishable from the outside.
+/// Why [`super::JitShared::record_code`] gave a block up **before** there was a
+/// [`PersistedCode`] to offer [`CodeCache::record`].
+///
+/// This is a different failure class from `unpersistable`, which means exactly
+/// one thing — the capture was classified and *this format cannot replay it*.
+/// A silent give-up means something else went wrong on the way to the record:
+/// there was no capture to classify. Those five `return`s used to leave no
+/// trace at all, so a run could report `unpersistable=0 missing=…` while every
+/// install was being dropped, and nothing said so.
+///
+/// One byte per reason, `u8`-valued so the counters can be an array: the
+/// labels are `nofunc|lock|nomod|capture|hash`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SilentReason {
+    /// The compiled block has no Cranelift function id (e.g. an interpreter or
+    /// a replay install), so there is nothing to capture.
+    NoFunc = 0,
+    /// The JIT engine lock was held by another thread. Expected under load and
+    /// benign — the block simply is not persisted this time.
+    Lock = 1,
+    /// No engine, or no module for that tier: the installer and the persister
+    /// disagree about which module holds the block.
+    NoMod = 2,
+    /// The module had no captured emission for that function id — the capture
+    /// was consumed by an earlier install of the same block, or was never
+    /// stored because the block was not compiled here at all.
+    ///
+    /// **A restored block lands in this bucket**, and that is the reading to
+    /// expect on a warm run: it counts installed blocks that had nothing to
+    /// capture, so on a restored run `capture` tracks `restored` — measured on
+    /// `crt_hello`, run 1 (cold) `restored=0 compiled=2 capture=0`, run 2
+    /// (warm) `restored=2 compiled=2 capture=2`. It is not an error and it is
+    /// not a lost blob — it is an install that arrived with no compile behind
+    /// it, which is exactly what every restored block is.
+    Capture = 3,
+    /// The guest bytes of the block could not be read back (unmapped, or the
+    /// range crosses something the memory layer refuses), so the blob could not
+    /// be keyed to what will run next time.
+    Hash = 4,
+}
+
+impl SilentReason {
+    /// Every reason, in byte order. Iterating this instead of a hand-written
+    /// list keeps the summary and the array in step.
+    pub(crate) const ALL: [SilentReason; 5] = [
+        SilentReason::NoFunc,
+        SilentReason::Lock,
+        SilentReason::NoMod,
+        SilentReason::Capture,
+        SilentReason::Hash,
+    ];
+
+    /// Array slot for this reason; total because `ALL` has one entry per
+    /// discriminant and `silent_counters_cover_every_reason` pins it.
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Stable short label, used in the exit summary.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            SilentReason::NoFunc => "nofunc",
+            SilentReason::Lock => "lock",
+            SilentReason::NoMod => "nomod",
+            SilentReason::Capture => "capture",
+            SilentReason::Hash => "hash",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct CodeCacheCounters {
     /// Times the cache was **consulted** with a guest VA — one per
@@ -763,6 +833,14 @@ pub(crate) struct CodeCacheCounters {
     /// number means the restore path is losing the lock race constantly, which
     /// is the signature of a guest thread being starved behind compiles.
     pub restore_deferred: AtomicU64,
+    /// Blocks dropped inside `record_code` before a [`PersistedCode`] existed,
+    /// one slot per [`SilentReason`].
+    ///
+    /// Kept out of `skipped_unpersistable` deliberately: that number has to keep
+    /// meaning "this format refuses to replay that code", which is a property of
+    /// the code, not of the moment it tried to be persisted. A `lock` give-up
+    /// says nothing about the block and will not happen next run.
+    pub silent: [AtomicU64; 5],
     /// Times the exit summary was actually emitted. Exactly 1 for the life of
     /// the process even when both the explicit session flush and `Drop` run —
     /// a counter rather than a log assertion, so a test can pin it.
@@ -789,6 +867,7 @@ impl CodeCacheCounters {
             flushes_written: g(&self.flushes_written),
             restore_deferred: g(&self.restore_deferred),
             summaries_reported: g(&self.summaries_reported),
+            silent: std::array::from_fn(|i| g(&self.silent[i])),
         }
     }
 
@@ -828,6 +907,9 @@ pub(crate) struct CodeCacheCounts {
     pub flushes_written: u64,
     pub restore_deferred: u64,
     pub summaries_reported: u64,
+    /// Per-[`SilentReason`] give-ups inside `record_code`; indexed by
+    /// [`SilentReason::index`].
+    pub silent: [u64; 5],
 }
 
 impl CodeCacheCounts {
@@ -837,6 +919,15 @@ impl CodeCacheCounts {
             .saturating_add(self.refused_file_mismatch)
             .saturating_add(self.refused_unrelocatable)
             .saturating_add(self.refused_malformed)
+    }
+
+    /// `reason=n` for each silent reason, in [`SilentReason::ALL`] order.
+    pub(crate) fn silent_breakdown(&self) -> String {
+        SilentReason::ALL
+            .iter()
+            .map(|r| format!("{}={}", r.label(), self.silent[r.index()]))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Fraction of "we had something to offer" cases that were replayed, in
@@ -1149,6 +1240,17 @@ impl CodeCache {
         }
     }
 
+    /// Count one block given up in `record_code` before a `PersistedCode`
+    /// existed; see [`SilentReason`].
+    ///
+    /// Gated on `enabled` like the rest of the counters: with the knob off a
+    /// persister that never runs must not report give-ups it never attempted.
+    pub(crate) fn note_silent(&self, why: SilentReason) {
+        if self.enabled {
+            self.counters.silent[why.index()].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Byte-validated lookup.
     ///
     /// There is deliberately no invalidation-generation check here. The
@@ -1433,7 +1535,11 @@ impl CodeCache {
         })
         .map(|line| {
             let counts = self.counters.snapshot();
-            format!("{line} hit_rate={}%", counts.hit_rate_pct())
+            format!(
+                "{line} hit_rate={}% unpersistable_silent({})",
+                counts.hit_rate_pct(),
+                counts.silent_breakdown()
+            )
         })
     }
 
@@ -1517,6 +1623,20 @@ mod probe_counter_tests {
         }
         std::fs::create_dir_all(&dir).expect("dir");
         dir
+    }
+
+    /// A disabled cache must not report give-ups it never attempted: the knob
+    /// being off is not the same finding as `record_code` dropping blocks.
+    #[test]
+    fn silent_counters_are_inert_with_the_knob_off() {
+        let cache = CodeCache::new();
+        assert!(!cache.enabled(), "the default cache is inert");
+        for why in SilentReason::ALL {
+            cache.note_silent(why);
+        }
+        let c = cache.counters().snapshot();
+        assert_eq!(c.silent, [0; 5], "nothing was attempted, nothing counts");
+        assert!(c.silent_breakdown().starts_with("nofunc=0"));
     }
 
     /// The counter must fire on **misses**, not only on hits.

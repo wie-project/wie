@@ -137,6 +137,24 @@ pub struct JitProfile {
     ///
     /// Shared-derived (see [`SHARED_DERIVED_STATS`](super::SHARED_DERIVED_STATS)).
     pub code_cache_unpersistable: u64,
+    /// Times the code cache was **consulted** with a guest VA, whatever came
+    /// back: a replay, a refusal, or no blob at all.
+    ///
+    /// This is the counter that makes `restored=0 refused=0` readable. Without
+    /// it those two zeros mean both "nobody asked the cache" and "it was asked
+    /// and had nothing to offer", and the difference is the whole diagnosis: the
+    /// entry block of `crt_hello` was written once and offered never, because
+    /// `precompile_at` compiled it before consulting anything — a missing call
+    /// site, not an empty cache.
+    ///
+    /// Identity to check on any run: every consultation resolves into exactly
+    /// one outcome, so `probes == restored + refused + absent + deferred`, with
+    /// the last two printed on the `CodeCache` exit summary. A `probes` that
+    /// tracks `restored` is the bug this field exists to expose — a counter that
+    /// only fires on a hit, which is the same blindness with a new name.
+    ///
+    /// Shared-derived (see [`SHARED_DERIVED_STATS`](super::SHARED_DERIVED_STATS)).
+    pub code_cache_probes: u64,
     /// Blocks compiled at the tier-up opt level (self-loops that earned it).
     /// Shared-derived (folded from the one [`JitShared`], see
     /// [`SHARED_DERIVED_STATS`](super::SHARED_DERIVED_STATS)).

@@ -51,7 +51,9 @@ mod code_cache;
 
 #[allow(unused_imports)] // wired up by the JitShared plumbing in a follow-up edit
 pub(crate) use code_cache::{CodeCache, CodeCacheCounts};
-pub(super) use code_cache::{CodeRestoreOutcome, PersistedCode, classify_capture_relocs};
+pub(super) use code_cache::{
+    CodeRestoreOutcome, PersistedCode, SilentReason, classify_capture_relocs,
+};
 
 use cranelift_module::{FuncId, Module, ModuleDeclarations, ModuleReloc};
 

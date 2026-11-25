@@ -456,6 +456,13 @@ fn tier_line(s: &JitStats) -> Option<String> {
 /// relocation the format refuses to persist, expected and *not* an error) are
 /// what explain a low or a zero `restored`.
 ///
+/// `probes` is consultations, not hits: every lookup that reached the disk —
+/// including the ones that found nothing, which is the majority on a cold
+/// run — so `probes=0` means the cache was never asked and `probes>restored`
+/// means it was asked and had nothing. Without it a run could not tell those
+/// two apart, which is how the entry block came to be recompiled every launch
+/// while this line reported a healthy-looking zero.
+///
 /// Printed unconditionally, zeros included: see [`jit_profile_report_lines`].
 /// With the knob off every counter is genuinely 0, so the line reads as
 /// "measured, nothing happened" rather than being absent.
@@ -473,8 +480,8 @@ fn code_cache_line(s: &JitStats) -> String {
         .checked_div(restored.saturating_add(refused))
         .unwrap_or(0);
     format!(
-        "[wie] jit_code_cache: restored={restored} refused={refused} unpersistable={} hit_rate={hit_rate}%",
-        s.profile.code_cache_unpersistable
+        "[wie] jit_code_cache: probes={} restored={restored} refused={refused} unpersistable={} hit_rate={hit_rate}%",
+        s.profile.code_cache_probes, s.profile.code_cache_unpersistable
     )
 }
 
@@ -598,7 +605,7 @@ mod tests {
     fn code_cache_line_reports_zeros_without_the_knob() {
         assert_eq!(
             code_cache_line(&JitStats::default()),
-            "[wie] jit_code_cache: restored=0 refused=0 unpersistable=0 hit_rate=0%"
+            "[wie] jit_code_cache: probes=0 restored=0 refused=0 unpersistable=0 hit_rate=0%"
         );
     }
 
@@ -608,12 +615,13 @@ mod tests {
     #[test]
     fn code_cache_line_hit_rate_uses_refusals_as_denominator() {
         let mut s = JitStats::default();
+        s.profile.code_cache_probes = 65;
         s.profile.code_cache_restored = 23;
         s.profile.code_cache_refused = 2;
         s.profile.code_cache_unpersistable = 40;
         assert_eq!(
             code_cache_line(&s),
-            "[wie] jit_code_cache: restored=23 refused=2 unpersistable=40 hit_rate=92%"
+            "[wie] jit_code_cache: probes=65 restored=23 refused=2 unpersistable=40 hit_rate=92%"
         );
 
         // Every refusal, no restores: 0%.
