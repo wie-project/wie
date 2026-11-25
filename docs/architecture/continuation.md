@@ -271,6 +271,14 @@ WIE_RUNTIME_PROFILE=1 ./target/release/wie run micro-exes/out/crt_hello.exe
 WIE_JIT_CODE_CACHE=1 WIE_CACHE_DIR=/tmp/cc ./target/release/wie run micro-exes/out/crt_hello.exe
 ```
 
+**The base binary is gone.** `/tmp/wie-head/target/release/wie` (commit `0cdf6fe`) was
+deleted during the end-of-session cleanup, so a frame A/B has to recreate it first:
+
+```sh
+git worktree add --detach /tmp/wie-head 0cdf6fe
+(cd /tmp/wie-head && CARGO_TARGET_DIR=/tmp/wie-head/target cargo build --release -p wie-cli)
+```
+
 **Frame A/Bs were off for the whole session** — five lanes compiling means no
 20-second quiet gap exists. The last valid paired figure stands at **3.67× median
 (2424/2480 vs 593/742) at `4183676`** and must never be presented as current for
