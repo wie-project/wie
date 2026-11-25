@@ -206,6 +206,49 @@ pub(super) struct FlagState {
     pub cf: Value,
     pub of: Value,
     pub pf: Value,
+    /// AF. Materialised **eagerly** by the writer that defines it, and this is a
+    /// measured decision, not an oversight.
+    ///
+    /// AF has no consumer of its own in x86 — no `jaf`, `setaf`, `cmovaf` — so
+    /// the only reader is a pack, which is exactly the shape that made the PF
+    /// deferral above pay. It does not pay here. Measured on the scaled blit
+    /// `0x1800d8fb0`, per-iteration host instructions, three binaries built in one
+    /// session from one tree and differing only in this file:
+    ///
+    /// | shape                                      | per iteration |
+    /// |--------------------------------------------|---------------|
+    /// | eager (this code)                          | **239**       |
+    /// | recipe kept in a register across the block | 245 (+6)      |
+    /// | recipe parked in an explicit stack slot    | 251 (+12)     |
+    ///
+    /// Both deferred shapes removed exactly the flag work they promised
+    /// (`and` -2, `cmp` -2, `cset` -2, and `and #0x10` 3 -> 1) and paid it back
+    /// elsewhere: the register shape added `ldur` +6 and `mov` +6, the slot shape
+    /// `ldur` +17.
+    ///
+    /// The reason is **not** the flag algebra and **not** a read/write ratio:
+    /// `and #0x10` went 3 -> 1, so AF work strictly decreased, and the block still
+    /// lost. It is a register cliff. This block already spills and reloads
+    /// heavily; the deferred carrier adds frame state, and the allocator answers
+    /// by re-spilling values it had been keeping in registers. Measured in the
+    /// slot shape, the extra loads are spread across six *unrelated* slots
+    /// (`#0x70`, `#0xb0`-`#0xd0`) each going 1 -> 4 reloads per iteration, plus
+    /// `#0xf8` — none of them an AF read. Six saved instructions cannot buy back
+    /// 12-17 reloads, and OF/CF deferral would be worth only ~4 (its census on
+    /// this block: 4 writer sites, **zero** hot consumers, all four `cset`s are
+    /// the writers materialising their own bits), which is below the noise floor
+    /// of that effect. Any future attempt must first show the block is off the
+    /// cliff — count the reloads, not the flag instructions.
+    ///
+    /// Do **not** re-quote "227": that number was reported for the register shape
+    /// and does not reproduce — the dump it came from has a materially different
+    /// unit size from the same source, so its binary predated the snapshot it was
+    /// attributed to. The three rows above are the reproducible ones.
+    ///
+    /// AF cannot be dropped, only moved: the DOOM Retro image pair contains
+    /// `lahf` 13, `sahf` 6 and `pushfq` 3, and the `0x256`/`0x216` literals in
+    /// `flag_consumer_tests::writers_that_keep_af_do_not_reset_it` pin the
+    /// observable consequence of getting this wrong.
     pub af: Value,
     pub old: Value,
     /// The packed word these fields were last written as, if it is still exact.
@@ -948,6 +991,7 @@ pub(super) fn zs_pf_preds(
 /// ZF/SF, plus the *value* whose parity PF is — the eager `pf_cond` ladder is
 /// left to the caller, which is what lets a writer defer it
 /// ([`FlagState::materialise_pf`]).
+///
 /// AF of one masked `(d, s, r)` triple: `((d ^ s ^ r) & 0x10) != 0`.
 ///
 /// Shared by the arithmetic writers and by the *logic* path, which has no
