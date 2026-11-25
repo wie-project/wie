@@ -2520,7 +2520,7 @@ mod tests {
     ];
     const FLOOR_BASE: u64 = 0x4000_0000;
 
-    fn floor_median(v: &mut Vec<f64>) -> f64 {
+    fn floor_median(v: &mut [f64]) -> f64 {
         if v.is_empty() {
             return f64::NAN;
         }
@@ -2687,6 +2687,6 @@ mod tests {
             floor_median(&mut baseline_us),
             baseline_us.len()
         );
-        print!("{out}");
+        eprint!("{out}");
     }
 }
