@@ -97,7 +97,16 @@ use std::time::{Duration, Instant};
 const MAGIC: [u8; 8] = *b"WIEJITC\x01";
 /// Current on-disk format version.
 ///
-/// v3 adds a per-record `compiled_at_opt` (an [`OptTier`] code). The per-FILE
+/// v4 adds a per-record **entry count** (`entries`), the evidence that a block
+/// was actually *run* rather than merely compiled (see
+/// [`LedgerProbe::wants_eager`]). v3 files are *migrated*, not deleted: every
+/// record decodes with `entries = 0`, which makes `wants_eager` false for all of
+/// them — "no entry evidence" is exactly the conservative answer, and it costs a
+/// migrated block nothing but the cold warm-up it already paid before this
+/// change. The v3 file is left on disk and rewritten as v4 by the next flush (a
+/// process that records nothing new leaves it as-is; migration is idempotent).
+///
+/// v3 added a per-record `compiled_at_opt` (an [`OptTier`] code). The per-FILE
 /// `opt_level` of v2 is not sufficient: hot-block tiering compiles one guest VA
 /// at both levels inside a single process, so a file keyed on the base level
 /// can hold a record that only ever succeeded at the tier level, and a base
@@ -108,7 +117,28 @@ const MAGIC: [u8; 8] = *b"WIEJITC\x01";
 /// files were keyed by PE hash alone, so a `WIE_JIT_OPT=none` run and a
 /// `WIE_JIT_OPT=speed` run shared one ledger file and each consumed the other's
 /// entries.
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
+
+/// Entry evidence a record needs before a warm boot compiles its block eagerly
+/// instead of letting it earn a compile through the visit threshold.
+///
+/// This is the whole fix for the eager-compile storm: with no entry evidence the
+/// ledger used to promote *every* known-good record to a full Cranelift compile
+/// at first sight, which on a console-shaped guest (365 records, 4 blocks ever
+/// entered) turned a 12.6 ms cold boot into a 63.6 ms warm one. Two entries is
+/// the smallest threshold that is not "compiled but never run":
+///
+/// - a block entered once per run is the shape the ledger must *not* promote —
+///   it will be entered once again on this boot, so compiling it eagerly cannot
+///   save a single dispatch;
+/// - a block entered twice or more is a loop head or a repeatedly-called
+///   function: it will be entered again, and the compile has to happen inside
+///   that loop rather than before it.
+///
+/// Deliberately not a knob: it is one comparison against evidence the ledger
+/// either has or does not, and the conservative direction (fewer eager compiles)
+/// only ever costs the visit warm-up that predates this feature.
+pub(super) const EAGER_MIN_ENTRIES: u32 = 2;
 
 /// Window hashed for `Never` (negative) entries: they lack an exact byte
 /// extent at record time, so both record and validate sides compare a fixed
@@ -220,6 +250,22 @@ pub(super) struct LedgerRec {
     /// that produced it, and `Never` ("do not retry compiling these bytes") is
     /// a *stronger* claim still. Neither transfers across opt levels.
     pub compiled_at_opt: OptTier,
+    /// Evidence that this block was **run**, not merely compiled.
+    ///
+    /// Only ever *grows* while the same guest bytes stay installed (see
+    /// [`PersistentJitCache::insert_rec`]), and it is published coarsely: the
+    /// per-thread tally in `jit::shared` reports a block at its first entry and
+    /// then at each doubling, so `0` means "compiled and never entered", `1`
+    /// means "entered exactly once", and above that the value is a power-of-two
+    /// lower bound. [`LedgerProbe::wants_eager`] only compares against
+    /// [`EAGER_MIN_ENTRIES`], but the file itself can then be read as a census of
+    /// the three populations.
+    ///
+    /// `0` is the *absence* of evidence and covers both shapes that must not be
+    /// promoted eagerly: a record written by this build for a block that was
+    /// never entered, and a v3 record migrated from a file that had no count
+    /// field at all.
+    pub entries: u32,
 }
 
 impl LedgerRec {
@@ -229,11 +275,46 @@ impl LedgerRec {
 }
 
 /// Byte-validated probe result for one guest VA against the active PE's
-/// ledger: `Some(insn_count)` when the previous run compiled these exact
-/// guest bytes successfully.
+/// ledger: `Some(probe)` when the previous run compiled these exact guest bytes
+/// successfully.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct LedgerProbe {
     pub insn_count: u32,
+    /// Entry evidence carried by the record (see [`LedgerRec::entries`]).
+    pub entries: u32,
+    /// `true` when this probe is backed by machine code the caller *already
+    /// installed* (the `WIE_JIT_CODE_CACHE` restore half of
+    /// `JitShared::restore_or_probe`), i.e. there is nothing left to compile.
+    pub restored: bool,
+}
+
+impl LedgerProbe {
+    /// Whether this record earns an **eager compile** at first sight.
+    ///
+    /// The ledger's job on a warm boot is to skip the visit warm-up for blocks
+    /// the previous run proved it needs — not to compile every block it happens
+    /// to remember. Without the entry gate, a console-shaped guest
+    /// (`crt_hello`: 365 records, 4 blocks ever entered) paid 364 full Cranelift
+    /// compiles for blocks it enters zero times, and a warm boot measured
+    /// **5× slower** than a cold one (63.6 ms vs 12.6 ms, 5 interleaved pairs).
+    ///
+    /// The rule, and why it is the conservative one:
+    ///
+    /// - `restored` ⇒ never: the block is already installed as `Ready`, so an
+    ///   "eager compile" here is a *duplicate* compile of a block that is about
+    ///   to be dispatched. Nothing to gain.
+    /// - `entries >= EAGER_MIN_ENTRIES` ⇒ yes: the block was re-entered last
+    ///   run, so it will be re-entered this run, and the compile has to happen
+    ///   before that loop rather than inside it.
+    /// - otherwise (never entered, entered once, or a migrated v3 record with no
+    ///   count) ⇒ no: the block falls back to the ordinary visit threshold, which
+    ///   is exactly its pre-ledger behaviour. A block that *is* hot crosses that
+    ///   threshold within a few thousand instructions and is compiled by the
+    ///   worker; a block that is not hot is never worth compiling at all.
+    #[must_use]
+    pub(super) fn wants_eager(&self) -> bool {
+        !self.restored && self.entries >= EAGER_MIN_ENTRIES
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +344,77 @@ struct DiskEntry {
     never: bool,
     /// [`OptTier::code`]; `None` on decode is a rejected record, never a guess.
     compiled_at_opt: u8,
+    /// Entry evidence; see [`LedgerRec::entries`]. Appended last so a v3 record
+    /// is this struct minus its last field — which is precisely the layout
+    /// [`DiskEntryV3`] mirrors, and why the migration can be a prefix decode
+    /// instead of a second parser.
+    entries: u32,
+}
+
+/// The `entries`-less v3 record layout, kept only to migrate files this build's
+/// predecessor wrote.
+///
+/// It must stay *byte-for-byte* what v3 wrote: a field added, removed or
+/// reordered here would decode a v3 payload into a plausible-looking v4 record
+/// and silently reintroduce the eager-compile storm (`entries` read out of
+/// bytes that meant something else entirely). The migration test
+/// (`v3_file_is_migrated_with_no_entry_evidence`) exists for exactly that
+/// failure mode, and `FORMAT_VERSION` is what makes the two layouts
+/// distinguishable in the first place.
+#[derive(bincode::Encode, bincode::Decode)]
+struct DiskEntryV3 {
+    va: u64,
+    guest_end: u64,
+    bytes_hash: u64,
+    insn_count: u32,
+    inv_gen: u64,
+    never: bool,
+    compiled_at_opt: u8,
+}
+
+impl From<DiskEntryV3> for DiskEntry {
+    fn from(e: DiskEntryV3) -> Self {
+        Self {
+            va: e.va,
+            guest_end: e.guest_end,
+            bytes_hash: e.bytes_hash,
+            insn_count: e.insn_count,
+            inv_gen: e.inv_gen,
+            never: e.never,
+            compiled_at_opt: e.compiled_at_opt,
+            // Absent count ⇒ no entry evidence ⇒ never taken down the eager
+            // path. This single line is the migration's whole policy.
+            entries: 0,
+        }
+    }
+}
+
+/// Leading fields of every ledger file, version-independent.
+///
+/// Decoded on its own before the rest of the payload is interpreted: bincode
+/// decodes field by field, so this struct consumes exactly the bytes of these
+/// two fields and leaves the remainder untouched. That is what makes
+/// [`load_body`] able to pick a record layout from `format_version` instead of
+/// assuming the current one — the v2→v3→v4 history has three layouts behind one
+/// magic, and only the version says which.
+#[derive(bincode::Decode)]
+struct FileHeader {
+    /// Decoded only to *skip* it — the version gate below is the field that
+    /// matters, and `load_file` re-checks this one against the full body.
+    _wie_version: String,
+    format_version: u32,
+}
+
+/// v3 file body: [`FileBody`] with the `entries`-less record layout.
+// `Encode` exists only so the migration test can write a v3 file; nothing in
+// the shipping path ever encodes this layout.
+#[derive(bincode::Encode, bincode::Decode)]
+struct FileBodyV3 {
+    wie_version: String,
+    format_version: u32,
+    key: u64,
+    opt_level: String,
+    entries: Vec<DiskEntryV3>,
 }
 
 /// Build one on-disk entry from a live record.
@@ -275,19 +427,74 @@ fn disk_entry(r: &LedgerRec) -> DiskEntry {
         inv_gen: r.inv_gen,
         never: r.never,
         compiled_at_opt: r.compiled_at_opt.code(),
+        entries: r.entries,
     }
 }
 
-fn load_body(path: &Path) -> Result<FileBody, String> {
+/// A decoded ledger file, and whether it had to be migrated on the way in.
+struct LoadedBody {
+    body: FileBody,
+    /// `true` when the bytes on disk were a v3 file converted in memory. The
+    /// file is deliberately **not** deleted or rewritten here: keeping it means a
+    /// process that records nothing new leaves the previous run's knowledge
+    /// untouched (migration is idempotent), and the next flush rewrites it as v4
+    /// anyway.
+    migrated: bool,
+}
+
+/// Read + decode `<key>.bin`, migrating a v3 body in memory.
+///
+/// `Ok(None)` means "a file this build cannot read" — a different format version.
+/// The caller deletes it, which is what every earlier version did and what keeps
+/// a stale layout from being re-parsed on every boot.
+fn load_body(path: &Path) -> Result<Option<LoadedBody>, String> {
     let raw = fs::read(path).map_err(|e| e.to_string())?;
     if raw.len() < MAGIC.len() || raw[..MAGIC.len()] != MAGIC {
         return Err("bad magic".into());
     }
-    let (body, consumed): (FileBody, usize) =
-        bincode::decode_from_slice(&raw[MAGIC.len()..], bincode::config::standard())
-            .map_err(|e| e.to_string())?;
-    let _ = consumed;
-    Ok(body)
+    let payload = &raw[MAGIC.len()..];
+    let cfg = bincode::config::standard();
+    let (head, _): (FileHeader, usize) =
+        bincode::decode_from_slice(payload, cfg).map_err(|e| e.to_string())?;
+    match head.format_version {
+        FORMAT_VERSION => {
+            let (body, consumed): (FileBody, usize) =
+                bincode::decode_from_slice(payload, cfg).map_err(|e| e.to_string())?;
+            let _ = consumed;
+            Ok(Some(LoadedBody {
+                body,
+                migrated: false,
+            }))
+        }
+        v if v == v3_format_version() => {
+            let (body, consumed): (FileBodyV3, usize) =
+                bincode::decode_from_slice(payload, cfg).map_err(|e| e.to_string())?;
+            let _ = consumed;
+            Ok(Some(LoadedBody {
+                body: FileBody {
+                    wie_version: body.wie_version,
+                    // The in-memory form is always the current one: the caller
+                    // validates `wie_version`/`key`/`opt_level` against it and
+                    // every later write is a v4 write.
+                    format_version: FORMAT_VERSION,
+                    key: body.key,
+                    opt_level: body.opt_level,
+                    entries: body.entries.into_iter().map(DiskEntry::from).collect(),
+                },
+                migrated: true,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The one older `format_version` this build still reads.
+///
+/// Named rather than inlined as `3` so the migration is greppable from the
+/// `FORMAT_VERSION` doc comment, and so the next bump has one place to decide
+/// what happens to v4 files.
+const fn v3_format_version() -> u32 {
+    3
 }
 
 fn write_body(path: &Path, body: &FileBody) -> Result<(), String> {
@@ -316,6 +523,15 @@ fn write_body(path: &Path, body: &FileBody) -> Result<(), String> {
 struct FlushState {
     pending: Vec<LedgerRec>,
     dirty_rewrite: bool,
+    /// Anything recorded (or raised) since the last flush started.
+    ///
+    /// Exists because a flush is *not* free: one 62-byte ledger rewrite costs
+    /// 2.5-13 ms on this host (APFS, loaded machine), and the end-of-session hook
+    /// plus `Drop` used to rewrite *both* ledger files **twice** — ~10-25 ms of
+    /// exit latency on a guest whose whole boot is 12 ms. A flush with nothing
+    /// dirty is now a no-op, which is also what makes the end-of-session hook
+    /// genuinely idempotent rather than merely cheap.
+    dirty: bool,
     last_flush: Instant,
     warned_err: bool,
 }
@@ -325,6 +541,7 @@ impl FlushState {
         Self {
             pending: Vec::new(),
             dirty_rewrite: false,
+            dirty: false,
             last_flush: Instant::now(),
             warned_err: false,
         }
@@ -364,6 +581,19 @@ pub(super) struct PersistentJitCache {
     /// Load-once latch per attached key.
     tables: PeTables,
     flush: Mutex<FlushState>,
+    /// Serializes whole flush *writes* (snapshot + temp file + rename).
+    ///
+    /// `flush` only covers bookkeeping: it is dropped before the I/O so a
+    /// recorder never waits on the disk. That left two flushes able to run
+    /// concurrently, and [`write_body`]'s temp name is per-*process*, not
+    /// per-call — so a guest thread's `APPEND_FLUSH_CAP` flush racing the
+    /// end-of-session one made the loser's `rename` fail with `ENOENT`,
+    /// which the error path then reported as "persistence disabled for this
+    /// run" and *dropped the ledger entirely*. Observed on DOOM Retro's exit
+    /// (2 background workers draining at the same moment), i.e. exactly the
+    /// long run whose warm boot the ledger exists to accelerate. A separate
+    /// mutex, not `flush`, so this never lands on the compile path.
+    flush_io: Mutex<()>,
 }
 
 impl PersistentJitCache {
@@ -396,6 +626,7 @@ impl PersistentJitCache {
             tiered: RwLock::new(ahash::HashSet::default()),
             tables: RwLock::new(ahash::HashMap::default()),
             flush: Mutex::new(FlushState::new()),
+            flush_io: Mutex::new(()),
         }
     }
 
@@ -409,6 +640,7 @@ impl PersistentJitCache {
             tiered: RwLock::new(ahash::HashSet::default()),
             tables: RwLock::new(ahash::HashMap::default()),
             flush: Mutex::new(FlushState::new()),
+            flush_io: Mutex::new(()),
         }
     }
 
@@ -484,17 +716,31 @@ impl PersistentJitCache {
         );
     }
 
-    /// Read + version-validate `<key>.bin`. A version/magic/WIE-version/opt-level
-    /// mismatch DELETES the stale file and returns an empty map ("reset").
+    /// Read + version-validate `<key>.bin`. An unreadable format version, or a
+    /// magic/WIE-version/opt-level mismatch, DELETES the stale file and returns
+    /// an empty map ("reset"). A **v3** file is migrated instead: its records
+    /// load with `entries = 0`, so none of them can earn an eager compile, and
+    /// the file itself is left for the next flush to rewrite.
     fn load_file(&self, key: u64) -> papaya::HashMap<u64, LedgerRec> {
         let empty = papaya::HashMap::new();
         let path = self.file_path_for(key);
-        let body = match load_body(&path) {
-            Ok(b) => b,
+        let loaded = match load_body(&path) {
+            Ok(Some(v)) => v,
+            // A format version this build does not read: reset it, as every
+            // earlier version did, so a stale layout is not re-parsed each boot.
+            Ok(None) => {
+                if fs::remove_file(&path).is_ok() {
+                    tracing::info!(
+                        key = format_args!("{key:#x}"),
+                        "jit disk cache format version unsupported — reset"
+                    );
+                }
+                return empty;
+            }
             Err(_) => return empty, // missing or unreadable: cold boot, keep quiet
         };
-        if body.format_version != FORMAT_VERSION
-            || body.wie_version != env!("CARGO_PKG_VERSION")
+        let LoadedBody { body, migrated } = loaded;
+        if body.wie_version != env!("CARGO_PKG_VERSION")
             || body.key != key
             || body.opt_level != self.opt_level
             || body.entries.len() > MAX_DISK_ENTRIES
@@ -508,6 +754,13 @@ impl PersistentJitCache {
                 );
             }
             return empty;
+        }
+        if migrated {
+            tracing::debug!(
+                key = format_args!("{key:#x}"),
+                entries = body.entries.len(),
+                "jit disk cache v3 file migrated (no entry evidence: none is eager)"
+            );
         }
         let map = papaya::HashMap::with_capacity(body.entries.len());
         let mut rejected = 0_u64;
@@ -541,6 +794,7 @@ impl PersistentJitCache {
                         inv_gen: e.inv_gen,
                         never: e.never,
                         compiled_at_opt,
+                        entries: e.entries,
                     },
                 );
             }
@@ -603,7 +857,69 @@ impl PersistentJitCache {
         let h = hash_guest_range(mem, va, rec.guest_end)?;
         (h == rec.bytes_hash).then_some(LedgerProbe {
             insn_count: rec.insn_count,
+            entries: rec.entries,
+            restored: false,
         })
+    }
+
+    /// Publish entry evidence for a block the guest has entered `level` times on
+    /// this thread (see [`LedgerRec::entries`]).
+    ///
+    /// Called from the dispatcher's per-entry hook, but only when a per-thread
+    /// tally crosses a publish level — that is, a handful of times per block per
+    /// thread, never per entry. DOOM executes ~149 M block dispatches in 100 s, so
+    /// a shared-counter lookup on each of them would cost seconds; the tally in
+    /// `jit::shared` exists to make this call rare.
+    ///
+    /// Takes the same lock as [`Self::insert_rec`] so a publish can never race a
+    /// re-install into "entries set on a record that was then replaced by a
+    /// zero-count one". It does **not** go through `insert_rec`: an entry is not
+    /// a write-wins event (it must not resurrect a `Never`, and it must not queue
+    /// an append that would grow `pending`), it only ever raises a value that is
+    /// already in the table — and `flush_table` snapshots the table, so a raised
+    /// count reaches the next flush without one.
+    pub(super) fn count_entry(&self, va: u64, level: u32) {
+        if !self.enabled || level == 0 {
+            return;
+        }
+        let Some(table) = self.active_table() else {
+            return;
+        };
+        let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
+        let pin = table.pin();
+        let Some(old) = pin.get(&va).copied() else {
+            return; // never compiled ⇒ nothing to describe
+        };
+        if old.never || old.entries >= level {
+            return;
+        }
+        pin.insert(
+            va,
+            LedgerRec {
+                entries: level,
+                ..old
+            },
+        );
+        // A raised count is a change to the file's contents even though it adds
+        // no append row, so it has to mark the handle dirty on its own.
+        st.dirty = true;
+    }
+
+    /// Flush the ledger now, fsyncing. The end-of-session hook.
+    ///
+    /// Without this the ledger of a short guest is never written at all: the
+    /// append buffer drains only at [`APPEND_FLUSH_CAP`] records or after
+    /// [`FLUSH_MIN_INTERVAL`], and `Drop for PersistentJitCache` does not run for
+    /// console guests (the last `Arc<JitShared>` outlives the session — see
+    /// `JitShared::finish_jit_caches`). `crt_hello` writes **one** record, so
+    /// both thresholds missed it for its entire existence.
+    pub(super) fn finish(&self) {
+        // NOT `force_fsync`: a ledger is a cache, so the most a power loss can
+        // cost is one recompile — while `sync_all` on this host costs 2-13 ms of
+        // *exit* latency on every run of the guest, against a 12 ms cold boot for
+        // `crt_hello`. The temp-file rename already guarantees a reader sees the
+        // previous file or the new one, never a torn one.
+        self.flush_now(false);
     }
 
     /// VAs of all `Never` (negative) records for the ACTIVE PE, for seeding
@@ -658,6 +974,16 @@ impl PersistentJitCache {
         self.active_table()
             .and_then(|t| t.pin().get(&va).copied())
             .map(|r| (r.never, r.guest_end, r.insn_count))
+    }
+
+    /// Whether a flush ever failed to write (the state that disables
+    /// persistence for the rest of the run).
+    #[cfg(test)]
+    pub(super) fn test_write_failed(&self) -> bool {
+        self.flush
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .warned_err
     }
 
     /// Number of records queued for the next flush (the append buffer).
@@ -752,6 +1078,10 @@ impl PersistentJitCache {
                 inv_gen,
                 never: false,
                 compiled_at_opt: tier,
+                // A fresh install carries no entry evidence; `count_entry` adds
+                // it once the guest actually runs the block, and `insert_rec`
+                // preserves what a previous install of the same bytes recorded.
+                entries: 0,
             },
             tier,
         );
@@ -796,6 +1126,8 @@ impl PersistentJitCache {
                 inv_gen: 0,
                 never: true,
                 compiled_at_opt: OptTier::Base,
+                // A `Never` verdict is not a block that ran: no evidence.
+                entries: 0,
             },
             OptTier::Base,
         );
@@ -821,12 +1153,27 @@ impl PersistentJitCache {
         {
             let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
             let pin = table.pin();
-            if !Self::write_wins(pin.get(&rec.va).copied(), &rec) {
+            let old = pin.get(&rec.va).copied();
+            if !Self::write_wins(old, &rec) {
                 return;
+            }
+            // Entry evidence describes the *bytes*, so it carries forward across
+            // a re-install of the same bytes and is dropped the moment they
+            // change: `Ready` is re-recorded after a resync/invalidation, and the
+            // document that replaces a block says nothing about whether the old
+            // one was entered. `Never → Ready` carries nothing either — a `Never`
+            // has no entry count to keep.
+            let mut rec = rec;
+            if let Some(old) = old
+                && !old.never
+                && old.bytes_hash == rec.bytes_hash
+            {
+                rec.entries = rec.entries.max(old.entries);
             }
             // Ready upserts overwrite older Never records for the same VA.
             pin.insert(rec.va, rec);
             st.pending.push(rec);
+            st.dirty = true;
         }
         // Outside the lock: `flush_tick` re-takes it (and `flush_now` holds it
         // across the table snapshot); a std `Mutex` is not reentrant.
@@ -879,6 +1226,8 @@ impl PersistentJitCache {
             let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
             st.pending.retain(|r| !r.overlaps(addr, end));
             st.dirty_rewrite = true;
+            // Dropping a row IS a change even though nothing was appended.
+            st.dirty = true;
             st.last_flush = Instant::now(); // invalidation flushes soon (below)
         }
         // Rewrite promptly (metadata files are small).
@@ -930,6 +1279,7 @@ impl PersistentJitCache {
                 return;
             }
             st.dirty_rewrite = true;
+            st.dirty = true;
         }
         let Some(base) = self.active_table() else {
             return;
@@ -970,8 +1320,19 @@ impl PersistentJitCache {
         // Drain the append buffer ONCE and split it: the routing is a pure
         // function of `compiled_at_opt`, so one drain feeds both files. Draining
         // per file would hand the first call everything and starve the second.
+        //
+        // One writer at a time, for the whole snapshot+write: see `flush_io`.
+        let _io = self.flush_io.lock().unwrap_or_else(|e| e.into_inner());
+        // `dirty` is cleared *here*, inside the drain's own critical section, so
+        // a write that lands after this point re-marks the state and reaches the
+        // next flush; and a flush of a clean handle returns without touching the
+        // disk at all.
         let (base_pending, tier_pending) = {
             let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
+            if !st.dirty {
+                return;
+            }
+            st.dirty = false;
             let pending = std::mem::take(&mut st.pending);
             let mut base_pending = Vec::new();
             let mut tier_pending = Vec::new();
@@ -1035,6 +1396,8 @@ impl PersistentJitCache {
             entries: snapshot,
         };
         let path = self.file_path_for(key);
+        let __t0 = Instant::now();
+        let __n = body.entries.len();
         let res = write_body(&path, &body).and_then(|()| {
             if force_fsync {
                 fs::File::open(&path)
@@ -1044,6 +1407,11 @@ impl PersistentJitCache {
                 Ok(())
             }
         });
+        eprintln!(
+            "[probe] flush_table {:?} entries={__n} path={}",
+            __t0.elapsed(),
+            path.display()
+        );
         match res {
             Ok(()) => {
                 let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
@@ -1252,6 +1620,7 @@ mod tests {
             inv_gen: 9,
             never: false,
             compiled_at_opt: tier.code(),
+            entries: 0,
         }
     }
 
@@ -1612,10 +1981,14 @@ mod tests {
     }
 
     #[test]
-    fn format_version_is_three_and_v2_files_are_deleted() {
+    fn format_version_is_four_and_v2_files_are_deleted() {
         // v2 recorded no per-record level, so those files are not merely
         // unreadable — they would be read as if every record were base-level.
-        assert_eq!(FORMAT_VERSION, 3);
+        // v3 is the one old layout this build *does* read, and
+        // `v3_file_is_migrated_with_no_entry_evidence` below proves the read is
+        // faithful — a misparse there would invent an entry count and silently
+        // put the eager-compile storm straight back.
+        assert_eq!(FORMAT_VERSION, 4);
         let dir = scratch_dir("v2-reset");
         let opt = JitConfig::get().opt_level();
         let key = jit_cache_key(PE_A, opt);
@@ -1637,6 +2010,241 @@ mod tests {
         cache.attach(PE_A);
         assert_eq!(cache.test_entries_len(), 0, "v2 records rejected");
         assert!(!path.exists(), "v2 file deleted, not orphaned");
+    }
+
+    /// A v3 file must load its records **and** must not lend any of them entry
+    /// evidence: the v3 layout has no count field, so the only safe reading is
+    /// "compiled, possibly never run" ⇒ never eager.
+    ///
+    /// This is the migration's whole risk: a reader that misparsed the old
+    /// record into a plausible count would reintroduce the exact bug the count
+    /// exists to fix, silently and only on machines with a pre-existing warm
+    /// cache.
+    #[test]
+    fn v3_file_is_migrated_with_no_entry_evidence() {
+        let dir = scratch_dir("v3-migrate");
+        let opt = JitConfig::get().opt_level();
+        let key = jit_cache_key(PE_A, opt);
+        let path = dir.join(format!("{key:016x}.bin"));
+        let code = [0x90_u8; 64];
+        let mem = test_memory(&[(&VA1, &code)], REGION, 0x1000);
+        let bytes_hash = hash_guest_range(&mem, VA1, VA1 + 64).expect("hash");
+        // Hand-encode the layout v3 wrote: the same header, then a record with
+        // no `entries` field at all.
+        let body = FileBodyV3 {
+            wie_version: env!("CARGO_PKG_VERSION").to_string(),
+            format_version: 3,
+            key,
+            opt_level: opt.to_string(),
+            entries: vec![DiskEntryV3 {
+                va: VA1,
+                guest_end: VA1 + 64,
+                bytes_hash,
+                insn_count: 9,
+                inv_gen: 5,
+                never: false,
+                compiled_at_opt: OptTier::Base.code(),
+            }],
+        };
+        let encoded =
+            bincode::encode_to_vec(&body, bincode::config::standard()).expect("encode v3");
+        let mut payload = Vec::with_capacity(MAGIC.len() + encoded.len());
+        payload.extend_from_slice(&MAGIC);
+        payload.extend_from_slice(&encoded);
+        fs::write(&path, &payload).expect("seed v3 file");
+
+        let cache = PersistentJitCache::with_base_dir(dir.clone());
+        cache.attach(PE_A);
+        assert_eq!(
+            cache.test_entries_len(),
+            1,
+            "v3 record migrated, not dropped"
+        );
+        assert!(
+            path.exists(),
+            "migrated file kept, rewritten at the next flush"
+        );
+        let probe = cache.probe(&mem, VA1).expect("v3 record still validates");
+        assert_eq!(
+            probe.insn_count, 9,
+            "the rest of the record survives intact"
+        );
+        assert_eq!(probe.entries, 0, "absent count is not invented");
+        assert!(
+            !probe.wants_eager(),
+            "a migrated record never takes the eager path"
+        );
+
+        // And once this run rewrites the file, it is a v4 file that still says
+        // "no evidence" rather than a v3 one that has to keep being migrated.
+        cache.finish();
+        let reloaded = PersistentJitCache::with_base_dir(dir.clone());
+        reloaded.attach(PE_A);
+        let again = reloaded.probe(&mem, VA1).expect("rewritten file reloads");
+        assert_eq!(again.entries, 0);
+        assert!(!again.wants_eager());
+    }
+
+    /// Entry evidence belongs to the *bytes*: a re-install of the same bytes
+    /// keeps it, different bytes start from zero.
+    #[test]
+    fn entry_evidence_survives_a_reinstall_of_the_same_bytes_only() {
+        let dir = scratch_dir("entry-merge");
+        let code = [0x90_u8; 64];
+        let mem = test_memory(&[(&VA1, &code)], REGION, 0x1000);
+        let cache = PersistentJitCache::with_base_dir(dir.clone());
+        cache.attach(PE_A);
+        cache.record_ready(&mem, VA1, VA1 + 64, 9, 5);
+        let fresh = cache.probe(&mem, VA1).expect("probe");
+        assert_eq!(fresh.entries, 0, "a fresh install carries no evidence");
+        assert!(!fresh.wants_eager());
+
+        cache.count_entry(VA1, 2);
+        let earned = cache.probe(&mem, VA1).expect("probe");
+        assert_eq!(earned.entries, 2, "publish reached the record");
+        assert!(earned.wants_eager());
+
+        // A re-record of the same bytes (resync / invalidation replay) must not
+        // reset what the block earned.
+        cache.record_ready(&mem, VA1, VA1 + 64, 9, 5);
+        assert_eq!(
+            cache.probe(&mem, VA1).expect("probe").entries,
+            2,
+            "same bytes keep the evidence across a re-install"
+        );
+
+        // Different bytes are different code, so the evidence must not carry.
+        mem.write(VA1, &[0xCC_u8; 8]).expect("patch bytes");
+        cache.record_ready(&mem, VA1, VA1 + 64, 9, 5);
+        let changed = cache.probe(&mem, VA1).expect("probe");
+        assert_eq!(changed.entries, 0, "new bytes: evidence reset");
+        assert!(!changed.wants_eager());
+    }
+
+    /// The count has to survive the process boundary — that is the whole point,
+    /// and `finish()` (not `Drop`) is the hook a guest session actually reaches.
+    #[test]
+    fn entry_evidence_is_persisted_and_drives_the_warm_boot() {
+        let dir = scratch_dir("entry-disk");
+        let code = [0x90_u8; 64];
+        let mem = test_memory(&[(&VA1, &code)], REGION, 0x1000);
+        {
+            let cache = PersistentJitCache::with_base_dir(dir.clone());
+            cache.attach(PE_A);
+            cache.record_ready(&mem, VA1, VA1 + 64, 9, 5);
+            cache.count_entry(VA1, 2);
+            cache.finish();
+        }
+        let warm = PersistentJitCache::with_base_dir(dir.clone());
+        warm.attach(PE_A);
+        let probe = warm.probe(&mem, VA1).expect("warm probe");
+        assert_eq!(probe.entries, 2);
+        assert!(
+            probe.wants_eager(),
+            "a block that ran twice compiles eagerly"
+        );
+        assert!(!probe.restored, "ledger-only hit installs nothing itself");
+    }
+
+    /// A handle with nothing recorded must not touch the disk.
+    ///
+    /// This is an exit-latency property, not tidiness: one ledger rewrite of 62
+    /// bytes measured 2.5-13 ms on this host, and the end-of-session hook is
+    /// followed by `Drop` — so a warm run that learns nothing used to pay a
+    /// double rewrite of both ledger files (~10-25 ms) on a guest whose entire
+    /// boot is 12 ms.
+    #[test]
+    fn a_clean_handle_does_not_rewrite_the_file() {
+        let dir = scratch_dir("clean-no-write");
+        let opt = JitConfig::get().opt_level();
+        let key = jit_cache_key(PE_A, opt);
+        let path = dir.join(format!("{key:016x}.bin"));
+        // A file this build cannot parse stands in for "the previous contents":
+        // if a flush wrote, it would replace these bytes with a real ledger.
+        let sentinel = b"not a ledger at all".to_vec();
+        fs::write(&path, &sentinel).expect("seed sentinel");
+
+        let cache = PersistentJitCache::with_base_dir(dir.clone());
+        cache.attach(PE_A); // loads nothing: the sentinel is unreadable
+        assert_eq!(cache.test_entries_len(), 0);
+        cache.finish(); // the end-of-session hook, on a handle that learned nothing
+
+        assert_eq!(
+            fs::read(&path).expect("read back"),
+            sentinel,
+            "a clean flush must be a no-op, not a rewrite"
+        );
+    }
+
+    /// An entry is not a compile: publishing one must never turn a negative
+    /// verdict into a positive row.
+    #[test]
+    fn entry_evidence_never_resurrects_a_never_verdict() {
+        let dir = scratch_dir("entry-never");
+        let bad = [0xCC_u8; 32];
+        let mem = test_memory(&[(&VA1, &bad)], REGION, 0x1000);
+        let cache = PersistentJitCache::with_base_dir(dir.clone());
+        cache.attach(PE_A);
+        cache.record_never(&mem, VA1);
+        cache.count_entry(VA1, 2);
+        assert_eq!(
+            cache.test_row(VA1).map(|r| r.0),
+            Some(true),
+            "still a Never after an entry publish"
+        );
+        assert!(cache.probe(&mem, VA1).is_none());
+    }
+
+    /// The three populations, as the persisted file records them: `0` for
+    /// compiled-and-never-entered, `1` for entered exactly once, and only `2`+
+    /// eager. The first publish is what makes "entered once" observable at all.
+    #[test]
+    fn one_entry_is_recorded_but_never_eager() {
+        let dir = scratch_dir("entry-once");
+        let code = [0x90_u8; 64];
+        let mem = test_memory(&[(&VA1, &code)], REGION, 0x1000);
+        let cache = PersistentJitCache::with_base_dir(dir.clone());
+        cache.attach(PE_A);
+        cache.record_ready(&mem, VA1, VA1 + 64, 9, 5);
+        assert_eq!(cache.probe(&mem, VA1).expect("probe").entries, 0);
+
+        cache.count_entry(VA1, 1); // the tally's first-entry publish
+        let once = cache.probe(&mem, VA1).expect("probe");
+        assert_eq!(once.entries, 1, "entered exactly once is recorded as 1");
+        assert!(
+            !once.wants_eager(),
+            "one entry is not evidence of a loop: it will be entered once again"
+        );
+        cache.finish();
+
+        let warm = PersistentJitCache::with_base_dir(dir.clone());
+        warm.attach(PE_A);
+        let p = warm.probe(&mem, VA1).expect("warm probe");
+        assert_eq!(p.entries, 1, "and it survives the process boundary");
+        assert!(!p.wants_eager());
+    }
+
+    /// The eager rule itself, with no engine in the way: what a warm boot does
+    /// with 0, 1, 2+ entries, and with restored code.
+    #[test]
+    fn eager_rule_is_entry_evidence_and_never_a_restore() {
+        let probe = |entries, restored| LedgerProbe {
+            insn_count: 3,
+            entries,
+            restored,
+        };
+        assert_eq!(EAGER_MIN_ENTRIES, 2);
+        // The two shapes the storm was made of: compiled but never entered, and
+        // entered exactly once. Neither can save a dispatch by compiling early.
+        assert!(!probe(0, false).wants_eager());
+        assert!(!probe(1, false).wants_eager());
+        // Re-entered: it will be re-entered again, so it must be compiled before
+        // the loop rather than inside it.
+        assert!(probe(2, false).wants_eager());
+        assert!(probe(64, false).wants_eager());
+        // Already replayed: the block is installed, a "compile" here is a
+        // duplicate of code that is about to run.
+        assert!(!probe(9, true).wants_eager());
     }
 
     #[test]
@@ -1759,6 +2367,60 @@ mod write_order {
             inv_gen: 0,
             never,
             compiled_at_opt: OptTier::Base,
+            entries: 0,
+        }
+    }
+
+    /// Concurrent flushes must not lose the ledger.
+    ///
+    /// `flush_now` deliberately does not hold the bookkeeping mutex across its
+    /// I/O, and `write_body`'s temp path is per-process — so two flushes running
+    /// at once used to write the *same* temp file and the loser's `rename` failed
+    /// `ENOENT`, which the error path reports as "persistence disabled for this
+    /// run". On DOOM Retro's exit that dropped the whole ledger. With `flush_io`
+    /// serialising the writes, every record reaches the file and no flush fails.
+    #[test]
+    fn concurrent_flushes_all_reach_the_file() {
+        const THREADS: usize = 4;
+        const PER: u64 = 8;
+        let dir = scratch("flush-race");
+        let cache = Arc::new(PersistentJitCache::with_base_dir(dir.clone()));
+        cache.attach(PE);
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mem = mem_with(0x4000);
+                let base = BASE + 0x400 * u64::try_from(t).expect("t");
+                for i in 0..PER {
+                    let va = base + 0x10 * i;
+                    cache.record_ready(&mem, va, va + 8, 3, 0);
+                    // Every thread flushes while the others are still recording.
+                    cache.test_flush();
+                }
+                barrier.wait();
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread");
+        }
+        assert!(
+            !cache.test_write_failed(),
+            "a flush must never fail just because another one is running"
+        );
+        cache.test_flush();
+        drop(cache);
+        let want: Vec<u64> = (0..THREADS)
+            .flat_map(|t| {
+                let base = BASE + 0x400 * u64::try_from(t).expect("t");
+                (0..PER).map(move |i| base + 0x10 * i)
+            })
+            .collect();
+        let got = PersistentJitCache::test_disk_vas(dir.clone(), PE);
+        for va in &want {
+            assert!(got.contains(va), "record {va:#x} reached the file");
         }
     }
 

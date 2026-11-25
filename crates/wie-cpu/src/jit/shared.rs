@@ -570,6 +570,13 @@ impl JitShared {
         if let Some(restored) = self.restore_from_code_cache(mem, va) {
             return Some(LedgerProbe {
                 insn_count: restored.insn_count,
+                // Restored code is already installed under `va`, so the caller
+                // needs no compile at all — and `restored: true` is what stops
+                // it from issuing one (see `LedgerProbe::wants_eager`). Before
+                // that flag existed, every restore was followed by a *duplicate
+                // full compile of the block it had just installed*.
+                entries: 0,
+                restored: true,
             });
         }
         self.persist.probe(mem, va)
@@ -793,7 +800,19 @@ impl JitShared {
     /// have been joined: a worker that records a blob after the flush will have
     /// it written by the next flush, never lost.
     pub fn finish_jit_caches(&self) {
+        let __t0 = std::time::Instant::now();
         self.code_cache().finish();
+        // And the *ledger*, which used to be flushed only by `Drop for
+        // PersistentJitCache` — a hook that, as the paragraph above documents,
+        // does not run for console guests. A short guest therefore persisted
+        // nothing: `crt_hello` writes one record, and both lazy-flush thresholds
+        // (`APPEND_FLUSH_CAP` records, `FLUSH_MIN_INTERVAL`) are out of reach, so
+        // its warm boot was permanently cold while the RUNBOOK claimed
+        // otherwise.
+        eprintln!("[probe] code_cache finish {:?}", __t0.elapsed());
+        let __t1 = std::time::Instant::now();
+        self.persist.finish();
+        eprintln!("[probe] persist finish {:?}", __t1.elapsed());
     }
 
     /// Test-only: the code-cache handle itself, so a test can hold a second
@@ -1613,6 +1632,80 @@ impl Drop for JitShared {
     }
 }
 
+/// Per-thread filter that decides *when* a block entry is worth publishing to
+/// the persistent ledger (see [`LedgerRec::entries`](super::cache_persist)).
+///
+/// The ledger needs one bit per block — "was this entered more than once?" — and
+/// the dispatcher can afford roughly nothing to produce it: DOOM dispatches
+/// ~149 M blocks in 100 s, so a shared-map lookup per entry would cost seconds
+/// (measured elsewhere in this tree at 15–25 ns each). A direct-mapped array of
+/// slots keyed on the RIP keeps the per-entry cost at a load, a compare and
+/// usually nothing else, and publishes a block only when its count crosses a
+/// level [`PersistentJitCache::count_entry`] should hear about.
+///
+/// **Deliberately lossy, in the safe direction.** Two blocks that hash to the
+/// same slot evict each other, so a block can fail to reach a publish level and
+/// simply never publish — which means it is compiled through the ordinary visit
+/// threshold next boot instead of eagerly. False negatives cost the pre-ledger
+/// behaviour; there are no false positives, because a slot only ever reports the
+/// RIP it holds. 64 slots covers the hot working set of every guest measured
+/// here (DOOM's hot loop touches ~8 blocks, its whole warm-up 557 of 3580), and
+/// saturation means the hottest blocks stop paying anything at all.
+pub(super) struct EntryTally {
+    slots: [(u64, u32); ENTRY_TALLY_SLOTS],
+}
+
+/// Slots in [`EntryTally`] (1 KiB per guest thread: 64 × `(u64, u32)` padded).
+const ENTRY_TALLY_SLOTS: usize = 64;
+
+/// Highest published level. Past this the tally reports nothing more: the only
+/// consumer compares against `cache_persist::EAGER_MIN_ENTRIES`, and a block
+/// entered 64 times
+/// is indistinguishable from one entered 10 000 times for that purpose.
+const ENTRY_TALLY_CAP: u32 = 64;
+
+impl EntryTally {
+    const EMPTY: (u64, u32) = (0, 0);
+
+    pub(super) const fn new() -> Self {
+        Self {
+            slots: [Self::EMPTY; ENTRY_TALLY_SLOTS],
+        }
+    }
+
+    /// Count one entry of `rip`; return the level to publish, or `0` for none.
+    ///
+    /// Publishes at the **first** entry and then at each doubling, so a record
+    /// says exactly `1` for "entered once" and a power-of-two lower bound above
+    /// that. That first publish is what lets the persisted file separate the two
+    /// shapes the eager rule must reject: `0` = compiled and never entered, `1` =
+    /// entered exactly once. A publish is rare by construction: at most seven
+    /// `count_entry` calls per block per thread, for the single hottest block,
+    /// instead of millions.
+    #[inline]
+    pub(super) fn bump(&mut self, rip: u64) -> u32 {
+        // Multiplication by an odd constant: RIPs of interest are 16-byte-ish
+        // apart inside one image, so the low bits are near-constant and the high
+        // bits carry the entropy.
+        let idx = usize::try_from((rip.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) & 63)
+            .unwrap_or(0)
+            % ENTRY_TALLY_SLOTS;
+        let slot = &mut self.slots[idx];
+        // `rip` can never be 0 (no guest block starts at the null page), so 0 is
+        // a safe "empty" tag and needs no separate valid flag.
+        if slot.0 != rip || slot.1 == 0 {
+            *slot = (rip, 1);
+            return 1;
+        }
+        if slot.1 >= ENTRY_TALLY_CAP {
+            return 0; // saturated: nothing left to learn about this block
+        }
+        slot.1 += 1;
+        let n = slot.1;
+        if n.is_power_of_two() { n } else { 0 }
+    }
+}
+
 /// Per-thread JIT execution state: registers, the persistent compiled-code
 /// frame, chain table, shadow stack. One instance per guest thread. Not shared.
 #[doc(hidden)]
@@ -1710,6 +1803,14 @@ pub struct PerThreadJitState {
     /// list is reached only from this engine's own `run_compiled` frames, and
     /// the engine is owned by exactly one host thread.
     pub large_free: LargeFreeList,
+    /// Entry-evidence filter for the persistent ledger; see [`EntryTally`].
+    ///
+    /// Per thread by construction, and never read by compiled code: it is
+    /// bumped from the dispatcher's per-entry hook and *publishes* into
+    /// `JitShared::persist` only when a block crosses a level, so the ledger's
+    /// `entries` column costs one array index in the hot path rather than a map
+    /// lookup per dispatch.
+    pub entry_tally: EntryTally,
 }
 
 // SAFETY: the raw pointers in `ctx` (guest `mem`, `chain_slots`, `large_free`,
@@ -1751,6 +1852,31 @@ impl PerThreadJitState {
             opcode_sample_i: 0,
             pending_promote_thr: 0,
             large_free: LargeFreeList::new(),
+            entry_tally: EntryTally::new(),
+        }
+    }
+
+    /// Count one dispatcher entry into the block at `rip`, and publish it to the
+    /// persistent ledger when it earns entry evidence.
+    ///
+    /// Called from `JitCpu::finish_compiled` — the single funnel every run of a
+    /// compiled block passes through, whether it was just compiled or found
+    /// `Ready` — so this is the ledger's definition of "the block ran". Chained
+    /// hops inside a block deliberately do not count: they are iterations of a
+    /// block, not re-entries of it, and the eager rule is about blocks a warm
+    /// boot will need *early*.
+    ///
+    /// The `persist_active` guard is the whole cost when the ledger is off
+    /// (the default): one relaxed load of a flag that never changes after
+    /// attach, on a path that is already doing far more work.
+    #[inline]
+    pub(super) fn note_block_entry(&mut self, rip: u64, shared: &JitShared) {
+        if !shared.persist_active() {
+            return;
+        }
+        let level = self.entry_tally.bump(rip);
+        if level != 0 {
+            shared.persist.count_entry(rip, level);
         }
     }
 }

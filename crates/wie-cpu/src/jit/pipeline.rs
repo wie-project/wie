@@ -691,8 +691,9 @@ impl JitCpu {
                         let mem = read_unpoisoned(&self.shared.mem);
                         self.shared.restore_or_probe(&mem, rip)
                     };
-                    if probe.is_some() {
-                        persist_eager = true;
+                    if let Some(probe) = probe {
+                        // Only a block that *earned* it: see `LedgerProbe::wants_eager`.
+                        persist_eager = probe.wants_eager();
                         self.stats.profile.warm_ledger_hits =
                             self.stats.profile.warm_ledger_hits.saturating_add(1);
                     }
@@ -1745,6 +1746,7 @@ impl JitCpu {
         entry_rip: u64,
         meta: CompiledRunMeta,
     ) -> (StepResult, usize) {
+        self.thread.note_block_entry(entry_rip, &self.shared);
         let (fault, dynamic_insns) = self.run_compiled(entry_rip, meta);
         // `dynamic_insns` was already charged to `jit_insns` / `guest_insns` by
         // `run_compiled`; carry it out as the step's retired count so the
