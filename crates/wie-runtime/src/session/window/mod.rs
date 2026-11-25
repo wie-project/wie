@@ -33,6 +33,18 @@ pub struct GuestHandle {
     pub(super) lock_wait_stats: Arc<crate::mt_runtime::LockWaitStats>,
 }
 
+impl GuestHandle {
+    /// Ask the session to stop as though Ctrl+C had arrived.
+    ///
+    /// Used by a host-initiated stop (`--screenshot-on-frame`): the run must
+    /// unwind from inside the pump rather than between quanta, both because a
+    /// quantum is millions of instructions long and because unwinding this way
+    /// is what prints the profile report from the thread that owns the session.
+    pub fn request_profile_stop(&self) {
+        wie_winapi::port::request_profile_stop();
+    }
+}
+
 /// Descend the child hierarchy of `root` with z-order hit-testing: at each
 /// level pick the topmost visible child containing `(rel_x, rel_y)`, then
 /// recurse into it. Coordinates stay child-relative at every step, so the

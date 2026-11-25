@@ -393,6 +393,31 @@ pub(crate) fn take_ctrlc_for_profile_stop() -> bool {
     pending
 }
 
+/// Request the same stop a Ctrl+C produces, for a **host-initiated** end of
+/// the run (`--screenshot-on-frame` reaching its frame).
+///
+/// Why this and not a flag checked between `run_until_stop` quanta: such a flag
+/// is only observed when the GUI loop regains control, and DOOM Retro does not
+/// give it back — a bounded capture run waited the full 30 s for a stop that
+/// never came, with the screenshot written and the log empty.
+/// `CTRLC_PENDING` is polled *inside* the pump, so the run unwinds without the
+/// loop — and unwinding through it is what prints the report from the thread
+/// that owns the session, the only thread that can.
+///
+/// **Measured cost of the stop, so nobody expects "instant" for the wrong
+/// reason:** on DOOM Retro a capture at frame 10 wrote its BMP at t+131.31 s and
+/// the process exited at t+131.41 s — **0.11 s**, part of it writing the 7 MB
+/// BMP. The pump turns ~650 times/s, so there is no coarse poll interval to cut
+/// here. What makes a frame-bounded run cost ~130 s is the guest: 14.9 G
+/// instructions to frame 10 at 119 M/s is 125.3 s of the run's 131.1 s, with
+/// `init_ms` 88.9 and every API handler together 618.7 ms. An earlier claim in
+/// this comment that the report arrives "~20 s later, so a frame-bounded run
+/// costs ~90 s of wall" was wrong: it derived the capture time from `wall_ms`
+/// instead of observing it.
+pub(crate) fn request_profile_stop() {
+    CTRLC_PENDING.store(true, Ordering::Release);
+}
+
 /// The cached-once diagnostics-SIGINT gate.
 ///
 /// Armed by `WIE_RUNTIME_PROFILE` (full report) or `WIE_JIT_OPCODE_HISTO=1`

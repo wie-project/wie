@@ -569,6 +569,10 @@ pub fn ensure_hooks_installed() {
 /// whose owner is then the guest key-delivery drain — so a disabled profile
 /// never steals the guest's Ctrl+C. See [`host_term`] internals for the full
 /// ownership and ordering argument.
+pub fn request_profile_stop() {
+    host_term::request_profile_stop();
+}
+
 pub fn take_ctrlc_for_profile_stop() -> bool {
     host_term::take_ctrlc_for_profile_stop()
 }

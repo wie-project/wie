@@ -267,7 +267,27 @@ impl WieApp {
                         )
                     });
                     if captured {
-                        event_loop.exit();
+                        // Stop the guest the way Ctrl+C does, so the run
+                        // unwinds *inside* the pump (a between-quanta flag is
+                        // never observed: DOOM Retro does not return to its
+                        // loop, measured) and the thread that owns the session
+                        // prints the profile report before the process exits.
+                        handle.request_profile_stop();
+                        self.capture_stop = true;
+                        // Deliberately do NOT `event_loop.exit()` here: the
+                        // guest thread prints the report only after it unwinds,
+                        // and ending the loop first took the process down
+                        // before that happened (measured: screenshot written,
+                        // log empty). The guest sends `WieEvent::HostInterrupt`
+                        // *after* printing, and that event closes the loop, so
+                        // the report is out before `run_app` returns. Verified
+                        // externally, by the two events a bystander can see:
+                        // frame 10, BMP written at t+131.31 s, process exit at
+                        // t+131.41 s — 0.11 s, not the ~20 s an earlier reading
+                        // of `wall_ms` implied. The ~130 s is guest work to
+                        // frame 10 (14.9 G instructions at 119 M/s), not this
+                        // branch. If the request never lands, the caller's
+                        // `timeout` still bounds the run.
                         return;
                     }
                 }

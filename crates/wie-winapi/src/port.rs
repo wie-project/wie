@@ -230,7 +230,7 @@ pub use crate::user32::{Dimension, MenuEntry, MenuRecord};
 // and the enumeration/parse helpers a park loop needs. Each row here replaces a
 // `wie_winapi::<module>::` path that the winapi-port gate now forbids.
 pub use crate::bottle::{bottle_root_from_env, drive_d_from_env};
-pub use crate::console::take_ctrlc_for_profile_stop;
+pub use crate::console::{request_profile_stop, take_ctrlc_for_profile_stop};
 pub use crate::exception::{RuntimeFunction, parse_pdata};
 pub use crate::gdi32::enumerate::advance_enumeration;
 pub use crate::kernel32::clock::{clock_is_fixed, clock_table_values, tick_count_32};

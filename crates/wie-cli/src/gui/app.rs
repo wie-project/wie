@@ -576,6 +576,11 @@ fn window_attributes(title: &str, width: u32, height: u32) -> winit::window::Win
 /// winit application state: bridges the guest windows to the present backend.
 struct WieApp {
     handle: Option<GuestHandle>,
+    /// A `--screenshot-on-frame` capture ended this run. The stop itself is
+    /// requested through the session (see the capture branch), which unwinds
+    /// as `HostInterrupt`; this flag is what keeps that a *normal* end — exit 0
+    /// rather than the status 130 a real Ctrl+C reports.
+    capture_stop: bool,
     /// One winit window per guest top-level window; [`WindowRegistry`] is
     /// empty until the first frame creates the first window, then reconciled
     /// from the guest on every publish (see [`WieApp::reconcile_windows`]).
@@ -831,8 +836,9 @@ impl ApplicationHandler<WieEvent> for WieApp {
             }
             WieEvent::HostInterrupt => {
                 // The guest thread already printed the profile report; record
-                // WHY the loop ended so `run_gui_windowed` exits 130.
-                self.host_interrupt_exit = true;
+                // WHY the loop ended so `run_gui_windowed` exits 130 — unless
+                // the stop was a capture, which is a normal end (exit 0).
+                self.host_interrupt_exit = !self.capture_stop;
                 event_loop.exit();
             }
         }
@@ -1165,6 +1171,11 @@ pub fn run_gui_windowed(
                         // for either knob: with only the histogram armed,
                         // profile_enabled() is false but the gated diag dump
                         // (iced counters, opcode histogram) must still fire.
+                        // A `--screenshot-on-frame` capture requests the same
+                        // in-pump stop a Ctrl+C does, so it unwinds here and
+                        // the report prints before the process can exit — that
+                        // is what makes a 40-frame measurement cost seconds
+                        // instead of a wall-clock timeout.
                         let interrupted = matches!(&result, Ok(GuiOutcome::HostInterrupt));
                         if interrupted {
                             session.finalize_profile(run_t0.elapsed().as_nanos(), 0, 0);
@@ -1199,6 +1210,7 @@ pub fn run_gui_windowed(
     // reconciliation creates a winit window per guest top-level.
     let mut app = WieApp {
         handle: Some(handle),
+        capture_stop: false,
         windows: WindowRegistry::new(),
         primary_hwnd: None,
         pending_frame,
