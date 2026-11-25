@@ -1,7 +1,36 @@
 //! Tier-0 baseline compiler: single-pass, no optimization, fast lowering.
 //!
-//! Target: 0.1–0.3 ms per block vs ~3 ms for Cranelift tier-1. The current
-//! implementation is a structural stub that satisfies the tier-0 wiring and
+//! Target: 0.1–0.3 ms per block, **against a measured 374 µs median for the
+//! Cranelift translation it would replace** — not against the "~3 ms" this
+//! header used to claim, which was wrong by ~8×.
+//!
+//! The measurement (`tests::tier0_diff_tests::reference_compile_cost_per_block`,
+//! release, IR verifier off, host load 7.6–9.0) compiles the `with_mem` blocks
+//! found by a linear sweep of DOOM Retro's `.text`:
+//!
+//! ```text
+//! 1 001 real with_mem blocks timed (4 000 found over the first 34 603
+//! instruction boundaries of a 1 363 KiB .text, sampled to 1 334, a quarter
+//! spent growing the arena before the timed region)
+//! min 185.1 µs   median 373.6 µs   mean 425.1 µs   p90 588.1 µs
+//! insns/block median 3   first-half median 373.0 vs second-half 375.1
+//! ```
+//!
+//! The flat halves are the point: that is block cost, not `mmap`/`mprotect`
+//! arena growth (the first version of this measurement reported 15 ms/block for
+//! exactly that reason).
+//!
+//! **These are not the 690 runtime blocks the census counted.** The census
+//! classified blocks a real DOOM run *reached* (4 225 first sightings, 690
+//! `with_mem`); this set is decoder-sampled — a block decoded at every
+//! instruction boundary of a `.text` prefix, which matches the shape (every RIP
+//! a run reaches is an instruction boundary) but not the runtime frequency
+//! distribution. Keep the two apart: 374 µs is the cost of the work, 690/4 225 is
+//! how much of it a run does at boot.
+//!
+//! A hand emitter therefore has to beat **374 µs**, and 185 µs is the floor it
+//! must clear to be worth anything at all. The current implementation is a
+//! structural stub that satisfies the tier-0 wiring and
 //! handles the common `mov`/`alu`/`branch`/`mem` shapes via the shared
 //! lowering (micro-stub fast path when eligible, otherwise a direct Cranelift
 //! compile with `opt_level = "none"` would be ideal). The stub keeps
@@ -12,7 +41,13 @@
 //!
 //! Contract with `pipeline.rs`:
 //! - `try_compile_baseline` is called synchronously on the guest thread
-//!   (first hit during boot, 0.2 ms budget).
+//!   (first hit during boot, 0.2 ms budget). **That budget is a target nobody
+//!   has shown an encoder path to**: the measured reference it would have to
+//!   beat is 374 µs median / 185 µs floor per block (above), so 0.2 ms is
+//!   ~1.9× faster than the median Cranelift block and only ~8 % under its
+//!   floor — read it as an aspiration with a denominator, not as a bound this
+//!   code meets. A budget line quoted against a wrong reference is how the
+//!   "~3 ms" figure survived here for as long as it did.
 //! - On success the caller installs the returned `CompiledBlock` as `Ready`
 //!   (tier-0) and enqueues a tier-1 Cranelift job for the same RIP. The
 //!   background worker's later install overwrites the tier-0 entry
