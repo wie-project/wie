@@ -306,7 +306,15 @@ impl WieApp {
             let is_first = self.primary_hwnd.is_none();
             let width = width.max(MIN_GUEST_WINDOW_SIZE) as u32;
             let height = height.max(MIN_GUEST_WINDOW_SIZE) as u32;
-            let attrs = window_attributes(&title, width, height);
+            // Every top-level window presents the executable's own identity:
+            // `DOOM Retro — <guest caption>`, or just the name when the guest
+            // caption is empty. NOT limited to the first window: SDL opens a
+            // helper ("SDLHelperWindowInputCatcher") top-level before the real
+            // main window, so "first" is not "main". A caption that already
+            // contains the name is left alone by `window_title`, which is what
+            // keeps the game's own `DOOM Retro` title unchanged.
+            let caption = self.identity.title_for(&title);
+            let attrs = window_attributes(&caption, width, height);
             let Ok(window) = event_loop.create_window(attrs) else {
                 tracing::error!(target: "wiegui", "create_window failed for a guest top-level");
                 continue;
@@ -325,6 +333,16 @@ impl WieApp {
             let scale_factor = window.scale_factor();
             window.focus_window();
             let id = window.id();
+            // The caption the native window was created with: the main
+            // window's title carries the executable's own name (see
+            // `crate::gui::identity`), so this line is the record of what
+            // the chrome shows.
+            tracing::info!(
+                target: "wiegui",
+                hwnd,
+                title = %caption,
+                "created host window"
+            );
             let rt = WindowRuntime {
                 hwnd: Hwnd::from(hwnd),
                 window: window.clone(),
@@ -615,6 +633,10 @@ struct WieApp {
     /// Menu items the menu bar was last rebuilt with (cheap change check).
     #[cfg(target_os = "macos")]
     last_menu_items: Arc<Vec<MenuNode>>,
+    /// The executable's own identity (name from its version resource, icon
+    /// from its `RT_GROUP_ICON`). The main window's title is prefixed with
+    /// the name; the Dock tile is set from the icon in `run_gui_windowed`.
+    identity: crate::gui::identity::GuiIdentity,
     /// Set when the guest thread reported a profiling Ctrl+C stop
     /// ([`WieEvent::HostInterrupt`]); read after `run_app` returns to exit
     /// with status 130.
@@ -891,6 +913,12 @@ pub fn run_gui_windowed(
     )?;
     let staged = prepared.staged;
 
+    // Read the guest executable's identity out of its own resources: the
+    // display name (FileDescription → ProductName → file stem) and the icon
+    // (first RT_GROUP_ICON, decoded to RGBA8). Best-effort by construction —
+    // a thin or unreadable binary degrades to its stem and no icon.
+    let identity = crate::gui::identity::GuiIdentity::load(&staged.run_path);
+
     // Explicit guest argv entries that name absolute `C:`/`D:` files must
     // exist in the mapped volumes BEFORE the guest thread starts — a missing
     // one is a launch error, not a runtime open failure. The volumes here are
@@ -912,6 +940,9 @@ pub fn run_gui_windowed(
     let event_loop = EventLoop::<WieEvent>::with_user_event()
         .build()
         .context("build event loop")?;
+    // The Dock tile can only be set once AppKit's shared application exists,
+    // which winit's event-loop build creates on this (the main) thread.
+    identity.apply_dock_icon();
     // Guest display dimensions = the primary monitor's LOGICAL size in
     // points, captured before the guest thread spawns. winit creates windows
     // in logical points on Retina macOS, so a guest frame rendered at this
@@ -1186,6 +1217,7 @@ pub fn run_gui_windowed(
         menu_bar: crate::gui::menu_bar::MacMenuBar::new(proxy.clone()),
         #[cfg(target_os = "macos")]
         last_menu_items: Arc::new(Vec::new()),
+        identity,
         host_interrupt_exit: false,
         capture,
     };

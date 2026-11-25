@@ -98,7 +98,11 @@ rfd = { version = "0.17", default-features = false }
 # NSScreen: the primary monitor's logical-point frame feeds
 # SessionOptions::display_metrics before the guest thread spawns (winit 0.30
 # exposes monitors only from inside the running loop via ActiveEventLoop).
-objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow", "NSPrintInfo", "NSPrintPanel", "NSPageLayout", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPrintOperation", "NSGraphics", "NSAlert", "NSButton", "NSScreen"] }
+# NSApplication: gui/identity.rs sets the Dock tile from the executable's own
+# RT_GROUP_ICON (`setApplicationIconImage:`) — the AppKit API for that chrome.
+# The feature is already on transitively (winit 0.30 lists it); naming it here
+# keeps this crate's direct edge explicit and does not add a package.
+objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow", "NSPrintInfo", "NSPrintPanel", "NSPageLayout", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPrintOperation", "NSGraphics", "NSAlert", "NSButton", "NSScreen", "NSApplication"] }
 objc2 = { version = "0.5", default-features = false, features = ["std", "alloc"] }
 objc2-foundation = { version = "0.2", default-features = false, features = [
     "dispatch",
@@ -112,3 +116,9 @@ objc2-foundation = { version = "0.2", default-features = false, features = [
 wgpu = { version = "30", default-features = false, features = ["metal", "wgsl"] }
 pollster = { version = "1.0" }
 bytemuck = { version = "1" }
+# PNG decode for the executable's own icon (gui/identity.rs): Windows icons
+# above 48 px ship a PNG-compressed RT_ICON entry, and wie-pe hands that payload
+# through undecoded so the shared PE crate needs no inflate implementation.
+# Already in Cargo.lock at this exact version — muda 0.19.3 (also macOS-only)
+# depends on it — so this edge adds no package and no new download.
+png = "0.18"

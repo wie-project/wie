@@ -42,6 +42,8 @@ pub mod find_dialog;
 pub mod font_dialog;
 pub mod headless;
 #[cfg(target_os = "macos")]
+pub mod identity;
+#[cfg(target_os = "macos")]
 pub mod input;
 #[cfg(target_os = "macos")]
 pub mod input_script;

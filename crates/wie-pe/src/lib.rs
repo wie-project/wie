@@ -22,9 +22,12 @@ pub use goblin::pe::PE;
 use serde::Serialize;
 use std::path::Path;
 
+pub mod identity;
 pub mod resources;
+pub use identity::{AppIdentity, NameSource, app_identity_from_bytes, app_identity_from_file};
 pub use resources::{
-    DialogItemTemplate, DialogTemplate, ItemClass, MenuItemTemplate, MenuTemplate, PixelRect,
+    DialogItemTemplate, DialogTemplate, IconData, IconGroup, IconGroupEntry, IconImage, ItemClass,
+    MenuItemTemplate, MenuTemplate, PixelRect, RgbaImage,
 };
 
 /// COFF `Machine` type (Microsoft PE format, `IMAGE_FILE_MACHINE_*`).

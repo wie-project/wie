@@ -2111,10 +2111,6 @@ pub(super) fn flag_cond_fs(
     fs: &FlagState,
     m: Mnemonic,
 ) -> Result<Value, LowerError> {
-    // `jp`/`jnp` and the `setp`/`cmovp` family are the only *hot-path* readers of
-    // PF, so those two arms go through `pf_value`, which emits the deferred
-    // parity ladder here instead of at the writer. Nothing else in the condition
-    // set touches PF.
     Ok(match m {
         // ZF alone, and its complement. Note `not_i1`, not `bnot`: Cranelift's
         // `bnot` is a *bitwise* NOT, so `bnot(1i8)` is `0xFE`, which is still
@@ -2152,11 +2148,8 @@ pub(super) fn flag_cond_fs(
         Mnemonic::Jno | Mnemonic::Cmovno | Mnemonic::Setno => not_i1(bcx, fs.of),
         Mnemonic::Js | Mnemonic::Cmovs | Mnemonic::Sets => fs.sf,
         Mnemonic::Jns | Mnemonic::Cmovns | Mnemonic::Setns => not_i1(bcx, fs.sf),
-        Mnemonic::Jp | Mnemonic::Cmovp | Mnemonic::Setp => fs.pf_value(bcx),
-        Mnemonic::Jnp | Mnemonic::Cmovnp | Mnemonic::Setnp => {
-            let pf = fs.pf_value(bcx);
-            not_i1(bcx, pf)
-        }
+        Mnemonic::Jp | Mnemonic::Cmovp | Mnemonic::Setp => fs.pf,
+        Mnemonic::Jnp | Mnemonic::Cmovnp | Mnemonic::Setnp => not_i1(bcx, fs.pf),
         _ => return Err(LowerError::form("condition_mnemonic")),
     })
 }

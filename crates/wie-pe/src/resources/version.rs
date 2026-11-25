@@ -238,6 +238,44 @@ pub fn parse_pe_version_resources(image: &[u8], sections: &[PeSectionMap]) -> Ve
     })
 }
 
+/// The `lang-codepage` prefix of an en-US `StringFileInfo` block (`040904b0`
+/// for the neutral/en-US ANSI table; only the language half is compared).
+const EN_US_BLOCK_PREFIX: &str = "0409";
+
+/// Look up one `StringFileInfo` value in a parsed block, preferring en-US.
+///
+/// A version resource can carry several language blocks (`0407` German,
+/// `0409` English, …) with the same keys and different text. The en-US block
+/// wins when it has a non-empty value; otherwise the first block in directory
+/// order that has one is used. Keys are matched case-insensitively (Windows
+/// treats them that way), values are trimmed, and an empty value counts as
+/// absent — an `rc` file that leaves `FileDescription` blank should not
+/// produce a blank title.
+#[must_use]
+pub fn string_value<'a>(info: &'a VersionInfo, key: &str) -> Option<&'a str> {
+    let mut first_any: Option<&'a str> = None;
+    for block in &info.string_blocks {
+        let block_is_en_us = block
+            .lang_codepage
+            .get(..EN_US_BLOCK_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(EN_US_BLOCK_PREFIX));
+        for entry in &block.entries {
+            if !entry.key.eq_ignore_ascii_case(key) {
+                continue;
+            }
+            let value = entry.value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            if block_is_en_us {
+                return Some(value);
+            }
+            first_any.get_or_insert(value);
+        }
+    }
+    first_any
+}
+
 /// Walk a `VS_VERSIONINFO` block against a `VerQueryValue` path.
 ///
 /// Path forms (case-insensitive keys, like Windows):
@@ -914,5 +952,107 @@ mod tests {
         assert_eq!(m.len, 16);
         let text = read_utf16_value(&resource.raw, m.offset, m.len).expect("decode value");
         assert_eq!(text, "1.2.3.4");
+    }
+
+    /// Build a `VS_VERSIONINFO` tree with one string table per
+    /// `(block_key, entries)` pair — no fixed info, no `VarFileInfo`.
+    fn block_with_tables(tables: &[(&str, &[(&str, &str)])]) -> Vec<u8> {
+        let mut string_info_children = Vec::new();
+        for (block_key, entries) in tables {
+            let mut lang_children = Vec::new();
+            for (key, value) in *entries {
+                let mut node = Vec::new();
+                append_node(&mut node, key, Some(&utf16_value(value)), true, None);
+                lang_children.extend(node);
+            }
+            let mut lang_block = Vec::new();
+            append_node(
+                &mut lang_block,
+                block_key,
+                None,
+                false,
+                Some(&lang_children),
+            );
+            string_info_children.extend(lang_block);
+        }
+        let mut string_info = Vec::new();
+        append_node(
+            &mut string_info,
+            "StringFileInfo",
+            None,
+            false,
+            Some(&string_info_children),
+        );
+        let mut root = Vec::new();
+        append_node(
+            &mut root,
+            "VS_VERSION_INFO",
+            None,
+            false,
+            Some(&string_info),
+        );
+        root
+    }
+
+    #[test]
+    fn string_value_prefers_the_en_us_block() {
+        let block = block_with_tables(&[
+            (
+                "040704b0",
+                &[
+                    ("FileDescription", "Editor (Deutsch)"),
+                    ("ProductName", "Produkt"),
+                ],
+            ),
+            (
+                "040904b0",
+                &[("FileDescription", "Editor"), ("ProductName", "Product")],
+            ),
+        ]);
+        let info = parse_version_info(&block).expect("block parses");
+        assert_eq!(info.string_blocks.len(), 2);
+        assert_eq!(string_value(&info, "FileDescription"), Some("Editor"));
+        // Key matching is case-insensitive, like VerQueryValue.
+        assert_eq!(string_value(&info, "filedescription"), Some("Editor"));
+        assert_eq!(string_value(&info, "ProductName"), Some("Product"));
+        assert_eq!(string_value(&info, "CompanyName"), None);
+    }
+
+    #[test]
+    fn string_value_falls_back_to_the_first_block_with_the_key() {
+        // No en-US block at all: the German one wins by directory order.
+        let block = block_with_tables(&[
+            ("040704b0", &[("FileDescription", "Editor (Deutsch)")]),
+            ("040c04b0", &[("CompanyName", "Editeur")]),
+        ]);
+        let info = parse_version_info(&block).expect("block parses");
+        assert_eq!(
+            string_value(&info, "FileDescription"),
+            Some("Editor (Deutsch)")
+        );
+        // A key only the en-US block would have answered falls through to
+        // the first block that carries it.
+        let block = block_with_tables(&[
+            ("040c04b0", &[("ProductName", "Produit")]),
+            ("040904b0", &[("FileDescription", "Editor")]),
+        ]);
+        let info = parse_version_info(&block).expect("block parses");
+        assert_eq!(string_value(&info, "ProductName"), Some("Produit"));
+    }
+
+    #[test]
+    fn string_value_skips_empty_values_and_handles_byte_order() {
+        // An `rc` file that leaves FileDescription blank must not hide the
+        // localized one, and a non-ASCII value proves the UTF-16LE decode.
+        let block = block_with_tables(&[
+            (
+                "040904b0",
+                &[("FileDescription", "   "), ("ProductName", "Fenêtre")],
+            ),
+            ("040704b0", &[("FileDescription", "Fenster")]),
+        ]);
+        let info = parse_version_info(&block).expect("block parses");
+        assert_eq!(string_value(&info, "FileDescription"), Some("Fenster"));
+        assert_eq!(string_value(&info, "ProductName"), Some("Fenêtre"));
     }
 }

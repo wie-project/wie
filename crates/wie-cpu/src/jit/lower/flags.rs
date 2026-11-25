@@ -218,24 +218,6 @@ pub(super) struct FlagState {
     /// [`FlagState::pack`] over exactly these fields, or a word those fields were
     /// decomposed from (in which case re-packing reproduces it bit for bit).
     pub packed: Option<Value>,
-    /// `pf` has **not** been materialised: it is `parity(src & 0xff)`, and `pf`
-    /// is stale until [`FlagState::materialise_pf`] runs.
-    ///
-    /// PF is the one flag no hot path in this emulator reads. `jp`/`jnp` and the
-    /// `setp`/`cmovp` family do, but they are `85 + 31` instructions across the
-    /// whole DOOM Retro image pair, against every `add`/`sub`/`and` in the guest;
-    /// everything else that wants PF — an exit pack, a chain hand-off, a fault
-    /// edge, `pushfq`, `lahf` — wants it as part of the *word*, at an edge the
-    /// block reaches once and not once per iteration. The parity ladder is ten
-    /// host instructions (`and #0xff`, three `lsr`/`eor` pairs, `and #1`,
-    /// `cmp`, `cset`), and on the scaled blit `0x1800d8fb0` it is emitted twice
-    /// per iteration, 21 of 266 host instructions, for a bit nothing in the loop
-    /// looks at.
-    ///
-    /// So the writer records the value whose parity PF is and emits nothing; the
-    /// ladder moves to [`Self::materialise_pf`], called at the pack and before a
-    /// `jp`-family condition. `None` means `pf` is already a real i1.
-    pub pf_src: Option<Value>,
 }
 
 /// Decode only the flag bits in `mask`, leaving the rest as `false`
@@ -286,7 +268,6 @@ pub(super) fn decompose_bits(bcx: &mut FunctionBuilder<'_>, rflags: Value, mask:
         } else {
             f
         },
-        pf_src: None,
         old: rflags,
         packed: Some(rflags),
     }
@@ -300,7 +281,6 @@ pub(super) fn decompose_packed(bcx: &mut FunctionBuilder<'_>, rflags: Value) -> 
         of: flag_set(bcx, rflags, Rflags::OF),
         pf: flag_set(bcx, rflags, Rflags::PF),
         af: flag_set(bcx, rflags, Rflags::AF),
-        pf_src: None,
         old: rflags,
         // These six fields came out of exactly this word, so it is a valid memo:
         // `pack` clears those bits and ORs back the values they were read from.
@@ -335,7 +315,6 @@ impl FlagState {
             of: f,
             pf: f,
             af: f,
-            pf_src: None,
             old: rflags,
             packed: Some(rflags),
         }
@@ -351,32 +330,8 @@ impl FlagState {
         self.of = flag_set(bcx, packed, Rflags::OF);
         self.pf = flag_set(bcx, packed, Rflags::PF);
         self.af = flag_set(bcx, packed, Rflags::AF);
-        self.pf_src = None;
         self.old = packed;
         self.packed = Some(packed);
-    }
-
-    /// Materialise PF if the last writer left it deferred.
-    ///
-    /// Idempotent — a second call is free — and **every** reader of [`Self::pf`]
-    /// that holds `&mut self` must call it first. The writers that defer are the
-    /// ones whose PF is `parity(result)` (`add`/`sub`/`adc`/`sbb`, the logical
-    /// ops); `mul`/`imul` leave PF alone and therefore leave a pending recipe
-    /// alone too, which is exactly the architectural rule.
-    /// PF as a value: the deferred parity ladder, emitted here if a writer left
-    /// one pending, otherwise the materialised field.
-    ///
-    /// Deliberately **not** memoised back into `pf`: `self` is a `&self` here
-    /// because the region emitter and the exit-argument builder both pack through
-    /// shared state, and a value created in a cold edge block must not leak into
-    /// a sibling block that the edge does not dominate. The cost of not memoising
-    /// is a second ladder only when a block packs twice *without* going through
-    /// `packed`/`pack_once`, which those memos already rule out.
-    pub(super) fn pf_value(&self, bcx: &mut FunctionBuilder<'_>) -> Value {
-        match self.pf_src {
-            Some(src) => pf_cond(bcx, src),
-            None => self.pf,
-        }
     }
 
     /// Compute ADD/SUB-family flags once (predicate-direct) from operands.
@@ -402,12 +357,10 @@ impl FlagState {
             PredSource::Plain,
             !keep_cf,
         );
-        let (zf, sf, pf_src) = zs_preds(bcx, result, bits);
+        let (zf, sf, pf) = zs_pf_preds(bcx, result, bits);
         self.zf = zf;
         self.sf = sf;
-        // PF is deferred: `pf_src` is the value whose parity it is, and the
-        // ten-instruction ladder is emitted by `materialise_pf` at the pack.
-        self.pf_src = Some(pf_src);
+        self.pf = pf;
         self.of = of_c;
         self.af = af_c;
         if !keep_cf {
@@ -418,12 +371,10 @@ impl FlagState {
 
     /// AND/OR/XOR/TEST flags: CF=OF=0, ZS/PF from result.
     pub(super) fn assign_logic(&mut self, bcx: &mut FunctionBuilder<'_>, result: Value, bits: u32) {
-        let (zf, sf, pf_src) = zs_preds(bcx, result, bits);
+        let (zf, sf, pf) = zs_pf_preds(bcx, result, bits);
         self.zf = zf;
         self.sf = sf;
-        // PF is deferred: `pf_src` is the value whose parity it is, and the
-        // ten-instruction ladder is emitted by `materialise_pf` at the pack.
-        self.pf_src = Some(pf_src);
+        self.pf = pf;
         // CF = OF = 0. `iconst(i1 0)` *is* the false predicate — the
         // `icmp_imm(Equal, iconst 0, 1)` this used to be materialised a zero, a
         // `cmp` and a `cset` for a constant, on every AND/OR/XOR/TEST.
@@ -466,12 +417,10 @@ impl FlagState {
         // from the base sub is replaced by the wide borrow below.
         let (_, of_c, af_c) =
             add_sub_preds(bcx, d, s, result, bits, true, PredSource::CarryIn, false);
-        let (zf, sf, pf_src) = zs_preds(bcx, result, bits);
+        let (zf, sf, pf) = zs_pf_preds(bcx, result, bits);
         self.zf = zf;
         self.sf = sf;
-        // PF is deferred: `pf_src` is the value whose parity it is, and the
-        // ten-instruction ladder is emitted by `materialise_pf` at the pack.
-        self.pf_src = Some(pf_src);
+        self.pf = pf;
         self.of = of_c;
         self.af = af_c;
         // Correct CF for carry-in: CF = d < s + cf (full width; s+cf may exceed).
@@ -505,12 +454,10 @@ impl FlagState {
             PredSource::CarryIn,
             false,
         );
-        let (zf, sf, pf_src) = zs_preds(bcx, result, bits);
+        let (zf, sf, pf) = zs_pf_preds(bcx, result, bits);
         self.zf = zf;
         self.sf = sf;
-        // PF is deferred: `pf_src` is the value whose parity it is, and the
-        // ten-instruction ladder is emitted by `materialise_pf` at the pack.
-        self.pf_src = Some(pf_src);
+        self.pf = pf;
         self.of = of_c;
         self.af = af_c;
         // Wide-add CF.
@@ -542,10 +489,7 @@ impl FlagState {
         let old_of = self.of;
         let old_zf = self.zf;
         let old_sf = self.sf;
-        // A shift's PF is a *select* between the incoming bit and the parity of
-        // the result, so the incoming value is genuinely read here; materialise
-        // it and keep this path eager.
-        let old_pf = self.pf_value(bcx);
+        let old_pf = self.pf;
 
         // CF (as an I64 0/1 lane first — Rcl/Rcr OF XOR compares it as a lane).
         let cf_bit = match kind {
@@ -628,7 +572,6 @@ impl FlagState {
             self.zf = bcx.ins().select(is_zero, old_zf, zf);
             self.sf = bcx.ins().select(is_zero, old_sf, sf);
             self.pf = bcx.ins().select(is_zero, old_pf, pf);
-            self.pf_src = None;
         }
         self.packed = None;
     }
@@ -647,10 +590,7 @@ impl FlagState {
         f = bcx.ins().bor(f, zf);
         let sf = select_flag(bcx, self.sf, Rflags::SF);
         f = bcx.ins().bor(f, sf);
-        // A deferred PF must exist before the word is assembled: this is the
-        // edge, which is where the parity ladder belongs.
-        let pf_v = self.pf_value(bcx);
-        let pf = select_flag(bcx, pf_v, Rflags::PF);
+        let pf = select_flag(bcx, self.pf, Rflags::PF);
         f = bcx.ins().bor(f, pf);
         let of = select_flag(bcx, self.of, Rflags::OF);
         f = bcx.ins().bor(f, of);
@@ -846,8 +786,6 @@ pub(super) fn packed_word(
         // a fault edge, which is the one place a wrong word is a wrong answer.
         Some(fs) => match fs.packed {
             Some(packed) => packed,
-            // A deferred PF only has to exist here, on the edge, so `pack` is
-            // where its ladder is emitted.
             None => fs.pack(bcx),
         },
         None => rflags,
@@ -891,10 +829,6 @@ pub(super) fn pack_state(bcx: &mut FunctionBuilder<'_>, fs: &mut FlagState) -> V
     if let Some(packed) = fs.packed {
         return packed;
     }
-    // The pack is where a deferred PF finally has to exist. It sits on an edge
-    // out of the block body (exit, chain hand-off, fault), not in front of a
-    // branch the body takes every iteration. `FlagState::pack` materialises it
-    // itself, so this is documentation rather than a second call site.
     let packed = fs.pack(bcx);
     // Keep the carrier in sync so later packs preserve only the untracked bits
     // (DF, IF, reserved) from the current architectural state, never a stale one.
@@ -938,24 +872,13 @@ pub(super) fn zs_pf_preds(
     result: Value,
     bits: u32,
 ) -> (Value, Value, Value) {
-    let (is_z, is_s, r) = zs_preds(bcx, result, bits);
-    (is_z, is_s, pf_cond(bcx, r))
-}
-
-/// ZF/SF, plus the *value* whose parity PF is — the eager `pf_cond` ladder is
-/// left to the caller, which is what lets a writer defer it
-/// ([`FlagState::materialise_pf`]).
-pub(super) fn zs_preds(
-    bcx: &mut FunctionBuilder<'_>,
-    result: Value,
-    bits: u32,
-) -> (Value, Value, Value) {
     let r = mask_width(bcx, result, bits);
     let is_z = bcx.ins().icmp_imm(IntCC::Equal, r, 0);
     let sb = iconst_u64(bcx, sign_bit(bits));
     let sign = bcx.ins().band(r, sb);
     let is_s = bcx.ins().icmp_imm(IntCC::NotEqual, sign, 0);
-    (is_z, is_s, r)
+    let is_pf = pf_cond(bcx, r);
+    (is_z, is_s, is_pf)
 }
 
 pub(super) fn flags_zs_pf(
