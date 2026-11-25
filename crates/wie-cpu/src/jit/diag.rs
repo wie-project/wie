@@ -7,6 +7,130 @@
 use super::JitStats;
 use super::config::JitConfig;
 use super::pipeline;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+// ── Per-rip block-entry counts ────────────────────────────────────────────
+//
+// The startup-latency question is *how many compiled blocks are entered exactly
+// once*, i.e. how much compilation bought nothing. Nothing in the engine answers
+// it: `CacheEntry::Hot { visits, .. }` stops counting the moment the block is
+// installed as `Ready`, so it is a promotion counter, not an entry total.
+//
+// The count is one increment on a path that already rebuilds pins, restamps the
+// generation and does several compares, and it is gated on the profile, so a
+// normal run pays one relaxed load and a branch:
+//
+// ```text
+// if !entry_counts_enabled() { return; }
+// ```
+//
+// Entries are serialised behind one `Mutex` **on purpose**. A lock-free sharded
+// table would be faster, but two guest rIPs sharing a slot would merge their
+// counts, and the two questions this exists to answer — "how many blocks were
+// entered exactly once" and "what share of entries do the top 20 take" — are
+// both computed from exact per-rIP totals. A diagnostic that quietly collides
+// two blocks cannot answer either. Enabled only with `WIE_RUNTIME_PROFILE`, so
+// the serialisation never applies to a run whose numbers are being timed.
+
+static ENTRY_COUNTS: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+
+/// Whether block-entry counting is armed. `WIE_RUNTIME_PROFILE` is the same gate
+/// the runtime profile uses, so the counts appear exactly when a profile report
+/// is going to be printed.
+fn entry_counts_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WIE_RUNTIME_PROFILE").is_some())
+}
+
+/// Count one entry to the compiled block at `rip`.
+///
+/// Called once per dispatch of a compiled block. Cheap when off (one relaxed
+/// load of a `OnceLock` plus a branch); exact and serialised when on.
+///
+/// Called from the first statement of `run_compiled` (`jit/pipeline.rs`), which
+/// already carries `entry_rip` for its pin refresh.
+pub(crate) fn count_block_entry(rip: u64) {
+    if !entry_counts_enabled() {
+        return;
+    }
+    let counts = ENTRY_COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut g) = counts.lock() {
+        let e = g.entry(rip).or_insert(0_u64);
+        *e = e.saturating_add(1);
+    }
+}
+
+/// `part` as a percentage of `total`, 0.0 when `total` is zero.
+fn share_pct(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    #[expect(clippy::cast_precision_loss, reason = "report percentages only")]
+    {
+        100.0 * (part as f64) / (total as f64)
+    }
+}
+
+/// The block-entry histogram, as report lines.
+///
+/// Answers, in one report: how many blocks were entered exactly once (compiled
+/// for nothing), how many entries those account for, and what share of all
+/// entries the twenty hottest blocks take.
+pub(crate) fn block_entry_report_lines() -> Vec<String> {
+    if !entry_counts_enabled() {
+        return Vec::new();
+    }
+    let Some(counts) = ENTRY_COUNTS.get() else {
+        return Vec::new();
+    };
+    let Ok(g) = counts.lock() else {
+        return Vec::new();
+    };
+    if g.is_empty() {
+        return Vec::new();
+    }
+    let v: Vec<(u64, u64)> = g.iter().map(|(rip, n)| (*rip, *n)).collect();
+    entry_report_lines(&v)
+}
+
+/// The histogram arithmetic, over an explicit `(rip, entries)` list.
+///
+/// Separated from the global so it can be asserted: the two numbers this exists
+/// to produce — the count of blocks entered exactly once, and the share of all
+/// entries taken by the top twenty — are the deliverable, and they should not
+/// only ever be read off a live run.
+fn entry_report_lines(v: &[(u64, u64)]) -> Vec<String> {
+    if v.is_empty() {
+        return Vec::new();
+    }
+    let mut v: Vec<(u64, u64)> = v.to_vec();
+    v.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let total_entries: u64 = v.iter().map(|(_, n)| *n).sum();
+    let distinct = u64::try_from(v.len()).unwrap_or(u64::MAX);
+    let once = v.iter().filter(|(_, n)| *n == 1).count();
+    let at_most_two = v.iter().filter(|(_, n)| *n <= 2).count();
+    let top20: u64 = v.iter().take(20).map(|(_, n)| *n).sum();
+    let pct = |part: u64| share_pct(part, total_entries);
+    let mut out = vec![format!(
+        "[wie] jit_block_entries: {total_entries} entries over {distinct} blocks; \
+         {once} blocks entered exactly once ({:.1}% of blocks), <=2 entries: {at_most_two}",
+        share_pct(u64::try_from(once).unwrap_or(u64::MAX), distinct)
+    )];
+    out.push(format!(
+        "[wie] jit_block_entries: top 20 blocks take {top20} entries = {:.1}% of all entries; \
+         blocks entered once account for {once} entries = {:.1}%",
+        pct(top20),
+        pct(u64::try_from(once).unwrap_or(0))
+    ));
+    for (rip, n) in v.iter().take(10) {
+        out.push(format!(
+            "[wie] jit_block_entries:   {rip:#x} entries={n} share={:.2}%",
+            pct(*n)
+        ));
+    }
+    out
+}
 
 /// Dump mem-path histogram when `WIE_JIT_MEM_TRACE=1` or `WIE_EXEC_TRACE=1`.
 ///
@@ -90,6 +214,7 @@ pub fn jit_profile_report_lines(s: &JitStats) -> Vec<String> {
     if JitConfig::get().opcode_hist_enabled() {
         out.extend(opcode_histogram_lines());
     }
+    out.extend(block_entry_report_lines());
     out
 }
 
@@ -333,6 +458,52 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.starts_with("[wie] jit_code_cache:")),
             "code-cache line missing from {lines:?}"
+        );
+    }
+
+    /// The two numbers this counter exists to produce, asserted on an explicit
+    /// histogram: blocks entered exactly once, and the share of all entries the
+    /// top twenty take. Thirty blocks here — twenty entered once, five twice,
+    /// five hot — so the expected values are exact, not eyeballed.
+    #[test]
+    fn entry_report_answers_the_two_questions() {
+        let mut v: Vec<(u64, u64)> = (0..20).map(|i| (0x1000 + i * 4, 1)).collect();
+        v.extend((0..5).map(|i| (0x2000 + i * 4, 2)));
+        v.extend([
+            (0x3000, 1000_u64),
+            (0x3004, 500),
+            (0x3008, 250),
+            (0x300c, 100),
+            (0x3010, 50),
+        ]);
+        // total = 20*1 + 5*2 + 1900 = 1930; top 20 = 1900 + 10 (the doubled) +
+        // 10 (once-only blocks, which fill the remaining ten slots) = 1920.
+        let lines = entry_report_lines(&v);
+        assert!(
+            lines[0].contains("1930 entries over 30 blocks"),
+            "summary line was {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("20 blocks entered exactly once"),
+            "once-only count was {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("top 20 blocks take 1920 entries = 99.5%"),
+            "top-20 share was {:?}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains("blocks entered once account for 20 entries = 1.0%"),
+            "once-only share was {:?}",
+            lines[1]
+        );
+        // The hottest block leads the listing, and its share is over half.
+        assert!(
+            lines[2].contains("0x3000 entries=1000 share=51.81%"),
+            "hot block line was {:?}",
+            lines[2]
         );
     }
 }

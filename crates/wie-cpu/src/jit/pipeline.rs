@@ -1759,6 +1759,7 @@ impl JitCpu {
         entry_rip: u64,
         meta: CompiledRunMeta,
     ) -> (Option<exec::InvalidMem>, u64) {
+        super::diag::count_block_entry(entry_rip);
         // Refresh pins only when GuestMemory generation changes (map/protect/free).
         // Rebuilding VAD-ranked pins every block was measurable on 7za.
         let mem_gen = self.shared.mem_gen.load(Ordering::Acquire);
