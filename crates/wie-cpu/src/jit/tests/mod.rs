@@ -27,6 +27,7 @@ mod region_emit_tests;
 mod simd_parity_tests;
 mod strlen_repro;
 mod testb_high_byte;
+mod tier0_diff_tests;
 mod tier_tests;
 mod trip_tests;
 use super::*;
