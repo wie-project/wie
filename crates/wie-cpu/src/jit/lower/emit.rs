@@ -570,6 +570,43 @@ pub(super) fn lower_self_loop_term(
     match term {
         BlockTerm::Jmp { target } if target == start_rip => {
             // Stay in native SSA — pass live regs as header params (no store/reload).
+            //
+            // # What the back edge costs, measured — and what it is NOT
+            //
+            // On the scaled blit `0x1800d8fb0` (54 % of DOOM Retro's guest time)
+            // the back edge's emitted tail is **35 of the iteration's 239 host
+            // instructions**, and 27 of those 35 are `[sp, …]` slot traffic: 13
+            // `ldur` before the invalidation guard and 14 `stur` after it. The 13
+            // live-in params that produce it are the guest registers homed at
+            // `#0x08, #0x10, #0x18, #0x40, #0x70, #0x78, #0x80, #0x88, #0x90,
+            // #0xa8, #0xb0, #0xb8, #0xc0, #0xc8`; the guard they straddle is
+            // `ldr inv_gen_ptr` / `ldar` / `ldr inv_gen_baked` / `cmp` / `b.ne`.
+            //
+            // Those pairs are the backend **materialising the header's phi
+            // params through stack slots**, because the 13 values cannot be
+            // coalesced across the acquire load. They are live writes, not a
+            // redundant writeback: every one of those slots is read by off-path
+            // blocks of the same unit (e.g. `#0x70` at `…7e8` and `…9ec`, `#0x90`
+            // at `…7c8`, `#0xa8` at `…7ac`), so a store that skipped them would
+            // hand a stale guest register to a probe fallback.
+            //
+            // In particular this is **not** [`writeback_gprs`] and **not**
+            // [`gpr_store_predicate`]: that path stores to `ctx_ptr + 8*i`, and
+            // this block's tail contains exactly two ctx-relative instructions,
+            // both loads (the guard). Its one `writeback_gprs` call sits inside
+            // the `on_stale` closure below, so it is cold. Changing the store
+            // predicate removes nothing here — measured, by trying to attribute
+            // 26 "cancel pairs" to it and finding the address spaces differ.
+            //
+            // The lever is therefore the loop-carried set and its coalescing, not
+            // the writeback: fewer live-in params, or passing the slot's value
+            // directly instead of a `load` of the slot it is stored back to.
+            // Either is a semantic change to block-parameter passing and needs
+            // its own slice; pessimism here costs 2 instructions per register,
+            // optimism costs a guest register.
+            //
+            // Numbers from `/tmp/blk_afeager2.txt` (unit 785, iteration path 239),
+            // analysis in `docs/architecture/scaled-blit-block-attribution.md`.
             let args = loop_header_args(gpr, live, rflags, pass_flags);
             // Charge this trip before jumping back: the block body retires
             // `insn_count` instructions again on the next iteration.
