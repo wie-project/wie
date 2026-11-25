@@ -34,7 +34,9 @@ were made free and nothing else changed: `1 / (1 - measured share)`.
 **Dead ends, with the number that kills each:** guest-VA==host-VA translation
 (≤1.4%), iced residue (≤0.8%), in-guest stubs for hot exports (≤1.2%), guest-heap
 allocation patterns (0.004%), WinAPI name resolution (0.01%), the existing
-`WIE_JIT_TARGET_WORK` lazy-compile knob (0.996 median). See §5.
+`WIE_JIT_TARGET_WORK` lazy-compile knob (0.996 median). See §5. Where the
+per-instruction cost itself goes — the census behind the "emitted code" rows above
+— is §12.
 
 ---
 
@@ -1608,3 +1610,154 @@ lowering, not more of it.
 | 5 | Host stops / handlers | ≤1.2% of wall on every class | ≤1.2% | — | dead |
 | 6 | Interpreter residue | 0.02-0.9% of retired instructions | ≤0.8% | — | dead |
 | 7 | Dispatcher entry | 4-5% (mx9), 1-14% (I/O) | ≤5% | — | **landed (32% → 4%)** |
+
+---
+
+## 12. Where the per-instruction cost goes: the census behind the ns/instruction figure
+
+Date: 2026-11-26. Every number below is a **counter** read out of a profile report
+that already existed; no new guest run was taken for this section and no host clock
+was read. The one figure that is not a counter — ns per host instruction — is
+labelled as arithmetic on a standing number that this section does not re-measure.
+
+The question: a DOOM Retro run retires guest instructions at a rate that works out
+to ≈8.4 ns each, and 8.4 ns buys roughly twenty-five host instructions at one per
+cycle. So the question is not "where does the time go" in the abstract — it is
+**how many host instructions does one guest instruction cost, and which of them can
+be removed**. The answer, from this census, is that host instruction *count*
+accounts for the time at ~1 IPC: the cost is instructions, not stalls, and every
+remaining lever has to delete instructions rather than shorten dependencies. That
+reframing is the point of this section.
+
+### 12.1 The two profiles, and why they are kept separate
+
+| profile | phase | guest instructions | frames published | build |
+|---|---|---|---|---|
+| `/tmp/final.log` | startup / asset load | 14 888 623 046 | 9 | release, tree committed as `7ffc1f6`, `opt_level=none`, `WIE_JIT_REGION` off |
+| `/tmp/prof-mirror.log` | render | 34 478 230 275 | 733 | release, a build containing `cced0b6` (the BitBlt stage counters) |
+
+They are never mixed below, and that is deliberate: the per-block census this
+section multiplies through (`docs/architecture/scaled-blit-block-attribution.md`,
+HEAD `bd9a5c7`) was taken on the **render** workload, and the standing 8.4 ns/insn
+figure comes from the **startup** workload. Weighting one phase's counts by the
+other's block shares would be the same class of provenance error as quoting a rate
+from a run that never reached its frame loop. Where the two are combined here it is
+stated, and the combination is the render phase's census with the render phase's
+counters.
+
+The builds differ, and neither differs in a way that touches the emit path for the
+three attributed blocks: between `cced0b6` and `7ffc1f6` the changes are BitBlt
+stage timers (instrumentation in `wie-winapi`) and the removal of the guest-I/O file
+mirror (open-time work). That is reasoning about the diff, not a measurement, and it
+is the one assumption this section rests on.
+
+### 12.2 The rows that sum exactly to `insns=`
+
+| | startup (`/tmp/final.log`) | render (`/tmp/prof-mirror.log`) |
+|---|---|---|
+| guest instructions | **14 888 623 046** | **34 478 230 275** |
+| … executed from compiled code | 14 822 570 444 (**99.56 %**) | 34 407 172 840 (**99.79 %**) |
+| … executed by the iced fallback | 66 052 602 (0.44 %) | 71 057 435 (**0.21 %**) |
+| **sum** | **exact** | **exact** |
+
+The interpreter residue is a rounding error on this workload, which is consistent
+with §5's dead-end verdict and is worth keeping next to any future proposal to
+optimise the residue.
+
+### 12.3 The event rows, as one event per N guest instructions
+
+| count | startup | render |
+|---|---|---|
+| dispatcher re-entries (`cache_hits`) | 127 786 895 → 1 per **116.5** | 129 374 235 → 1 per **266.5** |
+| native chain hops | 955 156 362 → 1 per **15.6** | 988 754 828 → 1 per **34.9** |
+| chain GPR stores | 6 093 305 170 → **6.38 per hop** | 6 302 102 268 → **6.37 per hop** |
+| memory-**helper** calls (`load`+`store`) | 1 210 033 → 1 per **12 304** | 19 548 149 → 1 per **1 764** |
+| API stops | 80 802 → 1 per **184 261** | 206 590 → 1 per **166 892** |
+| blocks compiled | 1 291 | 1 810 |
+
+Every dispatch-side row is small: one hop per 35 guest instructions in the render
+phase, six register stores per hop, one helper call per 1 764 instructions. None of
+them can be most of a 25-instruction bill. The cost is in what one block iteration
+does per guest instruction, which is §12.4.
+
+### 12.4 Prologue and epilogue, amortised: the 7.47 divisor
+
+The census in `scaled-blit-block-attribution.md` gives a **per-iteration** bill and
+a **per-entry / per-exit** bill. A per-iteration figure alone therefore understates
+the true cost, and the counters say exactly how much the entry/exit bill is spread
+over:
+
+```
+hops / dispatcher re-entries = 955 156 362 / 127 786 895 = 7.47 iterations per re-entry
+```
+
+| block | per iteration | + (entry 62 + exit 275) / 7.47 | loop-only | **amortised** | share of leaf samples |
+|---|---|---|---|---|---|
+| `0x1800d8fb0` | 174 | 174 + 45.1 = 219.1 | 21.75 | **27.39** | 54.1 % |
+| `0x1800a1c60` | 115 | 115 + 45.1 = 160.1 | 19.17 | **26.68** | 27.4 % |
+| `0x1800cef0b` | 177 | 177 + 45.1 = 222.1 | 17.70 | **22.21** | 14.6 % |
+| **weighted over 96.1 %** | | | 19.60 | **25.37** | |
+
+So one guest instruction costs ≈**25 host instructions**, not ≈20: the prologue
+(62) and epilogue (275) are **45 host instructions per iteration** — 21 % of block
+1's 219.1 — and larger than the 20-per-iteration probe guard. A per-iteration
+census cannot see that term at all, which is why the divisor is written out here
+rather than left implied.
+
+### 12.5 The consistency check — arithmetic only
+
+Standing figure, **not re-measured here**: ≈8.4 ns per guest instruction (derived
+elsewhere from 125.3 s of emulation and 14.9 G instructions).
+
+```
+8.4 ns / 25.37 host instructions per guest instruction = 0.331 ns per host instruction
+                                                      = 3.02 host instructions per ns
+                                                      = 0.94 host instructions per cycle at 3.2 GHz
+```
+
+That is the load-bearing result: the host instruction count **accounts for** the
+observed time at roughly one instruction per cycle. There is no large unexplained
+residue, so the levers in this document are correctly modelled as "delete
+instructions"; a story about stalls, caches or branch misses has to beat this
+arithmetic first, and nothing measured so far does. [Arithmetic on a standing
+figure — no clock was read for this line.]
+
+### 12.6 Three things that are not load-insensitive, stated as gaps
+
+1. **Inline probe-guard executions have no counter.** The fast path re-checks the
+   mapping guard inline; only probe *misses* reach a helper, which is why the helper
+   rows in §12.3 are near zero. Any statement about guard cost per instruction comes
+   from the static census (15–16 host instructions per memory operand; 3 per access
+   and 6 per iteration on the current blit iteration; 20 per iteration per this
+   census), never from a runtime count. If a future change wants the *dynamic*
+   operand count, it needs a counter that does not exist yet.
+2. **The iced fallback's per-instruction cost is unquantified.** It is 0.21 % of
+   render-phase instructions and there is no counter for what one of them costs. At
+   any plausible 10x a compiled instruction it is ~2 % of host work; that is an
+   order-of-magnitude bound, not a measurement, and no lever should rest on it.
+3. **Rate is a phase property.** These two profiles retired 14.9 G and 34.5 G guest
+   instructions over runs of similar length, so a single ns-per-instruction figure
+   describes the phase mix, not the JIT. The 8.4 ns figure above is therefore the
+   startup phase's, and this section quotes no other rate.
+
+### 12.7 The lever, attributed the way the campaign has settled it
+
+**The flag construction: at the settled ≈21 % of emitted code and ≈37 % per
+iteration of the scaled-blit block it costs 64.4 of that block's 219.1 host
+instructions per iteration, which weighted by the block's 54.1 % of leaf samples is
+≈4.4 of the 25.4 host instructions each guest instruction costs (17 %); at the
+narrower provably-dead figure (39 of 174) it is ≈2.6 per guest instruction (10 %).**
+
+Its nearest rival is the probe guard at 20 host instructions per iteration, and the
+term this section adds to that ranking is the prologue/epilogue pair at 45 per
+iteration — 21 % of the bill, larger than either. All three are counts of
+instructions that exist in emitted code today; none needs a new measurement to be
+compared.
+
+### 12.8 What this section does not do
+
+It does not re-derive the flag census (that closed at ≈21 % of emitted code and ≈37 %
+per iteration of the blit block), it does not optimise anything, and it assigns no
+work: the census is handed to the campaign owner, who owns the ordering. The
+reproduction path is the two profile logs named in §12.1 plus the census document
+named in §12.4; nothing here needs a run.

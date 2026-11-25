@@ -271,9 +271,10 @@ its 0.83–0.95 ms is first-use Cranelift backend setup versus the compile itsel
 **not measured** — that split needs a mark inside `precompile_at`, which is
 `wie-cpu`'s file; the split is inferred from where the call sits, not observed.
 
-**Is it worth a slice? Recommendation: no, not as a startup slice.** The mechanism
-that would make it cheap is JIT code-cache persistence, and on this workload that
-mechanism is inert:
+**Is it worth a slice? Not yet, and the reason is narrower than "the cache is inert".**
+
+The mechanism that would make it cheap is JIT code-cache persistence. Three runs
+against one `WIE_CACHE_DIR`, as originally taken:
 
 | run (same `WIE_CACHE_DIR`) | `jit_code_cache` | `precompile` |
 |---|---|---|
@@ -281,23 +282,47 @@ mechanism is inert:
 | 2 | `restored=0 refused=0 unpersistable=0 hit_rate=0%` | 0.86 ms |
 | 3 | `restored=0 refused=0 unpersistable=0 hit_rate=0%` | 0.83 ms |
 
-The cache directory does get written during those runs
-(`$WIE_CACHE_DIR/jit/*.bin`, two files, 8 KB total) yet **nothing is restored on the
-following runs**, and `precompile` does not move: 0.86 ms and 0.83 ms after a 1.62 ms
-cold run. So the entry block is compiled every time and costs what a first compile
-costs. That is the whole reason `precompile` is **flagged rather than cut** here.
+**Those zeros are the knob-off line, not a measurement of misses.** The report line
+is emitted unconditionally, and `WIE_JIT_CODE_CACHE` is opt-in (`1`/`true`/`on`/`yes`;
+anything else, including unset, is off) — `diag.rs`'s
+`code_cache_line_reports_zeros_without_the_knob` asserts exactly this string. So the
+table above says "the feature was off", which is why `precompile` does not move.
 
-**`restored=0` for a one-block workload is itself the open question.** The code cache
-writes files on every run and restores none of them on the next one, so for console
-guests it is not earning its keep — and that is a property of the code cache, not of
-the startup path. It belongs to whoever owns the code cache, and it is being queued
-as its own slice rather than absorbed into this one.
+**And the files in that directory are not machine code.** `$WIE_CACHE_DIR/jit/*.bin`
+(two files, 8 KB by `du` — 63 and 62 bytes of content) is the *metadata ledger*,
+`PersistentJitCache`, which by design stores no code: it answers "this block earned an
+eager compile", never "here is the code". The code cache writes into a different
+directory, `$WIE_CACHE_DIR/jit/code/<key>.code`, and only with the knob on.
+
+**With the knob on, the entry block is still compiled every run — because it is never
+offered to the cache.** Measured on `crt_hello` with a fresh cache dir and
+`WIE_JIT_CODE_CACHE=1`: run 1 writes `jit/code/<key>.code` (4 298 B, and since
+`compiles=1` that blob *is* the entry block), and run 2 still reports `restored=0`.
+The reason is on the path, not in the counters: `precompile_at` →
+`try_compile` → `decode` → `try_compile_region` → `try_compile_from_kind` has **no
+code-cache probe anywhere on it**, and the only probe site in the crate is
+`pipeline.rs`'s `restore_or_probe`, inside the dispatch **miss** branch. The
+precompiled entry block is `Ready` from init, so dispatch returns before any probe.
+Control on the same binary and knob: `7za i` restores 51 then 52 with
+`refused=95/32`, so the blob format, validation and counters all work — the entry
+block is simply never asked.
+
+**The real open question is therefore not "is one block worth a cache hit" but "the
+entry block is never offered to the cache, and nothing counts whether an offer was
+made".** `refused=0 unpersistable=0` is consistent with both "nothing to restore" and
+"nobody looked", which is the gap a `probes=` counter would close. Whether replaying
+a persisted 4 298-byte blob beats compiling it is **unmeasured** — there is no timing
+on the restore path, and the counters cannot supply one.
+
+Also worth knowing before anyone reads `restored=0` as a defect: the knob is off by
+default for a *correctness* reason (replaying captured host code), so a win here
+exists only for users who set it. It is not a reason to flip the default for a
+0.9 ms phase.
 
 **The one measurement that would change this answer:** a run where
-`jit_code_cache restored>0` *and* `precompile` falls below ~0.5 ms — i.e. first make
-restore actually hit for a one-block workload, then re-measure. If restore cannot be
-made to hit for this shape, `precompile` is the first compile and costs what the
-first compile costs, and the remaining lever is Cranelift backend setup cost inside
+`jit_code_cache restored>0` *and* `precompile` falls below ~0.5 ms — i.e. first offer
+the entry block to the cache, then re-measure. If restore cannot be made to pay for
+this shape, the remaining lever is Cranelift backend setup cost inside
 `precompile_at` — `wie-cpu`'s file, and the setup-vs-compile split would need a mark
 inside it to be measured.
 
