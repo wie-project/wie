@@ -65,6 +65,16 @@ pub(super) enum PendingFlags {
     Logic {
         res: Value,
         bits: u32,
+        /// The `(d, s, r)` whose AF this logical op **inherits**.
+        ///
+        /// AF is the one flag a logical op keeps, and it is the one flag a
+        /// pending writer knows how to produce. Without this, `cmp; and` lost it:
+        /// the `Logic` record overwrites the `Sub` record before the `Sub` was
+        /// ever materialised, so AF came from the entry word instead of from the
+        /// `cmp`. Measured as interpreter `0x256` vs compiled block `0x246` on
+        /// `cmp eax,ebx; and eax,ebx; pushfq` with `eax=1, ebx=2`.
+        /// Folded `d ^ s ^ r` of the writer this record replaced.
+        af_from: Option<Value>,
     },
     /// ADC: `res = a + b + cf`. Deferred like every other writer — the chain's
     /// next link reads CF from the predicate ([`pending_cf`]), not from the
@@ -165,9 +175,17 @@ pub(super) fn flush_pending_impl(
                 *rflags = flags_sub(bcx, *rflags, a, b, res, bits);
             }
         }
-        PendingFlags::Logic { res, bits } => {
+        PendingFlags::Logic { res, bits, af_from } => {
             if let Some(fs) = flag_state {
                 fs.assign_logic(bcx, res, bits);
+                // A logical op keeps AF: take it from the writer this record
+                // replaced, which is the only place it exists.
+                if let Some(af) = af_from {
+                    // Eager for now: the fix costs the five-instruction test here
+                    // and is worth it for two engines that agree; the deferral that
+                    // moves it to the pack is a separate, measured change.
+                    fs.af = crate::jit::lower::flags::af_cond_from(bcx, af);
+                }
                 if materialize {
                     *rflags = pack_state(bcx, fs);
                 }

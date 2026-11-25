@@ -1036,3 +1036,104 @@ fn pushfq_after_an_adc_chain_reads_the_chains_word() {
         }
     }
 }
+
+/// A **shift between the PF writer and its PF consumer**.
+///
+/// PF is deferred at the writer (`FlagState::pf_src`: the value whose parity PF
+/// is) and the ladder is emitted only where a bit is actually observed. The shift
+/// path is the one writer that has to *materialise* the incoming bit — its PF is
+/// `select(count_mod == 0, incoming, parity(result))` — and then clear the recipe,
+/// because after the select the deferred value is no longer what PF is.
+///
+/// Nothing else in this file has a shift between a PF writer and a PF reader, and
+/// that hole is load-bearing: deleting the `pf_src = None` in `assign_shift`
+/// survives every other test in the file, because every other PF consumer reads a
+/// recipe that is still correct. Each case is run with both consumers (`setp`,
+/// and `pushfq`/`pop rcx`, which packs the whole word), over operand pairs chosen
+/// so the pre-shift and post-shift parities disagree — `cmp 1,0` is parity-odd
+/// before the shift and parity-even after it.
+#[test]
+fn a_shift_between_the_pf_writer_and_its_consumer_uses_the_shifted_parity() {
+    for (case, eax, ebx) in CMP_CASES {
+        // shl eax,1 (D1 E0) / shr eax,1 (D1 E8): both rewrite PF from the result.
+        for (shift_name, shift) in [("shl", [0xD1_u8, 0xE0]), ("shr", [0xD1, 0xE8])] {
+            // setp cl: FLAGS -> GPR inside the body.
+            let mut code = Vec::from(CMP_EAX_EBX);
+            code.extend_from_slice(&shift);
+            code.extend_from_slice(&setcc_cl(0x0A));
+            let (iced, jit) = simd_dual(&code, &[], setup(eax, ebx));
+            assert_same_regs(
+                &iced,
+                &jit,
+                &format!("setp after {shift_name} after cmp, {case}"),
+            );
+
+            // pushfq; pop rcx: the same bit through the packed word, which is the
+            // path a stale recipe would corrupt without touching any GPR.
+            let mut code = Vec::from(CMP_EAX_EBX);
+            code.extend_from_slice(&shift);
+            code.extend_from_slice(&[0x9C, 0x59]);
+            let (iced, jit) = simd_dual(&code, &[], setup_with_stack(eax, ebx));
+            assert_same_regs(
+                &iced,
+                &jit,
+                &format!("pushfq after {shift_name} after cmp, {case}: the packed word differs"),
+            );
+        }
+    }
+}
+
+/// Writers that architecturally **keep** AF, observed through `pushfq`.
+///
+/// `and`/`or`/`xor`/`test` leave AF exactly as the previous writer set it, the
+/// shifts do not touch it, and `mul`/`imul` leave ZF/SF/AF/PF undefined (this
+/// lowering keeps them). Only bit 4 of the packed word moves when that rule is
+/// broken, which is why the observable is `pushfq`/`pop rcx` and the comparison is
+/// the whole register file.
+///
+/// This row is a **regression test for two separate bugs**, both invisible in
+/// every GPR and both found here:
+///
+/// * `cmp; and; pushfq` handed out `0x246` (AF clear) where the interpreter's
+///   word was `0x256` (AF set): the logical writer overwrote the pending `Sub`
+///   record — the only place its AF existed — before it was materialised. AF now
+///   rides through `PendingFlags::Logic::af_from`.
+/// * a pack after a shift or a multiply would lose a *deferred* AF recipe, which
+///   is what `assign_shift`/`assign_mul` leaving the recipe alone protects.
+///
+/// The `and` case additionally pins the whole word against the literal the
+/// interpreter produces, so a future change cannot "fix" the divergence by
+/// moving the interpreter to the compiled block's answer.
+#[test]
+fn writers_that_keep_af_do_not_reset_it() {
+    let writers: [(&str, &[u8]); 6] = [
+        ("and", &[0x23, 0xC3]),        // and eax, ebx
+        ("or", &[0x0B, 0xC3]),         // or eax, ebx
+        ("xor", &[0x33, 0xC3]),        // xor eax, ebx
+        ("test", &[0x85, 0xC3]),       // test eax, ebx
+        ("shl", &[0xD1, 0xE0]),        // shl eax, 1
+        ("imul", &[0x0F, 0xAF, 0xCA]), // imul ecx, edx
+    ];
+    for (case, eax, ebx) in CMP_CASES {
+        for (name, bytes) in writers {
+            let mut code = Vec::from(CMP_EAX_EBX);
+            code.extend_from_slice(bytes);
+            code.extend_from_slice(&[0x9C, 0x59]); // pushfq; pop rcx
+            let (iced, jit) = simd_dual(&code, &[], setup_with_stack(eax, ebx));
+            assert_same_regs(
+                &iced,
+                &jit,
+                &format!("pushfq after {name} (AF kept) after cmp, {case}"),
+            );
+            if name == "and" && eax == 1 && ebx == 2 {
+                // The oracle: `cmp 1,2` borrows into bit 4, `and 1,2` keeps it,
+                // and the rest of the word is ZF|PF|ALWAYS1|IF.
+                assert_eq!(
+                    jit.gpr(1),
+                    0x256,
+                    "and after cmp 1,2: the packed word moved off the interpreter's 0x256"
+                );
+            }
+        }
+    }
+}

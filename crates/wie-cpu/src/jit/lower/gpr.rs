@@ -694,6 +694,29 @@ pub(super) fn lower_pop(
     }
 }
 
+/// The AF recipe a *logic* writer inherits from the pending record it replaces.
+///
+/// AF is the one flag `and`/`or`/`xor`/`test` keep, so the record they overwrite
+/// is the only place it exists. Arithmetic records carry their own operands;
+/// a chain of logic writers hands the recipe straight on; anything that has
+/// already materialised its flags (or never described them) contributes nothing.
+fn inherited_af(bcx: &mut FunctionBuilder<'_>, pending: &PendingFlags) -> Option<Value> {
+    match *pending {
+        PendingFlags::Add { a, b, res, .. }
+        | PendingFlags::Sub { a, b, res, .. }
+        | PendingFlags::Adc { a, b, res, .. }
+        | PendingFlags::Sbb { a, b, res, .. } => {
+            Some(crate::jit::lower::flags::af_fold(bcx, a, b, res))
+        }
+        PendingFlags::Logic { af_from, .. } => af_from,
+        // INC/DEC are `add`/`sub` by 1 but carry no `b` operand here, and a
+        // shift's AF is the *incoming* one; both are left for a follow-up rather
+        // than guessed — a wrong AF recipe is worse than a missing one.
+        PendingFlags::Inc { .. } | PendingFlags::Dec { .. } | PendingFlags::Shift { .. } => None,
+        PendingFlags::None => None,
+    }
+}
+
 /// Lazy ALU: defer flag packing; overwrite previous pending (last writer wins).
 // The wide signature is a load-bearing JIT lowering helper carrying the whole lowering env.
 #[allow(clippy::too_many_arguments)]
@@ -735,7 +758,11 @@ pub(super) fn lower_arith_lazy(
             res: res_m,
             bits,
         },
-        Arith::Xor | Arith::And | Arith::Or => PendingFlags::Logic { res: res_m, bits },
+        Arith::Xor | Arith::And | Arith::Or => PendingFlags::Logic {
+            res: res_m,
+            bits,
+            af_from: inherited_af(bcx, pending),
+        },
         Arith::Adc | Arith::Sbb => PendingFlags::None,
     };
     Ok(())
@@ -762,7 +789,11 @@ pub(super) fn lower_cmp_test_lazy(
     } else {
         let res_raw = bcx.ins().band(a, b);
         let res = mask_width(bcx, res_raw, bits);
-        *pending = PendingFlags::Logic { res, bits };
+        *pending = PendingFlags::Logic {
+            res,
+            bits,
+            af_from: inherited_af(bcx, pending),
+        };
     }
     Ok(())
 }
