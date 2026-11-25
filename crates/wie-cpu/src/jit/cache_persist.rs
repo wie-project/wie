@@ -40,6 +40,40 @@
 //!   match the level the file declares, so a foreign record can never be served
 //!   to a compile expecting the other level (defence in depth behind the key).
 //!
+//! # Write-wins contract (one key, one flush window)
+//!
+//! A key is a guest VA; two verdicts can be written for it — `Ready` (the block
+//! compiled and installed) and `Never` (it structurally cannot compile) — and
+//! they are written **by different threads**: a worker's failure verdict for a
+//! queued block against a guest thread's successful inline install, or an
+//! install against a refusal after a resync. Which one survives is decided at
+//! the write, in [`PersistentJitCache::write_wins`], inside the same critical
+//! section as the table upsert and the append:
+//!
+//! - **`Ready` beats `Never`, in either arrival order.** `Never` claims "these
+//!   bytes cannot be compiled"; a successful install at the same VA is evidence
+//!   against it and the reverse is never true. This is not a preference: a
+//!   `Never` row makes [`PersistentJitCache::probe`] report *absent* and
+//!   [`PersistentJitCache::never_vas`] seed `CacheEntry::Never` on the next run,
+//!   so letting it win retires a block that compiles fine.
+//! - **Among `Ready` records for one key, the last install wins.** A re-install
+//!   is what replaces the block after a resync or an invalidation, so its extent
+//!   and byte hash describe the bytes that were live when the surviving block
+//!   was installed.
+//! - **The append buffer never outvotes the table.** A flush writes the table
+//!   (which already holds the winning record per key) and folds a queued record
+//!   back in only for a key the table no longer has — which is why an
+//!   invalidation has to purge the buffer as well as the table, or the flush it
+//!   triggers would write the tombstoned row straight back out.
+//!
+//! Enforcing the first rule with a *read* before the write is what used to fail:
+//! the reader could see an empty key, a concurrent install could fill it, and
+//! the `Never` the reader had already decided to write would then overwrite the
+//! `Ready` row. Measured on a synchronised first contact, the old shape lost the
+//! `Ready` row in ~20–44 % of rounds — and **never** produced a missing row (the
+//! row was always present, saying the opposite), which is why this reads like a
+//! flaky test and not like data loss.
+//!
 //! Note that `inv_gen` is a **per-process** counter starting at zero, so a
 //! persisted value is only meaningful as "the generation at capture time" —
 //! which is exactly why the code cache (which bakes it into the emitted edge
@@ -342,6 +376,10 @@ impl PersistentJitCache {
     /// - `0` / `false` / `off` → disabled;
     /// - anything else → that value used as the cache directory.
     pub(super) fn new() -> Self {
+        #[cfg(test)]
+        if let Some(dir) = test_dir() {
+            return Self::enabled_with(dir, JitConfig::get().opt_level());
+        }
         match resolve_config(std::env::var("WIE_JIT_CACHE").ok(), under_test_process()) {
             Some(dir) => Self::enabled_with(dir, JitConfig::get().opt_level()),
             None => Self::disabled(),
@@ -594,6 +632,92 @@ impl PersistentJitCache {
         self.tier_table().map_or(0, |t| t.pin().len())
     }
 
+    /// Sorted VAs currently in the active in-memory table.
+    ///
+    /// Exists so a test can tell the three failure shapes apart: a row that was
+    /// never *recorded* is absent here and absent from `pending`; a row recorded
+    /// and then *dropped* has left this table; a row present here but missing
+    /// from the file was lost by the *flush*.
+    #[cfg(test)]
+    pub(super) fn test_vas(&self) -> Vec<u64> {
+        let mut vas: Vec<u64> = self
+            .active_table()
+            .map(|t| t.pin().iter().map(|(&va, _)| va).collect())
+            .unwrap_or_default();
+        vas.sort_unstable();
+        vas
+    }
+
+    /// `(never, guest_end, insn_count)` for `va` in the active table.
+    ///
+    /// `Some((false, ..))` is the positive verdict a warm boot consumes;
+    /// `Some((true, ..))` probes as *absent* everywhere, which is why a test has
+    /// to look at the flag rather than at the row's presence.
+    #[cfg(test)]
+    pub(super) fn test_row(&self, va: u64) -> Option<(bool, u64, u32)> {
+        self.active_table()
+            .and_then(|t| t.pin().get(&va).copied())
+            .map(|r| (r.never, r.guest_end, r.insn_count))
+    }
+
+    /// Number of records queued for the next flush (the append buffer).
+    #[cfg(test)]
+    pub(super) fn test_pending_len(&self) -> usize {
+        self.flush
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .len()
+    }
+
+    /// Force a synchronous flush, exactly as `Drop` does.
+    ///
+    /// A test cannot reach the flush any other way: the append buffer drains at
+    /// [`APPEND_FLUSH_CAP`] or after [`FLUSH_MIN_INTERVAL`], and a live
+    /// `JitShared` never drops its handle inside a test process.
+    #[cfg(test)]
+    pub(super) fn test_flush(&self) {
+        self.flush_now(true);
+    }
+
+    /// What a *fresh* handle would conclude about `va` when reloaded from disk,
+    /// byte-validated against `mem` — the ledger's only real question.
+    #[cfg(test)]
+    pub(super) fn test_disk_probe(
+        dir: PathBuf,
+        pe_hash: u64,
+        mem: &GuestMemory,
+        va: u64,
+    ) -> Option<u32> {
+        let fresh = Self::with_base_dir(dir);
+        fresh.attach(pe_hash);
+        fresh.probe(mem, va).map(|p| p.insn_count)
+    }
+
+    /// Whether the row a *fresh* handle loads from disk for `va` is a `Never`
+    /// verdict (`Some(true)`), a positive one (`Some(false)`), or absent
+    /// (`None`) — the three shapes a reload can hand the next run.
+    #[cfg(test)]
+    pub(super) fn test_disk_row_never(dir: PathBuf, pe_hash: u64, va: u64) -> Option<bool> {
+        let fresh = Self::with_base_dir(dir);
+        fresh.attach(pe_hash);
+        fresh.active_table()?.pin().get(&va).map(|r| r.never)
+    }
+
+    /// Sorted VAs a *fresh* handle loads from disk for `pe_hash`, without
+    /// attaching to this process's handle.
+    ///
+    /// The engine's own ledger flushes on drop, which a live `JitShared` does
+    /// not reach inside a test; this is how a test asks "what would the next
+    /// process see", which is the only question a persistent ledger has to
+    /// answer.
+    #[cfg(test)]
+    pub(super) fn test_disk_vas(dir: PathBuf, pe_hash: u64) -> Vec<u64> {
+        let fresh = Self::with_base_dir(dir);
+        fresh.attach(pe_hash);
+        fresh.test_vas()
+    }
+
     /// Record one successfully installed block (inline or worker install).
     ///
     /// The record is filed under the key for the tier that actually compiled
@@ -651,8 +775,13 @@ impl PersistentJitCache {
         let Some(table) = self.active_table() else {
             return;
         };
+        // Fast path only — it skips the hash for the common "already recorded"
+        // case. It is NOT what enforces "Ready beats Never": a concurrent
+        // install can insert between this read and the write below, so the
+        // authority is [`Self::write_wins`], applied inside the write's own
+        // critical section.
         if table.pin().get(&va).is_some() {
-            return; // already recorded (Ready beats Never)
+            return;
         }
         let win = u64::try_from(NEVER_WINDOW).unwrap_or(u64::MAX);
         let Some(hash) = hash_guest_range(mem, va, va.saturating_add(win)) else {
@@ -680,13 +809,51 @@ impl PersistentJitCache {
         let Some(table) = table else {
             return;
         };
-        // Ready upserts overwrite older Never records for the same VA.
-        table.pin().insert(rec.va, rec);
+        // ONE critical section for the whole write — the merge rule, the table
+        // upsert and the append to the buffer. Splitting them is what used to
+        // let two recorders of the same key disagree: the check that enforces
+        // "Ready beats Never" lived in `record_never`, *before* the hash, so a
+        // concurrent install could insert a Ready row in the gap and be
+        // overwritten by the Never that had already decided to write. Measured
+        // on a synchronised first contact, the old shape lost the Ready row in
+        // 44 % of rounds (0 rows ever *missing*: the row was always there,
+        // saying the opposite). See the module docs' write-wins contract.
         {
             let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
+            let pin = table.pin();
+            if !Self::write_wins(pin.get(&rec.va).copied(), &rec) {
+                return;
+            }
+            // Ready upserts overwrite older Never records for the same VA.
+            pin.insert(rec.va, rec);
             st.pending.push(rec);
         }
+        // Outside the lock: `flush_tick` re-takes it (and `flush_now` holds it
+        // across the table snapshot); a std `Mutex` is not reentrant.
         self.flush_tick();
+    }
+
+    /// Whether `incoming` may replace `existing` for the same ledger key.
+    ///
+    /// This is the whole write-wins contract for one key, in one place, so
+    /// [`Self::insert_rec`] is its only caller and every writer obeys it:
+    ///
+    /// - **`Ready` beats `Never`.** `Never` claims "these bytes cannot be
+    ///   compiled"; a successful install at the same VA is direct evidence
+    ///   against it, and the reverse is never true — so a `Never` may not
+    ///   displace a `Ready`, whichever thread wrote first.
+    /// - **Among `Ready` records, the last write wins.** A re-install is what
+    ///   replaces a block after a resync or an invalidation, so its extent and
+    ///   byte hash describe the bytes that were live when the surviving block
+    ///   was installed. Keeping the older row would persist a hash of bytes
+    ///   that no longer exist, which `probe` would then refuse anyway.
+    /// - **A `Never` may replace a `Never`.** The window re-hashes under the
+    ///   same rule, so the newest verdict about the current bytes wins.
+    fn write_wins(existing: Option<LedgerRec>, incoming: &LedgerRec) -> bool {
+        match existing {
+            None => true,
+            Some(old) => !(incoming.never && !old.never),
+        }
     }
 
     /// Drop ledger records overlapping `[addr, addr+len)` (in-memory now, on
@@ -694,6 +861,12 @@ impl PersistentJitCache {
     ///
     /// Both ledgers are purged: the tier ledger holds records for the same guest
     /// bytes, and a stale entry there would be served to a later `speed` run.
+    /// The **append buffer is purged too**: a record queued in this window is no
+    /// longer in the table, and `flush_table` folds queued records back in for
+    /// any key the table does not hold — so without this the flush triggered
+    /// just below would write the invalidated row straight back out (and a
+    /// crash before the next flush would persist it for a whole warm boot).
+    /// `clear_all` drops the buffer for the same reason.
     pub(super) fn invalidate_range(&self, addr: u64, len: usize) {
         if !self.enabled || len == 0 {
             return;
@@ -704,6 +877,7 @@ impl PersistentJitCache {
         }
         {
             let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
+            st.pending.retain(|r| !r.overlaps(addr, end));
             st.dirty_rewrite = true;
             st.last_flush = Instant::now(); // invalidation flushes soon (below)
         }
@@ -927,6 +1101,33 @@ fn under_test_process() -> bool {
     // `NEXTEST`: cargo-nextest, which covers integration tests linked as an
     // external crate (no `cfg(test)` in wie-cpu at all).
     cfg!(test) || std::env::var_os("NEXTEST").is_some()
+}
+
+// Test-only directory override for the *next* handle built on this thread.
+//
+// The ambient ledger is deliberately inert in a test process (see
+// `under_test_process`) and `JitShared` builds its handle exactly once, deep
+// inside `JitCpu::open_x86_64`, so a test that needs the *engine's own* ledger
+// to be live has no other way in: `env::set_var` is `unsafe` under this crate's
+// lint set, and a `JitShared` field cannot be swapped after construction. A
+// thread-local keeps the override per test (nextest runs one test per process,
+// and a unit test's engine is built on the test thread), so two tests cannot
+// see each other's directory.
+#[cfg(test)]
+thread_local! {
+    static TEST_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Point subsequently constructed ledgers on this thread at `dir`.
+#[cfg(test)]
+pub(super) fn test_set_dir(dir: PathBuf) {
+    TEST_DIR.with(|d| *d.borrow_mut() = Some(dir));
+}
+
+/// The override installed by [`test_set_dir`], if any.
+#[cfg(test)]
+fn test_dir() -> Option<PathBuf> {
+    TEST_DIR.with(|d| d.borrow().clone())
 }
 
 /// Pure `WIE_JIT_CACHE` precedence resolver, split out of [`PersistentJitCache::new`]
@@ -1515,6 +1716,225 @@ mod tests {
         assert_eq!(
             resolve_config(dir, true),
             Some(PathBuf::from("/tmp/wie-jit-cache-some-dir"))
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod write_order {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wie-ledger-write-order-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _c: std::io::Result<()> = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    const PE: u64 = 0xA11C_E000_0000_0005;
+    const BASE: u64 = 0x0080_0000;
+
+    fn mem_with(len: usize) -> GuestMemory {
+        let mut mem = GuestMemory::new();
+        let size = (len + 0x2000) & !0xFFF;
+        mem.map(BASE & !0xFFF, size, crate::RwxPerms::ALL)
+            .expect("map");
+        mem.write(BASE, &vec![0x90_u8; len]).expect("write");
+        mem
+    }
+
+    fn rec(va: u64, end: u64, never: bool) -> LedgerRec {
+        LedgerRec {
+            va,
+            guest_end: end,
+            bytes_hash: 1,
+            insn_count: if never { 0 } else { 3 },
+            inv_gen: 0,
+            never,
+            compiled_at_opt: OptTier::Base,
+        }
+    }
+
+    /// The write-wins contract, exhaustively and without threads.
+    #[test]
+    fn ready_beats_never_and_the_last_ready_wins() {
+        let ready = rec(BASE, BASE + 8, false);
+        let never = rec(BASE, BASE + 32, true);
+        // Into an empty key, either write is admissible.
+        assert!(PersistentJitCache::write_wins(None, &ready));
+        assert!(PersistentJitCache::write_wins(None, &never));
+        // Never may not displace a Ready, in either arrival order.
+        assert!(!PersistentJitCache::write_wins(Some(ready), &never));
+        // Ready displaces Never, and a later Ready displaces an earlier one.
+        assert!(PersistentJitCache::write_wins(Some(never), &ready));
+        assert!(PersistentJitCache::write_wins(
+            Some(rec(BASE, BASE + 4, false)),
+            &ready
+        ));
+        // Never re-hashes over Never: the newest verdict about the bytes wins.
+        assert!(PersistentJitCache::write_wins(Some(never), &never));
+    }
+
+    /// Ten overlapping blocks queued off one 10-byte walk — what the JIT does
+    /// when the guest interprets and the entry block's install loses the race —
+    /// must all reach the file, the entry block included, in any order.
+    #[test]
+    fn overlapping_records_in_one_window_all_reach_the_file() {
+        let mem = mem_with(16);
+        let order = [
+            BASE + 9,
+            BASE + 1,
+            BASE + 5,
+            BASE + 2,
+            BASE + 8,
+            BASE,
+            BASE + 3,
+            BASE + 7,
+            BASE + 4,
+            BASE + 6,
+        ];
+        let dir = scratch("overlap");
+        let cache = PersistentJitCache::with_base_dir(dir.clone());
+        cache.attach(PE);
+        for &va in &order {
+            cache.record_ready(&mem, va, BASE + 10, 1, 0);
+        }
+        assert_eq!(cache.test_vas().len(), 10, "all ten rows in the table");
+        cache.test_flush();
+        let disk = PersistentJitCache::test_disk_vas(dir.clone(), PE);
+        assert_eq!(
+            disk.len(),
+            10,
+            "flush wrote {} of 10: {disk:x?}",
+            disk.len()
+        );
+        assert!(disk.contains(&BASE), "entry block row on disk: {disk:x?}");
+        assert_eq!(
+            PersistentJitCache::test_disk_probe(dir, PE, &mem, BASE),
+            Some(1),
+            "entry block probes clean after reload"
+        );
+    }
+
+    /// Two instals of the *same* key in one flush window: the newest wins, and
+    /// the file holds exactly one row for that key.
+    #[test]
+    fn newest_ready_wins_for_a_key_written_twice_in_one_window() {
+        let mem = mem_with(16);
+        let dir = scratch("twice");
+        {
+            let cache = PersistentJitCache::with_base_dir(dir.clone());
+            cache.attach(PE);
+            cache.record_ready(&mem, BASE, BASE + 4, 1, 0);
+            cache.record_ready(&mem, BASE, BASE + 12, 3, 0);
+            cache.test_flush();
+            assert_eq!(cache.test_vas(), vec![BASE], "one key, one row");
+        }
+        assert_eq!(
+            PersistentJitCache::test_disk_probe(dir.clone(), PE, &mem, BASE),
+            Some(3),
+            "on-disk row carries the newest install's insn_count"
+        );
+        assert_eq!(PersistentJitCache::test_disk_vas(dir, PE), vec![BASE]);
+    }
+
+    /// The bug this module was opened for: `Ready` and `Never` for the same VA
+    /// reach the ledger from different threads (a worker's failure verdict for a
+    /// queued block against a guest thread's successful install). Whichever
+    /// lands last, the row must be the `Ready` one — a `Never` makes `probe`
+    /// report *absent*, so a lost race used to erase a block that compiles fine
+    /// from the next run's ledger entirely.
+    ///
+    /// Synchronised two-thread first contact, so each round has exactly one
+    /// window. Against the pre-fix code this failed in ~44 % of rounds (0 rows
+    /// ever missing — the row was always there, saying the opposite), so
+    /// [`ROUNDS`] is two orders of magnitude more than enough.
+    #[test]
+    fn ready_beats_never_under_a_concurrent_first_contact() {
+        const ROUNDS: usize = 4_000;
+        let mem = Arc::new(mem_with(ROUNDS + 0x1000));
+        let cache = Arc::new(PersistentJitCache::with_base_dir(scratch("race")));
+        cache.attach(PE);
+        let round = Arc::new(AtomicUsize::new(0));
+        let wrong = Arc::new(AtomicUsize::new(0));
+        let go = Arc::new(Barrier::new(3));
+        let done = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+        for records_ready in [true, false] {
+            let (cache, mem, round, go, done) = (
+                Arc::clone(&cache),
+                Arc::clone(&mem),
+                Arc::clone(&round),
+                Arc::clone(&go),
+                Arc::clone(&done),
+            );
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..ROUNDS {
+                    go.wait();
+                    let va = BASE + round.load(Ordering::Relaxed) as u64;
+                    if records_ready {
+                        cache.record_ready(&mem, va, va + 8, 3, 0);
+                    } else {
+                        cache.record_never(&mem, va);
+                    }
+                    done.wait();
+                }
+            }));
+        }
+        for i in 0..ROUNDS {
+            round.store(i, Ordering::Relaxed);
+            go.wait(); // both writers start together
+            done.wait(); // both have finished
+            let va = BASE + i as u64;
+            let row = cache.active_table().and_then(|t| t.pin().get(&va).copied());
+            // A `Ready` was recorded for this VA in this round, so the surviving
+            // row must be that `Ready` — and it must exist.
+            match row {
+                Some(r) if !r.never => {}
+                _ => {
+                    wrong.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+        assert_eq!(
+            wrong.load(Ordering::Relaxed),
+            0,
+            "a concurrent Never verdict erased a Ready row in {} of {ROUNDS} rounds",
+            wrong.load(Ordering::Relaxed)
+        );
+    }
+
+    /// An invalidation must reach the append buffer, not only the table: the
+    /// flush it triggers folds queued rows back in for keys the table no longer
+    /// holds, so a row invalidated in the same window it was recorded in would
+    /// be written straight back to disk.
+    #[test]
+    fn invalidated_pending_record_is_not_written_back() {
+        let mem = mem_with(16);
+        let dir = scratch("tombstone");
+        let cache = PersistentJitCache::with_base_dir(dir.clone());
+        cache.attach(PE);
+        cache.record_ready(&mem, BASE, BASE + 16, 4, 0);
+        assert_eq!(cache.test_pending_len(), 1, "queued");
+        // The invalidation's own flush must leave nothing on disk for this VA —
+        // no second flush to clean up after it.
+        cache.invalidate_range(BASE, 16);
+        assert!(cache.test_vas().is_empty(), "dropped in memory");
+        assert_eq!(cache.test_pending_len(), 0, "dropped from the buffer");
+        let disk = PersistentJitCache::test_disk_vas(dir, PE);
+        assert!(
+            disk.is_empty(),
+            "invalidated row written back from the append buffer: {disk:x?}"
         );
     }
 }

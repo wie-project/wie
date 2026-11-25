@@ -1226,3 +1226,94 @@ fn sole_code_file(dir: &Path) -> PathBuf {
     assert_eq!(found.len(), 1, "expected one .code file, got {found:?}");
     found.pop().expect("one file")
 }
+
+// --- ledger write order, driven by the real install path --------------------
+
+/// Walk the 10 code bytes one `step_one` at a time, exactly as [`run_to_stop`]
+/// does **without** its `precompile_at(CODE_BASE)` ordering pin, so the entry
+/// block's background install races the later blocks' installs.
+fn walk_without_ordering_pin(cpu: &mut JitCpu) {
+    cpu.write_rip(CODE_BASE).expect("rip");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let Ok(rip) = cpu.read_rip() else { break };
+        if rip >= STOP_RIP {
+            break;
+        }
+        let Ok((result, _retired)) = cpu.step_one() else {
+            break;
+        };
+        if !matches!(result, StepResult::Continue) {
+            break;
+        }
+    }
+    // Installs land asynchronously; wait for the ledger to stop growing so the
+    // assertions see the settled set rather than a snapshot mid-walk.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last = usize::MAX;
+    let mut quiet = 0;
+    while Instant::now() < deadline && quiet < 4 {
+        std::thread::sleep(Duration::from_millis(25));
+        let now = cpu.shared.persist.test_entries_len();
+        quiet = if now == last { quiet + 1 } else { 0 };
+        last = now;
+    }
+}
+
+/// The ledger row for the entry block must survive an **unordered** interpreted
+/// walk: the walk queues one block per instruction, so the entry block's install
+/// races every later block's, and a refused (`Never`) verdict for the same VA
+/// can land in the same window (this is the shape that used to erase the row —
+/// see `cache_persist`'s `write_order` tests for the mechanism and the fix).
+///
+/// Two directions, because they fail for different reasons: the in-memory table
+/// must hold the entry block's `Ready` row, and the *next process* must be able
+/// to consume it.
+///
+/// This is a **guard**, not the repro: it also passed before the fix, because in
+/// this harness the entry block's install usually wins the race on its own. The
+/// erasure needs both writers on the *same* first contact, which
+/// `cache_persist::write_order::ready_beats_never_under_a_concurrent_first_contact`
+/// drives directly (and which failed in ~20–44 % of rounds before the fix).
+#[test]
+fn entry_block_ledger_row_survives_an_unordered_walk() {
+    use crate::jit::cache_persist;
+    let dir = scratch_dir("ledger-order");
+    cache_persist::test_set_dir(dir.clone());
+    let (mut cpu, _cache) = engine_with_cache(&dir);
+    walk_without_ordering_pin(&mut cpu);
+
+    let table = cpu.shared.persist.test_vas();
+    assert!(
+        table.contains(&CODE_BASE),
+        "the entry block never reached the ledger: table={table:x?}",
+    );
+    // It must be a *positive* row, not a `Never` verdict for the same VA: a
+    // `Never` probes as absent everywhere and would seed `CacheEntry::Never`
+    // next run, permanently retiring a block that compiles fine.
+    let (never, end, insns) = cpu
+        .shared
+        .persist
+        .test_row(CODE_BASE)
+        .expect("entry block row");
+    assert!(!never, "entry block row holds a Never verdict");
+    assert!(
+        end > CODE_BASE && end <= CODE_BASE + CODE.len() as u64,
+        "entry block extent {end:#x} inside the walked bytes"
+    );
+    assert!(insns > 0, "entry block row carries an instruction count");
+
+    cpu.shared.persist.test_flush();
+    let disk = cache_persist::PersistentJitCache::test_disk_vas(dir.clone(), PE_HASH);
+    assert!(
+        disk.contains(&CODE_BASE),
+        "flush wrote {} rows without the entry block: {disk:x?}",
+        disk.len()
+    );
+    // And the row a later process would load is still the positive one.
+    assert!(
+        cache_persist::PersistentJitCache::test_disk_row_never(dir, PE_HASH, CODE_BASE)
+            == Some(false),
+        "the reloaded ledger serves a Never verdict for the entry block"
+    );
+}
