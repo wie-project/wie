@@ -146,8 +146,8 @@ use super::super::tier::OptTier;
 use super::analysis::ensure_xmm_loaded;
 use super::emit::{MemEnv, TripCounter, emit_chain_or_exit, exit_args, writeback_gprs};
 use super::err::{LowerError, noted};
-use super::flags::{FlagState, decompose_packed, iconst_u64};
-use super::insn::{PendingFlags, flush_pending, lower_insn};
+use super::flags::{FlagState, decompose_packed, iconst_u64, pack_once};
+use super::insn::{PendingFlags, flush_pending_deferred, lower_insn};
 use super::mem::{hoist_pin_slot, hoist_refill};
 use super::region::{
     GuestInsn, LoopRegion, RegionLimits, RegionRefusal, form_loop_region, form_self_loop_region,
@@ -168,13 +168,60 @@ use cranelift_module::Module;
 use std::borrow::Cow;
 
 /// Guest GPRs carried as SSA block parameters on every region block and exit
-/// block, plus the RFLAGS carrier — the arity of [`exit_args`].
+/// block: `gpr[0..16]`, in [`exit_args`]' order, so [`writeback_gprs`] — written
+/// for the block path's exit block — serves the region's exits unchanged.
+const GPR_PARAMS: usize = 16;
+
+/// The block-parameter arity of a state block: the sixteen GPRs, the
+/// architectural RFLAGS word, and — only when [`JitConfig::ssa_flags_enabled`] —
+/// the six flag fields.
 ///
-/// Reusing `exit_args`' order (`gpr[0..16]`, then rflags) for the *internal* edges
-/// too is deliberate: the region has one block-parameter convention, so
-/// [`exit_args`] and [`writeback_gprs`] — written for the block path's exit block
-/// — serve the region's internal edges unchanged.
-const STATE_PARAMS: usize = 17;
+/// # Why the word *and* the fields
+///
+/// The word is not the flags carrier any more, but it is still needed: when SSA
+/// flags are on, `FlagState::pack` takes DF, IF and the reserved bit from a word
+/// (`FlagState::old`), and nothing inside a region writes those bits, so one
+/// carried word is exact for every pack the region can perform. When SSA flags are
+/// off the word *is* the carrier, which is why the six field parameters are
+/// conditional rather than unconditional: `WIE_JIT_SSA_FLAGS=0` must produce the
+/// same function as before this change.
+///
+/// # Why the six fields, and not a packed word
+///
+/// Measured, not argued. The region used to hand its successor a *packed word*:
+/// `pack_once` at every region-internal edge, then `decompose` at the target's
+/// entry. On a one-block loop that is a pack and a decode **per iteration**, and
+/// it was the whole of the region's per-iteration deficit against the block path
+/// (171 host instructions against 156 on DOOM's scaled blit `0x1800d8fb0`, with
+/// the pack built inline at `0x1559405ec`-`0x155940620`). The block path never
+/// pays it because its exit pack happens once per *exit*; the region was paying it
+/// once per back edge. Carrying the six fields as parameters removes both halves:
+/// nothing inside the region builds a word, and no block decodes one. The fields
+/// already exist as SSA values at the end of every body
+/// (`flush_pending_deferred` assigns them), so the edge costs no instructions —
+/// only parameters.
+const fn state_param_count(ssa_flags: bool) -> usize {
+    if ssa_flags {
+        GPR_PARAMS + 1 + 6
+    } else {
+        GPR_PARAMS + 1
+    }
+}
+
+/// The region's state, as one edge hands it to the next block.
+///
+/// `fields` is `[zf, sf, cf, of, pf, af]` — [`FlagState`]'s own field order — and
+/// they are **materialised**: `pf` is `FlagState::pf_value`'s result, not the
+/// deferred recipe, because a block parameter cannot carry a recipe.
+#[derive(Clone, Copy)]
+struct Carry {
+    gpr: [Value; 16],
+    /// The architectural word. With SSA flags this is a DF/IF/reserved carrier
+    /// (`FlagState::old`), *not* the six tracked bits; without SSA flags it is the
+    /// carrier.
+    word: Value,
+    fields: Option<[Value; 6]>,
+}
 
 /// The GPR slots an exit's writeback stores: all of them.
 ///
@@ -322,18 +369,138 @@ impl Layout {
 /// block, so the region has exactly one convention between its parts.
 fn state_block(bcx: &mut FunctionBuilder<'_>) -> Block {
     let blk = bcx.create_block();
-    for _ in 0..STATE_PARAMS {
+    for _ in 0..GPR_PARAMS + 1 {
+        bcx.append_block_param(blk, types::I64);
+    }
+    if JitConfig::get().ssa_flags_enabled() {
+        // The six fields are `FlagState`'s own type: a Cranelift `i1` is an I8
+        // holding 0 or 1, and `select_flag` widens it at the pack. Declaring them
+        // I64 would be a signature mismatch on every edge that passes one.
+        for _ in 0..6 {
+            bcx.append_block_param(blk, types::I8);
+        }
+    }
+    blk
+}
+
+/// A fresh CLIF block in the **word** convention — `gpr[0..16]` then the
+/// architectural RFLAGS word, which is `exit_args`' arity.
+///
+/// This is the shape `emit.rs` insists on: `emit_chain_or_exit` ends in
+/// `jump_exit`, which passes exactly seventeen arguments to the block a region
+/// designates as its store-and-return target. So the exit blocks and that shared
+/// target keep the block path's convention unchanged, and the six carried flag
+/// fields exist only *inside* the region. The pack therefore happens on the edge
+/// into an exit block — once per region exit, which is the block path's count.
+fn word_block(bcx: &mut FunctionBuilder<'_>) -> Block {
+    let blk = bcx.create_block();
+    for _ in 0..GPR_PARAMS + 1 {
         bcx.append_block_param(blk, types::I64);
     }
     blk
 }
 
-/// The state block parameters of `blk`, in [`exit_args`] order.
-fn state_params(bcx: &FunctionBuilder<'_>, blk: Block) -> ([Value; 16], Value) {
+/// The parameters of a [`word_block`]: the file and the architectural word.
+fn word_params(bcx: &FunctionBuilder<'_>, blk: Block) -> ([Value; 16], Value) {
     let params = bcx.block_params(blk);
-    let mut gpr = [params[0]; 16];
-    gpr.copy_from_slice(&params[..16]);
-    (gpr, params[16])
+    let mut gpr = [params[0]; GPR_PARAMS];
+    gpr.copy_from_slice(&params[..GPR_PARAMS]);
+    (gpr, params[GPR_PARAMS])
+}
+
+/// The state block parameters of `blk`, as a [`Carry`].
+fn state_params(bcx: &FunctionBuilder<'_>, blk: Block) -> Carry {
+    let params = bcx.block_params(blk);
+    let mut gpr = [params[0]; GPR_PARAMS];
+    gpr.copy_from_slice(&params[..GPR_PARAMS]);
+    let word = params[GPR_PARAMS];
+    let fields = if JitConfig::get().ssa_flags_enabled() {
+        let f = &params[GPR_PARAMS + 1..];
+        Some([f[0], f[1], f[2], f[3], f[4], f[5]])
+    } else {
+        None
+    };
+    Carry { gpr, word, fields }
+}
+
+/// The block arguments that hand `carry` to a state block.
+fn carry_args(carry: &Carry) -> Vec<BlockArg> {
+    let mut args = Vec::with_capacity(state_param_count(carry.fields.is_some()));
+    args.extend(carry.gpr.iter().map(|&v| BlockArg::Value(v)));
+    args.push(BlockArg::Value(carry.word));
+    if let Some(f) = carry.fields {
+        args.extend(f.iter().map(|&v| BlockArg::Value(v)));
+    }
+    args
+}
+
+impl Carry {
+    /// The SSA flag state these parameters represent, or `None` when the word is
+    /// the only authority (`WIE_JIT_SSA_FLAGS=0`).
+    ///
+    /// `packed: None` is the point: these fields are *values*, not a memo of a
+    /// word, so a pack has to rebuild — which is exactly what every pack in the
+    /// region already did for a block whose entry decode narrowed the mask.
+    fn state(self) -> Option<FlagState> {
+        self.fields.map(|f| FlagState {
+            zf: f[0],
+            sf: f[1],
+            cf: f[2],
+            of: f[3],
+            pf: f[4],
+            af: f[5],
+            pf_src: None,
+            old: self.word,
+            packed: None,
+        })
+    }
+
+    /// Turn a body's leaving state into the parameters its edges pass.
+    ///
+    /// Costs no instructions for the GPRs and none for five of the six flags: the
+    /// values already exist. It costs the PF ladder when the last writer deferred
+    /// PF (`FlagState::pf_src`), because a deferred parity recipe cannot be a
+    /// block parameter — a pack would have paid the same ladder, so this is a move
+    /// rather than an addition, and it is why the arithmetic below does not change.
+    fn out(
+        bcx: &mut FunctionBuilder<'_>,
+        gpr: &[Value; 16],
+        rflags: Value,
+        state: Option<&FlagState>,
+    ) -> Self {
+        match state {
+            None => Self {
+                gpr: *gpr,
+                word: rflags,
+                fields: None,
+            },
+            Some(fs) => Self {
+                gpr: *gpr,
+                // `old` is the word these fields were last consistent with, so it
+                // carries DF, IF, bit 1 and the reserved bits for every pack
+                // downstream — and nothing inside a region changes those except
+                // `cld`/`std`/`popfq`, which `FlagState::resync` re-seats.
+                word: fs.old,
+                fields: Some([fs.zf, fs.sf, fs.cf, fs.of, fs.pf_value(bcx), fs.af]),
+            },
+        }
+    }
+}
+
+/// The architectural word for a carry that has to leave the SSA state: an exit
+/// writeback, the shared store-and-return block, or the invalidation bailout on a
+/// back edge.
+///
+/// One pack, on a path that runs once per region *exit* — the same count the block
+/// path pays.
+fn carry_word(bcx: &mut FunctionBuilder<'_>, carry: &Carry) -> Value {
+    match carry.state() {
+        None => carry.word,
+        Some(fs) => {
+            let mut cache = None;
+            pack_once(bcx, &mut cache, Some(&fs), carry.word)
+        }
+    }
 }
 
 /// Resolve each region block's terminator and successors against the region.
@@ -415,24 +582,35 @@ fn plan_blocks<'r>(
 /// terminator reads the flags this body produced instead of re-deriving them from
 /// the carrier — the same hand-off `emit_body_and_term` makes to
 /// `lower_jcc_chain`.
+#[allow(clippy::too_many_arguments)]
 fn emit_body(
     bcx: &mut FunctionBuilder<'_>,
     plan: &BlockPlan<'_>,
     ctx_ptr: Value,
     flags: MemFlagsData,
     mem: &mut MemEnv,
+    carry: &Carry,
     gpr: &mut [Value; 16],
     rflags: &mut Value,
 ) -> Result<Option<FlagState>, LowerError> {
-    // The RFLAGS carrier is decomposed per block and re-packed at the end, which
-    // is exactly the self-loop header's discipline: the word carried across the
-    // edge is architecturally correct, so a trap, a host stop or a `pushfq` inside
-    // the loop sees real flags rather than a half-updated carrier.
-    let mut flag_state = if JitConfig::get().ssa_flags_enabled() {
-        Some(decompose_packed(bcx, *rflags))
-    } else {
-        None
-    };
+    // The flag state a block starts with comes from the edge that entered it —
+    // six block parameters, not a word to decode.
+    //
+    // This is where the region's per-iteration flag round trip used to live. It
+    // was an unconditional `decompose_packed` at every block entry, and a
+    // narrowed-mask variant of it (the same predicate the block path applies with
+    // `analysis::entry_decode_mask`) for as long as the mask was a per-block
+    // question: both only ever mattered because the *predecessor* had packed a
+    // word the block then had to take apart again. The mask narrowing was measured
+    // on `0x1800d8fb0` and refuted — the block ends with a `shr`, and
+    // `entry_decode_mask` bails to the full six bits for any writer `defines_all_six`
+    // does not admit, so the narrowed decode was byte-identical to the wide one.
+    // With the fields carried as parameters neither shape exists: the only
+    // decode in a region is the one in the prologue, once per region *entry*.
+    //
+    // `None` (the `WIE_JIT_SSA_FLAGS=0` arm) means the word is the authority, and
+    // `carry.word` is that word.
+    let mut flag_state = carry.state();
     let mut pending = PendingFlags::None;
     let mut dirty = [false; 16];
     let mut xmm_vals = [bcx.ins().iconst(types::I64, 0); 32];
@@ -472,13 +650,26 @@ fn emit_body(
         )
         .map_err(|e| noted(&guest.insn, e))?;
     }
-    // Pack the deferred ALU flags into the carrier before the terminator reads
-    // them (a `jcc` is the usual reason) and before the edge carries the word to
-    // the next block. `PendingFlags::None` is a no-op, so this is unconditional on
-    // purpose: it is what makes "the carrier is architectural at every region block
-    // boundary" true, rather than "true when the last instruction happened to need
-    // it".
-    flush_pending(bcx, rflags, &mut pending, &mut flag_state);
+    // Assign any deferred ALU flags to the state — but **do not pack**. The
+    // carrier is materialised by the edge that actually needs a word
+    // (`emit_term`'s `pack_once`), which is the discipline `emit.rs` adopted in
+    // `a2c499f` and the region path had kept the old eager shape of.
+    //
+    // Why the old shape cost per iteration: `flush_pending` here built the word
+    // out of the six flag bits at the end of *every* block body, and then the
+    // block's own `jcc` terminator — the usual consumer — read those same six
+    // bits from the state, not from the word. So a self-looping region packed a
+    // word per iteration that the iteration never read, and the next iteration's
+    // entry did the inverse decode. Measured on DOOM's scaled blit
+    // (`0x1800d8fb0`): 171 host instructions per iteration as a region against 156
+    // as a block, with the pack built inline at `0x1559405ec`-`0x155940620`.
+    //
+    // Deferring is safe for the same reason it is safe on the block path: every
+    // place a word is observable (the exit writeback, the invalidation bailout,
+    // the back-edge hand-off) goes through `pack_once`, and the fault edge already
+    // carries the *state* (`MemEnv::fault_flags` + `fault_pending`) and packs it
+    // in the fault block, where a fault actually lands.
+    flush_pending_deferred(bcx, rflags, &mut pending, &mut flag_state);
     Ok(flag_state)
 }
 
@@ -512,8 +703,7 @@ fn emit_back_edge(
     bcx: &mut FunctionBuilder<'_>,
     ctx_ptr: Value,
     flags: MemFlagsData,
-    gpr: &[Value; 16],
-    rflags: Value,
+    carry: &Carry,
     rflags_ptr: Value,
     trip: &TripCounter,
     inv_guard: bool,
@@ -536,9 +726,12 @@ fn emit_back_edge(
         bcx.switch_to_block(stale_blk);
         bcx.seal_block(stale_blk);
         // The region's SSA state is the only copy: bring it up to date, point the
-        // dispatcher at the loop header and leave.
+        // dispatcher at the loop header and leave. This is the one place on a back
+        // edge that needs a *word*, so it is the one place that builds one — and
+        // it is cold (a generation bump, not an iteration).
+        let word = carry_word(bcx, carry);
         writeback_gprs(
-            bcx, ctx_ptr, flags, gpr, &ALL_GPRS, None, rflags, rflags_ptr, true,
+            bcx, ctx_ptr, flags, &carry.gpr, &ALL_GPRS, None, word, rflags_ptr, true,
         );
         let rip_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RIP));
         let rip = iconst_u64(bcx, layout.entry);
@@ -549,7 +742,7 @@ fn emit_back_edge(
         bcx.switch_to_block(cont_blk);
         bcx.seal_block(cont_blk);
     }
-    bcx.ins().jump(header, &exit_args(gpr, rflags));
+    bcx.ins().jump(header, &carry_args(carry));
 }
 
 /// Emit one region block's terminator as native control flow.
@@ -569,7 +762,7 @@ fn emit_term(
     layout: &Layout,
     ctx_ptr: Value,
     flags: MemFlagsData,
-    gpr: &[Value; 16],
+    carry: &Carry,
     rflags: Value,
     rflags_ptr: Value,
     flag_state: Option<&FlagState>,
@@ -581,6 +774,9 @@ fn emit_term(
     struct Edge {
         branch_to: Block,
         work: Option<(Block, Block)>,
+        /// The target is an **exit** block, which takes the word convention
+        /// (`gpr`, `rflags`) rather than the region's state parameters.
+        to_exit: bool,
     }
 
     fn edge(
@@ -602,13 +798,34 @@ fn emit_term(
                 Edge {
                     branch_to: landing,
                     work: Some((landing, target)),
+                    to_exit: false,
                 }
             }
-            _ => Edge {
+            Dest::Leave(_) => Edge {
                 branch_to: target,
                 work: None,
+                to_exit: true,
+            },
+            Dest::Inside(_) => Edge {
+                branch_to: target,
+                work: None,
+                to_exit: false,
             },
         })
+    }
+
+    /// The arguments one edge passes: nothing through a landing block (it reads
+    /// the values this block leaves, which dominate it), the six carried fields to
+    /// a region block, and a packed word to an exit block — the one place in the
+    /// region a word is built, once per exit.
+    fn args_for(bcx: &mut FunctionBuilder<'_>, carry: &Carry, e: &Edge) -> Vec<BlockArg> {
+        if e.work.is_some() {
+            Vec::new()
+        } else if e.to_exit {
+            exit_args(&carry.gpr, carry_word(bcx, carry)).to_vec()
+        } else {
+            carry_args(carry)
+        }
     }
 
     // `leave` fills a landing block: charge, guard, then jump to the header.
@@ -618,8 +835,7 @@ fn emit_term(
         header: Block,
         ctx_ptr: Value,
         flags: MemFlagsData,
-        gpr: &[Value; 16],
-        rflags: Value,
+        carry: &Carry,
         rflags_ptr: Value,
         trip: &TripCounter,
         inv_guard: bool,
@@ -628,10 +844,20 @@ fn emit_term(
         bcx.switch_to_block(landing);
         bcx.seal_block(landing);
         emit_back_edge(
-            bcx, ctx_ptr, flags, gpr, rflags, rflags_ptr, trip, inv_guard, layout, header,
+            bcx, ctx_ptr, flags, carry, rflags_ptr, trip, inv_guard, layout, header,
         );
     }
 
+    // **No pack on an internal edge.** The body leaves the six flag fields as SSA
+    // values, and the edge passes them as block parameters instead of building a
+    // word the target would immediately take apart again.
+    //
+    // The pack lives where a word is actually observable, and only there: an exit
+    // block (`carry_word`, once per region exit), the shared store-and-return
+    // block, and the cold invalidation bailout on a back edge. That is the block
+    // path's shape and its cost; the region used to pay a pack *per iteration* on
+    // top of it, which is what made the scaled blit 171 host instructions per
+    // iteration as a region against 156 as a block.
     match plan.term {
         // A terminator-less region block falls through to its single successor.
         None | Some(BlockTerm::Jmp { .. }) => {
@@ -643,33 +869,32 @@ fn emit_term(
                     // state from *this* block, which dominates it.
                     bcx.ins().jump(landing, &[]);
                     work(
-                        bcx, landing, header, ctx_ptr, flags, gpr, rflags, rflags_ptr, trip,
-                        inv_guard, layout,
+                        bcx, landing, header, ctx_ptr, flags, carry, rflags_ptr, trip, inv_guard,
+                        layout,
                     );
                 }
                 None => {
-                    bcx.ins().jump(e.branch_to, &exit_args(gpr, rflags));
+                    let args = args_for(bcx, carry, &e);
+                    bcx.ins().jump(e.branch_to, &args);
                 }
             }
         }
         Some(BlockTerm::Jcc { mnemonic, .. }) => {
+            // The branch reads the *state* (`flag_cond_fs`); no word is built for
+            // it, and none is built for either side.
             let cond = emit_cond(bcx, flag_state, mnemonic, rflags)?;
             // Both sides carry the identical state: a `jcc` changes no register.
             let taken = edge(bcx, plan.dests[0], index, layout)?;
             let not_taken = edge(bcx, plan.dests[1], index, layout)?;
-            let args = exit_args(gpr, rflags);
-            // A side that branches straight to a state block passes the state; a side
-            // that goes through a landing block passes nothing, because the landing
-            // has no parameters — it reads this block's values, which dominate it.
-            let t_args: &[BlockArg] = if taken.work.is_some() { &[] } else { &args };
-            let n_args: &[BlockArg] = if not_taken.work.is_some() { &[] } else { &args };
+            let t_args = args_for(bcx, carry, &taken);
+            let n_args = args_for(bcx, carry, &not_taken);
             let (t_branch, n_branch) = (taken.branch_to, not_taken.branch_to);
-            bcx.ins().brif(cond, t_branch, t_args, n_branch, n_args);
+            bcx.ins().brif(cond, t_branch, &t_args, n_branch, &n_args);
             for e in [taken, not_taken] {
                 if let Some((landing, header)) = e.work {
                     work(
-                        bcx, landing, header, ctx_ptr, flags, gpr, rflags, rflags_ptr, trip,
-                        inv_guard, layout,
+                        bcx, landing, header, ctx_ptr, flags, carry, rflags_ptr, trip, inv_guard,
+                        layout,
                     );
                 }
             }
@@ -922,14 +1147,14 @@ pub(super) fn compile_region(
         // One exit block per *distinct target*: two exits landing on the same
         // guest RIP run the same store-and-chain sequence, so they share a block.
         for &va in &region.exit_targets() {
-            let blk = state_block(&mut bcx);
+            let blk = word_block(&mut bcx);
             layout.exits.push((va, blk));
         }
         // The shared store-and-return block: the fault target (`MemEnv::exit`) and
         // the chain-table-miss target of every exit. It does **not** touch `rip` —
         // a fault's helper has already written the faulting guest IP, and a chain
         // miss has already had its target stored.
-        let store_exit = state_block(&mut bcx);
+        let store_exit = word_block(&mut bcx);
 
         // ---- entry: load the whole guest file, once ------------------------
         let rflags_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_RFLAGS));
@@ -1001,21 +1226,47 @@ pub(super) fn compile_region(
         let inv_guard = JitConfig::get().chain_enabled();
 
         let header = layout.state[0];
-        bcx.ins().jump(header, &exit_args(&entry_gpr, entry_rflags));
+        // The one decode a region performs: the architectural word into the six
+        // carried fields, **once per region entry** rather than once per block
+        // entry or per back edge. `decompose_packed` is the full six-bit cone and
+        // the right shape here — the entry word is authoritative and nothing has
+        // been written yet, so it is also a valid `packed` memo.
+        let entry_carry = if JitConfig::get().ssa_flags_enabled() {
+            let fs = decompose_packed(&mut bcx, entry_rflags);
+            Carry {
+                gpr: entry_gpr,
+                word: entry_rflags,
+                fields: Some([fs.zf, fs.sf, fs.cf, fs.of, fs.pf, fs.af]),
+            }
+        } else {
+            Carry {
+                gpr: entry_gpr,
+                word: entry_rflags,
+                fields: None,
+            }
+        };
+        bcx.ins().jump(header, &carry_args(&entry_carry));
 
         // ---- one CLIF block per region block ------------------------------
         for (index, block_plan) in plan.iter().enumerate() {
             bcx.switch_to_block(layout.state[index]);
-            let (mut gpr, mut rflags) = state_params(&bcx, layout.state[index]);
+            let carry = state_params(&bcx, layout.state[index]);
+            let mut gpr = carry.gpr;
+            let mut rflags = carry.word;
             let flag_state = emit_body(
                 &mut bcx,
                 block_plan,
                 ctx_ptr,
                 flags,
                 &mut mem_env,
+                &carry,
                 &mut gpr,
                 &mut rflags,
             )?;
+            // The state this block hands on: `flush_pending_deferred` left the
+            // six fields as SSA values, so an internal edge costs parameters and
+            // no instructions.
+            let out = Carry::out(&mut bcx, &gpr, rflags, flag_state.as_ref());
             emit_term(
                 &mut bcx,
                 block_plan,
@@ -1023,7 +1274,7 @@ pub(super) fn compile_region(
                 &layout,
                 ctx_ptr,
                 flags,
-                &gpr,
+                &out,
                 rflags,
                 rflags_ptr,
                 flag_state.as_ref(),
@@ -1041,7 +1292,7 @@ pub(super) fn compile_region(
         let exits = std::mem::take(&mut layout.exits);
         for &(va, blk) in &exits {
             bcx.switch_to_block(blk);
-            let (gpr, rflags) = state_params(&bcx, blk);
+            let (gpr, rflags) = word_params(&bcx, blk);
             let href = chain
                 .chain_func(va)
                 .map(|fid| eng.module.declare_func_in_func(fid, bcx.func));
@@ -1071,7 +1322,7 @@ pub(super) fn compile_region(
         bcx.switch_to_block(store_exit);
         trip.flush(&mut bcx, ctx_ptr, flags);
         bcx.seal_block(store_exit);
-        let (exit_gpr, exit_rflags) = state_params(&bcx, store_exit);
+        let (exit_gpr, exit_rflags) = word_params(&bcx, store_exit);
         for (i, value) in exit_gpr.iter().enumerate() {
             let off = i64::try_from(i.saturating_mul(8)).unwrap_or(0);
             let p = bcx.ins().iadd_imm(ctx_ptr, off);
@@ -1092,6 +1343,8 @@ pub(super) fn compile_region(
     // *are* the emitted code's op count (the emitter is the optimiser).
     #[cfg(test)]
     tests::record_emit_shape(eng.ctx.func.dfg.num_blocks(), eng.ctx.func.dfg.num_insts());
+    #[cfg(test)]
+    tests::record_emit_dump(&format!("{}", eng.ctx.func.display()));
     tracing::debug!(
         start = format_args!("{:#x}", region.entry()),
         clif_blocks = eng.ctx.func.dfg.num_blocks(),
@@ -1176,6 +1429,46 @@ mod tests {
     /// Record the shape of the region just emitted (called from `compile_region`).
     pub(super) fn record_emit_shape(blocks: usize, insts: usize) {
         EMIT_SHAPE.with(|slot| slot.set(Some((blocks, insts))));
+    }
+
+    thread_local! {
+        /// The CLIF text of the last region this thread emitted.
+        ///
+        /// Same reason as `EMIT_SHAPE`: per-thread, test-only, and the only way a
+        /// test can attribute ops to *blocks* rather than to a function total. A
+        /// region's total op count mixes three very different costs — the entry
+        /// decode (once per region entry), the loop body (per iteration) and the
+        /// exit/bailout packs (per exit) — and a change that moves work between
+        /// them can raise the total while making the loop faster. That is exactly
+        /// what the flag-carrier change does, so the attribution has to exist.
+        static EMIT_DUMP: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+
+    pub(super) fn record_emit_dump(text: &str) {
+        EMIT_DUMP.with(|slot| slot.borrow_mut().clear());
+        EMIT_DUMP.with(|slot| slot.borrow_mut().push_str(text));
+    }
+
+    /// Per-block CLIF op counts of the last region emitted, in block order.
+    ///
+    /// Counts instructions only: Cranelift's display also prints the
+    /// `v123 -> v456` block-argument bookkeeping lines, which are not ops and
+    /// which inflated the first version of this measurement by 17-28 per block.
+    fn last_emit_per_block() -> Vec<(String, usize)> {
+        let text = EMIT_DUMP.with(|slot| slot.borrow().clone());
+        let mut out: Vec<(String, usize)> = Vec::new();
+        for line in text.lines() {
+            if line.starts_with("block") {
+                let name = line.split('(').next().unwrap_or("?").trim_end_matches(':');
+                out.push((name.to_string(), 0));
+            } else if line.starts_with("    ")
+                && !line.contains(" -> ")
+                && let Some(last) = out.last_mut()
+            {
+                last.1 += 1;
+            }
+        }
+        out
     }
 
     fn last_emit_shape() -> (usize, usize) {
@@ -1313,6 +1606,17 @@ mod tests {
             region.live_in().reg_count(),
             region.exit_targets().len(),
             region.back_edges().len()
+        );
+        // Attribution, not a total: the two region blocks are the per-iteration
+        // path, `block0` is the entry decode (once per region entry) and the exit
+        // blocks run once per exit. A flag-carrier change that moves a decode out
+        // of the loop and into the entry *raises* `clif_insts` while making the
+        // loop cheaper, so the total cannot be the assertion.
+        let per_block = last_emit_per_block();
+        eprintln!(
+            "doom region per-block ops: {:?}  (iteration path = first {} region blocks)",
+            per_block,
+            region.blocks().len()
         );
         // Structural floor: 1 entry + 2 region blocks + 2 exit blocks + 1 shared
         // store/return block = 6, plus one landing block for the `jl` back edge (it

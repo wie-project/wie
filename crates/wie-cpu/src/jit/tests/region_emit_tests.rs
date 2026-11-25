@@ -37,6 +37,7 @@ use super::harness::{Backend, Engine, map_code_page, open};
 use super::*;
 use crate::ThreadContext;
 use crate::exec::StepResult;
+use crate::regs::Rflags;
 
 /// `sub rcx, 1` in the first block, `jg` back to it from the second.
 ///
@@ -857,6 +858,92 @@ fn a_self_loop_region_matches_the_interpreter() {
         assert_eq!(jit.rflags, iced.rflags, "rcx={rcx}: flags leaving the loop");
         assert_eq!(jit.gpr[0], rcx, "RAX counted the iterations");
         assert_eq!(jit.gpr[1], 0, "RCX reached zero");
+    }
+}
+
+/// A region exit must hand back the **whole** architectural word, including the
+/// bits no region tracks.
+///
+/// The region carries RFLAGS as six SSA fields since the flag-carrier slice, and
+/// one word alongside them whose only job is DF, IF, bit 1 and the reserved bits —
+/// the pack at an exit clears the six tracked bits from that word and ORs the
+/// fields back in. Nothing inside the region can change the untracked bits except
+/// `cld`/`std`/`popfq`, which `FlagState::resync` re-seats, so a single carried
+/// word is exact everywhere.
+///
+/// That is precisely the invariant a wrong carrier breaks *silently*: carry a zero
+/// (or a fresh `iconst`) instead of the word the region was entered with and every
+/// tracked flag is still right while IF and DF come back clear. The interpreter
+/// preserves them, so the differential below catches it — and it is the only
+/// assertion in this suite that can, because a register-only or arithmetic-only
+/// check passes.
+///
+/// **The fixture is the two-block loop, and that is a measurement, not a taste.**
+/// The same test written against the one-block self-loop (`SELF_LOOP`) does *not*
+/// discriminate: with `Carry::out` mutated to carry `iconst 0`, both of its arms
+/// still return `0x246` (IF|ZF|PF|bit1) on both backends. Whatever word that exit
+/// writes, it is not the carried one, and no existing test notices because the six
+/// tracked bits are rebuilt from the fields either way. This fixture — flags
+/// written in block A, read by a `jg` in block B, one native back edge between them
+/// — fails under the same mutation (`a_region_loop_matches_the_interpreter` and
+/// `the_folded_region_matches_the_interpreter` both catch it), so it is the shape
+/// that actually exercises the carrier.
+#[test]
+fn a_region_exit_keeps_the_flag_bits_the_region_never_tracked() {
+    // IF (0x200) and DF (0x400) are architecturally preserved by `sub`/`jg`. Bit 1
+    // is the reserved bit, always set. Starting from `Rflags::DEFAULT` means any
+    // pack that rebuilds the word from the six tracked fields alone loses IF.
+    const UNTRACKED: u64 = 0x400 | 0x200; // DF | IF
+    for rcx in [1_u64, 4] {
+        let mut results: Vec<ThreadContext> = Vec::new();
+        for backend in [Backend::Iced, Backend::Jit] {
+            let mut engine = open(backend);
+            if let Engine::Jit(cpu) = &mut engine {
+                cpu.shared_jit()
+                    .region_force
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            {
+                let cpu = engine.cpu();
+                cpu.virtual_alloc(
+                    CROSS_FLAGS_ENTRY,
+                    0x1000,
+                    MEM_RESERVE | MEM_COMMIT,
+                    protect::PAGE_EXECUTE_READWRITE,
+                )
+                .expect("map the fixture page");
+                cpu.mem_write(CROSS_FLAGS_ENTRY, &CROSS_FLAGS_LOOP)
+                    .expect("write the fixture");
+                let mut ctx = cpu.snapshot_thread_context();
+                ctx.gpr[1] = rcx;
+                ctx.rflags = Rflags::DEFAULT;
+                ctx.rip = CROSS_FLAGS_ENTRY;
+                cpu.restore_thread_context(&ctx);
+            }
+            if let Engine::Jit(cpu) = &mut engine {
+                let compiled = compile_and_install(cpu.as_mut(), CROSS_FLAGS_ENTRY);
+                assert_eq!(
+                    compiled.insn_count, 3,
+                    "precondition: this RIP came out as a region, not a block"
+                );
+            }
+            results.push(run_to_exit(
+                &mut engine,
+                CROSS_FLAGS_EXIT,
+                CROSS_FLAGS_ENTRY,
+            ));
+        }
+        let (iced, jit) = (&results[0], &results[1]);
+        assert_eq!(
+            u64::from(jit.rflags) & UNTRACKED,
+            u64::from(iced.rflags) & UNTRACKED,
+            "rcx={rcx}: the exit pack dropped a bit the region does not track — \
+             the carrier it packs from is not the word the region was entered with"
+        );
+        assert_eq!(
+            jit.rflags, iced.rflags,
+            "rcx={rcx}: the whole exit word must match the interpreter's"
+        );
     }
 }
 
