@@ -151,8 +151,15 @@ pub struct ExecStats {
 /// Inline compilation counters on this engine.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CompileStats {
-    /// Successful block compiles.
+    /// Successful compiles — blocks **and** loop regions together.
+    ///
+    /// `compiles=` alone could not be read: a DOOM pre-render burst reported
+    /// `compiles=85` for 1 block plus 84 regions, so a reader had to reconstruct
+    /// the split from the log. [`Self::regions`] is the part of this number that
+    /// came from `try_compile_region`.
     pub compiles: u64,
+    /// Of `compiles`, how many were loop **regions** rather than single blocks.
+    pub regions: u64,
     /// Block decode declined or cold skip.
     pub compile_skip: u64,
 }
@@ -341,6 +348,7 @@ impl JitStats {
         add(&mut self.exec.code_invs, other.exec.code_invs);
         // compile
         add(&mut self.compile.compiles, other.compile.compiles);
+        add(&mut self.compile.regions, other.compile.regions);
         add(&mut self.compile.compile_skip, other.compile.compile_skip);
         // bg (compiles / workers are shared-derived: skipped)
         add(&mut self.bg.waits, other.bg.waits);

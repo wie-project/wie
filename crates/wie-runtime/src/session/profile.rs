@@ -546,10 +546,11 @@ impl RuntimeProfile {
         }
         if let Some(j) = self.jit() {
             lines.push(format!(
-                "jit: insns={} iced={} compiles={} skip={} bg_compiles={} bg_stalls={} bg_stall_us={} bg_fallback={} cache_hits={} load={} store={}",
+                "jit: insns={} iced={} compiles={} regions={} skip={} bg_compiles={} bg_stalls={} bg_stall_us={} bg_fallback={} cache_hits={} load={} store={}",
                 j.exec.jit_insns,
                 j.exec.iced_insns,
                 j.compile.compiles,
+                j.compile.regions,
                 j.compile.compile_skip,
                 j.bg.compiles,
                 j.bg.waits,

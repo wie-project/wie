@@ -1461,6 +1461,7 @@ impl JitCpu {
         // the whole loop, so `compile_by_insns` records the region's real size.
         let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.stats.compile.compiles = self.stats.compile.compiles.saturating_add(1);
+        self.stats.compile.regions = self.stats.compile.regions.saturating_add(1);
         self.stats.profile.inline_compiles = self.stats.profile.inline_compiles.saturating_add(1);
         self.stats.profile.compile_us = self.stats.profile.compile_us.saturating_add(us);
         self.stats
