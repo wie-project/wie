@@ -1248,6 +1248,225 @@ For timings, the region A/B is still the only measurement that settles it.
 
 ---
 
+## 11. The probe-hoist line: what landed, what it measured, and where it stops
+
+§7 specified the hoist and §9 measured the block it was aimed at. This section is
+the record of the implementation that followed: three states of the guard on one
+real block, the two design moves that fell out of building it, and one closed
+question (batching) with the census that closed it. Every number below names the
+binary and the run that produced it.
+
+**Counting rule for this whole section** — the same rule §7.4 and §9.4 used:
+`lldb` attached to the live guest, `disassemble` of the *compiled* function for
+`0x1800cef0b`, and the count is of instructions **executed on the pin-hit path per
+iteration**, not laid-out text. Blocks start at a host address taken from
+`WIE_JIT_MAP`; the guard is counted separately from the access (the hit block
+holds the store plus its operand reloads).
+
+### 11.1 Three states of the guard, one block
+
+The block is §9's, `0x1800cef0b`, `insns=10`, four 4-byte stores per path. All four
+guarded operands read **pin slot 0** — `ctx` offsets `0xb08`, `0xb10`, `0xb18`,
+`0xb20`, `0xb28` (`OFF_PINS + 0..32`) plus the generation at `0xaf8` — with no
+data-pin slot loaded at all. That is `stack_pin`, the one descriptor
+`lower/mod.rs` hands to `mem::block_homes`, which is why this block is on the
+hoisted path at all (§11.3).
+
+| state | guard per operand | per iteration (4 operands) | operand 1, guard + access | provenance |
+| --- | --- | --- | --- | --- |
+| today: two-sided pin probe | **15** | **60** | 19 | `/tmp/wie-block3-a2c499f`, sha256 `a9eadd04a3e100b6`, the §9 slice binary; `/tmp/b1.map` + `/tmp/b1.dis`, host `0x151f00000` |
+| hoisted, two compares | **6** | **24** | 12 | `/tmp/wie-ab-4183676/target/release/wie`, sha256 `49bbf811736915cf`, HEAD `4183676`; `/tmp/n1.map` + `/tmp/n1.dis`, host `0x1588f8000` |
+| hoisted, one compare (`HomeSpan.len`) | **5** | **20** | 11 | main-tree release, sha256 `0196a8970100d498`; `/tmp/s3.map` + `/tmp/s3.dis`, host `0x138354000` |
+
+The executed sequences, verbatim from those disassemblies (one operand each):
+
+```text
+today:   ldur base, sub, ldur presence, tst, b.ne, cmp, b.hs, cmp, stur, b.lo,
+         ldur hi, cmp, b.hi, cbnz, and                                    = 15
+two cmp: ldur lo, cmp, b.lo, ldur hi, cmp, b.ls                            =  6
+one cmp: ldur lo, sub, ldur len, cmp, b.lo -> hit                          =  5
+```
+
+The **60 against §9's 63** is the same measurement one instruction per operand
+apart, taken on a different compile of the same block; it is a cross-check, not a
+disagreement.
+
+### 11.2 The two design moves, and one dropped check
+
+**Homes live on `RefillProbe`, not on `MemEnv`.** `RefillProbe` is already `None`
+under `WIE_JIT_MEM=slow`, on the stack super path, in region mode, and in a block
+with no memory operand — so tying the published homes to it makes those four
+exclusions *structural* instead of a convention four construction sites have to
+remember. The consequence that mattered: `err.rs` and `region_emit.rs` needed no
+edit, and the `MemEnv` field count did not grow.
+
+**`HomeSpan.len` replaces `(lo, hi)`.** Publishing a *count of valid start
+addresses* (`stage_end - size - stage_lo + 1`) instead of an inclusive upper bound
+removes two things at once, and both were instructions or states that had to be
+right:
+
+* the **wrap term** disappears as a term: a wrapped `addr + size` is an `addr`
+  more than `len - 1` above `lo`, which is the same failed compare, so there is no
+  separate `no_wrap` predicate and no second branch;
+* the **sentinel pair** disappears: empty is `len == 0`, and `t < 0` is
+  unsatisfiable, so `(lo = 1, hi = 0)` is not needed to encode "never answer".
+
+A pin home's `len` is a runtime value (two instructions at publish time); a
+**slot** home's is a compile-time constant, `PAGE_SIZE - size + 1`, so a
+slot-derived guard carries no bound computation at all.
+
+**The in-frame generation compare is not emitted**, and the reason is recorded
+rather than implied: it compared `JitCtx::mem_gen` against the prologue's own
+load, and the dispatcher (`pipeline.rs::run_compiled`) is the only writer of that
+field, so inside one frame the two agree by construction. What actually catches a
+re-protect is the per-entry descriptor reload, proven by
+`a_reprotect_between_executions_is_caught` — whose hand-run negative control (never
+committed) showed that without the reload the stale span *is* taken and the store
+lands through a guest-read-only page.
+`only_an_in_frame_move_needs_the_generation_compare` shows the compare buys
+exactly the case that cannot happen. Both tests are named here so the next reader
+does not re-add the three instructions.
+
+### 11.3 Why 15 → 6 is structural for pin-resolved operands, and why 24 beat 19
+
+§7.4 and §9.4 predicted **19 per iteration** for four operands: four per operand
+plus one three-instruction generation compare shared by the block. The build
+measured **24**, and the difference is not a miscount — it is where the bounds
+live.
+
+The generation compare is gone (11.2), so the prediction's +3 is absent. But each
+operand must *reload* the two bounds, because the span is defined in the entry
+block and consumed in the loop body, and at `opt_level=none` a value whose live
+range crosses a block boundary is spilled:
+
+```text
+0x1588f815c: ldur x0,  [sp, #0x20]     ; span.lo
+0x1588f8168: ldur x12, [sp, #0x18]     ; span.hi   (4183676, two-compare form)
+```
+
+That is **two stack reloads per operand — the next 8 instructions per iteration**,
+and it is why 6 per operand was measured against a predicted 4. They are also not
+recoverable per operand: a value consumed in a different block than it is defined
+cannot stay in a register at this optimisation level, so the per-operand floor for
+a two-sided test is 5–6 and the only way below it is to check once for a whole
+class (§11.4).
+
+The delta is **structural for pin-resolved operands only**. `block_homes` is given
+`stack_pin`; a block whose operands resolve through the refill table or the stack
+super path publishes nothing and keeps today's code byte for byte. That boundary
+is what §11.5 is about.
+
+### 11.4 The batching question — closed, with the census that closed it
+
+One check per `(width, direction)` class, instead of one per operand, was the
+obvious next step. It was designed, taken apart, and dropped. Four findings, in
+the order they landed:
+
+1. **`umin`/`umax` are not free, so the generic form is dead.** A scratch function
+   at `opt_level=none` computing a four-address min/max tree lays out to **14 host
+   instructions** — six min/max at `cmp` + `csel` each (12), plus the tree's `add`
+   and `ret`. Generic batching would then be ~17 per iteration against today's 20.
+   Measured from the emitted bytes with `llvm-mc --disassemble`, not inferred.
+2. **The affine precondition fails on the motivating block.** `0x1800cef0b` is not
+   four stores off one base; the base is rewritten between them:
+
+   ```text
+   1800cef0b: movl %r8d,(%rax)   1800cef0e: addq $0x4,%rax
+   1800cef12: movl %r8d,(%rax)   1800cef15: addq $0x4,%rax      … ×4
+   ```
+
+   The addresses are affine in the *initial* `%rax`, which is not the same thing as
+   a class with an invariant base.
+3. **Batching anyway diverges the guest state on the fault path, which is why it was
+   refused.** A batched guard has one failure edge, and it must run today's
+   unchanged chains for every member in program order. Doing that would skip the
+   four `addq %rax,4` between the members, so a fault at member 3 would report
+   `%rax` at its entry value instead of entry+8. Re-emitting those adds needs flag
+   liveness (they write flags) that the lowering does not have. The design had been
+   accepted *because* it preserved the fault contract; it did not, so it was not
+   built.
+4. **Census.** Two maps, same classifier (validated against three synthetic cases —
+   contiguous pair eligible, `add`-separated pair a near-miss, mixed widths
+   neither):
+
+   | run | blocks | eligible contiguous group | rewritten-base shape | static ceiling |
+   | --- | --- | --- | --- | --- |
+   | `/tmp/s3.map` (sha `0196a8970100d498`) | 9 026 | **617 (6.8 %)** | 9 (0.1 %) | — |
+   | `/tmp/s6.map` (same binary, sampling run) | 7 338 compiled, 4 260 fully resolved | **362 (8.5 %)** | — | **3 988 of 16 995 guard instructions = 23.5 %** |
+
+   `0x1800cef0b` is one of the 9 near-misses, not one of the eligible blocks. The
+   23.5 % is a **static** ceiling: it credits every eligible block equally, and it
+   is not an execution weight.
+
+**Open — heat weighting.** The static 23.5 % and the executed share are different
+numbers, and only the second decides whether batching is worth an `emit.rs`
+change. It is unmeasured, and the reason is a property of the environment rather
+than of the code: wall-clock sampling was taken in a sandbox where the guest parks
+between frames. Three 8-second `sample` runs over a `--screenshot-on-frame 4000`
+guest produced **17 287 JIT leaf samples, of which 17 275 were in the
+`0x1400665xx` message-wait cluster** (`0x140066570`: 11 565, `0x1400665c4`: 5 465,
+`0x140066540`: 206, `0x1400665e5`: 30, `0x1400665f0`: 9), leaving 12 samples across
+two blocks outside it. Sampling there measures idleness, not the render burst.
+There is nothing to read instead: `JitProfile` carries `bg_wait_hits`,
+`warm_ledger_hits` and `cache_hits`, but **no per-rip execution count**.
+
+To close it, either sample in a harness that actually renders (the 24.5 fps A/B
+harness), map with `WIE_JIT_MAP`, and aggregate as `samples × (5n − 6)` over
+`samples × 5 · memops`; or add a temporary per-block counter. **Do not write the
+"batching is worthless" conclusion from 23.5 %**: a static ceiling and a
+heat-weighted share are different claims, and the static number is the *upper*
+bound.
+
+### 11.5 What phase 2 would need, for refill- or super-path resolved operands
+
+Phase 1 serves pin-resolved operands. A block whose operand is answered by the
+refill table, or emitted on the stack super path, keeps today's code — and the
+census above counts *shapes*, not descriptor provenance, so how many blocks fall
+on that side is the next thing to count, not a number this document has.
+
+For those blocks the pieces already exist and are tested, and the boundary is
+explicit:
+
+* **A refill-slot home is not loop-invariant.** It is resolved for one page
+  (`page_base`), so a caller must **republish** `page_base` and `base` from the
+  chain's hit block when an access leaves that page — loop-carried parameters,
+  which is exactly why phase 1 declined it. Eviction of the slot is *not* a
+  republish event: the home holds the page's host base, which a conflict cannot
+  move.
+* **The super path carries no guard at all**, by construction: it emits bare host
+  memops for the stack window, and a descriptor check there would be wrong, not
+  merely redundant.
+* **A slot guard is cheaper per operand than a pin one** once the republish is
+  paid, because `span_of_slot`'s `len` is a compile-time constant (§11.2). The
+  cost of phase 2 is the republish and the back-edge parameters, not the guard.
+* The contract to preserve is §7.5/§7.6's: on any failed predicate, control enters
+  the *unchanged* chain, which re-derives translation from scratch and reports
+  faults exactly as it does today.
+
+### 11.6 How the four-store tests earn their place
+
+The tests that guard this line are worth recording next to the numbers, because
+one of them was wrong first and the wrongness is instructive:
+
+* The emitted-guard contract is held differentially against the probes it replaces
+  — three pin shapes × four widths × twenty addresses, plus `u64::MAX - 3` (wrap),
+  page crossings, dead descriptors and moved/short pins. The hoisted form must
+  accept exactly what the probe accepts and fall into it otherwise.
+* `one_operand_outside_the_span_does_not_ride_on_its_neighbours` is the
+  memory-safety case: four stores sharing one span, with the fourth addressing a
+  page the pin does not cover, and a canary word where that store would land.
+* **The mutation run is the evidence, not the reasoning.** Applying one block-wide
+  check to all four stores — precisely the bug the test exists to catch — turned
+  the canary from `0x1122_3344_5566_7788` into `0x1122_3344_BBBB_0003`, the fourth
+  operand's value written straight through a span that should have refused it, and
+  the test died on that assertion.
+* The first version of that test was **wrong**: the canary sat at `+0x1040` while
+  the outside operand stored at `+0x1000`, so the corruption never happened and the
+  test only caught the wrong return sentinel. The fixture was corrected — outside
+  operand aimed at the canary word, canary asserted first — so the failure names
+  the corruption rather than a return value. A test that checks an answer is not a
+  test that checks the memory.
+
 ## Appendix: reproducing
 
 ```sh
