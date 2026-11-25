@@ -39,6 +39,13 @@ static ENTRY_COUNTS: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
 /// the runtime profile uses, so the counts appear exactly when a profile report
 /// is going to be printed.
 fn entry_counts_enabled() -> bool {
+    profile_gate_on()
+}
+
+/// Whether the `WIE_RUNTIME_PROFILE` gate is on. The exact switch the runtime
+/// profile uses, so every counter here appears precisely when a report is going
+/// to be printed, and costs one relaxed `OnceLock` load when it is not.
+pub(crate) fn profile_gate_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("WIE_RUNTIME_PROFILE").is_some())
 }
@@ -77,7 +84,7 @@ fn share_pct(part: u64, total: u64) -> f64 {
 /// Answers, in one report: how many blocks were entered exactly once (compiled
 /// for nothing), how many entries those account for, and what share of all
 /// entries the twenty hottest blocks take.
-pub(crate) fn block_entry_report_lines() -> Vec<String> {
+pub(crate) fn block_entry_report_lines(stats: &JitStats) -> Vec<String> {
     if !entry_counts_enabled() {
         return Vec::new();
     }
@@ -91,7 +98,23 @@ pub(crate) fn block_entry_report_lines() -> Vec<String> {
         return Vec::new();
     }
     let v: Vec<(u64, u64)> = g.iter().map(|(rip, n)| (*rip, *n)).collect();
-    entry_report_lines(&v)
+    // The counter and `exec.cache_hits` are not the same measure, and the
+    // difference has to be visible on every run rather than explained once:
+    // `cache_hits` charges a block found `Ready` in the cache, while this
+    // counter also charges the block that an *inline* compile produced and the
+    // dispatcher executed on the same visit. Measured on `crt_hello`: 6 entries
+    // against `cache_hits=5` with `jit_profile: inline=1`, and 17 against 16 on
+    // an earlier run — the delta is the inline-executed block, every time.
+    let mut out = entry_report_lines(&v);
+    if let Some(first) = out.first_mut() {
+        let cache_hits = stats.exec.cache_hits;
+        let entries: u64 = v.iter().map(|(_, n)| *n).sum();
+        let delta = entries.saturating_sub(cache_hits);
+        first.push_str(&format!(
+            "; cache_hits={cache_hits}, delta={delta} (inline-compiled and run on the same visit)"
+        ));
+    }
+    out
 }
 
 /// The histogram arithmetic, over an explicit `(rip, entries)` list.
@@ -130,6 +153,163 @@ fn entry_report_lines(v: &[(u64, u64)]) -> Vec<String> {
         ));
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Eager-promotion site attribution (`WIE_RUNTIME_PROFILE`).
+//
+// `jit_profile: eager=N` is a single number in front of three different code
+// paths: the region fold, the boot-mode self-loop baseline branch, and the
+// `eager || persist_eager` branch. Work-gating the fast-UCRT arm moved that
+// number from 368 to 365 on `crt_hello`, i.e. the arm the comment at the
+// no-stall site credited with the startup cost was worth 3 — so the split has to
+// come from a measurement, not from reading one arm and inferring. These
+// counters are that measurement, and they render `sum_sites` next to the
+// profile's own `eager=N` so an unexplained residual is visible on every run
+// instead of turning into a story about which arm "must" be firing.
+//
+// The per-RIP map exists to separate the two readings of a large count: many
+// blocks decided once apiece, or one block re-decided on every visit. The second
+// is a defect (a baseline compile whose install does not stick), the first is a
+// policy shape, and they need different fixes.
+// ---------------------------------------------------------------------------
+
+/// Which non-loop `eager_compiles` site fired.
+#[derive(Clone, Copy)]
+pub(super) enum EagerSite {
+    /// A latch's loop header was folded into a region (`promote_loop_headers`).
+    RegionFold,
+    /// The `eager || persist_eager` branch.
+    EagerBranch,
+}
+
+#[derive(Default)]
+struct EagerTally {
+    region_fold: u64,
+    eager_branch: u64,
+    loop_attempts: u64,
+    loop_compiles: u64,
+    loop_cache_present: u64,
+    loop_rips: HashMap<u64, u64>,
+}
+
+static EAGER_TALLY: OnceLock<Mutex<EagerTally>> = OnceLock::new();
+
+fn eager_tally() -> &'static Mutex<EagerTally> {
+    EAGER_TALLY.get_or_init(|| Mutex::new(EagerTally::default()))
+}
+
+/// Count one decision at a non-loop `eager_compiles` site.
+pub(super) fn count_eager_site(site: EagerSite) {
+    if !profile_gate_on() {
+        return;
+    }
+    if let Ok(mut g) = eager_tally().lock() {
+        match site {
+            EagerSite::RegionFold => g.region_fold = g.region_fold.saturating_add(1),
+            EagerSite::EagerBranch => g.eager_branch = g.eager_branch.saturating_add(1),
+        }
+    }
+}
+
+/// Note one boot-mode self-loop baseline **attempt**, and whether the cache
+/// already held an entry for `rip` when the attempt was made.
+///
+/// A nonzero `cache_present_at_attempt` is a contradiction — the decision site
+/// is only reached from the cache-miss path — so it is counted rather than
+/// assumed away.
+pub(super) fn note_loop_baseline_attempt(rip: u64, cache_present: bool) {
+    if !profile_gate_on() {
+        return;
+    }
+    if let Ok(mut g) = eager_tally().lock() {
+        g.loop_attempts = g.loop_attempts.saturating_add(1);
+        if cache_present {
+            g.loop_cache_present = g.loop_cache_present.saturating_add(1);
+        }
+        let e = g.loop_rips.entry(rip).or_insert(0_u64);
+        *e = e.saturating_add(1);
+    }
+}
+
+/// Note that a boot-mode self-loop baseline compile succeeded — the one site
+/// that charges both `eager_compiles` and `bg_enqueues`.
+pub(super) fn note_loop_baseline_compile() {
+    if !profile_gate_on() {
+        return;
+    }
+    if let Ok(mut g) = eager_tally().lock() {
+        g.loop_compiles = g.loop_compiles.saturating_add(1);
+    }
+}
+
+/// A point-in-time copy of the tally, so the arithmetic can be asserted.
+#[derive(Default)]
+struct EagerSnapshot {
+    region_fold: u64,
+    eager_branch: u64,
+    loop_attempts: u64,
+    loop_compiles: u64,
+    loop_cache_present: u64,
+    loop_rips: Vec<(u64, u64)>,
+    /// The profile's own `eager=` total, for the reconciliation.
+    reported_eager: u64,
+}
+
+/// Render the site split, with the reconciliation against `eager=` in the line.
+fn eager_site_lines(snap: &EagerSnapshot) -> Vec<String> {
+    let sum_sites = snap
+        .region_fold
+        .saturating_add(snap.eager_branch)
+        .saturating_add(snap.loop_compiles);
+    if sum_sites == 0 && snap.loop_attempts == 0 && snap.reported_eager == 0 {
+        return Vec::new();
+    }
+    let mut rips = snap.loop_rips.clone();
+    rips.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let distinct = u64::try_from(rips.len()).unwrap_or(u64::MAX);
+    let max_per_rip = rips.first().map_or(0, |(_, n)| *n);
+    let unexplained = snap.reported_eager.saturating_sub(sum_sites);
+    let mut out = vec![format!(
+        "[wie] jit_eager_sites: region_fold={} eager_branch={} loop_baseline_compiles={} \
+         (attempts={} distinct_rips={distinct} max_per_rip={max_per_rip} \
+         cache_present_at_attempt={}) | sum_sites={sum_sites} reported_eager={} unexplained={unexplained}",
+        snap.region_fold,
+        snap.eager_branch,
+        snap.loop_compiles,
+        snap.loop_attempts,
+        snap.loop_cache_present,
+        snap.reported_eager
+    )];
+    for (rip, n) in rips.iter().take(3) {
+        out.push(format!(
+            "[wie] jit_eager_sites:   loop_baseline {rip:#x} decisions={n}"
+        ));
+    }
+    out
+}
+
+/// The site split as report lines; empty when nothing was recorded.
+fn eager_site_report_lines(stats: &JitStats) -> Vec<String> {
+    if !profile_gate_on() {
+        return Vec::new();
+    }
+    let Some(tally) = EAGER_TALLY.get() else {
+        return Vec::new();
+    };
+    let Ok(g) = tally.lock() else {
+        return Vec::new();
+    };
+    let snap = EagerSnapshot {
+        region_fold: g.region_fold,
+        eager_branch: g.eager_branch,
+        loop_attempts: g.loop_attempts,
+        loop_compiles: g.loop_compiles,
+        loop_cache_present: g.loop_cache_present,
+        loop_rips: g.loop_rips.iter().map(|(r, n)| (*r, *n)).collect(),
+        reported_eager: stats.profile.eager_compiles,
+    };
+    eager_site_lines(&snap)
 }
 
 /// Dump mem-path histogram when `WIE_JIT_MEM_TRACE=1` or `WIE_EXEC_TRACE=1`.
@@ -214,7 +394,8 @@ pub fn jit_profile_report_lines(s: &JitStats) -> Vec<String> {
     if JitConfig::get().opcode_hist_enabled() {
         out.extend(opcode_histogram_lines());
     }
-    out.extend(block_entry_report_lines());
+    out.extend(block_entry_report_lines(s));
+    out.extend(eager_site_report_lines(s));
     out
 }
 
@@ -459,6 +640,51 @@ mod tests {
             lines.iter().any(|l| l.starts_with("[wie] jit_code_cache:")),
             "code-cache line missing from {lines:?}"
         );
+    }
+
+    /// The site split must reconcile against the profile's own `eager=N`, and
+    /// any residual must be named rather than absorbed. This is the shape that
+    /// started the question: `crt_hello` reports `eager=368` while the two
+    /// non-loop sites account for 3 of it, so `unexplained=3` on the first line
+    /// is the number that ends the guessing about which arm "must" be firing.
+    #[test]
+    fn eager_site_line_names_the_unexplained_residual() {
+        let snap = EagerSnapshot {
+            region_fold: 0,
+            eager_branch: 0,
+            loop_attempts: 365,
+            loop_compiles: 365,
+            loop_cache_present: 0,
+            loop_rips: vec![(0x1400_0f0f0, 300), (0x1400_0a1c0, 60), (0x1400_0b220, 5)],
+            reported_eager: 368,
+        };
+        let lines = eager_site_lines(&snap);
+        assert_eq!(lines.len(), 4, "one summary line plus the top three rips");
+        let head = &lines[0];
+        for want in [
+            "loop_baseline_compiles=365",
+            "attempts=365",
+            "distinct_rips=3",
+            "max_per_rip=300",
+            "sum_sites=365",
+            "reported_eager=368",
+            "unexplained=3",
+        ] {
+            assert!(
+                head.contains(want),
+                "summary line is missing {want}: {head}"
+            );
+        }
+        // Sorted by decisions, so the re-decided block is the first one named:
+        // one rip with 300 of 365 attempts is the "install does not stick"
+        // signature, and it must be distinguishable from 300 blocks decided once.
+        assert!(lines[1].contains("0x14000f0f0"), "{}", lines[1]);
+        assert!(lines[1].contains("decisions=300"), "{}", lines[1]);
+        // The decision site is reached from the cache-miss path, so an entry
+        // visible at attempt time is a contradiction the report must expose.
+        assert_eq!(snap.loop_cache_present, 0);
+        // Nothing recorded and nothing reported prints nothing, not a zero line.
+        assert!(eager_site_lines(&EagerSnapshot::default()).is_empty());
     }
 
     /// The two numbers this counter exists to produce, asserted on an explicit

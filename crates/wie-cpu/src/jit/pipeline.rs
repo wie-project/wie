@@ -810,9 +810,22 @@ impl JitCpu {
                         inv_gen,
                     ) {
                         let meta = CompiledRunMeta::from(&region);
+                        super::diag::count_eager_site(super::diag::EagerSite::RegionFold);
                         self.stats.profile.eager_compiles =
                             self.stats.profile.eager_compiles.saturating_add(1);
                         return Ok(self.finish_compiled(rip, meta));
+                    }
+                    if is_loop && super::diag::profile_gate_on() {
+                        // Diagnostic attribution, gated so it costs a relaxed
+                        // `OnceLock` load when the profile is off. Recording the
+                        // attempt *before* the compile is deliberate: an attempt
+                        // that fails to compile also re-decides on the next visit,
+                        // and only the attempt count shows that.
+                        let present = {
+                            let cache = self.shared.cache.pin();
+                            cache.get(&rip).is_some()
+                        };
+                        super::diag::note_loop_baseline_attempt(rip, present);
                     }
                     if is_loop
                         && let Some(baseline) = baseline::try_compile_baseline(
@@ -826,6 +839,7 @@ impl JitCpu {
                         drop(self.enqueue_bg(rip, &kind, inv_gen, false));
                         let meta = CompiledRunMeta::from(&baseline);
                         self.insert_ready(rip, baseline);
+                        super::diag::note_loop_baseline_compile();
                         self.stats.profile.eager_compiles =
                             self.stats.profile.eager_compiles.saturating_add(1);
                         return Ok(self.finish_compiled(rip, meta));
@@ -836,6 +850,7 @@ impl JitCpu {
                     // revisit). Prefer the background worker and block briefly
                     // on this entry only. On timeout the wait attempts an inline
                     // compile on the guest thread instead of cooling down.
+                    super::diag::count_eager_site(super::diag::EagerSite::EagerBranch);
                     self.stats.profile.eager_compiles =
                         self.stats.profile.eager_compiles.saturating_add(1);
                     if self.bg_queue_too_deep() {
@@ -864,9 +879,16 @@ impl JitCpu {
                         // the `Queued` arm of [`Self::step_one`].
                         //
                         // This is the site that made `crt_hello` slow, and it
-                        // is the *only* one that mattered: boot mode reaches it
-                        // for every fast-UCRT block (`select_hot_threshold`
-                        // returns `eager` for those), so a 433-instruction
+                        // is the *only* one that mattered, per the 105
+                        // `stalled_ok` compiles that `hit_ready=0` forced. The
+                        // reason *this* branch was reached that often is no
+                        // longer the fast-UCRT arm: work-gating it
+                        // (`select_hot_threshold`) moved `eager` from 368 to 365
+                        // on the same fixture with `iced_fb=446` unchanged, so
+                        // the traffic that arrived here came from elsewhere — the
+                        // boot-mode self-loop baseline branch below is the
+                        // remaining candidate, count unproven. Either way the
+                        // no-stall rule is what fixed it, so a 433-instruction
                         // hello-world queued and then slept on 105 compiles —
                         // `stalled_ok=105`, 45-63 ms of a 47-68 ms emulation
                         // phase, with `hit_ready=0`. Fixing the `Queued` arm
@@ -2101,7 +2123,9 @@ pub(super) fn ranges_overlap(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
 
 /// Select the visit threshold and eagerness for a decoded block.
 ///
-/// Fast-UCRT blocks always compile eagerly. Self-loops use the dedicated loop
+/// Fast-UCRT blocks promote after two visits but are not eager: the shape says
+/// the block ends in an inlined call, not that it will be entered again.
+/// Self-loops use the dedicated loop
 /// hotness — a back-edge is the cheapest possible hotness signal, because one
 /// entry can run the block a million times (HotSpot draws the same distinction
 /// between an invocation counter and a back-edge counter). Otherwise promotion
@@ -2124,7 +2148,23 @@ pub(super) fn select_hot_threshold(
     target_work: u64,
 ) -> (u32, bool) {
     if is_ucrt {
-        (2, true)
+        // Work-gated, not eager: a block ending in a fast UCRT call is a shape,
+        // not evidence of a revisit. The 2-visit threshold keeps promotion cheap
+        // for blocks that do repeat while removing the compile whose native code
+        // is never entered.
+        //
+        // **Measured, and not the answer to `crt_hello`.** This arm is worth
+        // 3 eager compiles, not the bulk: with it eager, `crt_hello` reported
+        // `eager=368 bg_enq=368`; with it work-gated, `eager=365 bg_enq=365`
+        // and `iced_fb=446` unchanged, i.e. the 365 came from somewhere else.
+        // The other two `eager_compiles` sites cannot account for them either:
+        // the region fold needs `WIE_JIT_REGION` (`promote_loop_headers` returns
+        // `None` first), and the self-loop baseline branch needs one visit per
+        // decision, while the same run reports `block_entries=5`. So the counter
+        // is not tracking the policy's notion of an eager compile; see the note
+        // on `eager_compiles` in the RUNBOOK before reading that number as a
+        // count of first-sight compiles.
+        (2, false)
     } else if is_loop {
         (loop_hotness, loop_hotness == 0)
     } else if forced_eager {
@@ -2288,9 +2328,20 @@ mod tests {
     /// Fast-UCRT blocks always compile eagerly regardless of body length,
     /// cutoff, or regime.
     #[test]
-    fn ucrt_always_eager() {
-        assert!(select_hot_threshold(true, false, 1, 8, false, TARGET).1);
-        assert!(select_hot_threshold(true, false, 1, 8, true, TARGET).1);
+    fn ucrt_blocks_promote_cheap_but_not_eager() {
+        // A UCRT-ending block is a shape, not evidence of a revisit. Measured on
+        // `crt_hello` (472 guest instructions retired): this arm accounted for
+        // `eager=368 bg_enq=368` while only 28 blocks compiled and 4 were ever
+        // entered as compiled code. The 2-visit threshold keeps promotion cheap
+        // for the blocks that do repeat; first sight no longer compiles.
+        for forced in [false, true] {
+            let (thr, eager) = select_hot_threshold(true, false, 1, 8, forced, TARGET);
+            assert_eq!(thr, 2, "UCRT promotion stays cheap (forced_eager={forced})");
+            assert!(!eager, "UCRT blocks are work-gated (forced_eager={forced})");
+        }
+        // The self-loop arm is the one that must stay synchronous: one entry
+        // there covers the whole run, so there is no second visit to learn from.
+        assert!(select_hot_threshold(false, true, 8, 0, false, TARGET).1);
     }
 
     /// Self-loops use the dedicated loop hotness, not the size model; with a
