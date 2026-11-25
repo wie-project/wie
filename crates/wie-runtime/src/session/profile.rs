@@ -481,6 +481,15 @@ impl RuntimeProfile {
             self.noisy_calls(),
             self.charged_calls()
         ));
+        // A worker killed by an invalid guest access shows up as a guest-side
+        // timeout or handshake mismatch, which is a symptom. Name the cause in
+        // the report so it cannot be diagnosed only by arithmetic on exit codes.
+        if let Some(detail) = crate::mt_runtime::worker_fault_first() {
+            lines.push(format!(
+                "mt_worker_faults={} first: {detail}",
+                crate::mt_runtime::worker_fault_count()
+            ));
+        }
         if self.guest_lock_wait_ns() > 0 || self.presenter_lock_wait_ns() > 0 {
             lines.push(format!(
                 "winapi_lock_wait: guest_ms={:.3} guest_max_ms={:.3} \

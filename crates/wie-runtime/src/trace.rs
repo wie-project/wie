@@ -247,7 +247,26 @@ pub fn run_micro_exe_with_options(
     }
     let entry_point_va = session.entry_point_va();
     let initial_rsp = session.initial_rsp();
-    let run = session.run_until_stop(max_api)?;
+    // Faults are per run: a second guest in the same process must not inherit
+    // the first one's verdict.
+    crate::mt_runtime::reset_worker_faults();
+    let mut run = session.run_until_stop(max_api)?;
+    // A worker killed by an invalid guest access has already marked the process
+    // dying, but the guest usually does not notice: on `mt_contention 4 64 40`
+    // every faulting run still reaches `ExitProcess code=0`. Reporting that as
+    // success is a false green — a suite can pass while workers die — so a
+    // would-be-successful exit becomes a runtime stop that names the fault.
+    // The guest's own non-zero code is left alone: the fault must not mask it.
+    if matches!(
+        run.termination,
+        EntryTraceTermination::ExitProcess { code: 0 }
+    ) && let Some(detail) = crate::mt_runtime::worker_fault_first()
+    {
+        run.termination = EntryTraceTermination::RuntimeStop(format!(
+            "a guest worker died on an invalid guest memory access ({detail}); \
+             ExitProcess would have reported success"
+        ));
+    }
     let wall_ns = wall_t0.elapsed().as_nanos();
     let (cpu1_user, cpu1_sys) = wie_cpu::process_cpu_times_us();
     let cpu_user_us = cpu1_user.saturating_sub(cpu0_user);

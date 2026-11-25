@@ -19,6 +19,100 @@ use std::time::Instant;
 use wie_cpu::{CpuEngine, GuestMemory, IcedCpu, JitCpu, RunUntilHook};
 use wie_winapi::port::{GuestHeap, PendingSpawn, WinApiState};
 
+// ── Worker fault record ────────────────────────────────────────────────
+//
+// A worker that dies on an invalid guest access kills the guest's
+// synchronization partners (they wait for a handshake that can never arrive),
+// so the guest's own exit code is the *symptom* and the fault is the *cause*.
+// Reporting only the exit code made one such bug look like a lost wake for two
+// rounds of investigation: `mt_contention` exits 17 (“pingpong handshake
+// mismatch”) because the worker that should have pinged was killed, and the
+// 5-second wait that follows is the guest's own timeout, not the defect.
+//
+// So every worker fault is recorded once (count + the first fault's detail) and
+// surfaced by the runtime profile report as well as at the site, which makes the
+// cause readable without arithmetic on exit codes.
+
+/// Worker faults observed in this process (atomics: bumped from worker threads).
+static WORKER_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// Detail of the first worker fault (tid/rip/addr/size/direction/value).
+static WORKER_FAULT_FIRST: Mutex<Option<String>> = Mutex::new(None);
+
+/// How many workers have died on an invalid guest access.
+#[must_use]
+pub(crate) fn worker_fault_count() -> u64 {
+    WORKER_FAULTS.load(Ordering::Relaxed)
+}
+
+/// The first worker fault's detail, if any worker has died on one.
+#[must_use]
+pub(crate) fn worker_fault_first() -> Option<String> {
+    lock(&WORKER_FAULT_FIRST).clone()
+}
+
+/// Clear the fault record (a new guest run starts with a clean verdict).
+pub(crate) fn reset_worker_faults() {
+    WORKER_FAULTS.store(0, Ordering::Relaxed);
+    *lock(&WORKER_FAULT_FIRST) = None;
+}
+
+/// Name a backend access-type code the way the guest sees it.
+///
+/// `wie_cpu` encodes these Unicorn-style (`exec::AccessType::as_i32`): 0 = read,
+/// 1 = write, 16 = fetch. An unknown code is reported verbatim rather than
+/// guessed, so a new encoding shows up in the log instead of being mislabelled.
+fn access_direction(access_type: i32) -> String {
+    match access_type {
+        0 => "read".to_string(),
+        1 => "write".to_string(),
+        16 => "fetch".to_string(),
+        other => format!("type={other}"),
+    }
+}
+
+/// Record one worker fault and return its detail string.
+fn record_worker_fault(detail: String) {
+    WORKER_FAULTS.fetch_add(1, Ordering::Relaxed);
+    let mut slot = lock(&WORKER_FAULT_FIRST);
+    if slot.is_none() {
+        *slot = Some(detail);
+    }
+}
+
+/// Re-read the faulting address through the ordinary engine read path and
+/// describe the answer in one token.
+///
+/// Reported as `ok` when the bytes read back fine, or `err:<reason>` with the
+/// page map's own words (`unmapped`, `not committed`, `permission denied`) —
+/// those three are different bugs and the log should not flatten them.
+///
+/// A read is used even when the fault was a write: the question is whether the
+/// page *resolves* now, and a read answers it without touching guest state. The
+/// probe runs microseconds after the verdict, so `ok` does not by itself prove
+/// the page was mapped at fault time — it proves the refusal is not reproducible
+/// from the same address through the same layer, which is what separates a
+/// wrong verdict from a genuinely absent page.
+fn re_probe_after_fault(engine: &mut dyn CpuEngine, address: u64, size: i32) -> String {
+    let Ok(len) = usize::try_from(size) else {
+        return format!("skip:size={size}");
+    };
+    if len == 0 || len > 64 || address == 0 {
+        return format!("skip:size={size}");
+    }
+    let mut buf = [0u8; 64];
+    match engine.mem_read(address, &mut buf[..len]) {
+        Ok(()) => "ok".to_string(),
+        Err(error) => {
+            let text = error.to_string();
+            // Keep the line one record long: the reason is the payload, the
+            // repeated address is not.
+            let reason: String = text.chars().take(80).collect();
+            format!("err:{reason}")
+        }
+    }
+}
+
 // ── Lock helpers ───────────────────────────────────────────────────────
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -733,15 +827,59 @@ impl QuantumHooks for WorkerHooks {
         // Primary session path treats this as a hard stop; workers must too.
         // Logged for the same reason as the emulation-error arm above.
         if run.invalid_memory.hit {
+            let direction = access_direction(run.invalid_memory.access_type);
+            // A write carries the value it tried to store, which is how a
+            // corrupted-pointer fault is told from a partial-width one.
+            let stored = if run.invalid_memory.access_type == 1 {
+                format!(" value={:#x}", run.invalid_memory.value)
+            } else {
+                String::new()
+            };
+            // Re-probe the same address through the ordinary engine read path,
+            // immediately after the verdict, and report the answer beside it.
+            // This is the split that decides which layer owns the bug: a page
+            // that reads back fine microseconds later means the *resolve chain*
+            // that produced the verdict was wrong (stale generation / bad
+            // refill), while a page still refused means it really was absent
+            // from the page map at that instant (a VAD/free walking into a
+            // neighbour). Nothing here changes behaviour — the probe is a read
+            // of `size` bytes into a scratch buffer, and every failure of the
+            // probe itself is reported rather than propagated.
+            let probe = re_probe_after_fault(
+                core.engine(),
+                run.invalid_memory.address,
+                run.invalid_memory.size,
+            );
+            let detail = format!(
+                "tid={:#x} rip={:#x} access={direction} addr={:#x} size={}{stored} exc={:#x} reprobe={probe}",
+                self.tid,
+                rip_now,
+                run.invalid_memory.address,
+                run.invalid_memory.size,
+                run.invalid_memory.exception_code,
+            );
             tracing::error!(
                 target: "wiegui",
                 tid = format_args!("{:#x}", self.tid),
                 addr = format_args!("{:#x}", run.invalid_memory.address),
                 exc = format_args!("{:#x}", run.invalid_memory.exception_code),
                 size = run.invalid_memory.size,
+                access = %direction,
+                value = format_args!("{:#x}", run.invalid_memory.value),
                 rip = format_args!("{:#x}", rip_now),
+                reprobe = %probe,
                 "worker thread invalid guest memory — failing the run (was a silent thread exit)"
             );
+            // The consequence line, because this is the arm whose absence cost
+            // two rounds: a dead worker does not report itself, the *guest*
+            // does — as a handshake mismatch or a timeout minutes later.
+            tracing::error!(
+                target: "wiegui",
+                "{detail} — worker {:#x} is dead; guest synchronization waiting on it \
+                 will now time out or mismatch, and that timeout is a symptom, not the cause",
+                self.tid
+            );
+            record_worker_fault(detail);
             // Same reasoning as the emulation-error arm: a dead worker must not
             // leave the process deadlocked on guest synchronization that
             // expects it to arrive.

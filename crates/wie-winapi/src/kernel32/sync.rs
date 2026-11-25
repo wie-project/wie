@@ -943,6 +943,17 @@ pub(crate) fn handle_set_event(ctx: &mut HandlerContext<'_>) -> Result<WinApiHan
     let handle = engine.read_rcx()?;
     let ok = match state.kernel.sync.object(handle) {
         Some(crate::KernelObject::Event(e)) => {
+            if std::env::var_os("WIE_MT_DEBUG").is_some() {
+                let signaled_before = e.state.lock().map_or(true, |guard| guard.signaled);
+                tracing::error!(
+                    handle = format_args!("{handle:#x}"),
+                    manual = e.manual_reset,
+                    signaled_before,
+                    waiters = e.waiters.len(),
+                    active_tid = format_args!("{:#x}", state.kernel.threads.current_tid()),
+                    "[mt] SetEvent"
+                );
+            }
             e.set();
             true
         }

@@ -9,7 +9,7 @@ use ahash::HashMapExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wie_cpu::ThreadContext;
 
@@ -732,6 +732,19 @@ impl EventObject {
     }
 
     /// Wait until signaled (auto-reset consumes). Returns false on timeout.
+    ///
+    /// **A wake is not a signal.** `Condvar` is allowed to return from a timed
+    /// wait without either a notification or the deadline expiring (a spurious
+    /// wake), and a notification can arrive for a state change that this wait
+    /// does not consume. Neither may be reported as `WAIT_OBJECT_0`: the return
+    /// value is the guest's only evidence that the object was acquired, so a
+    /// falsely-`true` return is a wrong answer the guest acts on (it consumes a
+    /// handshake it never received, and the peer's signal is left for someone
+    /// else). The timeout branch therefore re-checks `signaled` in a loop until
+    /// the **deadline** — not until the next wake — and only consumption or the
+    /// deadline can end the wait. `timeout_result.timed_out()` is deliberately
+    /// not consulted: a wake that arrives just before the deadline must still be
+    /// honoured, or the last signal before a timeout would be lost instead.
     pub fn wait(&self, timeout_ms: u32) -> bool {
         let Ok(mut guard) = self.state.lock() else {
             return true;
@@ -757,25 +770,25 @@ impl EventObject {
             }
             return true;
         }
-        let remain = Duration::from_millis(u64::from(timeout_ms));
-        let (next, timeout_result) = match self.cv.wait_timeout(guard, remain) {
-            Ok(x) => x,
-            Err(p) => {
-                let (inner, _) = p.into_inner();
-                return inner.signaled;
+        let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        loop {
+            if guard.signaled {
+                if !self.manual_reset {
+                    guard.signaled = false;
+                }
+                return true;
             }
-        };
-        guard = next;
-        if guard.signaled {
-            if !self.manual_reset {
-                guard.signaled = false;
+            let Some(remain) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            if remain.is_zero() {
+                return false;
             }
-            return true;
+            guard = match self.cv.wait_timeout(guard, remain) {
+                Ok((next, _)) => next,
+                Err(p) => p.into_inner().0,
+            };
         }
-        if timeout_result.timed_out() {
-            return false;
-        }
-        true
     }
 }
 
@@ -1339,6 +1352,105 @@ mod wait_registry_tests {
     use super::*;
     use crate::wake::ThreadInbox;
     use std::time::{Duration, Instant};
+
+    /// A **notification that is not a signal** must not satisfy a wait.
+    ///
+    /// `Condvar` may return from a timed wait with neither the predicate set nor
+    /// the deadline reached. Before the deadline loop in [`EventObject::wait`],
+    /// that shape was reported as `WAIT_OBJECT_0` (`if timed_out { false } else
+    /// { true }` never re-read `signaled`), so the guest consumed a handshake it
+    /// never received and the peer's later `SetEvent` stayed pending — a
+    /// wrong-wake, which on an auto-reset event is a wrong answer the guest acts
+    /// on. This test produces exactly that shape (a bare `notify_one` with no
+    /// state change) and fails if the re-check is dropped: the waiter would then
+    /// return `true` within milliseconds of the notification.
+    #[test]
+    fn spurious_notification_does_not_satisfy_an_event_wait() {
+        let event = Arc::new(EventObject {
+            handle: 0xA003,
+            manual_reset: false,
+            state: Mutex::new(EventInner { signaled: false }),
+            cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
+        });
+        let returned: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let waiter = {
+            let event = Arc::clone(&event);
+            let returned = Arc::clone(&returned);
+            std::thread::spawn(move || {
+                let value = event.wait(5_000);
+                *returned.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
+            })
+        };
+        // Let the waiter reach the timed wait, then notify without signalling.
+        std::thread::sleep(Duration::from_millis(50));
+        event.cv.notify_one();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            *returned.lock().unwrap_or_else(|p| p.into_inner()),
+            None,
+            "a bare notification must leave the wait parked"
+        );
+        // The real signal must still complete it, and be consumed by it.
+        event.set();
+        waiter.join().expect("waiter");
+        assert_eq!(
+            *returned.lock().unwrap_or_else(|p| p.into_inner()),
+            Some(true),
+            "set() satisfies the parked wait"
+        );
+        assert!(
+            !event
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .signaled,
+            "auto-reset consume cleared the signal"
+        );
+    }
+
+    /// A finite timeout returns `false` at its deadline, and not before it: a
+    /// wait that gave up early would be the mirror-image bug (a missed wake).
+    #[test]
+    fn finite_timeout_returns_false_at_the_deadline_not_before() {
+        let event = EventObject {
+            handle: 0xA004,
+            manual_reset: false,
+            state: Mutex::new(EventInner { signaled: false }),
+            cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
+        };
+        let t0 = Instant::now();
+        assert!(!event.wait(120), "an unsignalled event times out");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(100),
+            "must wait out the timeout, took {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// A signal arriving inside the timeout window is honoured even when it
+    /// lands late, so the deadline loop must not swallow the last wake before
+    /// the timeout expires.
+    #[test]
+    fn signal_just_before_the_deadline_is_honoured() {
+        let event = Arc::new(EventObject {
+            handle: 0xA005,
+            manual_reset: false,
+            state: Mutex::new(EventInner { signaled: false }),
+            cv: Condvar::new(),
+            waiters: WaiterRegistry::default(),
+        });
+        let signaler = {
+            let event = Arc::clone(&event);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                event.set();
+            })
+        };
+        assert!(event.wait(5_000), "a signal inside the window is consumed");
+        signaler.join().expect("signaler");
+    }
 
     /// A manual-reset `SetEvent` delivers a token to every inbox-parked
     /// waiter; an auto-reset set delivers exactly one.
