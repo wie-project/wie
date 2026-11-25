@@ -248,9 +248,8 @@ impl super::GuestMemory {
             .min();
         let next_run = self
             .pages
-            .iter_runs()
-            .map(|r| r.start_page.saturating_mul(PAGE_SIZE))
-            .find(|&b| b > page_va);
+            .first_start_page_after(page_va >> 12)
+            .map(|p| p.saturating_mul(PAGE_SIZE));
 
         let end_va = match (next_vad, next_run) {
             (Some(a), Some(b)) => a.min(b),

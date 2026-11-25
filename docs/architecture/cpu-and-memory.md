@@ -216,10 +216,47 @@ there is unconditionally a dead thread — which is what the four fatal deaths w
 family.
 
 The one mutation in flight is a peer thread's `VirtualFree(p, 0, MEM_RELEASE)` of *its own* region,
-while the JIT's stub reads guest memory through a raw pointer with no lock. The candidates are a
-shared arena whose free rebuilds a structure non-atomically against a concurrent walk, a generation
-bump that invalidates a lookup for the wrong region, and a free that unlinks by range rather than by
-identity. The discriminating test is in `mem::tests`.
+while the JIT's stub reads guest memory through a raw pointer with no lock. The mechanism is now
+identified: `PageMap::runs` was a bare `BTreeMap` walked through `&self` by the reader while the
+churn thread mutated it through `&mut self` inside `VirtualFree`'s `set_range`. That is aliasing UB,
+and it is not merely incoherent — the tear is observable as an incoherent run entry, which in
+release is reported as `unmapped` on a live page.
+
+The instrument is `jit/lower/mem_fault_race_tests.rs`: a time-bounded (2 s per phase) harness whose
+writer thread churns one region with `VirtualAlloc`/`VirtualFree` under the guest-memory write lock
+while the reader walks a *different*, never-freed region through a raw `*const GuestMemory`. Against
+the unlocked map it panicked at `pagemap.rs:202`, and the panic is the whole diagnosis:
+
+```
+thread '…a_peer_free_of_another_region_never_makes_a_stable_page_unmapped' panicked at
+crates/wie-cpu/src/mem/pagemap.rs:202:13:
+assertion `left == right` failed
+  left: 131072
+ right: 131072
+```
+
+Read that twice: the assertion fires with both sides **equal**. `start` was captured from the range
+iteration and `run.start_page` was read afterwards; the writer replaced the entry between the two
+loads, and by the time `Debug` formatted them the tree was whole again. Only a torn read can fail an
+equality between two values it prints as equal.
+
+`PageMap::runs` is now `RwLock<BTreeMap<u64, PageRun>>` (guard taken inside the structure, dropped at
+every accessor's return, no guard escapes the module; the emitted TLB fast path never reaches it
+because a cache hit returns before the guard). Acceptance, measured on this host:
+
+* `losses=0` over the 2 s budget, while the duplicate-writer control stays non-zero
+  (`refusals=3084 … 14271` across runs) — the sensor is alive;
+* `alloc_failures=0`;
+* `debug_assert_eq!` at `pagemap.rs:202` no longer fires in a debug build, and it stays for the
+  single-threaded logic bug it can still catch (key disagreeing with `start_page`);
+* whole `wie-cpu` suite green in dev and release.
+
+**Why the existing suite never saw this:** nothing in it mutates the page map from one thread while
+another walks it. The harness is the first thing that does, which is why the defect surfaced as
+`debug_assert` text at line 202 rather than as a failing test. Uncontended, the guard costs 5.3 ns
+per acquire (20 M acquires, shape-matched `RwLock<BTreeMap<…>>` standalone bench, `rustc -O`, this
+host) and the guarded walk 16.5 ns; the guard's effect on a real guest under contention is
+**unmeasured**, because this host's frame timings are load-sensitive and no quiet window exists.
 
 ### Two process rules this cost us
 

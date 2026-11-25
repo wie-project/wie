@@ -2399,3 +2399,7 @@ pub(super) fn lower_shift_lazy(
     };
     Ok(())
 }
+
+
+#[cfg(test)]
+mod mem_fault_race_tests;

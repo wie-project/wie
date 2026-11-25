@@ -7,7 +7,9 @@ use super::backend::{PAGE_SHIFT, PAGE_SIZE};
 use super::protect::{AccessKind, PageProtect};
 use crate::CpuError;
 use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Guest page lifecycle state (Microsoft Learn page states).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -154,7 +156,15 @@ impl PageRun {
 #[derive(Debug)]
 pub struct PageMap {
     /// Keyed by `start_page`; runs do not overlap.
-    runs: BTreeMap<u64, PageRun>,
+    ///
+    /// Behind an [`RwLock`] because the map is walked from paths that do not
+    /// hold the outer `GuestMemory` lock — the JIT load/store stubs fall back
+    /// to it — while another thread may be re-mapping inside `VirtualAlloc` /
+    /// `VirtualFree`. Mutating the `BTreeMap` through a shared reference is
+    /// aliasing UB, so a version word (seqlock) would only detect the tear, and
+    /// an RCU snapshot would pay a full-tree clone on every mutation. The
+    /// guard never escapes this module: every accessor returns an owned value.
+    runs: RwLock<BTreeMap<u64, PageRun>>,
     /// Packed hot-run cache (see [`pack_cache`] / [`cache_hit`]).
     cache: AtomicU64,
 }
@@ -162,7 +172,7 @@ pub struct PageMap {
 impl Default for PageMap {
     fn default() -> Self {
         Self {
-            runs: BTreeMap::new(),
+            runs: RwLock::new(BTreeMap::new()),
             cache: AtomicU64::new(0),
         }
     }
@@ -171,7 +181,7 @@ impl Default for PageMap {
 impl Clone for PageMap {
     fn clone(&self) -> Self {
         Self {
-            runs: self.runs.clone(),
+            runs: RwLock::new(self.read_runs().clone()),
             cache: AtomicU64::new(self.cache.load(Ordering::Relaxed)),
         }
     }
@@ -189,6 +199,17 @@ impl PageMap {
         self.cache.store(0, Ordering::Relaxed);
     }
 
+    /// Shared guard on the run tree. Poison cannot lose a walk: the tree is
+    /// plain data and every writer either finished or did not start.
+    fn read_runs(&self) -> RwLockReadGuard<'_, BTreeMap<u64, PageRun>> {
+        self.runs.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Exclusive guard on the run tree.
+    fn write_runs(&self) -> RwLockWriteGuard<'_, BTreeMap<u64, PageRun>> {
+        self.runs.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Look up the run covering `page_key`, if any.
     #[must_use]
     pub fn lookup(&self, page_key: u64) -> Option<PageRun> {
@@ -197,13 +218,19 @@ impl PageMap {
             return Some(hit);
         }
         // Greatest start_page ≤ page_key.
-        let (&start, run) = self.runs.range(..=page_key).next_back()?;
-        if page_key < run.end_page {
-            debug_assert_eq!(start, run.start_page);
-            Some(*run)
-        } else {
-            None
-        }
+        lookup_in(&self.read_runs(), page_key)
+    }
+
+    /// First stored run start strictly above `page`, as a page key.
+    ///
+    /// Exists so callers that only need one boundary (`VirtualQuery`'s free-run
+    /// end) do not have to materialise the tree; the guard is dropped here.
+    #[must_use]
+    pub fn first_start_page_after(&self, page: u64) -> Option<u64> {
+        self.read_runs()
+            .range((Excluded(page), Unbounded))
+            .next()
+            .map(|(&k, _)| k)
     }
 
     /// Cache a successful lookup for subsequent adjacent accesses.
@@ -290,6 +317,10 @@ impl PageMap {
     }
 
     /// Core mutator on page-key half-open range `[start_page, end_page)`.
+    ///
+    /// Holds the write guard across the whole split / remove / merge sequence,
+    /// so a concurrent walk sees the map either fully before or fully after the
+    /// remap and never a half-replaced tree.
     fn set_page_range(
         &mut self,
         start_page: u64,
@@ -301,20 +332,17 @@ impl PageMap {
             return;
         }
         self.bump_cache();
+        let mut runs = self.write_runs();
 
         // Collect runs that overlap [start_page, end_page) and any adjacent merges.
         // First split any run that straddles the boundaries so we can replace the middle.
-        self.split_at(start_page);
-        self.split_at(end_page);
+        split_at_in(&mut runs, start_page);
+        split_at_in(&mut runs, end_page);
 
         // Remove fully covered runs inside [start_page, end_page).
-        let doomed: Vec<u64> = self
-            .runs
-            .range(start_page..end_page)
-            .map(|(&k, _)| k)
-            .collect();
+        let doomed: Vec<u64> = runs.range(start_page..end_page).map(|(&k, _)| k).collect();
         for k in doomed {
-            self.runs.remove(&k);
+            runs.remove(&k);
         }
 
         if state != PageState::Free {
@@ -326,59 +354,23 @@ impl PageMap {
             };
             // Merge with left neighbour if homogeneous.
             if start_page > 0
-                && let Some(left) = self.lookup_exact_end(start_page)
+                && let Some(left) = lookup_exact_end_in(&runs, start_page)
                 && left.state == state
                 && left.protect == protect
             {
                 new_run.start_page = left.start_page;
-                self.runs.remove(&left.start_page);
+                runs.remove(&left.start_page);
             }
             // Merge with right neighbour.
-            if let Some(right) = self.runs.get(&end_page).copied()
+            if let Some(right) = runs.get(&end_page).copied()
                 && right.state == state
                 && right.protect == protect
             {
                 new_run.end_page = right.end_page;
-                self.runs.remove(&end_page);
+                runs.remove(&end_page);
             }
-            self.runs.insert(new_run.start_page, new_run);
+            runs.insert(new_run.start_page, new_run);
         }
-    }
-
-    /// Run whose exclusive end equals `page`, if stored as a single entry.
-    fn lookup_exact_end(&self, page: u64) -> Option<PageRun> {
-        let (&start, run) = self.runs.range(..page).next_back()?;
-        if run.end_page == page && run.start_page == start {
-            Some(*run)
-        } else {
-            None
-        }
-    }
-
-    /// Split a run at `page` so that `page` is either a run start or outside all runs.
-    fn split_at(&mut self, page: u64) {
-        let Some(run) = self.lookup(page) else {
-            return;
-        };
-        if run.start_page == page {
-            return;
-        }
-        // page is strictly inside [start, end).
-        self.runs.remove(&run.start_page);
-        let left = PageRun {
-            start_page: run.start_page,
-            end_page: page,
-            state: run.state,
-            protect: run.protect,
-        };
-        let right = PageRun {
-            start_page: page,
-            end_page: run.end_page,
-            state: run.state,
-            protect: run.protect,
-        };
-        self.runs.insert(left.start_page, left);
-        self.runs.insert(right.start_page, right);
     }
 
     /// Homogeneous run starting at or covering `va` for VirtualQuery.
@@ -388,16 +380,58 @@ impl PageMap {
         self.lookup(page)
     }
 
-    /// Iterate all stored runs in VA order.
-    pub fn iter_runs(&self) -> impl Iterator<Item = &PageRun> {
-        self.runs.values()
-    }
-
     /// Number of stored runs (diagnostics / tests).
     #[must_use]
     pub fn run_count(&self) -> usize {
-        self.runs.len()
+        self.read_runs().len()
     }
+}
+
+/// Greatest `start_page ≤ page_key` run that covers `page_key`.
+fn lookup_in(runs: &BTreeMap<u64, PageRun>, page_key: u64) -> Option<PageRun> {
+    let (&start, run) = runs.range(..=page_key).next_back()?;
+    if page_key < run.end_page {
+        debug_assert_eq!(start, run.start_page);
+        Some(*run)
+    } else {
+        None
+    }
+}
+
+/// Run whose exclusive end equals `page`, if stored as a single entry.
+fn lookup_exact_end_in(runs: &BTreeMap<u64, PageRun>, page: u64) -> Option<PageRun> {
+    let (&start, run) = runs.range(..page).next_back()?;
+    if run.end_page == page && run.start_page == start {
+        Some(*run)
+    } else {
+        None
+    }
+}
+
+/// Split a run at `page` so that `page` is either a run start or outside all runs.
+fn split_at_in(runs: &mut BTreeMap<u64, PageRun>, page: u64) {
+    let Some(run) = lookup_in(runs, page) else {
+        return;
+    };
+    if run.start_page == page {
+        return;
+    }
+    // page is strictly inside [start, end).
+    runs.remove(&run.start_page);
+    let left = PageRun {
+        start_page: run.start_page,
+        end_page: page,
+        state: run.state,
+        protect: run.protect,
+    };
+    let right = PageRun {
+        start_page: page,
+        end_page: run.end_page,
+        state: run.state,
+        protect: run.protect,
+    };
+    runs.insert(left.start_page, left);
+    runs.insert(right.start_page, right);
 }
 
 fn access_denied(va: u64, kind: AccessKind, why: &str) -> CpuError {
