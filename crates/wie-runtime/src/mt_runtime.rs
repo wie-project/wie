@@ -666,9 +666,25 @@ impl QuantumHooks for WorkerHooks {
         run: &RunUntilHook,
         error: Option<&wie_cpu::CpuError>,
     ) -> Result<Option<Step>> {
-        if error.is_some() {
+        if let Some(error) = error {
             // Emulation backend failure — same hard-exit as the primary's
             // RuntimeStop, but for a worker thread it is a thread failure.
+            // Never silent: a worker that dies here leaves every peer parked on
+            // a guest barrier (the count never reaches N, the gate is never
+            // set) and the process hangs at 0% CPU with nothing in the log.
+            tracing::error!(
+                target: "wiegui",
+                tid = format_args!("{:#x}", self.tid),
+                error = %error,
+                "worker thread hit an emulation error — failing the run (was a silent thread exit)"
+            );
+            // A worker fault is a RUN failure, not a per-thread event. Exiting
+            // just this thread leaves every peer parked on whatever guest
+            // synchronization it was in (a barrier count that can never reach
+            // N, a manual-reset gate nobody will set) and the primary joining
+            // them: process wedged at 0% CPU with nothing in the log. Windows
+            // would raise the exception process-wide; do the same.
+            core.with_locked(|_, st| st.scheduler().mark_process_dying());
             return Ok(Some(Step::ExitThread(1)));
         }
         // Pthread return trampoline: the start routine returned. RAX holds
@@ -715,7 +731,21 @@ impl QuantumHooks for WorkerHooks {
         }
         // Invalid guest access must not soft-yield forever (same RIP retried).
         // Primary session path treats this as a hard stop; workers must too.
+        // Logged for the same reason as the emulation-error arm above.
         if run.invalid_memory.hit {
+            tracing::error!(
+                target: "wiegui",
+                tid = format_args!("{:#x}", self.tid),
+                addr = format_args!("{:#x}", run.invalid_memory.address),
+                exc = format_args!("{:#x}", run.invalid_memory.exception_code),
+                size = run.invalid_memory.size,
+                rip = format_args!("{:#x}", rip_now),
+                "worker thread invalid guest memory — failing the run (was a silent thread exit)"
+            );
+            // Same reasoning as the emulation-error arm: a dead worker must not
+            // leave the process deadlocked on guest synchronization that
+            // expects it to arrive.
+            core.with_locked(|_, st| st.scheduler().mark_process_dying());
             return Ok(Some(Step::ExitThread(1)));
         }
         Ok(None)
