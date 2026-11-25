@@ -8,38 +8,75 @@ use super::{
 };
 use crate::CpuError;
 
+/// Attempts a data access may make when the *map moved under it*.
+///
+/// A generation bump is global: it says "someone, somewhere, mapped, protected or
+/// freed something", not "the page you are touching is wrong". During a churn
+/// workload every thread's access can therefore land inside another thread's bump
+/// window, and reporting that as a guest fault kills a thread that did nothing
+/// wrong. The retry is bounded and always re-checks the access against the page
+/// map, which is the authority: if the page is gone or now denies the access, the
+/// retry terminates in a fault on its first iteration.
+const DATA_ACCESS_ATTEMPTS: u32 = 3;
+
+/// Why a single data-access attempt did not complete.
+enum DataAccess {
+    /// The page map says this access is illegal — a guest fault, never retried.
+    Fault(CpuError),
+    /// The map moved under the attempt; the page may still permit exactly this
+    /// access, so re-resolve and check again.
+    Retry,
+}
+
 impl super::GuestMemory {
     /// Write `bytes` at guest `address` after SPC (write permission).
     ///
     /// Uses pointer-based write to mmap arena data plane — no backend mutation,
     /// so this method takes `&self` and is safe for concurrent caller threads.
+    ///
+    /// A generation bump that lands between the page check and the store is
+    /// re-resolved and re-checked rather than reported (see [`DataAccess`]); a
+    /// page that is genuinely gone or read-only still fails on the first attempt.
     pub(crate) fn write(&self, address: u64, bytes: &[u8]) -> Result<(), crate::CpuError> {
+        self.data_access("mem_write", address, || self.write_attempt(address, bytes))
+    }
+
+    /// One write attempt; see [`Self::write`].
+    fn write_attempt(&self, address: u64, bytes: &[u8]) -> Result<(), DataAccess> {
         let gen_start = self.generation();
         self.pages
-            .check_access(address, bytes.len(), protect::AccessKind::Write)?;
+            .check_access(address, bytes.len(), protect::AccessKind::Write)
+            .map_err(DataAccess::Fault)?;
         // Lock-free pointer-based write: each page is resolved separately
         // since cross-page spans may cross arena boundaries.
         let mut offset = 0_usize;
         let mut va = address;
         while offset < bytes.len() {
             let page_off = usize::try_from(va & (PAGE_SIZE - 1))
-                .map_err(|_| CpuError::Message("page offset does not fit usize".into()))?;
+                .map_err(|_| CpuError::Message("page offset does not fit usize".into()))
+                .map_err(DataAccess::Fault)?;
             let src = bytes
                 .get(offset..)
-                .ok_or_else(|| CpuError::Message("write slice OOB".into()))?;
+                .ok_or_else(|| CpuError::Message("write slice OOB".into()))
+                .map_err(DataAccess::Fault)?;
             let room_in_page = PAGE_SIZE_USIZE.saturating_sub(page_off);
             let chunk = room_in_page.min(src.len());
-            let dst = self
-                .backend
-                .write_ptr(va)
-                .ok_or_else(|| CpuError::Message(format!("mem_write unmapped {va:#x}")))?;
-            // SAFETY: write_ptr resolved a host pointer; generation check
-            // BEFORE the write guards against concurrent arena removal
-            // (VirtualFree/MEM_RELEASE unmaps the arena and bumps generation).
+            let dst = self.backend.write_ptr(va);
+            // A null resolve is only a fault if the map has *not* moved: under a
+            // concurrent release the arena array can be mid-rebuild, which is the
+            // same "lost race reported as a fault" shape as the generation check.
+            let Some(dst) = dst else {
+                return Err(if self.generation() == gen_start {
+                    DataAccess::Fault(CpuError::Message(format!("mem_write unmapped {va:#x}")))
+                } else {
+                    DataAccess::Retry
+                });
+            };
+            // Generation check BEFORE the write guards against concurrent arena
+            // removal (VirtualFree/MEM_RELEASE unmaps the arena and bumps the
+            // generation), so this never stores through a freed host pointer.
             if self.generation() != gen_start {
-                return Err(CpuError::Message(format!(
-                    "mem_write generation changed at {va:#x} (concurrent map/free)"
-                )));
+                return Err(DataAccess::Retry);
             }
             #[expect(unsafe_code)]
             unsafe {
@@ -52,18 +89,64 @@ impl super::GuestMemory {
     }
 
     /// Read into `bytes` from guest `address` after SPC (read permission).
+    ///
+    /// Same re-resolve contract as [`Self::write`].
     pub(crate) fn read(&self, address: u64, bytes: &mut [u8]) -> Result<(), crate::CpuError> {
+        self.data_access("mem_read", address, || self.read_attempt(address, bytes))
+    }
+
+    /// One read attempt; see [`Self::read`].
+    fn read_attempt(&self, address: u64, bytes: &mut [u8]) -> Result<(), DataAccess> {
         let gen_start = self.generation();
         self.pages
-            .check_access(address, bytes.len(), protect::AccessKind::Read)?;
-        // Generation check BEFORE read guards against concurrent arena removal
+            .check_access(address, bytes.len(), protect::AccessKind::Read)
+            .map_err(DataAccess::Fault)?;
+        // Generation check BEFORE the read guards against concurrent arena removal
         // by another thread (VirtualFree/MEM_RELEASE bumps generation + unmap).
         if self.generation() != gen_start {
-            return Err(CpuError::Message(format!(
-                "mem_read generation changed at {address:#x} (concurrent map/free)"
-            )));
+            return Err(DataAccess::Retry);
         }
-        self.backend.read(address, bytes)
+        self.backend.read(address, bytes).map_err(|e| {
+            if self.generation() == gen_start {
+                DataAccess::Fault(e)
+            } else {
+                DataAccess::Retry
+            }
+        })
+    }
+
+    /// Bounded re-resolve loop shared by [`Self::read`] and [`Self::write`].
+    ///
+    /// Each turn re-runs `check_access`, so the page map — not the retry — decides
+    /// whether the access is legal. On exhaustion the last attempt's own error is
+    /// reported, and a churn that never settles is a fault with the reason spelled
+    /// out: never a silent success.
+    fn data_access<F>(&self, op: &str, address: u64, mut attempt: F) -> Result<(), CpuError>
+    where
+        F: FnMut() -> Result<(), DataAccess>,
+    {
+        let mut attempts = 0_u32;
+        loop {
+            attempts = attempts.saturating_add(1);
+            match attempt() {
+                Ok(()) => return Ok(()),
+                Err(DataAccess::Fault(e)) => return Err(e),
+                Err(DataAccess::Retry) => {
+                    if attempts >= DATA_ACCESS_ATTEMPTS {
+                        // The map kept moving. Deliberately *not* a success: report
+                        // it, with the count, so a churn that never settles shows up
+                        // as a fault instead of vanishing.
+                        return Err(CpuError::Message(format!(
+                            "{op} generation changed at {address:#x} \
+                             (concurrent map/free, {attempts} attempts)"
+                        )));
+                    }
+                    // Give the mapping thread a chance to leave its critical
+                    // section before re-resolving. Slow path only.
+                    std::thread::yield_now();
+                }
+            }
+        }
     }
 
     /// Copy `len` bytes guest→guest without bouncing through a host buffer.

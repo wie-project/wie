@@ -1231,3 +1231,117 @@ fn engine_memory_generation_follows_protection_changes() {
     cpu.mem_write(base, &[1, 2, 3, 4])
         .expect("write after RW restore");
 }
+
+// ── A generation bump is not a fault ──────────────────────────────────────
+//
+// The generation is global: it says "some thread, somewhere, mapped, protected
+// or freed something", not "the page you are touching is wrong". During a churn
+// workload every thread's access can land inside another thread's bump window,
+// and reporting that as a guest fault kills a thread that did nothing illegal.
+// That is the `invalid guest memory` that killed `mt_contention` workers on a
+// stack store, an IAT load and a churn-block store — none of them a bad address.
+
+/// Stable page + concurrent churn of a *different* region ⇒ no fault.
+///
+/// The reader uses the same shape the JIT stubs use: a `&GuestMemory` taken once
+/// and used without the outer lock. A read guard, or re-locking per access, would
+/// let the writer serialise against the reader and the test would pass vacuously.
+#[test]
+fn a_peer_churn_of_another_region_never_faults_a_stable_access() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    const STABLE: u64 = 0x3000_0000;
+    const CHURN_HINT: u64 = 0x3100_0000;
+    const PAGE: usize = 0x1000;
+    // Enough accesses that the writer thread is guaranteed to interleave; the
+    // churn counter below proves it did, so the test cannot pass vacuously.
+    const ACCESSES: u32 = 100_000;
+
+    let mem = std::sync::Arc::new(std::sync::Mutex::new(GuestMemory::new()));
+    let primed = {
+        let mut m = mem.lock().expect("lock");
+        m.map(STABLE, 0x2000, crate::RwxPerms::READ_WRITE)
+            .expect("map stable region");
+        m.write(STABLE, &[0x5A; 16]).expect("seed stable region");
+        m.virtual_alloc(
+            CHURN_HINT,
+            PAGE,
+            MEM_COMMIT | MEM_RESERVE,
+            protect::PAGE_READWRITE,
+        )
+        .expect("prime churn region")
+    };
+    let raw: *const GuestMemory = {
+        let guard = mem.lock().expect("lock");
+        std::ptr::from_ref(&*guard)
+    };
+
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let churn_cycles = std::sync::Arc::new(AtomicU64::new(0));
+    let mut faults: Vec<String> = Vec::new();
+    let mut unmapped_still_faults = false;
+
+    std::thread::scope(|scope| {
+        let w_mem = std::sync::Arc::clone(&mem);
+        let w_stop = std::sync::Arc::clone(&stop);
+        let w_cycles = std::sync::Arc::clone(&churn_cycles);
+        scope.spawn(move || {
+            let mut cur = primed;
+            while !w_stop.load(Ordering::Relaxed) {
+                let Ok(mut m) = w_mem.lock() else { break };
+                // A failed free just ends the churn; the point is the bump rate.
+                if m.virtual_free(cur, 0, MEM_RELEASE).is_err() {
+                    break;
+                }
+                match m.virtual_alloc(
+                    CHURN_HINT,
+                    PAGE,
+                    MEM_COMMIT | MEM_RESERVE,
+                    protect::PAGE_READWRITE,
+                ) {
+                    Ok(p) => cur = p,
+                    Err(_) => break,
+                }
+                w_cycles.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // SAFETY: the reader only calls `&self` methods. The writer's `&mut` on the
+        // same `GuestMemory` is the race under test — it is what the production
+        // stubs do with `ctx.mem`, and it is why the data path re-resolves.
+        #[expect(unsafe_code)]
+        let reader = unsafe { &*raw };
+        // Let the churn thread reach its loop before the first access.
+        std::thread::yield_now();
+        let mut buf = [0_u8; 8];
+        for _ in 0..ACCESSES {
+            if let Err(e) = reader.read(STABLE, &mut buf) {
+                faults.push(format!("read: {e}"));
+            }
+            if let Err(e) = reader.write(STABLE + 8, &[0xA5; 8]) {
+                faults.push(format!("write: {e}"));
+            }
+        }
+        // The retry must not swallow a real fault: a page the map was never told
+        // about still fails, on the first attempt, through the same path.
+        unmapped_still_faults = reader.read(STABLE + 0x40_0000, &mut buf).is_err();
+        stop.store(true, Ordering::Relaxed);
+    });
+
+    let cycles = churn_cycles.load(Ordering::Relaxed);
+    assert!(
+        cycles > 0,
+        "the churn thread never ran, so this test proves nothing (vacuous)"
+    );
+    assert!(
+        unmapped_still_faults,
+        "an unmapped page must still fault; the re-resolve must not become a silent success"
+    );
+    assert!(
+        faults.is_empty(),
+        "{} of {} accesses faulted on a stable page under churn; first: {:?}",
+        faults.len(),
+        ACCESSES * 2,
+        faults.first()
+    );
+}
