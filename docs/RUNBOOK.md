@@ -156,6 +156,24 @@ the gate honest — a filter that matches nothing is refused (nextest exits 4 to
 but a `--no-tests=pass` config would silently green it), and `--list` prints the plan
 so a surprising mapping is visible before anything compiles.
 
+### What a commit has to prove
+
+Proportional to the diff, and no more:
+
+| change | before committing |
+|---|---|
+| a locale string, a doc, a comment | nothing; `cargo check` if a type is involved |
+| one function in one module | `cargo check -p <crate> --all-targets` + the test that names that behaviour (one `-E 'test(...)'` expression) |
+| a lowering/encoder/emitter arm | the above, plus a dual-engine parity case, plus `--release` if codegen shape changed |
+| a shared interface, or anything about to be pushed | `./scripts/gate.sh --smoke`, then `--workspace` once |
+
+The whole-package suites (`nextest -p wie-cpu`, `-p wie-runtime`) are *push-time*
+gates, not edit-time ones: re-running 547 CPU tests or 196 runtime tests after a
+one-line fix buys nothing the touched-behaviour test did not already answer, and a
+120 s `wie-runtime` run per edit is how a lane stops making edits. If a change could
+plausibly break a neighbour, say which neighbour and run *that* test — the point is
+to name the risk, not to blanket-re-run everything.
+
 ## Benchmarks & regression gate
 
 Criterion suites live in `crates/wie-cpu/benches/jit_hot_paths.rs`
