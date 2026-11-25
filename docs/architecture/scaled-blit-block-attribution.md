@@ -192,6 +192,15 @@ contained 62 instructions that do not execute per iteration. The audit's 38 % wa
 therefore right to within the width of the flag rule, and this document's own 37 %
 was the last remaining error in this table.
 
+**Correction (2026-11-25), measured after the flag lanes closed: quote 14.6 %, not
+37.3 % or 44.3 %.** Both of those are shares of *earlier revisions of this block*
+(266 and 174 instructions) and both are superseded. On the current
+239-instruction iteration — probe span guard in place, PF deferred, pack moved
+into the cold miss path — flag materialisation is **35 of 239 = 14.6 %**,
+address-listed in §12.1. The 37 % figure the campaign has been quoting is the
+*pre-deferral 266-instruction block*; if it is quoted at all it must carry that
+label. §12 has the provenance and every other category's cost.
+
 ---
 
 ## 4. The two hypotheses, settled
@@ -1536,3 +1545,149 @@ consumer on the path the instruction is claimed dead on — for the exit-only fl
 bits, the check is that the continue edge neither reads the register nor stores
 to `JitCtx+0x88`; for the slot pairs, that the register is unmodified
 between the load and the store of the same slot.
+
+---
+
+# 12. The block after the flag, probe and pack lanes closed — what to quote, and what not
+
+Provenance for every number below: release build of `c108f18`
+(`CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build
+--release -p wie-cli`), captured with `/tmp/dump_blit.sh` — `WIE_JIT_REGION=0`,
+`--screenshot-on-frame 20`, one `lldb` disassembly of 1400 instructions, the run
+killed the moment the dump was in hand — into `/tmp/blk_afeager2.txt` (sha256
+`4ab41b46…`). Unit 785 host instructions; loop head `…1c0`, back edge `…cb50`;
+counted with `/tmp/iter_count.py` (forward-reachable from the head ∩
+backward-reachable from the back edge). Single run; instruction counts are
+load-insensitive; **no frame number here** (five lanes compiling throughout), and
+`WIE_JIT_REGION` was off, so this is the *block* form.
+
+## 12.1 The iteration, by category — 239 host instructions, and it sums exactly
+
+| category | n | what it is, with addresses |
+|---|---|---|
+| guest arithmetic | 73 | the blit itself: `…1c0 add`, the `add`/`orr`/`eor`/`csel` body, RIP advance |
+| slot traffic in the body | 28 | `…22c`–`…2cc`, `…448`–`…558`, `…660`–`…6a0` (`ldur`/`stur [sp,*]`) |
+| **latch phi slot traffic** | **27** | `…ac8`–`…af0` (13 loads) + `…cb0c`–`…cb40` (14 stores) — §12.3 |
+| **flag materialisation** | **35** | `…1c4`–`…214` (add chain), `…6c8`–`…6fc` (32-bit sub chain) = **14.6 %** |
+| branches and guards | 22 | `…250`–`…51c` (`b.lo`×5, `b.hi`×3, `b.eq`×2, `b.ne`×2, `cbnz`, plus fallback legs) |
+| guest memory accesses | 18 | `…2b8/2c0/2c8`, `…438/44c/460`, `…4ec/4f4/4fc`, `…664/67c/694`, ctx loads `…318/54c/af8/cb00` |
+| probe addressing | 9 | `…238 madd`, `…294 lsr#12`, `…2ac mul`, `…2b0 lsr#51`, `…4c8/4e0/4e4`, bias `add` `…240/474` |
+| **probe guards** | **6** | `…244/248/24c`, `…478/47c/480` — 3 per guarded access, 2 accesses — §12.2 |
+| masks and zero-extensions | 9 | `…290/4c4 and #0xfff`, `…6a4/6b4/6bc/6c0/6c4 and #0xffffffff`, `…6a8/6b8 mov #0xffffffff` |
+| loop plumbing | 9 | `…300`, `…caf4`–`…cb50` boundaries, `b head` |
+| other | 3 | `…314`, `…afc` (`ldar`), `…cafc` |
+| **total** | **239** | |
+
+Two arithmetic notes, because both were wrong once:
+
+* The **latch tail is 35 instructions** (`…ac8`–`…cb50`), but only **27** are its
+  own slot traffic; the other 8 sit in the categories above (2 guest arithmetic,
+  2 ctx loads under *guest memory*, 2 branch, 1 `ldar` under *other*, 1 `b` under
+  plumbing). Counting a 35-instruction latch category *and* the categories it
+  overlaps double-counts by 8. The table above sums to 239.
+* Flag cost is **35 / 239 = 14.6 %**. An earlier pass reported 34 / 239 = 14.2 %;
+  the address-listed census adds one flag-home store the first pass filed under
+  slot traffic. **14.6 % supersedes 14.2 %.**
+
+## 12.2 PF is 0 per iteration, pack is 0 per iteration, the probe hoist is spent
+
+* **PF: 0 of 239.** No `and #0xff` + 3×(`lsr`,`eor`) ladder is on the iteration
+  path. The three ladders in the unit are in exit blocks: `…39c`–`…3c0` (feeds
+  pack A `…3e4`, with `csel` at `…3e0` for a shift's conditional PF), inside pack
+  C `…728`–`…74c`, and inside pack D `…b74`–`…b94`. None is backward-reachable
+  from the back edge, so each costs 9 instructions *once per loop exit*. The only
+  `#0xff` uses on the path are guest byte tests (`…268`, `…49c`, `…700`), and
+  there is no `jp`/`jnp`/`setp`/`lahf` on the path.
+* **Pack: 0 of 239.** Four sites exist (`…3e4` 19 insns, `…618` 18, `…708` 28,
+  `…cb54` 25) and none is backward-reachable from the back edge — the pack already
+  lives in the cold miss path.
+* **Probe guard: 3 instructions per guarded access, 6 per iteration**, not 20.
+  The guard is `sub x, addr, lo` / `cmp x, len` / `b.lo fail` at `…244` and
+  `…478`; the span bias folds into the access's addressing mode. The 20/iteration
+  figure in §4.1 was a **static** path count that includes the refill fallback
+  blocks (`cmp x2,#0x1000`, `ldr [x25,x6]`, …), which do not execute when the span
+  hits (the guard's evolution from 15 → 6 is the existing §11; this is the
+  executed cost of where it landed). The hoist is therefore **spent**: the
+  generation term is folded into the
+  descriptor at block entry (`hoist_refill`), and a per-iteration `mem_gen`
+  compare would *add* 3 instructions. The per-access 3 are the minimum for a
+  checked access — they depend on the runtime address, so no prologue hoist
+  removes them.
+
+## 12.3 The latch is live phi materialisation, and it is **not** `writeback_gprs`
+
+27 of the back edge's 35 tail instructions move a guest register from a `[sp,N]`
+slot to the same `[sp,N]` slot: 13 loads before the invalidation guard, 14 stores
+after it. The slots are `#0x08, #0x10, #0x18, #0x40, #0x70, #0x78, #0x80, #0x88,
+#0x90, #0xa8, #0xb0, #0xb8, #0xc0, #0xc8`; the guard they straddle is
+`ldr inv_gen_ptr` (`…af8`) / `ldar` (`…afc`) / `ldr inv_gen_baked` (`…cb00`) /
+`cmp` (`…cb04`) / `b.ne` (`…cb08`).
+
+They are the backend **materialising the header's 13 live-in block params through
+stack slots**, because those values cannot be coalesced across the acquire load at
+this register pressure. They are **live**, not dead: every one of those slots is
+read by off-path blocks of the same unit (`#0x70` at `…7e8`/`…9ec`, `#0x90` at
+`…7c8`, `#0xa8` at `…7ab`, `#0xc8` at `…78c`, `#0x08` at `…844`…`…960`), so
+skipping a store would hand a stale guest register to a probe fallback.
+
+**This is not a redundant writeback, and it has been mis-attributed once already.**
+`writeback_gprs` (`lower/emit.rs`) stores to `ctx_ptr + 8*i`; the tail contains
+exactly two ctx-relative instructions, both loads. Its single call in
+`lower_self_loop_term` sits inside the `on_stale` closure, i.e. cold. Changing
+`gpr_store_predicate` — the obvious-looking fix — removes **zero** instructions
+from this block; it was proposed, then refuted by the address spaces. The lever is
+the loop-carried set or passing the slot's value directly instead of a `load` of
+the slot it is stored back to: a block-parameter semantics change needing its own
+slice (pessimism costs 2 instructions per register, optimism costs a guest
+register). The same note is in the source at `lower_self_loop_term`.
+
+## 12.4 AF cannot be deferred; the OF/CF carrier is negative expected value
+
+Three binaries built in one session from one tree, differing only in
+`lower/flags.rs` + `lower/insn.rs`:
+
+| shape | per iteration |
+|---|---|
+| AF eager (what shipped) | **239** |
+| AF recipe kept in a register across the block | 245 (+6) |
+| AF recipe parked in an explicit stack slot | 251 (+12) |
+
+Both deferred shapes removed exactly the flag work they promised (`and` −2,
+`cmp` −2, `cset` −2, `and #0x10` 3 → 1) and paid it back in reloads: the register
+shape added `ldur` +6 and `mov` +6; the slot shape `ldur` +17, spread across six
+*unrelated* slots (`#0x70`, `#0xb0`–`#0xd0`) each going 1 → 4. **The cause is a
+register cliff, not a read count** — an earlier note in this lane attributed it to
+"AF read ~17× per iteration", and `and #0x10` strictly *decreased*, so that
+attribution was wrong. **Do not quote 227**: it was reported for the register
+shape, does not reproduce, and came from a binary that predated the snapshot it
+was attributed to.
+
+OF/CF: the path census is 4 writer sites (`…1c4/…1d0` add, `…6c8/…6d0` 32-bit sub)
+materialising 8 instructions with **zero hot consumers** — no branch with
+`hs/lo/vs/vc/ge/lt/gt/le/hi/ls`, no `csel`, no `adc`-form carry-in, no
+`and #0x1`/`and #0x800` pack insert. Carrying a carry predicate to the exit is
+still negative: the pack sites consume *bits* (registers plus `[sp,#0x30/0x28/0x20]`),
+not the writer operands (`w1`/`w2` never reach a site), so it needs a new slot
+pair — 2 `stur` per iteration to save 2 `cset`, before this block's measured
++6/+12 punishment for added frame state. Not implemented, and it should not be.
+
+## 12.5 What this section supersedes
+
+* 37.3 % / 44.3 % flag share → **14.6 %** (and 37 % only as the *pre-deferral
+  266-instruction block*).
+* "the probe guard costs 20 per iteration" → **6 per iteration, 3 per access**;
+  the hoist item is spent.
+* "AF deferral is worth 10 per iteration (227)" → **AF stays eager at 239;
+  deferral loses; 227 does not reproduce.**
+* "the latch is ~26 instructions of redundant writeback" → **live phi
+  materialisation of 13 header params; the writeback is cold and innocent.**
+
+## 12.6 Interaction with the region form
+
+`region_compile` is landing a flag carrier in `region_emit.rs` (plain
+`flush_pending` per block where the block path defers) on this same guest block;
+their measured baseline is 171 and their target ~150-156, on **their** binary,
+under `WIE_JIT_REGION=1`. Those numbers and this section's 239 do not compose by
+subtraction — different form, different denominator. When that lands, retake the
+count on a binary containing both and extend this section rather than mixing the
+two.

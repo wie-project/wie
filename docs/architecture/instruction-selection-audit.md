@@ -30,6 +30,25 @@ further ≈16 % is host-stack spill traffic that follows from the same live-valu
 frame-offset class from the previous pass is confirmed already optimal (§6.1) — that negative is
 repeated here so it is not re-attempted.
 
+**Settled since this audit, with measurements** — details, provenance and addresses in
+[`scaled-blit-block-attribution.md`](scaled-blit-block-attribution.md) §12:
+
+* **§5.1 (probe predicates) is spent.** The emitted guard on the hottest block is now
+  3 instructions per guarded access, 6 per iteration (`sub`/`cmp`/`b.lo`, bias folded
+  into the addressing mode), and the mapping-generation term is folded into the
+  descriptor at block entry. A per-iteration `mem_gen` compare would *add* 3
+  instructions, so the "hoist it out of the loop" item has no work left in it.
+* **§5.3 (EFLAGS rebuilt bit by bit) is spent for the hot path.** Pack and PF are both
+  **0 instructions per iteration** on that block: the four pack sites and the three
+  parity ladders are all in blocks that are not backward-reachable from the back edge.
+* **The flag share in §5.3 is superseded.** Flag materialisation is 14.6 % of that
+  block's 239-instruction iteration, not 37.3 % or 44.3 % — those are shares of the
+  *pre-deferral* 266- and 174-instruction revisions of the same block.
+* **AF cannot be deferred** (239 / 245 / 251 across three binaries; the loss is reload
+  pressure from a register cliff, not read count), and the OF/CF carrier is negative
+  expected value even though OF/CF has zero hot consumers.
+
+
 ---
 
 ## 1. Method (exact commands)
