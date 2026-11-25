@@ -265,6 +265,39 @@ pub(super) struct LedgerRec {
     /// promoted eagerly: a record written by this build for a block that was
     /// never entered, and a v3 record migrated from a file that had no count
     /// field at all.
+    ///
+    /// **What it means when several guest threads run the same block: the
+    /// largest per-thread count, not a total across threads.** The other two
+    /// candidates are wrong for reasons the rule itself supplies:
+    ///
+    /// - *A sum* would make a block that each of N threads enters exactly once
+    ///   (a barrier, a shared init, a rendezvous) look hot: N entries for an
+    ///   8-thread guest. That is the same mistake as promoting every `Ready`
+    ///   record, only wearing threads — the population the eager gate exists to
+    ///   exclude. It is also unaffordable: a shared per-entry increment measured
+    ///   15-25 ns here, against ~149 M dispatches per 100 s of DOOM.
+    /// - *One record per thread* would grow the file with the thread count and
+    ///   ask the eager question N times per block, for a compile that is per-VA
+    ///   and happens once: the extra records have no consumer.
+    ///
+    /// The quantity the rule actually needs is *re-entry pressure on a thread*,
+    /// because that is what decides whether an early compile pays: a block some
+    /// thread re-enters will be re-entered again on the next boot, so it must be
+    /// compiled before that loop rather than inside it. A block each thread
+    /// enters once costs **at most one compile on the critical path** next boot —
+    /// whichever thread arrives first compiles it, the others find it `Ready` —
+    /// which is exactly the cost the rule already accepts for the single-threaded
+    /// "entered once" case. So the maximum is not a proxy for the sum; it is the
+    /// bounded cost the decision is made against.
+    ///
+    /// Reachable false negative, recorded on purpose: a shared block that no
+    /// single thread enters twice (four threads, one visit each per outer
+    /// iteration) is never eager, and pays one compile per boot. Bounded by one
+    /// compile per block per boot, never one per thread. **Unmeasured**: this
+    /// shape was reasoned from the publish rule, not exercised by a guest that
+    /// enters a block once per thread and never twice from one thread; the
+    /// `mt_contention` census (3 % entered-once of 103 records) only bounds how
+    /// often it could occur.
     pub entries: u32,
 }
 
@@ -863,7 +896,15 @@ impl PersistentJitCache {
     }
 
     /// Publish entry evidence for a block the guest has entered `level` times on
-    /// this thread (see [`LedgerRec::entries`]).
+    /// **this** thread (see [`LedgerRec::entries`] for why several threads mean
+    /// `max`, not a sum).
+    ///
+    /// The merge is `max(old, level)` and it only ever grows, which is what makes
+    /// the two-thread cases agree with the intent: two threads that each enter a
+    /// block once publish `1` and `1`, and the record stays `1` (not eager — one
+    /// compile on the critical path next boot); one thread that enters it twice
+    /// publishes `2`, and the record becomes `2` (eager). Order does not matter,
+    /// because the operation is idempotent, commutative and associative.
     ///
     /// Called from the dispatcher's per-entry hook, but only when a per-thread
     /// tally crosses a publish level — that is, a handful of times per block per
@@ -1396,8 +1437,6 @@ impl PersistentJitCache {
             entries: snapshot,
         };
         let path = self.file_path_for(key);
-        let __t0 = Instant::now();
-        let __n = body.entries.len();
         let res = write_body(&path, &body).and_then(|()| {
             if force_fsync {
                 fs::File::open(&path)
@@ -1407,11 +1446,6 @@ impl PersistentJitCache {
                 Ok(())
             }
         });
-        eprintln!(
-            "[probe] flush_table {:?} entries={__n} path={}",
-            __t0.elapsed(),
-            path.display()
-        );
         match res {
             Ok(()) => {
                 let mut st = self.flush.lock().unwrap_or_else(|e| e.into_inner());
@@ -2222,6 +2256,53 @@ mod tests {
         let p = warm.probe(&mem, VA1).expect("warm probe");
         assert_eq!(p.entries, 1, "and it survives the process boundary");
         assert!(!p.wants_eager());
+    }
+
+    /// Several guest threads running one block: `entries` is the **largest
+    /// per-thread count, not a total** — and the threshold has to stay honest
+    /// under that meaning.
+    ///
+    /// Four threads that each enter a block exactly once publish four `1`s (each
+    /// thread's tally reports its first entry). If the record summed them it
+    /// would hold `4`, clear `EAGER_MIN_ENTRIES`, and a warm boot would compile a
+    /// rendezvous block eagerly — the same mistake as promoting every `Ready`
+    /// record, just wearing threads. Under `max` it stays `1`: next boot the
+    /// first thread to arrive compiles it and the rest find it `Ready`, so the
+    /// cost of refusing is one compile, exactly as for a single-threaded block
+    /// entered once.
+    #[test]
+    fn entries_is_the_largest_per_thread_count_not_a_total() {
+        let dir = scratch_dir("entries-threads");
+        let code = [0x90_u8; 64];
+        let mem = test_memory(&[(&VA1, &code)], REGION, 0x1000);
+        let cache = PersistentJitCache::with_base_dir(dir.clone());
+        cache.attach(PE_A);
+        cache.record_ready(&mem, VA1, VA1 + 64, 9, 5);
+
+        // Four threads, one entry each: four publishes of level 1.
+        for _ in 0..4 {
+            cache.count_entry(VA1, 1);
+        }
+        let cross = cache.probe(&mem, VA1).expect("probe");
+        assert_eq!(cross.entries, 1, "max per thread, not a sum of 4");
+        assert!(
+            !cross.wants_eager(),
+            "a block each thread enters once costs one compile, not N"
+        );
+
+        // One thread re-entering is what earns the eager compile.
+        cache.count_entry(VA1, 2);
+        let earned = cache.probe(&mem, VA1).expect("probe");
+        assert_eq!(earned.entries, 2, "one thread's second entry is enough");
+        assert!(earned.wants_eager());
+
+        // Order does not matter: a later, lower publish cannot lower the record.
+        cache.count_entry(VA1, 1);
+        assert_eq!(
+            cache.probe(&mem, VA1).expect("probe").entries,
+            2,
+            "the merge is a monotone max"
+        );
     }
 
     /// The eager rule itself, with no engine in the way: what a warm boot does

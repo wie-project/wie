@@ -1,9 +1,12 @@
 # Compile-selection policy: what to compile, when, and at which tier
 
-Status: **one win shipped, one candidate refuted.** Boot mode no longer lowers the
-promotion threshold (§3.1, 1.23x on `h` / 1.12x on `x`). The threshold *shape*
-correction was measured and refuted (§3.1). Decision 3 is still blocked on machinery
-that does not exist yet.
+Status: **two wins shipped, one candidate refuted, one negative result recorded.**
+Boot mode no longer lowers the promotion threshold (§3.1, 1.23x on `h` / 1.12x on
+`x`). The threshold *shape* correction was measured and refuted (§3.1). The
+persistent ledger no longer bypasses the "when" decision unconditionally: it takes
+the eager path only for a block that earned one (§3.2), which is what makes a warm
+boot stop being *slower* than a cold one — and its measured effect on DOOM is nil.
+Decision 3 is still blocked on machinery that does not exist yet.
 
 Scope: how a decoded guest block becomes machine code. Not lowering quality, not
 dispatch cost — those are `performance-ceiling.md` levers L1/L3.
@@ -176,6 +179,133 @@ Not changed, and deliberately: the two `thr = 1` sites in `cool_down` and
 once the inline token bucket is spent) and their intent is "do not apply backoff during
 warmup", not "compile everything immediately". They were unchanged in the measurement
 above, so the win does not depend on them; they are a separate candidate.
+
+### 3.2 The persistent ledger: bypassing "when" with evidence, and the rule that makes it safe
+
+`WIE_JIT_CACHE` (metadata ledger, `jit/cache_persist.rs`) persists per-PE, per-VA
+records of blocks that compiled, so a warm boot can skip the "when" decision for
+them entirely: a byte-validated hit compiles the block at first sight. That
+bypass used to be **unconditional** — any record meant an eager compile — and on a
+console-shaped guest that is backwards: of 365 eager compiles, **364 came from the
+ledger fast path**, for a guest that ever enters **4** of its 365 compiled blocks.
+A warm boot then measured **5× slower** than a cold one (63.6 ms against 12.6 ms,
+5 interleaved pairs).
+
+**That 5× figure is historical and must not be quoted as current.** It was taken on
+a tree where the eager path took 364 ledger hits; after `0b6e800` (boot mode no
+longer forces `thr = 1`, §3.1) plus the UCRT arm plus the rule below, the same
+guest is a **one-compile guest** and there is nothing left to remove there.
+
+#### The rule
+
+A record carries an **entry count**, and the eager path is taken only when the
+block earned it:
+
+```text
+entries == 0            -> never eager   (compiled, never entered)
+entries == 1            -> never eager   (entered once; will be entered once again)
+entries >= 2            -> eager         (EAGER_MIN_ENTRIES, not a knob)
+```
+
+`entries` is **the largest per-thread count, not a total across threads**, and it
+is published coarsely (at the first entry, then at each doubling) because the
+dispatcher cannot afford a shared increment per entry — a shared map lookup
+measured 15-25 ns against ~149 M dispatches per 100 s of DOOM. Two rejected
+alternatives, recorded so they are not re-proposed:
+
+- **Sum across threads.** A block each of N threads enters exactly once (a
+  barrier, a shared init, a rendezvous) would read `N` and clear the threshold.
+  That is the same mistake as promoting every `Ready` record, only wearing
+  threads. The compile is also per-VA and happens once: whichever thread arrives
+  first compiles it and the rest find it `Ready`, so refusing eager for such a
+  block costs **at most one compile on the critical path**, which is the cost the
+  rule already accepts for the single-threaded "entered once" case. The maximum
+  is therefore the quantity the decision is made against, not a proxy for the sum.
+- **One record per thread.** The file would grow with the thread count and ask the
+  eager question N times per block, for a compile that happens once. No consumer.
+
+Reachable false negative, accepted: a shared block that no single thread enters
+twice is never eager and pays one compile per boot, never one per thread.
+
+#### The evidence
+
+100 s DOOM Retro, `--screenshot`, single runs on a host at load 8-10, ledger
+decoded after the run (7 007 records):
+
+| population | records | share | eager? |
+|---|---|---|---|
+| compiled, never entered | 5 559 | 79 % | no |
+| entered exactly once | 496 | 7 % | no |
+| entered >= 2 | 893 | 13 % | yes |
+| `Never` (failed compile) | 59 | 1 % | no |
+
+**86 % of the records are in the two groups the rule refuses**, i.e. the
+population the old unconditional bypass compiled eagerly. The same census on a
+4-thread guest (`mt_contention 4 4096`, 103 records) shows cross-thread-once
+blocks at 3 %, so the max-vs-sum choice does not move that guest either.
+
+What it buys, measured rather than assumed: **nothing on DOOM in a 45 s or 100 s
+window.** 100 s, ledger on vs off: `eager` 282 vs 35, `iced_fb` 69.68 M vs
+71.32 M (**-2 %**), `compile_us` 50.63 s vs 51.84 s (-2 %; since `f2e432a` that
+field also contains engine-lock queueing, so it is not pure compile work — both
+arms used the same meter, so the ratio stands), `bg_compiles` 16 614 vs 16 471
+(**+0.9 %**). At 45 s the ledger arm looked 20 % more expensive
+in background compiles, and at 100 s that difference is gone. `frames_published`
+(684 vs 440) is not usable at a wall-clock kill: the arms stopped at different
+guest phases (33.1 G vs 26.5 G instructions).
+
+On the guest the rule was built for it is the whole point: `crt_hello` warm **18.2
+ms with the ledger on against 17.4 ms off** (median of 5 interleaved pairs, paired
+mean **+2.0 ms**), where the residual is one rewrite of two tiny ledger files and
+nothing else. Its ledger holds two records — one "entered once", one "never
+entered" — so the rule refuses both and the only eager compile in the run is the
+genuine self-loop path, not the ledger.
+
+**Follow-up measured and deliberately not implemented.** Because a probe hit now
+falls through to the ordinary promotion machinery instead of compiling eagerly, a
+warm run could in principle do *more* promotion work than a cold one. On the 100 s
+run it does not (+0.9 % `bg_compiles`, iced 2 % lower), so suppressing the
+boot/baseline enqueue for a probe hit stays unimplemented — it would widen the
+diff into `pipeline.rs` for no measured effect.
+
+#### Two defects this exposed, and what they cost
+
+- **The ledger was never flushed for a console guest.** `finish_jit_caches()` only
+  called `code_cache().finish()`; `Drop for PersistentJitCache` does not run for
+  console guests (the last `Arc<JitShared>` outlives the session), and the lazy
+  flush needs 256 records or 5 s. `crt_hello` writes **one** record, so it
+  persisted nothing for its entire existence while the RUNBOOK claimed otherwise.
+  The end-of-session hook now flushes the ledger too.
+- **Concurrent flushes dropped the whole ledger.** `flush_now` deliberately drops
+  its bookkeeping lock before the I/O, and `write_body`'s temp path was
+  per-*process*, not per-call: two flushes wrote the same temp file, the loser's
+  `rename` failed `ENOENT`, and the error path reports that as "persistence
+  disabled for this run" — taking every record with it. It fired on DOOM Retro's
+  exit, i.e. exactly the long run the ledger exists to accelerate. A separate
+  `flush_io` mutex now serialises snapshot+write; `concurrent_flushes_all_reach_the_file`
+  fails 3/3 with it removed.
+- Exit cost, because persisting at all is not free: four rewrites (finish + `Drop`,
+  both files, both fsynced) measured **+13.9 ms** of exit latency against a 12 ms
+  boot; a `dirty` gate (a flush with nothing recorded is a no-op) and dropping
+  `force_fsync` from the end-of-session flush bring it to **+2.0 ms**. One 62-byte
+  ledger rewrite costs 2.5-13 ms on this host, so the fsync is not the dominant
+  term — the `dirty` gate is.
+
+#### Format, for whoever reads the file
+
+The ledger is bincode (`bincode::config::standard()`, varint integers) behind the
+`WIEJITC\x01` magic: `{version, format_version, key, opt_level, entries[]}` with
+one record `{va, guest_end, bytes_hash, insn_count, inv_gen, never, compiled_at_opt,
+entries}`. `FORMAT_VERSION` is **4**; `entries` was appended last, so a v3 file is
+one field shorter and is **migrated, not deleted**: every record decodes with
+`entries = 0`, which is exactly "no entry evidence" and therefore never eager. The
+file is left in place and rewritten as v4 by the next flush, so a run that records
+nothing new cannot lose the previous run's knowledge. A reader that misparsed a v3
+record into a plausible count would silently restore the eager-compile storm, which
+is why `v3_file_is_migrated_with_no_entry_evidence` asserts the migrated count is
+0 and `wants_eager()` is false.
+
+---
 
 ## 4. What is observable
 
