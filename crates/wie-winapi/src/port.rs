@@ -134,6 +134,7 @@ pub use crate::kernel32::load_stages::report_lines as load_library_report_lines;
 pub fn handler_stage_report_lines() -> Vec<String> {
     let mut lines = crate::kernel32::load_stages::report_lines();
     lines.extend(crate::gdi32::blit_stages::report_lines());
+    lines.extend(crate::kernel32::file_stages::report_lines());
     lines
 }
 

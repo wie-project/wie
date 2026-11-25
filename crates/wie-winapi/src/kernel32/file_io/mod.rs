@@ -773,7 +773,9 @@ pub(crate) fn finish_create_file(
     // as a ReadDirectoryChangesW anchor; anything else falls through to the
     // regular open, which cannot load a directory's bytes.
     if (desired_access & FILE_LIST_DIRECTORY) != 0
-        && let Some(handle) = open_directory_for_watch(state, file_name)
+        && let Some(handle) = crate::kernel32::file_stages::timed_dir_probe(|| {
+            open_directory_for_watch(state, file_name)
+        })
     {
         state.process.last_error = 0;
         tracing::info!(
@@ -786,51 +788,52 @@ pub(crate) fn finish_create_file(
         return handle;
     }
 
-    let return_value =
-        match open_or_create_guest_path(state, file_name, desired_access, creation_disposition) {
-            Ok(OpenFileOutcome::Handle(handle)) => {
+    let return_value = match crate::kernel32::file_stages::timed_open(|| {
+        open_or_create_guest_path(state, file_name, desired_access, creation_disposition)
+    }) {
+        Ok(OpenFileOutcome::Handle(handle)) => {
+            state.process.last_error = 0;
+            handle
+        }
+        Ok(OpenFileOutcome::HandleCreated(handle)) => {
+            // OPEN_ALWAYS / CREATE_ALWAYS created a new file (docs: GetLastError may be 0).
+            state.process.last_error = 0;
+            handle
+        }
+        Ok(OpenFileOutcome::HandleExists(handle)) => {
+            // Microsoft Learn: CREATE_ALWAYS / OPEN_ALWAYS set ERROR_ALREADY_EXISTS
+            // when the named file already existed.
+            if creation_disposition == CREATE_ALWAYS || creation_disposition == OPEN_ALWAYS {
+                state.process.last_error = ERROR_ALREADY_EXISTS;
+            } else {
                 state.process.last_error = 0;
-                handle
             }
-            Ok(OpenFileOutcome::HandleCreated(handle)) => {
-                // OPEN_ALWAYS / CREATE_ALWAYS created a new file (docs: GetLastError may be 0).
-                state.process.last_error = 0;
-                handle
+            handle
+        }
+        Err(win_error) => {
+            // Not-found on an OPEN_EXISTING probe is a routine existence
+            // check (e.g. a game scanning for its data files) — keep it
+            // out of the error channel; anything else is a real failure.
+            if win_error == ERROR_FILE_NOT_FOUND && creation_disposition == OPEN_EXISTING {
+                tracing::debug!(
+                    path = %file_name,
+                    desired_access,
+                    win_error,
+                    "{api_name} probe not found"
+                );
+            } else {
+                tracing::error!(
+                    path = %file_name,
+                    desired_access,
+                    creation_disposition,
+                    win_error,
+                    "{api_name} open failed"
+                );
             }
-            Ok(OpenFileOutcome::HandleExists(handle)) => {
-                // Microsoft Learn: CREATE_ALWAYS / OPEN_ALWAYS set ERROR_ALREADY_EXISTS
-                // when the named file already existed.
-                if creation_disposition == CREATE_ALWAYS || creation_disposition == OPEN_ALWAYS {
-                    state.process.last_error = ERROR_ALREADY_EXISTS;
-                } else {
-                    state.process.last_error = 0;
-                }
-                handle
-            }
-            Err(win_error) => {
-                // Not-found on an OPEN_EXISTING probe is a routine existence
-                // check (e.g. a game scanning for its data files) — keep it
-                // out of the error channel; anything else is a real failure.
-                if win_error == ERROR_FILE_NOT_FOUND && creation_disposition == OPEN_EXISTING {
-                    tracing::debug!(
-                        path = %file_name,
-                        desired_access,
-                        win_error,
-                        "{api_name} probe not found"
-                    );
-                } else {
-                    tracing::error!(
-                        path = %file_name,
-                        desired_access,
-                        creation_disposition,
-                        win_error,
-                        "{api_name} open failed"
-                    );
-                }
-                state.process.last_error = win_error;
-                INVALID_HANDLE_VALUE
-            }
-        };
+            state.process.last_error = win_error;
+            INVALID_HANDLE_VALUE
+        }
+    };
 
     if return_value != INVALID_HANDLE_VALUE {
         tracing::info!(
@@ -842,7 +845,9 @@ pub(crate) fn finish_create_file(
         );
         // Best-effort teardown: failure to register the mirror is not fatal —
         // the guest I/O accelerator simply falls back to the host path.
-        let _ = crate::guest_io_host::register_open_file(engine, state, return_value).ok();
+        let _ = crate::kernel32::file_stages::timed_register(|| {
+            crate::guest_io_host::register_open_file(engine, state, return_value).ok()
+        });
     }
 
     return_value

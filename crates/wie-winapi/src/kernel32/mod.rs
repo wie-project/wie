@@ -335,6 +335,7 @@ const LOGICAL_DRIVE_TCHARS: u32 = 4;
 pub mod clock;
 pub mod environment;
 pub mod file_io;
+pub mod file_stages;
 pub mod heap;
 pub mod load_stages;
 pub mod memory;
