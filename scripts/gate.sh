@@ -110,11 +110,10 @@ package_for_dir() {
 filter_for_path() {
     local path="$1"
     case "$path" in
-        crates/*/tests/*.rs)
-            local bin
-            bin="$(basename "$path" .rs)"
-            printf 'binary(%s)' "$bin"
-            ;;
+        # `src` first: a `case` glob's `*` matches `/`, so `crates/*/tests/*.rs`
+        # also matched `crates/wie-cpu/src/jit/tests/real_guest_blocks.rs` and
+        # asked nextest for a test binary named after the module — `binary(...)`,
+        # which no such target exists for. The narrower intent wins by order.
         crates/*/src/*.rs)
             # Strip the crate prefix, drop the file name, and treat a trailing
             # `tests`/`mod` segment as organisational rather than meaningful.
@@ -129,6 +128,11 @@ filter_for_path() {
                 printf 'test(%s)' "${rel//\//::}"
             fi
             ;;
+        crates/*/tests/*.rs)
+            local bin
+            bin="$(basename "$path" .rs)"
+            printf 'binary(%s)' "$bin"
+            ;;
         *) printf '' ;;
     esac
 }
@@ -142,8 +146,10 @@ filter_for_path() {
 target_for_path() {
     local path="$1"
     case "$path" in
-        crates/*/tests/*.rs) printf -- '--test %s' "$(basename "$path" .rs)" ;;
+        # Same ordering reason as `filter_for_path`: a module under `src/…/tests/`
+        # is not a `--test` target, it is compiled into the lib target.
         crates/*/src/*.rs)   printf -- '--lib' ;;
+        crates/*/tests/*.rs) printf -- '--test %s' "$(basename "$path" .rs)" ;;
         *) printf '' ;;
     esac
 }
