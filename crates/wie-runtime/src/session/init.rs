@@ -62,7 +62,18 @@ fn stage_wad_payload(
     {
         let entry = entry.with_context(|| "read exe-dir entry".to_string())?;
         let src = entry.path();
-        if !src.is_file() {
+        // `DirEntry::file_type` answers from the directory entry's own type
+        // (no syscall on APFS/HFS+); `Path::is_file` costs one `stat` per
+        // entry. This loop runs over every file beside the exe on each start —
+        // 214 stats / 0.71 ms for a hello-world that opens no WAD — so take
+        // the free answer and keep the follow-stat only for symlinks, which is
+        // the one case where the two disagree (`is_file` follows, `d_type`
+        // does not).
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("exe-dir entry type: {}", src.display()))?;
+        let is_regular = file_type.is_file() || (file_type.is_symlink() && src.is_file());
+        if !is_regular {
             continue;
         }
         let Some(fname) = src.file_name() else {
@@ -904,16 +915,21 @@ impl super::RuntimeSession {
             .or_else(crate::knobs::drive_d_root_from_env);
         let volumes =
             wie_winapi::port::VolumeConfig::from_parts(bottle_root.clone(), drive_d_root.clone());
+        t_phase = phase("vfs-env+config", t_phase);
 
         let mut process =
             wie_pe::process_identity_from_host_path_with_args(path, &options.guest_args);
         tracing::debug!(target: "wie_cmdline", module_path = %process.module_path, cmdline = %process.command_line, "guest command line");
+        t_phase = phase("vfs-identity", t_phase);
         // The loader defaults the module path to `C:\{name}` (it has no volume
         // knowledge); remap through the volume config when the host path lives
         // under a mapped volume — the bottle's `drive_c` or the D: bridge.
+        // This is the first filesystem-touching step of the phase: the volume
+        // mapping canonicalizes both the host path and the bottle's `drive_c`.
         if let Some(guest_path) = wie_winapi::port::host_path_to_guest(&volumes, path) {
             process.module_path = guest_path;
         }
+        t_phase = phase("vfs-host-to-guest", t_phase);
         // The CLI stages external app folders beside the exe and sets the
         // process current directory to the staged app dir (normal Windows
         // launch semantics: relative resource paths resolve from the exe's
@@ -924,7 +940,7 @@ impl super::RuntimeSession {
         // Make sibling `.wad` game data guest-visible (DOOM Retro needs its
         // IWAD + resource WAD; the host exe dir is outside the bottle).
         stage_wad_payload(&volumes, path, &process.module_path)?;
-        t_phase = phase("identity+vfs-resolve", t_phase);
+        t_phase = phase("vfs-wad-stage", t_phase);
         write_process_identity_strings(
             &mut engine,
             command_line_a_ptr,
