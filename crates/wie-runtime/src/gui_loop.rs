@@ -66,6 +66,11 @@ pub enum GuiOutcome {
 /// when the guest calls `ExitProcess` (or `PostQuitMessage` → `GetMessage`
 /// returns 0).
 pub fn run_windowed(session: &mut RuntimeSession, control: &GuiControl) -> Result<GuiOutcome> {
+    // Startup attribution for GUI launches: session constructed → first frame
+    // the presenter can take. Reported under `WIE_RUNTIME_PROFILE` because the
+    // profile report (printed by the caller after this returns) has no
+    // time-to-first-frame field.
+    let t_first_frame = std::time::Instant::now();
     let mut paint_posted = false;
     loop {
         let summary = session
@@ -97,6 +102,13 @@ pub fn run_windowed(session: &mut RuntimeSession, control: &GuiControl) -> Resul
                     // Headless capture mode: the guest has painted its
                     // initial frame and gone idle; return so the caller can
                     // take the frame.
+                    if session.profile_enabled() {
+                        tracing::error!(
+                            "wie_startup: first_frame_ms={:.2} frames_published={}",
+                            t_first_frame.elapsed().as_secs_f64() * 1e3,
+                            session.profile().frames_published()
+                        );
+                    }
                     return Ok(GuiOutcome::WaitingForMessage);
                 }
                 // After the initial paint, park until something wakes the

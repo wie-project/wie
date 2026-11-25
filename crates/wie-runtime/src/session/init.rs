@@ -394,12 +394,14 @@ impl super::RuntimeSession {
         options: SessionOptions,
     ) -> Result<Self> {
         let t_init = Instant::now();
-        let phase = |name: &str, t0: Instant| {
-            tracing::debug!(
-                phase = name,
-                ms = t0.elapsed().as_secs_f64() * 1e3,
-                "init phase"
-            );
+        // Per-phase wall times, reported as one `init_phases:` line under
+        // `WIE_RUNTIME_PROFILE` (the `debug!` alone is invisible in a normal
+        // run, which is why the 7 ms of init had no attribution).
+        let mut init_phases: Vec<(&'static str, u128)> = Vec::new();
+        let mut phase = |name: &'static str, t0: Instant| {
+            let elapsed = t0.elapsed();
+            tracing::debug!(phase = name, ms = elapsed.as_secs_f64() * 1e3, "init phase");
+            init_phases.push((name, elapsed.as_nanos()));
             Instant::now()
         };
         // Env heap override applies even when callers pass `DEFAULT_LAYOUT` explicitly
@@ -724,22 +726,24 @@ impl super::RuntimeSession {
             .install_runtime_hooks(layout.fake_api.base, fake_api_end, Arc::clone(&stop_bitmap))
             .context("failed to install persistent runtime hooks")?;
 
-        // Selective precompile: in-guest stubs (GetLastError / CS / …) and the
-        // PE entry point so the first guest block runs compiled instead of iced.
-        // Full .text section precompile is deferred — precompiling every fake-API
-        // VA spikes init peak RAM, and precompiling large sections adds startup
-        // time disproportionate to the interpreted warmup saved.
+        // Precompile ONLY the PE entry point, synchronously: the very first
+        // guest block must be compiled before the guest runs.
         //
-        // Stubs go to the background compiler (deferred): the guest cannot call
-        // any stub until it starts executing, so the Cranelift work overlaps
-        // with the entry-point run instead of blocking session init. Only the
-        // entry point compiles synchronously — the very first block must be
-        // ready before the guest runs.
-        for entry in &fake_api_entries {
-            if entry.traits.guest_stub() {
-                engine.precompile_deferred_at(entry.fake_target_va);
-            }
-        }
+        // Guest stubs are deliberately NOT precompiled. The loop that used to
+        // enqueue every planted stub here (`precompile_deferred_at`) cost init
+        // on two axes and paid for work a short run never uses:
+        //   • the first enqueue is what spawned the whole background pool
+        //     (`ensure_bg_worker`) — four threads created inside this phase
+        //     while the guest had not yet executed an instruction;
+        //   • it queued ~124 Cranelift compiles at ~0.4–0.5 ms each, which kept
+        //     `bg_queue_depth` >= 4 for the whole run, so every guest-thread
+        //     promotion took the `bg_queue_too_deep` → defer path.
+        // Losing the precompile costs nothing in correctness: no stub can be
+        // called before the guest executes, and a stub that is never called is
+        // never worth compiling. A stub that IS called is compiled on first
+        // call by the ordinary promotion path (inline if no worker is up yet),
+        // so the only exposure is a first-call compile on the guest thread —
+        // which is what a lazy pool is for.
         engine.precompile_at(image_summary.entry_point_va);
         t_phase = phase("precompile", t_phase);
 
@@ -920,6 +924,7 @@ impl super::RuntimeSession {
         // Make sibling `.wad` game data guest-visible (DOOM Retro needs its
         // IWAD + resource WAD; the host exe dir is outside the bottle).
         stage_wad_payload(&volumes, path, &process.module_path)?;
+        t_phase = phase("identity+vfs-resolve", t_phase);
         write_process_identity_strings(
             &mut engine,
             command_line_a_ptr,
@@ -943,6 +948,7 @@ impl super::RuntimeSession {
             &options.guest_args,
             command_line_a_ptr,
         )?;
+        t_phase = phase("identity-strings+crt-argv", t_phase);
 
         let environment_strings_w = build_default_environment_strings_w()?;
 
@@ -958,7 +964,7 @@ impl super::RuntimeSession {
                 &environment_strings_w_ptr.to_le_bytes(),
             )
             .context("failed to write fake PP Environment pointer")?;
-        t_phase = phase("identity+env-strings", t_phase);
+        t_phase = phase("env-block", t_phase);
 
         engine
             .mem_map(
@@ -1237,6 +1243,7 @@ impl super::RuntimeSession {
         let _ = phase("winapi-state+session", t_phase);
         if session.profile_enabled {
             session.profile.set_init_ns(t_init.elapsed().as_nanos());
+            session.profile.set_init_phases(init_phases);
             session.profile.set_mem_backend(
                 session
                     .process

@@ -9,6 +9,11 @@ use ahash::HashMap;
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeProfile {
     init_ns: u128,
+    /// Ordered session-init phases: `(phase name, wall ns)`, recorded only
+    /// while `WIE_RUNTIME_PROFILE` is armed. The whole startup path (PE load,
+    /// import resolution, dispatch/soft-API plant, pre-compile, TEB/CRT/env,
+    /// WinAPI state, session construction) in one report line.
+    init_phases: Vec<(&'static str, u128)>,
     emu_ns: u128,
     handler_ns: u128,
     resolve_ns: u128,
@@ -72,6 +77,12 @@ impl RuntimeProfile {
     #[must_use]
     pub fn init_ns(&self) -> u128 {
         self.init_ns
+    }
+    /// Ordered per-phase init breakdown (`(phase, ns)`); empty unless the
+    /// profile was armed during session init.
+    #[must_use]
+    pub fn init_phases(&self) -> &[(&'static str, u128)] {
+        &self.init_phases
     }
     /// Wall time spent inside `run_until_stop` (guest instruction execution).
     #[must_use]
@@ -343,6 +354,11 @@ impl RuntimeProfile {
         self.init_ns = ns;
     }
 
+    /// Set the ordered per-phase init breakdown.
+    pub(crate) fn set_init_phases(&mut self, phases: Vec<(&'static str, u128)>) {
+        self.init_phases = phases;
+    }
+
     /// Set the active memory backend name.
     pub(crate) fn set_mem_backend(&mut self, name: String) {
         self.mem_backend = name;
@@ -502,6 +518,16 @@ impl RuntimeProfile {
             total as f64 / 1e6,
             self.init_ns() as f64 / 1e6,
         ));
+        if !self.init_phases().is_empty() {
+            let mut line = String::from("init_phases:");
+            let mut sum_ns: u128 = 0;
+            for (name, ns) in self.init_phases() {
+                line.push_str(&format!(" {name}={:.2}", *ns as f64 / 1e6));
+                sum_ns = sum_ns.saturating_add(*ns);
+            }
+            line.push_str(&format!(" | sum_ms={:.2}", sum_ns as f64 / 1e6));
+            lines.push(line);
+        }
         if self.no_hook_slice_max() > 0 {
             lines.push(format!(
                 "no_hook: slices_max={} insns_max={:.1}M",
