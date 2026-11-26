@@ -147,25 +147,29 @@ The immediate next milestone is **Qt-class apps**: OpenGL, `CreateProcess`, wins
 OLE clipboard/drag-drop stack unlock real Qt5 GUI apps; audio + D3D9 completion + GPU offload
 then unlock games. Progress is tracked in the live log at `.slim/deepwork/gui-implementation.md`.
 
-## Run modes, and one open trap
+## Run modes
 
-`wie run <exe>` has two shapes and the choice is now visible instead of silent:
+`wie run <exe>` has two shapes, and the shape is chosen by the flags, never by the
+host: **micro** is the default and everything else, **console** is `--console`, and
+`--persistent`, `--gui` and `--screenshot` are their own entries.
 
-- **console** — stdin is a terminal and no micro-only flag was given. Raw mode that
-  is restored on every exit path, live host stdin, the runtime re-entered per
-  quantum until the guest calls `ExitProcess`. This is what plays a game.
-- **micro** — everything else (a pipe, a CI runner, and any run with `--max-api`,
-  `--expect-code`, `--stdin`, `--drive-d`, `--app-dir` or guest argv). One shot,
-  bounded by a fixed budget of host API stops, which is the wall that keeps a hung
-  micro test from hanging the suite. Hitting it now says so — the budget, that it is
-  a CI wall, and the two ways to move it — instead of "did not reach ExitProcess",
-  which read as a crash printed over a board the guest had just drawn.
+- **micro** — one shot, bounded by a fixed budget of host API stops. That bound is
+  the wall that keeps a hung micro test from hanging the suite, and CI relies on it
+  (`run-micro-suite.sh` passes no `--max-api`). Hitting it now says so — the budget,
+  that it is a CI wall, and the two ways to move it — instead of "did not reach
+  ExitProcess", which read as a crash printed over a board the guest had just drawn.
+  It stays the default on a terminal too: a run that decides its mode from `isatty`
+  made `WIE_RUNTIME_PROFILE=1 wie run long_loop.exe` take the interactive entry,
+  which never exits and prints no report, so profiling a micro from a terminal
+  stopped working. Explicit flag, explicit mode.
+- **console** (`--console`) — raw mode that is restored on every exit path, live
+  host stdin, the runtime re-entered per quantum until the guest calls
+  `ExitProcess`. This is the mode that plays a game that reads the keyboard.
 
-**Open trap:** in console mode, a *pty whose input has closed* leaves the guest
-polling forever, because the live-stdin path reports "no input" rather than EOF. A
-human's terminal never reaches EOF, so this only bites scripted pty runs (a
-`script`-wrapped test, a closed terminal emulator pane); the fix is an EOF stop in
-the live-stdin read path, next to the existing Ctrl+C stop. Not done yet.
+**Open trap (console only):** a pty whose input has closed leaves the guest polling
+forever, because the live-stdin path reports "no input" rather than EOF. A human's
+terminal never reaches EOF, so this only bites scripted pty runs; the fix is an EOF
+stop in the live-stdin read path, next to the existing Ctrl+C stop. Not done yet.
 
 ## History
 
