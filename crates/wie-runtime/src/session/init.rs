@@ -443,6 +443,10 @@ impl super::RuntimeSession {
             std::fs::read(path)
                 .with_context(|| format!("failed to read PE file: {}", path.display()))?,
         );
+        // Split out of the old `pe-read-parse`: a ~5 KB exe cost 0.3 ms here, and
+        // reading it off disk and parsing it are different failures (cold page
+        // cache vs a pathological import table), so they get different numbers.
+        t_phase = phase("pe-file-read", t_phase);
         // Parse PE once (avoids double-parse: pe_identity_from_bytes and
         // load_pe_direct_from_bytes both used to call PE::parse independently).
         let pe = wie_pe::PE::parse(&pe_bytes).context("failed to parse PE image")?;
@@ -450,7 +454,7 @@ impl super::RuntimeSession {
             .context("failed to extract PE identity")?;
         let image_size =
             usize::try_from(identity.size_of_image).context("size_of_image does not fit usize")?;
-        t_phase = phase("pe-read-parse", t_phase);
+        t_phase = phase("pe-parse-identity", t_phase);
 
         // WIE CPU backend (JIT default; `WIE_CPU=iced` for interpreter).
         let backend = wie_cpu::open_cpu().context("failed to open WIE CPU backend")?;
@@ -466,12 +470,14 @@ impl super::RuntimeSession {
         if let Some(shared) = &shared_jit {
             shared.attach_pe_cache(wie_cpu::jit_cache_pe_hash(&pe_bytes));
         }
+        t_phase = phase("jit-cache-attach", t_phase);
 
         // One MEM_IMAGE arena, temporary RWX — headers/sections/IAT are written
         // directly into guest memory (no intermediate Vec<u8> buffer).
         engine
             .mem_map_image(identity.image_base, image_size, wie_cpu::RwxPerms::ALL)
             .context("failed to map PE image memory")?;
+        t_phase = phase("image-map", t_phase);
 
         // Load PE directly into guest memory: writes headers + sections + patches IAT
         // in-place through the engine using the already-parsed PE. Returns the section
@@ -545,6 +551,7 @@ impl super::RuntimeSession {
             .context("failed to load PE64 image directly into guest memory")?
         };
 
+        t_phase = phase("image-load-imports", t_phase);
         let fake_api_entries = collect_stub_entries(&iat_entries, &soft_apis);
 
         wie_winapi::port::apply_pe_section_protects(
@@ -553,7 +560,7 @@ impl super::RuntimeSession {
             pe_map_plan.image_base,
         )
         .context("failed to apply PE section protects")?;
-        t_phase = phase("image-load+protects", t_phase);
+        t_phase = phase("image-protects", t_phase);
 
         engine
             .mem_map(
@@ -735,33 +742,45 @@ impl super::RuntimeSession {
             });
         }
 
+        t_phase = phase("jit-fast-path", t_phase);
         // Freeze once — every worker + the primary engine share this Arc
         // instead of paying a per-thread `Vec::clone` of the fake-API bitmap.
         let stop_bitmap: Arc<[u8]> = Arc::from(stop_bitmap.into_boxed_slice());
         engine
             .install_runtime_hooks(layout.fake_api.base, fake_api_end, Arc::clone(&stop_bitmap))
             .context("failed to install persistent runtime hooks")?;
+        t_phase = phase("runtime-hooks", t_phase);
 
-        // Precompile ONLY the PE entry point, synchronously: the very first
-        // guest block must be compiled before the guest runs.
+        // Nothing is precompiled here, not even the PE entry point.
         //
-        // Guest stubs are deliberately NOT precompiled. The loop that used to
-        // enqueue every planted stub here (`precompile_deferred_at`) cost init
-        // on two axes and paid for work a short run never uses:
-        //   • the first enqueue is what spawned the whole background pool
-        //     (`ensure_bg_worker`) — four threads created inside this phase
-        //     while the guest had not yet executed an instruction;
-        //   • it queued ~124 Cranelift compiles at ~0.4–0.5 ms each, which kept
-        //     `bg_queue_depth` >= 4 for the whole run, so every guest-thread
-        //     promotion took the `bg_queue_too_deep` → defer path.
-        // Losing the precompile costs nothing in correctness: no stub can be
-        // called before the guest executes, and a stub that is never called is
-        // never worth compiling. A stub that IS called is compiled on first
-        // call by the ordinary promotion path (inline if no worker is up yet),
-        // so the only exposure is a first-call compile on the guest thread —
-        // which is what a lazy pool is for.
-        engine.precompile_at(image_summary.entry_point_va);
-        t_phase = phase("precompile", t_phase);
+        // Guest stubs were the first to go: the loop that enqueued every
+        // planted stub here (`precompile_deferred_at`) cost init on two axes and
+        // paid for work a short run never uses — the first enqueue is what
+        // spawned the whole background pool, and it queued ~124 Cranelift
+        // compiles at ~0.4–0.5 ms each, which kept `bg_queue_depth` >= 4 for the
+        // whole run so every guest-thread promotion took the defer path.
+        //
+        // The entry point followed, for the same reason. `precompile_at` was
+        // 1.5 ms of *serial* init (measured: `entry-compile` in `init_phases`),
+        // and for a guest that retires a few hundred instructions and enters its
+        // entry block once it bought nothing: on `crt_hello` the block was
+        // compiled, entered once, and accounted for 14 of 472 retired
+        // instructions. Dropping the call moved the first dispatch onto the
+        // ordinary path, which defers a miss to a worker and interprets while the
+        // compile is in flight — the same path every other block already takes.
+        //
+        // Both cases are safe because nothing here is load-bearing for
+        // correctness: no block can be entered before the guest executes, a block
+        // that is never entered is never worth compiling, and a block that IS
+        // entered is compiled by the normal promotion path. The measured cost of
+        // the removal on a guest that *does* need its blocks is nil
+        // (`long_loop`, 1.1e9 retired instructions: 365.6 -> 370.2 ms, inside
+        // noise for that run, `bg_stalls=0` in both arms, JIT share 99.9 % in
+        // both because the worker compiles it).
+        //
+        // The `entry-compile` mark went with the call: it is the phase's own
+        // 1.48 ms that is the record, and a phase that always reports 0.00 is
+        // noise in every run's table rather than a measurement.
 
         engine
             .mem_map(
@@ -994,6 +1013,7 @@ impl super::RuntimeSession {
                 wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake process heap memory")?;
+        t_phase = phase("heap-map", t_phase);
 
         engine
             .mem_map(
@@ -1002,6 +1022,7 @@ impl super::RuntimeSession {
                 wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake process heap shadow memory")?;
+        t_phase = phase("shadow-map", t_phase);
 
         engine
             .mem_map(
@@ -1010,7 +1031,7 @@ impl super::RuntimeSession {
                 wie_cpu::RwxPerms::READ_WRITE,
             )
             .context("failed to map fake resource memory")?;
-        t_phase = phase("heap+resource-maps", t_phase);
+        t_phase = phase("resource-map", t_phase);
 
         // Register named layout and PE section ranges.
         register_layout_regions(
