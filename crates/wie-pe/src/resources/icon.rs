@@ -11,7 +11,11 @@
 //! * a `BITMAPINFOHEADER` DIB with no `BITMAPFILEHEADER`: an XOR bitmap
 //!   followed by the 1-bpp AND mask, which is why `biHeight` is **twice** the
 //!   icon's height. `biSize` is the palette offset (the DIB starts at the
-//!   header, unlike a `.bmp` file), rows are bottom-up and 4-byte aligned;
+//!   header, unlike a `.bmp` file), rows are bottom-up and 4-byte aligned.
+//!   In the AND mask a **set bit means transparent** — the mask is ANDed with
+//!   the destination, so `1` keeps the background and `0` draws the icon
+//!   colour (the GDI `SRCAND`+`SRCINVERT` draw sequence); getting this
+//!   backwards paints the icon's background and punches out its body;
 //! * or, for large entries since Vista, a PNG stream (recognised by its
 //!   signature and handed through untouched — decoding it needs a deflate
 //!   implementation this crate does not carry, and the only consumer is the
@@ -255,10 +259,16 @@ pub fn decode_icon(bytes: &[u8]) -> Option<IconData> {
 
 /// Decode an icon DIB (XOR bitmap + AND mask, no `BITMAPFILEHEADER`) to RGBA8.
 ///
-/// Supports 1-, 4-, 8-, 24- and 32-bpp `BI_RGB` payloads. For 32-bpp
-/// payloads the alpha channel is authoritative when the file fills it (any
-/// non-zero alpha byte); otherwise — old `rc.exe` output leaves it zero — the
-/// AND mask supplies transparency, exactly as Windows does.
+/// Supports 1-, 4-, 8-, 24- and 32-bpp `BI_RGB` payloads. Precedence for
+/// transparency, in this order:
+///
+/// 1. **32-bpp with any non-zero alpha byte:** the alpha channel wins outright
+///    and the AND mask is ignored (that is what Windows does for a 32-bpp
+///    icon that carries alpha).
+/// 2. **everything else** (1/4/8/24-bpp, and a 32-bpp icon whose alpha channel
+///    is entirely zero, as old `rc.exe` output leaves it): the AND mask
+///    decides, and in that mask **a set bit is transparent**.
+/// 3. **no mask at all** (a truncated resource): every pixel is opaque.
 #[must_use]
 pub fn decode_dib_to_rgba(bytes: &[u8]) -> Option<RgbaImage> {
     let header_size = read_u32_at(bytes, 0)?;
@@ -327,10 +337,10 @@ pub fn decode_dib_to_rgba(bytes: &[u8]) -> Option<RgbaImage> {
             let [red, green, blue] = dib_rgb(xor, xor_row, x, bit_count, palette)?;
             let alpha = if has_alpha {
                 dib_alpha32(xor, xor_row, x)?
-            } else if mask_opaque(mask, mask_row, x) {
-                0xFF
-            } else {
+            } else if mask_transparent(mask, mask_row, x) {
                 0
+            } else {
+                0xFF
             };
             pixels.extend_from_slice(&[red, green, blue, alpha]);
         }
@@ -399,14 +409,17 @@ fn dib_alpha32(xor: &[u8], row: usize, x: usize) -> Option<u8> {
         .copied()
 }
 
-/// Whether the AND mask marks a pixel opaque (bit 1). A missing mask keeps
-/// the pixel opaque.
-fn mask_opaque(mask: Option<&[u8]>, row: usize, x: usize) -> bool {
+/// Whether the AND mask marks a pixel transparent.
+///
+/// A **set** bit means transparent: GDI ANDs the mask with the destination, so
+/// `1` leaves the background and `0` lets the icon colour through. A missing
+/// mask (truncated resource) is treated as fully opaque.
+fn mask_transparent(mask: Option<&[u8]>, row: usize, x: usize) -> bool {
     match mask {
-        None => true,
+        None => false,
         Some(bytes) => match row.checked_add(x / 8).and_then(|pos| bytes.get(pos)) {
             Some(byte) => (byte >> (7 - x % 8)) & 1 == 1,
-            None => true,
+            None => false,
         },
     }
 }
@@ -500,9 +513,10 @@ mod tests {
         (image, sections)
     }
 
-    /// A 32-bpp icon DIB: `alpha` per source pixel (bottom-up rows), `mask`
-    /// per source pixel (1 = opaque). `R` is 255, `B`/`G` encode x/y so a
-    /// correct decode is visibly non-uniform.
+    /// A 32-bpp icon DIB: `alpha` per source pixel (bottom-up rows), and the
+    /// raw AND-mask bit per source pixel, where **1 = transparent** (the ICO
+    /// convention). `R` is 255, `B`/`G` encode x/y so a correct decode is
+    /// visibly non-uniform.
     fn dib32(width: u32, height: u32, alpha: &[u8], mask: &[u8]) -> Vec<u8> {
         let mut dib = Vec::new();
         put_u32(&mut dib, 40); // biSize
@@ -546,12 +560,13 @@ mod tests {
 
     #[test]
     fn dib_32bpp_uses_the_alpha_channel_when_present() {
-        // Every alpha byte is non-zero, so the AND mask must be ignored — it
-        // marks the whole bitmap transparent.
+        // Every alpha byte is non-zero, so the AND mask must be ignored — and
+        // this mask marks the whole bitmap transparent, so a decoder that let
+        // the mask win would return an all-zero alpha here.
         let alpha: Vec<u8> = (0..16)
             .map(|i| u8::try_from(10 + i).expect("fits"))
             .collect();
-        let mask = vec![0_u8; 16];
+        let mask = vec![1_u8; 16];
         let image = dib32(4, 4, &alpha, &mask);
         let decoded = decode_dib_to_rgba(&image).expect("decodes");
         assert_eq!((decoded.width, decoded.height), (4, 4));
@@ -565,16 +580,34 @@ mod tests {
     }
 
     #[test]
-    fn dib_32bpp_falls_back_to_the_and_mask_when_alpha_is_empty() {
+    fn dib_32bpp_zero_alpha_follows_the_and_mask_where_a_set_bit_is_transparent() {
         // Old rc.exe output: a zero alpha channel, transparency in the mask.
+        // A SET mask bit is transparent, so the only set bit here makes the
+        // source pixel (0, 0) — the bottom-left output pixel — transparent.
         let mut mask = vec![0_u8; 16];
-        mask[0] = 1; // source pixel (0, 0), the bottom-left output pixel
+        mask[0] = 1;
         let image = dib32(4, 4, &[0_u8; 16], &mask);
         let decoded = decode_dib_to_rgba(&image).expect("decodes");
-        // Bottom-left (source row 0) is opaque...
-        assert_eq!(&decoded.pixels[48..52], &[255, 0, 0, 0xFF]);
-        // ...and the top-left (source row 3, masked out) is transparent.
-        assert_eq!(decoded.pixels[3], 0);
+        // Bottom-left is transparent...
+        assert_eq!(&decoded.pixels[48..52], &[255, 0, 0, 0]);
+        // ...and everything else is opaque (the mask bit is clear there).
+        assert_eq!(&decoded.pixels[0..4], &[255, 48, 0, 0xFF]);
+        assert_eq!(decoded.pixels[3], 0xFF);
+    }
+
+    #[test]
+    fn dib_32bpp_nonzero_alpha_wins_over_the_and_mask() {
+        // The documented precedence: 32-bpp with any non-zero alpha byte lets
+        // the alpha channel decide and ignores the mask, even when the mask
+        // marks every pixel transparent.
+        let alpha = [10_u8, 20, 30, 40];
+        let mask = vec![1_u8; 4];
+        let image = dib32(2, 2, &alpha, &mask);
+        let decoded = decode_dib_to_rgba(&image).expect("decodes");
+        // Top row = source row 1 (bottom-up): alphas 30, 40.
+        assert_eq!(&decoded.pixels[0..8], &[255, 16, 0, 30, 255, 16, 16, 40]);
+        // Bottom row = source row 0: alphas 10, 20.
+        assert_eq!(&decoded.pixels[8..16], &[255, 0, 0, 10, 255, 0, 16, 20]);
     }
 
     #[test]
@@ -596,9 +629,9 @@ mod tests {
         // XOR rows (bottom-up): row 0 = [1, 0], row 1 = [0, 1].
         dib.extend_from_slice(&[1, 0, 0, 0]);
         dib.extend_from_slice(&[0, 1, 0, 0]);
-        // AND mask rows, all opaque.
-        dib.extend_from_slice(&[0xC0, 0, 0, 0]);
-        dib.extend_from_slice(&[0xC0, 0, 0, 0]);
+        // AND mask rows, all opaque (a clear bit is opaque).
+        dib.extend_from_slice(&[0x00, 0, 0, 0]);
+        dib.extend_from_slice(&[0x00, 0, 0, 0]);
         let decoded = decode_dib_to_rgba(&dib).expect("decodes");
         assert_eq!((decoded.width, decoded.height), (2, 2));
         // Top-left = source row 1, x=0 → palette index 0 (red).
@@ -761,5 +794,183 @@ mod tests {
             }
             other => panic!("expected a DIB, got {other:?}"),
         }
+    }
+
+    /// A `GRPICONDIR` with one entry of explicit width and height.
+    fn group_bytes_wh(width: u8, height: u8, bit_count: u16, bytes: u32, id: u16) -> Vec<u8> {
+        let mut group = Vec::new();
+        put_u16(&mut group, 0); // idReserved
+        put_u16(&mut group, 1); // idType = icon
+        put_u16(&mut group, 1); // idCount
+        group.extend_from_slice(&[width, height, 0, 0]);
+        put_u16(&mut group, 1); // planes
+        put_u16(&mut group, bit_count);
+        put_u32(&mut group, bytes);
+        put_u16(&mut group, id);
+        group
+    }
+
+    /// A DIB with an explicit palette (`B, G, R, 0` quads) and explicit XOR /
+    /// AND-mask row bytes. `height` is the icon height; `biHeight` is doubled
+    /// as the format requires.
+    fn dib_with(
+        bit_count: u16,
+        width: u32,
+        height: u32,
+        palette: &[[u8; 4]],
+        xor_rows: &[u8],
+        mask_rows: &[u8],
+    ) -> Vec<u8> {
+        let mut dib = Vec::new();
+        put_u32(&mut dib, 40); // biSize
+        put_u32(&mut dib, width);
+        put_u32(&mut dib, height * 2);
+        put_u16(&mut dib, 1); // planes
+        put_u16(&mut dib, bit_count);
+        put_u32(&mut dib, 0); // BI_RGB
+        put_u32(&mut dib, 0); // sizeImage
+        put_u32(&mut dib, 0); // x ppm
+        put_u32(&mut dib, 0); // y ppm
+        put_u32(&mut dib, u32::try_from(palette.len()).expect("fits")); // clrUsed
+        put_u32(&mut dib, 0); // clrImportant
+        for quad in palette {
+            dib.extend_from_slice(quad);
+        }
+        dib.extend_from_slice(xor_rows);
+        dib.extend_from_slice(mask_rows);
+        dib
+    }
+
+    /// Pack AND-mask rows: one bit per pixel, each row padded to 4 bytes, and
+    /// `true` means transparent (the ICO convention: a set bit is transparent).
+    fn mask_rows(width: usize, rows: &[&[bool]]) -> Vec<u8> {
+        let stride = width.div_ceil(8).div_ceil(4) * 4;
+        let mut out = Vec::new();
+        for row in rows {
+            let mut bytes = vec![0_u8; stride];
+            for (x, transparent) in row.iter().enumerate() {
+                if *transparent {
+                    bytes[x / 8] |= 0x80 >> (x % 8);
+                }
+            }
+            out.extend_from_slice(&bytes);
+        }
+        out
+    }
+
+    /// Decode a synthetic PE's single icon through the real path: resource
+    /// directory → `RT_GROUP_ICON` → matching `RT_ICON` → RGBA8.
+    fn decode_synthetic(dib: &[u8], group: &[u8]) -> RgbaImage {
+        let (image, sections) = synthetic_image(dib, group);
+        let groups = parse_pe_icon_groups(&image, &sections);
+        assert_eq!(groups.len(), 1, "the group icon parses out of the tree");
+        let icons = parse_pe_icons(&image, &sections);
+        assert_eq!(icons.len(), 1, "the icon payload parses out of the tree");
+        match decode_icon_group(&icons, &groups[0]).expect("the payload decodes") {
+            IconData::Rgba(image) => image,
+            other => panic!("expected a DIB payload, got {other:?}"),
+        }
+    }
+
+    /// One RGBA pixel, asserted by value rather than by dimensions.
+    fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
+        let index = usize::try_from((y * image.width + x) * 4).expect("fits");
+        let slice = image.pixels.get(index..index + 4).expect("pixel in range");
+        [slice[0], slice[1], slice[2], slice[3]]
+    }
+
+    #[test]
+    fn dib_1bpp_reads_the_palette_and_the_and_mask() {
+        // 8x2, 1 bpp, a two-entry palette of arbitrary values (a hardcoded
+        // black/white decoder fails the colour asserts). Source row 0 (bottom)
+        // is 1010_1010, row 1 (top) is 0101_0101, and the mask marks ONLY the
+        // top-left pixel transparent.
+        let palette = [
+            [0x30, 0x20, 0x10, 0], // B, G, R → (0x10, 0x20, 0x30)
+            [0xCC, 0xBB, 0xAA, 0], // → (0xAA, 0xBB, 0xCC)
+        ];
+        let xor_rows = [0xAA, 0, 0, 0, 0x55, 0, 0, 0];
+        let top: [bool; 8] = [true, false, false, false, false, false, false, false];
+        let bottom: [bool; 8] = [false; 8];
+        let mask = mask_rows(8, &[&bottom, &top]);
+        let dib = dib_with(1, 8, 2, &palette, &xor_rows, &mask);
+        let group = group_bytes_wh(8, 2, 1, u32::try_from(dib.len()).expect("fits"), 1);
+        let decoded = decode_synthetic(&dib, &group);
+        assert_eq!((decoded.width, decoded.height), (8, 2));
+        // Top row = source row 1 = 0x55: indices 0, 1, 0, 1, …
+        assert_eq!(pixel(&decoded, 0, 0), [0x10, 0x20, 0x30, 0]);
+        assert_eq!(pixel(&decoded, 1, 0), [0xAA, 0xBB, 0xCC, 0xFF]);
+        assert_eq!(pixel(&decoded, 2, 0), [0x10, 0x20, 0x30, 0xFF]);
+        // Bottom row = source row 0 = 0xAA: indices 1, 0, …
+        assert_eq!(pixel(&decoded, 0, 1), [0xAA, 0xBB, 0xCC, 0xFF]);
+        assert_eq!(pixel(&decoded, 1, 1), [0x10, 0x20, 0x30, 0xFF]);
+    }
+
+    #[test]
+    fn dib_4bpp_reads_a_non_default_palette_and_the_and_mask() {
+        // 4x2, 4 bpp. The palette is deliberately NOT the VGA one: VGA index 3
+        // is cyan (0x00, 0x80, 0x80) and index 12 is yellow (0xC0, 0xC0, 0x00),
+        // so a decoder that hardcodes the 16-colour table fails here.
+        let mut palette = [[0x03_u8, 0x02, 0x01, 0]; 16]; // filler → (1, 2, 3)
+        palette[3] = [0x33, 0x22, 0x11, 0]; // → (0x11, 0x22, 0x33)
+        palette[7] = [0x99, 0x88, 0x77, 0]; // → (0x77, 0x88, 0x99)
+        palette[12] = [0x66, 0x55, 0x44, 0]; // → (0x44, 0x55, 0x66)
+        // Bottom source row: indices 3, 12, 7, 0 → bytes 0x3C, 0x70.
+        // Top source row: indices 12, 3, 0, 7 → bytes 0xC3, 0x07.
+        let xor_rows = [0x3C, 0x70, 0, 0, 0xC3, 0x07, 0, 0];
+        let top: [bool; 4] = [true, false, false, false];
+        let bottom: [bool; 4] = [false; 4];
+        let mask = mask_rows(4, &[&bottom, &top]);
+        let dib = dib_with(4, 4, 2, &palette, &xor_rows, &mask);
+        let group = group_bytes_wh(4, 2, 4, u32::try_from(dib.len()).expect("fits"), 1);
+        let decoded = decode_synthetic(&dib, &group);
+        // Top row = source row 1: transparent, idx 3, idx 0, idx 7.
+        assert_eq!(pixel(&decoded, 0, 0), [0x44, 0x55, 0x66, 0]);
+        assert_eq!(pixel(&decoded, 1, 0), [0x11, 0x22, 0x33, 0xFF]);
+        assert_eq!(pixel(&decoded, 2, 0), [0x01, 0x02, 0x03, 0xFF]);
+        assert_eq!(pixel(&decoded, 3, 0), [0x77, 0x88, 0x99, 0xFF]);
+        // Bottom row = source row 0: idx 3, idx 12, idx 7, idx 0.
+        assert_eq!(pixel(&decoded, 0, 1), [0x11, 0x22, 0x33, 0xFF]);
+        assert_eq!(pixel(&decoded, 1, 1), [0x44, 0x55, 0x66, 0xFF]);
+        assert_eq!(pixel(&decoded, 2, 1), [0x77, 0x88, 0x99, 0xFF]);
+        assert_eq!(pixel(&decoded, 3, 1), [0x01, 0x02, 0x03, 0xFF]);
+    }
+
+    #[test]
+    fn dib_24bpp_pads_rows_and_has_no_palette() {
+        // 13x7: odd width AND odd height, the adversarial case for the row
+        // padding. 13 * 24 = 312 bits = 39 bytes, so the DIB stride is
+        // ((13 * 24 + 31) / 32) * 4 = 40 bytes; a decoder that uses 39 reads
+        // every row after the first shifted by one byte.
+        let (width, height, stride) = (13_u32, 7_u32, 40_usize);
+        let mut xor_rows = Vec::new();
+        for y in 0..height {
+            let mut row = Vec::new();
+            for x in 0..width {
+                // B = 10x, G = 10y, R = 255: every pixel is distinguishable,
+                // and both coordinates are visible in the result.
+                row.extend_from_slice(&[
+                    u8::try_from(x * 10).expect("fits"),
+                    u8::try_from(y * 10).expect("fits"),
+                    255,
+                ]);
+            }
+            row.resize(stride, 0);
+            xor_rows.extend_from_slice(&row);
+        }
+        let opaque = [[false; 13]; 7];
+        let rows: Vec<&[bool]> = opaque.iter().map(|row| row.as_slice()).collect();
+        let mask = mask_rows(13, &rows);
+        let dib = dib_with(24, width, height, &[], &xor_rows, &mask);
+        let group = group_bytes_wh(13, 7, 24, u32::try_from(dib.len()).expect("fits"), 1);
+        let decoded = decode_synthetic(&dib, &group);
+        assert_eq!((decoded.width, decoded.height), (13, 7));
+        // No palette: colours come straight from the BGR triples. Output row 0
+        // is source row 6 (DIBs are bottom-up).
+        assert_eq!(pixel(&decoded, 0, 0), [255, 60, 0, 0xFF]);
+        assert_eq!(pixel(&decoded, 12, 0), [255, 60, 120, 0xFF]);
+        assert_eq!(pixel(&decoded, 6, 3), [255, 30, 60, 0xFF]);
+        assert_eq!(pixel(&decoded, 0, 6), [255, 0, 0, 0xFF]);
+        assert_eq!(pixel(&decoded, 12, 6), [255, 0, 120, 0xFF]);
     }
 }
