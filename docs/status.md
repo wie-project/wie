@@ -147,6 +147,26 @@ The immediate next milestone is **Qt-class apps**: OpenGL, `CreateProcess`, wins
 OLE clipboard/drag-drop stack unlock real Qt5 GUI apps; audio + D3D9 completion + GPU offload
 then unlock games. Progress is tracked in the live log at `.slim/deepwork/gui-implementation.md`.
 
+## Run modes, and one open trap
+
+`wie run <exe>` has two shapes and the choice is now visible instead of silent:
+
+- **console** — stdin is a terminal and no micro-only flag was given. Raw mode that
+  is restored on every exit path, live host stdin, the runtime re-entered per
+  quantum until the guest calls `ExitProcess`. This is what plays a game.
+- **micro** — everything else (a pipe, a CI runner, and any run with `--max-api`,
+  `--expect-code`, `--stdin`, `--drive-d`, `--app-dir` or guest argv). One shot,
+  bounded by a fixed budget of host API stops, which is the wall that keeps a hung
+  micro test from hanging the suite. Hitting it now says so — the budget, that it is
+  a CI wall, and the two ways to move it — instead of "did not reach ExitProcess",
+  which read as a crash printed over a board the guest had just drawn.
+
+**Open trap:** in console mode, a *pty whose input has closed* leaves the guest
+polling forever, because the live-stdin path reports "no input" rather than EOF. A
+human's terminal never reaches EOF, so this only bites scripted pty runs (a
+`script`-wrapped test, a closed terminal emulator pane); the fix is an EOF stop in
+the live-stdin read path, next to the existing Ctrl+C stop. Not done yet.
+
 ## History
 
 Early work targeted an alternate way to run FuSoYa's Lunar Magic and used Unicorn Engine. After full init sequences proved feasible, Unicorn-specific paths were removed in favour of iced-x86 + Cranelift. The 2026 roadmap then landed the memory backend (mmap-only, soft-translate), the JIT fast paths (multi sticky, region pins, super path, SIMD, bulk strings), the GUI program (windows → controls → dialogs → menus → fonts → wgpu present), the D3D9 software renderer, a type-system-driven architecture cleanup, and the 2026-08 wave: **native macOS dialogs**, **real printing**, the **global-bottle policy** (no setup — apps just work, exes installed to `C:\Program Files\{name}\`, the Windows folder skeleton seeded), a zero-copy struct-read layer, VS 2.0 + PS 2.0 shader execution with flow control, and the pull-based repaint system.

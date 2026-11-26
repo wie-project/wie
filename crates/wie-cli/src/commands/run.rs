@@ -525,6 +525,24 @@ pub fn run_micro(path: &Path, options: MicroRunOptions<'_>) -> Result<()> {
             bail!("run_micro: exit={code} expected={}", options.expect_code);
         }
         None => {
+            // `ApiLimit` is this entry's normal wall, not a guest fault: the
+            // micro entry spends one fixed budget of host API stops and stops.
+            // Say what the budget was and what removes it, because the old
+            // message ("did not reach ExitProcess") was printed over a guest
+            // that had taken the screen, and read as a crash.
+            if matches!(
+                summary.run.termination,
+                wie_runtime::EntryTraceTermination::ApiLimit
+            ) {
+                bail!(
+                    concat!(
+                        "run_micro: stopped at the host-API cap of {} host-API stops before the ",
+                        "guest exited. That cap is a CI wall, not a guest limit: --console plays ",
+                        "it interactively, a larger --max-api raises the wall"
+                    ),
+                    options.max_api
+                );
+            }
             bail!(
                 "run_micro: did not reach ExitProcess (termination={:?})",
                 summary.run.termination

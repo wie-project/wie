@@ -286,6 +286,63 @@ pub fn reject_micro_only_flags(
     Ok(())
 }
 
+/// Whether a `wie run` with no mode flag should take the console entry.
+///
+/// The default entry is micro: one shot, bounded by `--max-api`, failing with
+/// `did not reach ExitProcess` when the bound is hit. That bound is a CI wall —
+/// it is what keeps a hung micro test from hanging the suite — and it is
+/// actively wrong for a guest that reads the keyboard, where it surfaces as
+/// "the game quit after six moves". So when the host can supply a live terminal
+/// and the caller asked for nothing that only micro can honour, the console
+/// entry is the honest reading of "run this program".
+///
+/// Every disjunct here is a flag that micro alone understands, or guest argv
+/// (the console entry does not forward it, so switching would silently drop the
+/// arguments). None of them is a mode flag: `--console`, `--persistent`,
+/// `--gui` and `--screenshot` are dispatched before this is consulted.
+fn interactive_console_default(
+    max_api: Option<usize>,
+    expect_code: u32,
+    stdin: Option<&std::path::Path>,
+    drive_d: Option<&std::path::Path>,
+    app_dir: Option<&std::path::Path>,
+    guest_args: &[String],
+) -> bool {
+    let stdin_is_terminal = {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal()
+    };
+    interactive_console_eligible(
+        max_api,
+        expect_code,
+        stdin,
+        drive_d,
+        app_dir,
+        guest_args,
+        stdin_is_terminal,
+    )
+}
+
+/// [`interactive_console_default`] with the terminal test injected, so the rule
+/// is testable without a tty.
+fn interactive_console_eligible(
+    max_api: Option<usize>,
+    expect_code: u32,
+    stdin: Option<&std::path::Path>,
+    drive_d: Option<&std::path::Path>,
+    app_dir: Option<&std::path::Path>,
+    guest_args: &[String],
+    stdin_is_terminal: bool,
+) -> bool {
+    stdin_is_terminal
+        && max_api.is_none()
+        && expect_code == 0
+        && stdin.is_none()
+        && drive_d.is_none()
+        && app_dir.is_none()
+        && guest_args.is_empty()
+}
+
 /// Shared run-entry dispatch, used by both `run` (via `--bottle` / `--root`)
 /// and `bottle run <name>`.
 ///
@@ -421,6 +478,27 @@ pub fn run_entry(
         )?;
         let max = max_api.unwrap_or(PERSISTENT_MAX_API_DEFAULT);
         commands::run_until_yield(path, max, root.as_deref())?;
+    } else if interactive_console_default(
+        max_api,
+        expect_code,
+        stdin.as_deref(),
+        drive_d.as_deref(),
+        app_dir.as_deref(),
+        &guest_args,
+    ) {
+        // A guest that is reading the keyboard needs the console entry: it
+        // takes the terminal into raw mode it can restore, reads live stdin,
+        // and re-enters the runtime per quantum until the guest exits. The
+        // micro entry below stops the whole run at the API cap instead, which
+        // is the right wall for a CI micro but a cliff for anyone playing a
+        // game — 2048 quit after six moves with `termination=ApiLimit` and an
+        // unreadable line where the board had been.
+        eprintln!(
+            "wie: stdin is a terminal — running interactively until the guest exits \
+             (Ctrl+C to stop; --max-api / --stdin / --drive-d / --app-dir / guest args \
+             select the bounded micro mode)"
+        );
+        commands::run_console_interactive(path, max_api, root.as_deref())?;
     } else {
         let max = max_api.unwrap_or(MICRO_MAX_API_DEFAULT);
         commands::run_micro(
@@ -586,7 +664,7 @@ pub fn version_text_if_requested(argv: &[OsString]) -> Option<&'static str> {
 
 #[cfg(test)]
 mod version_fast_path_tests {
-    use super::{Cli, VERSION_TEXT, version_text_if_requested};
+    use super::{Cli, VERSION_TEXT, interactive_console_eligible, version_text_if_requested};
     use clap::CommandFactory;
     use std::ffi::OsString;
 
@@ -628,5 +706,73 @@ mod version_fast_path_tests {
                 "{argv:?}"
             );
         }
+    }
+
+    /// The rule that decides whether a bare `wie run` plays a console guest
+    /// instead of running it once against a fixed API budget.
+    ///
+    /// Each `false` case is one thing that only the micro entry can honour, or
+    /// guest argv it would silently drop — the reason the switch cannot be "is
+    /// stdin a terminal" alone.
+    #[test]
+    fn a_bare_run_on_a_terminal_takes_the_console_entry() {
+        let no_args: &[String] = &[];
+        let one_arg = [String::from("-n")];
+        assert!(interactive_console_eligible(
+            None, 0, None, None, None, no_args, true
+        ));
+
+        // Not a terminal: a pipe or a CI runner keeps the bounded micro entry.
+        assert!(!interactive_console_eligible(
+            None, 0, None, None, None, no_args, false
+        ));
+
+        // `--max-api` is itself a request for a bounded run.
+        assert!(!interactive_console_eligible(
+            Some(10),
+            0,
+            None,
+            None,
+            None,
+            no_args,
+            true
+        ));
+        // `--expect-code` is a micro-mode assertion.
+        assert!(!interactive_console_eligible(
+            None, 3, None, None, None, no_args, true
+        ));
+        // Micro-only inputs: a staged stdin file, a drive-D root, an app dir.
+        let path = std::path::Path::new("/tmp");
+        assert!(!interactive_console_eligible(
+            None,
+            0,
+            Some(path),
+            None,
+            None,
+            no_args,
+            true
+        ));
+        assert!(!interactive_console_eligible(
+            None,
+            0,
+            None,
+            Some(path),
+            None,
+            no_args,
+            true
+        ));
+        assert!(!interactive_console_eligible(
+            None,
+            0,
+            None,
+            None,
+            Some(path),
+            no_args,
+            true
+        ));
+        // Guest argv: the console entry forwards none, so switching would drop it.
+        assert!(!interactive_console_eligible(
+            None, 0, None, None, None, &one_arg, true
+        ));
     }
 }
