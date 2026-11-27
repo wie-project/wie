@@ -525,7 +525,7 @@ impl FlagState {
     }
 
     /// ADC flags, predicate-direct mirror of `flags_adc`: iced
-    /// `set_add_flags(d, s+cf, result)` then CF from the wide add.
+    /// `set_add_flags(d, s, result)` then CF from the wide add.
     /// `cf` is the carry-in as a WIDENED I64 0/1 lane (select_flag), never an i1.
     pub(super) fn assign_adc(
         &mut self,
@@ -536,20 +536,11 @@ impl FlagState {
         result: Value,
         bits: u32,
     ) {
-        let s_eff = bcx.ins().iadd(s, cf);
-        let s_eff_m = mask_width(bcx, s_eff, bits);
-        // Base flags from add(d, s_eff, result) via add_sub_preds(sub=false);
-        // the CF from the base add is replaced by the wide-add CF below.
-        let (_, of_c, af_c) = add_sub_preds(
-            bcx,
-            d,
-            s_eff_m,
-            result,
-            bits,
-            false,
-            PredSource::CarryIn,
-            false,
-        );
+        let s_m = mask_width(bcx, s, bits);
+        // OF and AF come from the operands themselves (the carry is already in
+        // `result`); the CF from this base add is replaced below.
+        let (_, of_c, af_c) =
+            add_sub_preds(bcx, d, s_m, result, bits, false, PredSource::CarryIn, false);
         let (zf, sf, pf_src) = zs_preds(bcx, result, bits);
         self.zf = zf;
         self.sf = sf;

@@ -921,7 +921,7 @@ pub(super) fn flags_sbb(
     f
 }
 
-/// ADC flags: match iced `set_add_flags(d, s+cf, result)` then CF from wide add.
+/// ADC flags: match iced `set_add_flags(d, s, result)` then CF from wide add.
 pub(super) fn flags_adc(
     bcx: &mut FunctionBuilder<'_>,
     old: Value,
@@ -931,9 +931,8 @@ pub(super) fn flags_adc(
     result: Value,
     bits: u32,
 ) -> Value {
-    let s_eff = bcx.ins().iadd(s, cf);
-    let s_eff_m = mask_width(bcx, s_eff, bits);
-    let mut f = flags_add(bcx, old, d, s_eff_m, result, bits);
+    let s_m = mask_width(bcx, s, bits);
+    let mut f = flags_add(bcx, old, d, s_m, result, bits);
     if bits >= 64 {
         let sum_ds = bcx.ins().iadd(d, s);
         let c1 = bcx.ins().icmp(IntCC::UnsignedLessThan, sum_ds, d);

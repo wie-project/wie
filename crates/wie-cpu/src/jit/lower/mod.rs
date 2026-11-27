@@ -2387,10 +2387,13 @@ pub(super) fn lower_shift_lazy(
     let dst_raw = read_op_mem(bcx, instr, 0, gpr, fault_word, mem)?;
     let dst = mask_width(bcx, dst_raw, bits);
     let count_raw = read_op_mem(bcx, instr, 1, gpr, fault_word, mem)?;
-    let mask63 = iconst_u64(bcx, 0x3f);
-    let count_masked = bcx.ins().band(count_raw, mask63);
+    // x86 takes six count bits for a 64-bit operand and five otherwise. Only
+    // rotates then reduce by the operand width.
+    let count_mask = iconst_u64(bcx, if bits >= 64 { 0x3f } else { 0x1f });
+    let count_masked = bcx.ins().band(count_raw, count_mask);
     let bits_v = iconst_u64(bcx, u64::from(bits));
-    let count_mod = if bits >= 64 {
+    let plain_shift = matches!(kind, ShiftKind::Shl | ShiftKind::Shr | ShiftKind::Sar);
+    let count_mod = if bits >= 64 || plain_shift {
         count_masked
     } else {
         bcx.ins().urem(count_masked, bits_v)
