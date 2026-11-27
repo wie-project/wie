@@ -1,10 +1,14 @@
-//! A last-page cache per memory access site, for loops.
+//! A last-page cache for memory accesses in loops.
 //!
 //! The prologue homes in [`super::mem`] are built from the stack pin, so every
 //! global, DLL-data or heap access in a loop paid the whole refill-table probe
-//! on every iteration. Here each of the first [`SITES`] access sites of a loop
-//! remembers the page the refill probe last resolved for it, and checks that
-//! with one subtract and one compare.
+//! on every iteration. Here each distinct (base, index, direction) of a loop's
+//! operands, up to [`SITES`], remembers the page the refill probe last resolved
+//! for it, and checks that with one subtract and one compare. Operands through
+//! the same registers share a site, since they usually walk the same buffer.
+//! `RSP`/`RBP` operands and implicit stack accesses take none: the stack home
+//! already serves them. The choice only affects speed — every site check bounds
+//! the address itself.
 //!
 //! # Why a remembered page is no staler than the probe it short-cuts
 //!
@@ -17,6 +21,8 @@
 
 use cranelift::codegen::ir::{Block, BlockArg, condcodes::IntCC, types};
 use cranelift::prelude::{FunctionBuilder, InstBuilder, Value, Variable};
+
+use iced_x86::Register;
 
 use crate::mem::PAGE_SIZE;
 
@@ -33,10 +39,19 @@ pub(super) struct Site {
     bias: Variable,
 }
 
-/// The sites of one loop, handed out to accesses in emission order.
+/// Which operand registers an access goes through, the guest page for a
+/// fixed address (0 otherwise), and its direction.
+type Key = (Register, Register, u64, bool);
+
+/// The sites of one loop, handed out by operand key in emission order.
 pub(super) struct SiteHomes {
     sites: Vec<Site>,
-    next: std::cell::Cell<usize>,
+    keys: std::cell::RefCell<Vec<Key>>,
+    /// `(base, index, fixed page)` of the operand being lowered.
+    operand: std::cell::Cell<Option<(Register, Register, u64)>>,
+    /// The slot already chosen for the current operand, per direction. A 16-byte
+    /// operand asks again from its split path, and must get the same one back.
+    chosen: std::cell::Cell<[Option<usize>; 2]>,
 }
 
 impl SiteHomes {
@@ -50,18 +65,52 @@ impl SiteHomes {
             .collect();
         let homes = Self {
             sites,
-            next: std::cell::Cell::new(0),
+            keys: std::cell::RefCell::new(Vec::with_capacity(SITES)),
+            operand: std::cell::Cell::new(None),
+            chosen: std::cell::Cell::new([None; 2]),
         };
         homes.clear(bcx);
         homes
     }
 
-    /// The next unused site, if any is left.
-    pub(super) fn take(&self) -> Option<Site> {
-        let index = self.next.get();
-        let site = self.sites.get(index).copied()?;
-        self.next.set(index.saturating_add(1));
-        Some(site)
+    /// Record the registers of the operand whose address is being computed.
+    pub(super) fn note_operand(&self, base: Register, index: Register, disp: u64) {
+        // With a fixed address, operands on the same page can share a site.
+        let fixed = index == Register::None
+            && matches!(base, Register::None | Register::RIP | Register::EIP);
+        let page = if fixed { disp / PAGE_SIZE } else { 0 };
+        self.operand.set(Some((base, index, page)));
+        self.chosen.set([None; 2]);
+    }
+
+    /// Forget the operand, so a following implicit stack access takes no site.
+    pub(super) fn end_operand(&self) {
+        self.operand.set(None);
+        self.chosen.set([None; 2]);
+    }
+
+    /// The site serving the current operand in this direction, if it gets one.
+    pub(super) fn site_for(&self, write: bool) -> Option<Site> {
+        let (base, index, page) = self.operand.get()?;
+        if matches!(base, Register::RSP | Register::RBP) {
+            return None;
+        }
+        let mut chosen = self.chosen.get();
+        if let Some(slot) = chosen.get(usize::from(write)).copied().flatten() {
+            return self.sites.get(slot).copied();
+        }
+        let key = (base, index, page, write);
+        let mut keys = self.keys.borrow_mut();
+        let found = keys.iter().position(|k| *k == key);
+        let slot = found.unwrap_or_else(|| {
+            keys.push(key);
+            keys.len().saturating_sub(1)
+        });
+        if let Some(entry) = chosen.get_mut(usize::from(write)) {
+            *entry = Some(slot);
+        }
+        self.chosen.set(chosen);
+        self.sites.get(slot).copied()
     }
 
     /// Forget every remembered page (after a helper access).

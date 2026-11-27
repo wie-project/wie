@@ -895,12 +895,19 @@ pub(super) fn block_home_sizes(insns: &[DecodedInsn]) -> Vec<u32> {
                 .map(|m| u32::try_from(m.memory_size().size()).unwrap_or(0))
                 .collect()
         };
-        let Some(size) = sizes_here.into_iter().find(|s| matches!(s, 1 | 2 | 4 | 8)) else {
+        let Some(size) = sizes_here
+            .into_iter()
+            .find(|s| matches!(s, 1 | 2 | 4 | 8 | 16))
+        else {
             continue;
         };
-        if matches!(size, 1 | 2 | 4 | 8) && !sizes.contains(&size) {
+        if matches!(size, 1 | 2 | 4 | 8 | 16) && !sizes.contains(&size) {
             sizes.push(size);
-            if sizes.len() == 4 {
+            // A 16-byte operand that misses is served as two 8-byte halves.
+            if size == 16 && !sizes.contains(&8) {
+                sizes.push(8);
+            }
+            if sizes.len() >= 4 {
                 break;
             }
         }
@@ -1083,6 +1090,118 @@ pub(super) fn store_guest_bytes(
     }
 }
 
+// ── 128-bit operands ────────────────────────────────────────────────────
+//
+// One check covering all 16 bytes, then one vector load or store. Anything the
+// check does not accept takes the two 8-byte accesses unchanged, so faults and
+// page crossings behave exactly as before.
+
+/// Whether a 16-byte operand has anything to check it with.
+fn has_wide_fast_path(
+    mem: &MemEnv,
+    write: bool,
+) -> (Option<super::site_homes::Site>, Option<HomeSpan>) {
+    if !JitConfig::get().mem_inline_enabled()
+        || !JitConfig::get().simd_enabled()
+        || mem.super_stack.is_some()
+    {
+        return (None, None);
+    }
+    (
+        mem.sites.as_ref().and_then(|sites| sites.site_for(write)),
+        home_for(mem.refill.as_ref(), 16, write),
+    )
+}
+
+/// Load 16 bytes as a lo/hi pair.
+pub(super) fn call_load16(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    gpr: &[Value; 16],
+    rflags: Value,
+    addr: Value,
+    insn_ip: u64,
+) -> Result<(Value, Value), LowerError> {
+    let split = |bcx: &mut FunctionBuilder<'_>| -> Result<(Value, Value), LowerError> {
+        let lo = call_load(bcx, mem, gpr, rflags, addr, 8, insn_ip)?;
+        let addr_hi = bcx.ins().iadd_imm(addr, 8);
+        let hi = call_load(bcx, mem, gpr, rflags, addr_hi, 8, insn_ip)?;
+        Ok((lo, hi))
+    };
+    let (site, home) = has_wide_fast_path(mem, false);
+    if site.is_none() && home.is_none() {
+        return split(bcx);
+    }
+    let merge = bcx.create_block();
+    bcx.append_block_param(merge, types::I8X16);
+    let flags = mem.guest_flags;
+    if let Some(site) = site {
+        site.probe(bcx, addr, 16, merge, |bcx, host| {
+            Some(bcx.ins().load(types::I8X16, flags, host, 0))
+        });
+    }
+    if let Some(span) = home {
+        let fail = bcx.create_block();
+        let host = home_span_probe(bcx, &span, addr, fail);
+        let v = bcx.ins().load(types::I8X16, flags, host, 0);
+        bcx.ins().jump(merge, &[BlockArg::Value(v)]);
+        bcx.switch_to_block(fail);
+        bcx.seal_block(fail);
+    }
+    let (lo, hi) = split(bcx)?;
+    let v = super::analysis::pair_to_i8x16(bcx, mem.flags, lo, hi);
+    bcx.ins().jump(merge, &[BlockArg::Value(v)]);
+    bcx.switch_to_block(merge);
+    bcx.seal_block(merge);
+    let v = bcx.block_params(merge)[0];
+    Ok(super::analysis::i8x16_to_pair(bcx, mem.flags, v))
+}
+
+/// Store a lo/hi pair as 16 bytes.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn call_store16(
+    bcx: &mut FunctionBuilder<'_>,
+    mem: &MemEnv,
+    gpr: &[Value; 16],
+    rflags: Value,
+    addr: Value,
+    lo: Value,
+    hi: Value,
+    insn_ip: u64,
+) -> Result<(), LowerError> {
+    let split = |bcx: &mut FunctionBuilder<'_>| -> Result<(), LowerError> {
+        call_store(bcx, mem, gpr, rflags, addr, 8, lo, insn_ip)?;
+        let addr_hi = bcx.ins().iadd_imm(addr, 8);
+        call_store(bcx, mem, gpr, rflags, addr_hi, 8, hi, insn_ip)
+    };
+    let (site, home) = has_wide_fast_path(mem, true);
+    if site.is_none() && home.is_none() {
+        return split(bcx);
+    }
+    let merge = bcx.create_block();
+    let flags = mem.guest_flags;
+    let v = super::analysis::pair_to_i8x16(bcx, mem.flags, lo, hi);
+    if let Some(site) = site {
+        site.probe(bcx, addr, 16, merge, |bcx, host| {
+            bcx.ins().store(flags, v, host, 0);
+            None
+        });
+    }
+    if let Some(span) = home {
+        let fail = bcx.create_block();
+        let host = home_span_probe(bcx, &span, addr, fail);
+        bcx.ins().store(flags, v, host, 0);
+        bcx.ins().jump(merge, &[]);
+        bcx.switch_to_block(fail);
+        bcx.seal_block(fail);
+    }
+    split(bcx)?;
+    bcx.ins().jump(merge, &[]);
+    bcx.switch_to_block(merge);
+    bcx.seal_block(merge);
+    Ok(())
+}
+
 pub(super) fn call_load(
     bcx: &mut FunctionBuilder<'_>,
     mem: &MemEnv,
@@ -1126,6 +1245,14 @@ pub(super) fn call_load(
     // exactly what `hoisted_pin_probe` accepts. After a home miss the stack stage
     // below therefore cannot hit, so it is not emitted: it was a dozen dead
     // instructions in front of every heap or image access.
+    // First the page this operand used last (loops, non-stack operands only).
+    let site = mem.sites.as_ref().and_then(|sites| sites.site_for(false));
+    if let Some(site) = site {
+        site.probe(bcx, addr, size, merge, |bcx, host| {
+            Some(load_guest_bytes(bcx, mem.guest_flags, host, size))
+        });
+    }
+
     let home = home_for(mem.refill.as_ref(), size, false);
     if let Some(span) = home {
         let fail = bcx.create_block();
@@ -1134,14 +1261,6 @@ pub(super) fn call_load(
         bcx.ins().jump(merge, &[BlockArg::Value(v)]);
         bcx.switch_to_block(fail);
         bcx.seal_block(fail);
-    }
-
-    // Then the page this site used last (loops only).
-    let site = mem.sites.as_ref().and_then(|sites| sites.take());
-    if let Some(site) = site {
-        site.probe(bcx, addr, size, merge, |bcx, host| {
-            Some(load_guest_bytes(bcx, mem.guest_flags, host, size))
-        });
     }
 
     if let Some(ref pin) = mem.stack_pin.filter(|_| home.is_none()) {
@@ -1275,6 +1394,15 @@ pub(super) fn call_store(
     // exactly what `hoisted_pin_probe` accepts. After a home miss the stack stage
     // below therefore cannot hit, so it is not emitted: it was a dozen dead
     // instructions in front of every heap or image access.
+    // First the page this operand used last (loops, non-stack operands only).
+    let site = mem.sites.as_ref().and_then(|sites| sites.site_for(true));
+    if let Some(site) = site {
+        site.probe(bcx, addr, size, merge, |bcx, host| {
+            store_guest_bytes(bcx, mem.guest_flags, host, size, value);
+            None
+        });
+    }
+
     let home = home_for(mem.refill.as_ref(), size, true);
     if let Some(span) = home {
         let fail = bcx.create_block();
@@ -1283,15 +1411,6 @@ pub(super) fn call_store(
         bcx.ins().jump(merge, &[]);
         bcx.switch_to_block(fail);
         bcx.seal_block(fail);
-    }
-
-    // Then the page this site used last (loops only).
-    let site = mem.sites.as_ref().and_then(|sites| sites.take());
-    if let Some(site) = site {
-        site.probe(bcx, addr, size, merge, |bcx, host| {
-            store_guest_bytes(bcx, mem.guest_flags, host, size, value);
-            None
-        });
     }
 
     if let Some(ref pin) = mem.stack_pin.filter(|_| home.is_none()) {

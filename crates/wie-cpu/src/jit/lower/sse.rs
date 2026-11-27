@@ -10,7 +10,7 @@ use super::emit::MemEnv;
 use super::err::LowerError;
 use super::flags::iconst_u64;
 use super::gpr::{effective_addr, read_gpr, write_gpr};
-use super::mem::{call_load, call_store};
+use super::mem::{call_load, call_load16, call_store, call_store16};
 
 use crate::exec::{self};
 use cranelift::prelude::*;
@@ -90,12 +90,7 @@ pub(super) fn load_sse_mem(
             let hi = iconst_u64(bcx, 0);
             Ok((lo, hi))
         }
-        16 => {
-            let lo = call_load(bcx, mem, gpr, rflags, addr, 8, insn_ip)?;
-            let addr_hi = bcx.ins().iadd_imm(addr, 8);
-            let hi = call_load(bcx, mem, gpr, rflags, addr_hi, 8, insn_ip)?;
-            Ok((lo, hi))
-        }
+        16 => call_load16(bcx, mem, gpr, rflags, addr, insn_ip),
         _ => Err(LowerError::form("sse_load_width")),
     }
 }
@@ -115,11 +110,7 @@ pub(super) fn store_sse_mem(
 ) -> Result<(), LowerError> {
     match nbytes {
         4 | 8 => call_store(bcx, mem, gpr, rflags, addr, nbytes, lo, insn_ip),
-        16 => {
-            call_store(bcx, mem, gpr, rflags, addr, 8, lo, insn_ip)?;
-            let addr_hi = bcx.ins().iadd_imm(addr, 8);
-            call_store(bcx, mem, gpr, rflags, addr_hi, 8, hi, insn_ip)
-        }
+        16 => call_store16(bcx, mem, gpr, rflags, addr, lo, hi, insn_ip),
         _ => Err(LowerError::form("sse_store_width")),
     }
 }
