@@ -166,3 +166,30 @@ on the start-of-day binary too, so it no longer reproduces anything.
 Not done: 16-byte memory accesses are still split in two (`movdqu` ≈ 2 ns), XMM
 registers are still written through to the context every instruction, and
 `call`/`ret` is unchanged.
+
+## 9. Third pass (uncommitted)
+
+`micro-exes/instr_bench/gpr_check.py` compares integer results, flags and
+call/ret (recursion, indirect calls, shared `ret`) with Rosetta. It found, and
+this pass fixed: `adc` OF/AF computed against source-plus-carry; 8/16-bit shifts
+by more than their width reduced the count modulo the width; a 32-bit shift by
+zero did not clear the upper half. 1335 results now match.
+
+| change | effect |
+| --- | --- |
+| Page caches checked first for non-stack operands, shared by (base, index, direction) | global load/store 0.70 → 0.28 ns |
+| One check for 16-byte operands, split path on a miss | `movdqu` 2.0 → 0.28 ns |
+| Both | `sib` 65 → 46 ms, `bytes` 234 → 162 ms |
+
+**`call`/`ret`.** A call to a lone `ret` went to a hand-written Rust stub that was
+slower than the compiled block; it is now compiled: `call_ret` 11.7 → 7.5 ns,
+indirect call 13.0 → 9.3 ns. Calls to larger callees (`call_leaf2`, `fib`) are
+unchanged. Tried and reverted: a block records its successor and returns, and a
+host loop calls it (no nesting). With a 4096-hop budget `fib` was 6 % faster and
+`indirect`'s median 7 % slower, so removing nesting (what a tail-call
+convention would buy) is not the lever. Untried: pairing guest `call`/`ret` with
+host call/return so the host's return predictor works, and inlining leaf callees
+into loop regions.
+
+Open: region loops are 5–8× Rosetta on stack loads (`load_stack_rgn`), since
+regions have no block-wide stack guard.

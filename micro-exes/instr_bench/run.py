@@ -66,6 +66,8 @@ CASES = {
               "divsd %xmm1, %xmm0", 1),
     "movdqu_load": ("", "movdqu {i}*16(%r10), %xmm0", 1),
     "movdqu_store": ("movl $77, %eax\n movd %eax, %xmm0", "movdqu %xmm0, {i}*16(%r10)", 1),
+    "movdqu_rip": ("", "movdqu {const}(%rip), %xmm0", 1),
+    "call_leaf2": ("", "callq {leaf2}", 3),
     "paddd": ("movl $3, %eax\n movd %eax, %xmm1", "paddd %xmm1, %xmm0", 1),
 }
 
@@ -80,6 +82,10 @@ def assembly(prefix):
     out = [".text"]
     leaf = prefix + "bench_leaf"
     out += [f".globl {leaf}", f"{leaf}:", " retq"]
+    # Two instructions, so it is compiled rather than served by the `ret` stub.
+    leaf2, const = prefix + "bench_leaf2", prefix + "bench_const"
+    out += [f".globl {leaf2}", f"{leaf2}:", " leaq 1(%rax), %rax", " retq",
+            ".p2align 4", f"{const}:", " .quad 0x0123456789abcdef, 0x1122334455667788"]
     for name, (setup, body, _) in CASES.items():
         sym = f"{prefix}k_{name}"
         out += [f".globl {sym}", ".p2align 4", f"{sym}:",
@@ -94,7 +100,8 @@ def assembly(prefix):
         for i in range(UNROLL):
             if name.endswith("_rgn") and i == UNROLL // 2:
                 out += [" jmp 8f", " nop", "8:"]
-            out.append(" " + body.replace("{i}", str(i)).replace("{leaf}", leaf))
+            out.append(" " + body.replace("{i}", str(i)).replace("{leaf2}", leaf2)
+                       .replace("{leaf}", leaf).replace("{const}", const))
         out += [" subq $1, %r11", " jnz 1b",
                 " movq %rax, 4000(%r10)", " movdqu %xmm0, 4008(%r10)",
                 " addq $168, %rsp", " retq"]
