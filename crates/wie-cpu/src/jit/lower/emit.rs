@@ -183,6 +183,11 @@ fn emit_chain_hop_accounting(
     flags: MemFlagsData,
     store_ops: u64,
 ) {
+    // Two memory read-modify-writes on every transfer: emitted only when a
+    // report will read them. Unit tests assert on the counters, so keep them.
+    if !(cfg!(test) || crate::jit::diag::profile_gate_on()) {
+        return;
+    }
     let hops_ptr = bcx.ins().iadd_imm(ctx_ptr, i64::from(OFF_CHAIN_HOPS));
     let hops = bcx.ins().load(types::I64, flags, hops_ptr, 0);
     let hops1 = bcx.ins().iadd_imm(hops, 1);
@@ -1009,6 +1014,8 @@ pub(super) struct RefillProbe {
 }
 
 pub(super) struct MemEnv {
+    /// Per-site last-page caches; `Some` only inside a loop with inline memory.
+    pub(super) sites: Option<super::site_homes::SiteHomes>,
     pub(super) ctx_ptr: Value,
     pub(super) load_ref: Option<cranelift::codegen::ir::FuncRef>,
     pub(super) store_ref: Option<cranelift::codegen::ir::FuncRef>,

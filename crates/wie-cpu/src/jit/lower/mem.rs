@@ -1122,7 +1122,12 @@ pub(super) fn call_load(
     // everything from scratch — the hoist only adds an edge into it, and the
     // descriptor it was published from is re-read on every block entry (which is
     // what catches a re-protect; see `mem_hoist_tests::a_reprotect_between_executions_is_caught`).
-    if let Some(span) = home_for(mem.refill.as_ref(), size, false) {
+    // A home is the stack pin published at entry, and `home_span_probe` accepts
+    // exactly what `hoisted_pin_probe` accepts. After a home miss the stack stage
+    // below therefore cannot hit, so it is not emitted: it was a dozen dead
+    // instructions in front of every heap or image access.
+    let home = home_for(mem.refill.as_ref(), size, false);
+    if let Some(span) = home {
         let fail = bcx.create_block();
         let host = home_span_probe(bcx, &span, addr, fail);
         let v = load_guest_bytes(bcx, mem.guest_flags, host, size);
@@ -1131,7 +1136,15 @@ pub(super) fn call_load(
         bcx.seal_block(fail);
     }
 
-    if let Some(ref pin) = mem.stack_pin {
+    // Then the page this site used last (loops only).
+    let site = mem.sites.as_ref().and_then(|sites| sites.take());
+    if let Some(site) = site {
+        site.probe(bcx, addr, size, merge, |bcx, host| {
+            Some(load_guest_bytes(bcx, mem.guest_flags, host, size))
+        });
+    }
+
+    if let Some(ref pin) = mem.stack_pin.filter(|_| home.is_none()) {
         emit_probe_stage(
             bcx,
             merge,
@@ -1145,7 +1158,12 @@ pub(super) fn call_load(
             bcx,
             merge,
             |bcx, miss| refill_tlb_probe(bcx, refill, mem.flags, addr, size, false, miss),
-            |bcx, host| Some(load_guest_bytes(bcx, mem.guest_flags, host, size)),
+            |bcx, host| {
+                if let Some(site) = site {
+                    site.fill(bcx, addr, host);
+                }
+                Some(load_guest_bytes(bcx, mem.guest_flags, host, size))
+            },
         );
     }
 
@@ -1216,6 +1234,9 @@ pub(super) fn emit_load_helper(
     let call = bcx.ins().call(load_ref, &[mem.ctx_ptr, addr, size_v, ip_v]);
     let slow_val = bcx.inst_results(call)[0];
     check_fault_after_ucrt(bcx, mem, gpr, rflags);
+    if let Some(sites) = mem.sites.as_ref() {
+        sites.clear(bcx);
+    }
     slow_val
 }
 
@@ -1250,7 +1271,12 @@ pub(super) fn call_store(
     let merge = bcx.create_block();
 
     // Hoisted fast path (see `call_load`): the write-direction home.
-    if let Some(span) = home_for(mem.refill.as_ref(), size, true) {
+    // A home is the stack pin published at entry, and `home_span_probe` accepts
+    // exactly what `hoisted_pin_probe` accepts. After a home miss the stack stage
+    // below therefore cannot hit, so it is not emitted: it was a dozen dead
+    // instructions in front of every heap or image access.
+    let home = home_for(mem.refill.as_ref(), size, true);
+    if let Some(span) = home {
         let fail = bcx.create_block();
         let host = home_span_probe(bcx, &span, addr, fail);
         store_guest_bytes(bcx, mem.guest_flags, host, size, value);
@@ -1259,7 +1285,16 @@ pub(super) fn call_store(
         bcx.seal_block(fail);
     }
 
-    if let Some(ref pin) = mem.stack_pin {
+    // Then the page this site used last (loops only).
+    let site = mem.sites.as_ref().and_then(|sites| sites.take());
+    if let Some(site) = site {
+        site.probe(bcx, addr, size, merge, |bcx, host| {
+            store_guest_bytes(bcx, mem.guest_flags, host, size, value);
+            None
+        });
+    }
+
+    if let Some(ref pin) = mem.stack_pin.filter(|_| home.is_none()) {
         emit_probe_stage(
             bcx,
             merge,
@@ -1277,6 +1312,9 @@ pub(super) fn call_store(
             merge,
             |bcx, miss| refill_tlb_probe(bcx, refill, mem.flags, addr, size, true, miss),
             |bcx, host| {
+                if let Some(site) = site {
+                    site.fill(bcx, addr, host);
+                }
                 store_guest_bytes(bcx, mem.guest_flags, host, size, value);
                 None
             },
@@ -1321,6 +1359,9 @@ pub(super) fn emit_store_helper(
     bcx.ins()
         .call(store_ref, &[mem.ctx_ptr, addr, size_v, value, ip_v]);
     check_fault_after_ucrt(bcx, mem, gpr, rflags);
+    if let Some(sites) = mem.sites.as_ref() {
+        sites.clear(bcx);
+    }
 }
 
 // ── Probe-guard decision table ──────────────────────────────────────────
