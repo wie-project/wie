@@ -115,7 +115,9 @@ pub(super) fn match_micro_stub(
         return None;
     }
     match n {
-        1 => Some(MicroStub::Ret),
+        // A lone `ret` is compiled: the Rust stub and its chain lookup were
+        // slower than the emitted block.
+        1 => None,
         2 => classify_two_insn(&insns[0].instr),
         _ => None,
     }
