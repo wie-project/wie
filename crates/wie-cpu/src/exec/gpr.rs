@@ -110,11 +110,12 @@ pub(super) fn exec_arith(
             }
         }
         ArithOp::Adc => {
-            // Flags from full add with carry-in.
+            // OF and AF come from the operands themselves (the carry is already
+            // in `result`); CF needs the full-width sum.
             let wide = u128::from(d)
                 .wrapping_add(u128::from(s))
                 .wrapping_add(u128::from(cf));
-            regs::set_add_flags(regs, d, s.wrapping_add(cf), result, size);
+            regs::set_add_flags(regs, d, s, result, size);
             regs.set_flag(Rflags::CF, wide > u128::from(mask));
             if !locked {
                 write_op(mem, regs, instr, 0, result & mask)?;

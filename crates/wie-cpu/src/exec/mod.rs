@@ -1076,12 +1076,22 @@ fn exec_shift(
     } else {
         width
     };
-    let count_mod = if rot_width == 0 {
+    // Only rotates reduce by the operand width. A narrow shift by more than its
+    // width really shifts everything out.
+    let count_mod = if matches!(kind, ShiftKind::Shl | ShiftKind::Shr | ShiftKind::Sar) {
+        count_masked
+    } else if rot_width == 0 {
         0
     } else {
         count_masked % rot_width
     };
     if count_mod == 0 {
+        // Flags are untouched, but a 32-bit register destination is still
+        // written, which clears its upper half.
+        if size == 4 && instr.op0_kind() == OpKind::Register {
+            let value = read_op(mem, regs, instr, 0)?;
+            write_op(mem, regs, instr, 0, value & mask)?;
+        }
         return Ok(());
     }
     let ctx = ShiftCtx {
