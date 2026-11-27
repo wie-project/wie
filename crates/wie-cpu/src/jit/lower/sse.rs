@@ -636,8 +636,8 @@ pub(super) fn lower_sse_shufpd(
     let (s1_lo, s1_hi) = read_xmm_pair(xmm, dst)?;
     let (s2_lo, s2_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
     let imm = instr.immediate(2) & 0xff;
-    let lo = if imm & 1 == 0 { s1_lo } else { s2_lo };
-    let hi = if imm & 2 == 0 { s1_hi } else { s2_hi };
+    let lo = if imm & 1 == 0 { s1_lo } else { s1_hi };
+    let hi = if imm & 2 == 0 { s2_lo } else { s2_hi };
     store_xmm_pair(bcx, mem, xmm, di, lo, hi);
     Ok(())
 }
@@ -911,6 +911,7 @@ pub(super) fn lower_sse_int_binop(
     let di = xmm_index(dst)?;
     let (a_lo, a_hi) = read_xmm_pair(xmm, dst)?;
     let (b_lo, b_hi) = read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?;
+    let (a_lo, a_hi, b_lo, b_hi) = op.half_operands(a_lo, a_hi, b_lo, b_hi);
     let packed = if JitConfig::get().simd_enabled() {
         match op {
             exec::SseIntOp::Paddb => vec_binop(

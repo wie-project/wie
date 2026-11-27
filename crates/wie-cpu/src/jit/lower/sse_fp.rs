@@ -3,7 +3,9 @@
 
 use super::super::config::JitConfig;
 use super::SseBit;
-use super::analysis::{i8x16_to_pair, pair_to_i8x16, read_xmm_pair, store_xmm_pair, xmm_index};
+use super::analysis::{
+    half_as_f64, i8x16_to_pair, pair_to_i8x16, read_xmm_pair, store_xmm_pair, xmm_index,
+};
 use super::emit::MemEnv;
 use super::flags::iconst_u64;
 use super::gpr::{bool_to_i64, effective_addr, is_imm_kind, read_gpr, write_gpr};
@@ -152,17 +154,21 @@ pub(super) fn lower_sse_shift(
         k if is_imm_kind(k) => Some(instr.immediate(1) & 0xff),
         _ => None,
     };
-    let (count_lo, count_hi) = if imm.is_none() {
-        read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?
+    // A register or memory count is the low 64 bits only.
+    let count_lo = if imm.is_none() {
+        read_sse_src_pair(bcx, instr, gpr, rflags, mem, xmm, 16)?.0
     } else {
-        (iconst_u64(bcx, 0), iconst_u64(bcx, 0))
+        iconst_u64(bcx, 0)
     };
     let (lo, hi) = if JitConfig::get().simd_enabled() {
         if let Some(c) = imm {
-            if c >= u64::from(width) {
-                // x86: count >= element width → all zeroes.
+            let arithmetic = matches!(op, exec::SseShiftOp::Psraw | exec::SseShiftOp::Psrad);
+            if c >= u64::from(width) && !arithmetic {
+                // x86: logical count >= element width → all zeroes.
                 (iconst_u64(bcx, 0), iconst_u64(bcx, 0))
             } else {
+                // An arithmetic count past the width fills with the sign.
+                let c = c.min(u64::from(width) - 1);
                 // The AArch64 lowering of vector ishl/ushr/sshr only handles a
                 // scalar count (it vec_dup's it), so pass the count as a scalar.
                 let a_vec = pair_to_vec(bcx, mem.flags, a_lo, a_hi, lane_ty);
@@ -178,9 +184,10 @@ pub(super) fn lower_sse_shift(
                 .sse_shift_ref
                 .ok_or_else(|| LowerError::verifier("internal: sse shift helper not declared"))?;
             let op_v = iconst_u64(bcx, op.to_abi());
-            let c1 = bcx.ins().call(sref, &[op_v, a_lo, count_lo]);
+            let count = splat_variable_count(bcx, count_lo, width);
+            let c1 = bcx.ins().call(sref, &[op_v, a_lo, count]);
             let lo = bcx.inst_results(c1)[0];
-            let c2 = bcx.ins().call(sref, &[op_v, a_hi, count_hi]);
+            let c2 = bcx.ins().call(sref, &[op_v, a_hi, count]);
             let hi = bcx.inst_results(c2)[0];
             (lo, hi)
         }
@@ -194,7 +201,10 @@ pub(super) fn lower_sse_shift(
                 let splat = splat_count(c, width);
                 (iconst_u64(bcx, splat), iconst_u64(bcx, splat))
             }
-            None => (count_lo, count_hi),
+            None => {
+                let count = splat_variable_count(bcx, count_lo, width);
+                (count, count)
+            }
         };
         let c1 = bcx.ins().call(sref, &[op_v, a_lo, c_lo]);
         let lo = bcx.inst_results(c1)[0];
@@ -204,6 +214,19 @@ pub(super) fn lower_sse_shift(
     };
     store_xmm_pair(bcx, mem, xmm, di, lo, hi);
     Ok(())
+}
+
+/// The helper takes a count per lane: clamp the one x86 count to 255 and splat it.
+fn splat_variable_count(bcx: &mut FunctionBuilder<'_>, count: Value, width: u32) -> Value {
+    let max = iconst_u64(bcx, 0xff);
+    let clamped = bcx.ins().umin(count, max);
+    match width {
+        16 | 32 => {
+            let factor = iconst_u64(bcx, splat_count(1, width));
+            bcx.ins().imul(clamped, factor)
+        }
+        _ => clamped,
+    }
 }
 
 /// Vector shift by (compile-time or per-lane) count.
@@ -860,12 +883,8 @@ pub(super) fn lower_sse_scalar_fp(
     let _ = b_hi;
     let (new_lo, new_hi) = if JitConfig::get().simd_enabled() {
         if width == FloatWidth::F64 {
-            let fa = bcx
-                .ins()
-                .bitcast(types::F64, super::bitcast_flags(mem.flags), a_lo);
-            let fb = bcx
-                .ins()
-                .bitcast(types::F64, super::bitcast_flags(mem.flags), b_lo);
+            let fa = half_as_f64(bcx, mem.flags, a_lo);
+            let fb = half_as_f64(bcx, mem.flags, b_lo);
             let fr = clif_fbinop(bcx, op, fa, fb);
             let r = bcx
                 .ins()

@@ -11,6 +11,7 @@ use super::err::LowerError;
 use super::opclass;
 use crate::regs::Rflags;
 
+use cranelift::codegen::ir::{InstructionData, Opcode, ValueDef};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::MemFlagsData;
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
@@ -99,12 +100,60 @@ pub(super) fn load_xmm_pair(
 // Skipping the per-def RMW eliminates a JitCtx aliasing edge that was blocking
 // Cranelift LICM/CSE on sticky/pin metadata inside SSE-heavy loop bodies.
 
+/// The `I64X2` value `v` is lane `lane` of, if it is one.
+fn lane_source(bcx: &FunctionBuilder<'_>, v: Value, lane: u8) -> Option<Value> {
+    let ValueDef::Result(inst, 0) = bcx.func.dfg.value_def(v) else {
+        return None;
+    };
+    match bcx.func.dfg.insts[inst] {
+        InstructionData::BinaryImm8 {
+            opcode: Opcode::Extractlane,
+            arg,
+            imm,
+        } if imm == lane && bcx.func.dfg.value_type(arg) == types::I64X2 => Some(arg),
+        _ => None,
+    }
+}
+
+/// A lo/hi half pair's low half as an `F64`.
+///
+/// The XMM bank holds integer halves, so a chain of float ops used to move each
+/// result to a general register and straight back, which is most of its latency.
+/// When the half was extracted from a vector, or bitcast from a float, reuse
+/// that value instead. Same bits, same dominance.
+pub(super) fn half_as_f64(bcx: &mut FunctionBuilder<'_>, flags: MemFlagsData, lo: Value) -> Value {
+    let cast = super::bitcast_flags(flags);
+    if let ValueDef::Result(inst, 0) = bcx.func.dfg.value_def(lo)
+        && let InstructionData::LoadNoOffset {
+            opcode: Opcode::Bitcast,
+            arg,
+            ..
+        } = bcx.func.dfg.insts[inst]
+        && bcx.func.dfg.value_type(arg) == types::F64
+    {
+        return arg;
+    }
+    if let Some(vector) = lane_source(bcx, lo, 0) {
+        let floats = bcx.ins().bitcast(types::F64X2, cast, vector);
+        return bcx.ins().extractlane(floats, 0);
+    }
+    bcx.ins().bitcast(types::F64, cast, lo)
+}
+
 pub(super) fn pair_to_i8x16(
     bcx: &mut FunctionBuilder<'_>,
     flags: MemFlagsData,
     lo: Value,
     hi: Value,
 ) -> Value {
+    // Both halves of one vector, in order: that vector is the answer.
+    if let Some(vector) = lane_source(bcx, lo, 0)
+        && lane_source(bcx, hi, 1) == Some(vector)
+    {
+        return bcx
+            .ins()
+            .bitcast(types::I8X16, super::bitcast_flags(flags), vector);
+    }
     let zero = iconst_u64(bcx, 0);
     let mut v = bcx.ins().splat(types::I64X2, zero);
     v = bcx.ins().insertlane(v, lo, 0);
