@@ -1160,6 +1160,9 @@ pub(super) fn emit_body_and_term(
     };
 
     for d in body {
+        if let Some(sites) = mem_env.sites.as_ref() {
+            sites.end_operand();
+        }
         ensure_gprs_loaded(bcx, ctx_ptr, gpr_vals, gpr_loaded, &d.instr, flags);
         ensure_xmm_loaded(bcx, ctx_ptr, flags, &d.instr, xmm_vals, xmm_loaded);
         // Every per-instruction refusal is recorded HERE, once, while the

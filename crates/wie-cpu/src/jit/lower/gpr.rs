@@ -277,6 +277,9 @@ pub(super) fn effective_addr(
 ) -> Result<Value, LowerError> {
     let base = instr.memory_base();
     let disp = instr.memory_displacement64();
+    if let Some(sites) = mem.sites.as_ref() {
+        sites.note_operand(base, instr.memory_index(), disp);
+    }
     let disp_c = iconst_u64(bcx, disp);
     // RIP-relative: iced already folded next_ip+disp into displacement64.
     if base == Register::RIP || base == Register::EIP {
