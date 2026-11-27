@@ -3,35 +3,22 @@ use crate::IcedCpu;
 use crate::exec::degrade_first_sighting;
 use iced_x86::Mnemonic;
 
-/// Wave 4 degrade-not-die: an unimplemented mnemonic (x87 `f2xm1`) must NOT
-/// stop the interpreter — the fallback advances RIP past the instruction,
-/// leaves register state untouched, and counts the execution in the
-/// `degraded_insn_count` coverage metric. The counter is a global; the test
-/// only asserts a strict increase to stay robust against parallel tests.
+/// An unimplemented mnemonic (x87 `f2xm1`) stops the run, naming itself, and
+/// leaves RIP-visible state alone. Skipping it would hand the guest wrong data.
 #[test]
-fn unimplemented_mnemonic_degrades_instead_of_stopping() {
+fn unimplemented_mnemonic_stops_the_run() {
     crate::exec::iced_decode_cache_flush();
     let mut iced = IcedCpu::open_x86_64();
     map_code_region(&mut iced, SIMD_BASE, 0x2000);
-    // D9 F0 = f2xm1: an x87 transcendental op with no interpreter
-    // implementation (and no x87 register file at all) — the pre-Wave-4
-    // behavior was a session stop.
-    let code = [0xD9_u8, 0xF0_u8];
-    iced.mem_write(SIMD_BASE, &code).expect("iced code");
+    // D9 F0 = f2xm1.
+    iced.mem_write(SIMD_BASE, &[0xD9_u8, 0xF0_u8])
+        .expect("iced code");
     iced.write_rip(SIMD_BASE).expect("iced rip");
 
-    let before = crate::degraded_insn_count();
-    iced.step_once()
-        .expect("degrade fallback must not stop the session");
-    let after = crate::degraded_insn_count();
+    let error = format!("{:?}", iced.step_once().expect_err("must stop"));
     assert!(
-        after > before,
-        "the fallback must count the degraded execution (before={before})"
-    );
-    assert_eq!(
-        iced.regs().rip,
-        SIMD_BASE + u64::from(code.len() as u32),
-        "RIP must advance past the degraded instruction"
+        error.contains("unimplemented mnemonic F2xm1"),
+        "the stop must name the instruction, got {error}"
     );
 }
 

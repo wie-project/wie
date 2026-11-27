@@ -711,13 +711,13 @@ fn simd_shuffles_match_iced() {
         let (iced, jit) = simd_dual(bytes, &[], |r| set_pair(r, x0, x1));
         assert_same_regs(&iced, &jit, name);
     }
-    // Hand-check SHUFPD imm 0x01: low lane from src2, high lane from src1
-    // (the UCRT wcscpy fast path uses this — the guest File menus died on
-    // it before the iced implementation landed).
+    // Hand-check SHUFPD imm 0x01: low lane is the destination's high half
+    // (imm bit 0), high lane the source's low half (imm bit 1). Matches
+    // Rosetta (`micro-exes/instr_bench/sse_check.py`).
     let a = 0x1111_2222_3333_4444_5555_6666_7777_8888_u128;
     let b = 0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000_1111_u128;
     let (iced, jit) = simd_dual(&[0x66, 0x0f, 0xc6, 0xc1, 0x01], &[], |r| set_pair(r, a, b));
-    let want = 0x1111_2222_3333_4444_EEEE_FFFF_0000_1111_u128;
+    let want = 0xEEEE_FFFF_0000_1111_1111_2222_3333_4444_u128;
     assert_eq!(iced.xmm_at(0), want, "iced shufpd");
     assert_eq!(jit.xmm_at(0), want, "jit shufpd");
     // Hand-check PSHUFD imm 0x1B = [3,2,1,0] (reverse dwords).
@@ -972,4 +972,28 @@ fn simd_memory_operands_match_iced() {
         0x0000_0000_0000_0000_0000_0000_0000_0006,
         "jit paddd mem"
     );
+}
+
+/// The packs narrow all of the destination into the low half and all of the
+/// source into the high half. Iced and the JIT share the semantics, so a
+/// differential alone cannot catch a mistake: the expected values are literal.
+#[test]
+fn packs_concatenate_destination_then_source() {
+    // Words 1,2,3,4 and 5,6,7,8; dwords 1,2 and 3,4.
+    let words_a = 0x0004_0003_0002_0001_u128 | (0x0008_0007_0006_0005_u128 << 64);
+    let words_b = 0x000c_000b_000a_0009_u128 | (0x0010_000f_000e_000d_u128 << 64);
+    let dwords_a = 0x0000_0002_0000_0001_u128 | (0x0000_0004_0000_0003_u128 << 64);
+    let dwords_b = 0x0000_0006_0000_0005_u128 | (0x0000_0008_0000_0007_u128 << 64);
+    let bytes_want = 0x100f_0e0d_0c0b_0a09_0807_0605_0403_0201_u128;
+    let words_want = 0x0008_0007_0006_0005_0004_0003_0002_0001_u128;
+    for (name, opcode, a, b, want) in [
+        ("packuswb", 0x67_u8, words_a, words_b, bytes_want),
+        ("packsswb", 0x63, words_a, words_b, bytes_want),
+        ("packssdw", 0x6b, dwords_a, dwords_b, words_want),
+    ] {
+        // `<op> xmm0, xmm1`
+        let (iced, jit) = simd_dual(&[0x66, 0x0f, opcode, 0xc1], &[], |r| set_pair(r, a, b));
+        assert_eq!(iced.xmm_at(0), want, "iced {name}");
+        assert_eq!(jit.xmm_at(0), want, "jit {name}");
+    }
 }

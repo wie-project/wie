@@ -121,7 +121,8 @@ fn setcc_reads_flags_set_earlier_in_the_block() {
 ///
 /// Layout: `39 D8` (cmp) · `7x 01` (jcc +1) · `90` (nop) · `0F 0B` (ud2). Taken
 /// leaves RIP at the ud2, not-taken at the nop, so RIP *is* the condition and
-/// the comparison covers the branch as well as RFLAGS.
+/// the comparison covers the branch as well as RFLAGS. Neither is executed: the
+/// ud2 would stop the run.
 #[test]
 fn jcc_reads_flags_set_earlier_in_the_block() {
     for (case, eax, ebx) in CMP_CASES {
@@ -129,13 +130,12 @@ fn jcc_reads_flags_set_earlier_in_the_block() {
             let cc = u8::try_from(cc).expect("0..16");
             let mut code = Vec::from(CMP_EAX_EBX);
             code.extend_from_slice(&[0x70 | cc, 0x01, 0x90, 0x0F, 0x0B]);
-            // Stop on the first RIP at or past the `nop`: reached directly when
-            // the branch is not taken, and skipped over when it is.
-            let stop = super::SIMD_BASE + 6;
+            // Stop on the first RIP at or past the `nop`.
+            let stop = super::SIMD_BASE + 4;
             let (iced, jit) = chain_dual(&code, stop, setup(eax, ebx), |_| {});
             assert_same_regs(&iced, &jit, &format!("j{name} after cmp, {case}"));
             assert!(
-                iced.rip == super::SIMD_BASE + 6 || iced.rip == super::SIMD_BASE + 7,
+                iced.rip == super::SIMD_BASE + 4 || iced.rip == super::SIMD_BASE + 5,
                 "j{name}, {case}: rip {:#x} is neither the nop nor the ud2",
                 iced.rip
             );
