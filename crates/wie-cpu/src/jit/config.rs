@@ -124,11 +124,11 @@ pub(super) struct JitConfig {
     /// question about CLIF, and this is how it gets answered — by counting ops
     /// in the dump rather than reasoning about them.
     ir_dump_path: Option<std::path::PathBuf>,
-    /// `WIE_JIT_REGION=1` — compile a hot RIP that is a **loop header** as one
+    /// `WIE_JIT_REGION` (default on, `0` disables) — compile a hot RIP that is a **loop header** as one
     /// Cranelift function for the whole loop region, with the back edge as a
     /// native `jump`, instead of one function per basic block chained by hops
-    /// (`jit/lower/region.rs`, `jit/lower/region_emit.rs`). Off by default; see
-    /// [`Self::region_enabled`] for why.
+    /// (`jit/lower/region.rs`, `jit/lower/region_emit.rs`). See
+    /// [`Self::region_enabled`].
     region_enabled: bool,
     /// `WIE_JIT_REGION_SELF_LOOP=1` — let region formation fold a **one-block
     /// self-loop**: the block whose own terminator comes back to its entry
@@ -404,20 +404,15 @@ impl JitConfig {
             code_cache_enabled: code_cache_enabled_from_env(
                 std::env::var("WIE_JIT_CODE_CACHE").ok(),
             ),
-            // Loop-region compilation (`WIE_JIT_REGION=1`). Parsed as a plain
-            // opt-in, NOT forced off under `cfg(test)`: the unit tests that
-            // exercise the region emitter need it on, and they flip the
-            // per-`JitShared` latch (`JitShared::region_force`) rather than this
-            // process-wide value, because `JitConfig` is a `OnceLock` read once
-            // per process (see `region_enabled`).
-            region_enabled: matches!(
-                std::env::var("WIE_JIT_REGION"),
-                Ok(v)
-                    if v == "1"
-                        || v.eq_ignore_ascii_case("true")
-                        || v.eq_ignore_ascii_case("on")
-                        || v.eq_ignore_ascii_case("yes")
-            ),
+            // Loop-region compilation, default on (`WIE_JIT_REGION=0` disables).
+            // Off by default in unit tests, which pin one-function-per-block
+            // shapes; region tests opt in through `JitShared::region_force`.
+            region_enabled: std::env::var("WIE_JIT_REGION").map_or(!cfg!(test), |v| {
+                !(v == "0"
+                    || v.eq_ignore_ascii_case("false")
+                    || v.eq_ignore_ascii_case("off")
+                    || v.eq_ignore_ascii_case("no"))
+            }),
             // Self-loop regions (`WIE_JIT_REGION_SELF_LOOP=1`). Same plain
             // opt-in parse, and the same reason it is not forced off under
             // `cfg(test)`: the emitter's self-loop tests flip the per-engine
@@ -449,30 +444,12 @@ impl JitConfig {
     }
 
     /// Whether a hot loop header compiles as a **loop region** — one Cranelift
-    /// function for the whole loop, with the back edge as a native `jump`
-    /// (`WIE_JIT_REGION=1`).
+    /// function for the whole loop, with the back edge as a native `jump`.
     ///
-    /// # Why the default is off
-    ///
-    /// Not for want of a reason to turn it on, but because of what a default
-    /// *means* here: every other default in this file was chosen by a paired
-    /// measurement on the calibrated corpus (`scripts/real-guest-perf.sh`), and a
-    /// region changes the shape of emitted code for whole loops rather than
-    /// adding a probe to one path. The measured evidence for it is one loop in
-    /// one guest (DOOM Retro's 2-block, 36-instruction inner loop — the
-    /// `frames_published` arm in `docs/RUNBOOK.md`), on the one host that could
-    /// run it; and the emitter's exit-store set is deliberately conservative
-    /// (see `lower::region_emit`) in a way that a wider corpus might want
-    /// tightened before it is everybody's default. Anything that can silently
-    /// miscompile instead of slowing down stays behind a knob until a corpus says
-    /// otherwise — the same rule `WIE_JIT_CODE_CACHE` follows, and the opposite
-    /// of how `WIE_JIT_MEM`'s default was justified (that one had 6/6 paired
-    /// runs behind it).
-    ///
-    /// The other half: a region is *one* compilation unit for up to
-    /// `RegionLimits::max_blocks` blocks, so its compile cost is paid up front
-    /// against a visit threshold calibrated for a single block. That trade is
-    /// what a default would be asserting, and one guest is not a corpus.
+    /// Default **on**; `WIE_JIT_REGION=0` restores one function per basic block.
+    /// The measurements behind the default are in
+    /// `docs/architecture/rosetta-speed-plan.md`. A region is one compilation
+    /// unit, so short runs can pay more compile time than they win back.
     #[must_use]
     pub(super) fn region_enabled(&self) -> bool {
         self.region_enabled
@@ -565,6 +542,10 @@ impl JitConfig {
         // cross that line, or a `.code` file written by one setting replays the
         // other setting's shape.
         h = mix(h, u64::from(self.region_self_loop_enabled));
+        // The chain depth cap is an immediate in every chain edge.
+        h = mix(h, super::lower::MAX_CHAIN_DEPTH);
+        // Chain-hop counters exist in emitted code only while profiling.
+        h = mix(h, u64::from(crate::jit::diag::profile_gate_on()));
         // Build + host shape. `cfg!` keeps this a compile-time constant, so a
         // debug-built test process can never accept a release blob.
         h = mix(h, u64::from(cfg!(debug_assertions)));

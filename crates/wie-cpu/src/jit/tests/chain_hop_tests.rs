@@ -289,7 +289,7 @@ fn run_ring(iters: u64) -> JitCpu {
 ///
 /// Ground truth is exact: 5 instructions per iteration, and the two counters
 /// partition the work, so their sum must equal `5 * iters` with no slack. This
-/// ring crosses the `MAX_CHAIN_DEPTH` cap every ~48 hops, so it covers the
+/// ring crosses the `MAX_CHAIN_DEPTH` cap every ~32 hops, so it covers the
 /// depth-cap exit and all three post-call exits on every frame boundary.
 #[test]
 fn chained_blocks_retire_every_guest_instruction() {

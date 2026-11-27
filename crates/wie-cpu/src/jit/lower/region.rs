@@ -264,8 +264,8 @@ pub(super) struct RegionLimits {
 impl Default for RegionLimits {
     fn default() -> Self {
         Self {
-            max_blocks: 8,
-            max_insns: 192,
+            max_blocks: 32,
+            max_insns: 512,
             max_exit_targets: 4,
             max_explore_blocks: 512,
         }
