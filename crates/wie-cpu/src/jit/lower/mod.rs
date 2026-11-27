@@ -754,10 +754,11 @@ pub(super) const OFF_REFILL: i32 = std::mem::offset_of!(JitCtx, refill) as i32;
 
 /// Max nested host frames for JIT block chaining.
 ///
-/// Guest `call`/`jmp`/`ret` chain via host C `call` into the successor block.
-/// ~48 keeps most hot chains in-process while staying well under default host
-/// stacks even with large Cranelift frames (seen: stack overflow on 7za scan).
-pub(super) const MAX_CHAIN_DEPTH: u64 = 48;
+/// Guest `call`/`jmp`/`ret` chain via a host `call` into the successor block, so
+/// every hop is eventually unwound by a host `ret`. Measured on one Apple M3,
+/// 48 is much slower than 40 or below (`fib` +55 %, `indirect` +75 %). The cause
+/// is unknown. 32 keeps margin under that cliff.
+pub(super) const MAX_CHAIN_DEPTH: u64 = 32;
 
 // Layout sanity: Cranelift IR offsets must match `repr(C)` packing.
 const _: () = {
@@ -1008,6 +1009,8 @@ mod mem;
 pub(crate) mod opclass;
 mod region;
 mod region_emit;
+mod site_homes;
+use site_homes::SiteHomes;
 mod sse;
 mod sse_fp;
 mod string;
@@ -1555,6 +1558,8 @@ pub(super) fn compile_block(
                     block_homes(&mut bcx, stack_pin, insns, self_loop)
                 };
                 let refill = attach_homes(&refill, homes);
+                let sites = (self_loop && !is_super && refill.is_some())
+                    .then(|| SiteHomes::declare(&mut bcx));
 
                 let mut path_gpr = entry_gpr;
                 let mut path_loaded = entry_loaded;
@@ -1609,6 +1614,7 @@ pub(super) fn compile_block(
                 }
 
                 let mut mem_env = MemEnv {
+                    sites,
                     ctx_ptr,
                     load_ref,
                     store_ref,
@@ -1689,6 +1695,7 @@ pub(super) fn compile_block(
             // in this **entry** block, before the jump below — `loop_header` is what
             // the back edge targets, so a span built there would be per-iteration.
             let refill = attach_homes(&refill, block_homes(&mut bcx, stack_pin, insns, self_loop));
+            let sites = (self_loop && refill.is_some()).then(|| SiteHomes::declare(&mut bcx));
             let loop_header = if self_loop {
                 let h = bcx.create_block();
                 for &is_live in live_eff.iter().take(16) {
@@ -1751,6 +1758,7 @@ pub(super) fn compile_block(
             };
 
             let mut mem_env = MemEnv {
+                sites,
                 ctx_ptr,
                 load_ref,
                 store_ref,
@@ -1859,10 +1867,13 @@ pub(super) fn compile_block(
     }
 
     dump_ir_if_requested("block", start_rip, insns.len(), &eng.ctx.func);
+    eng.ctx
+        .set_disasm(JitConfig::get().ir_dump_path().is_some());
 
     eng.module
         .define_function(func_id, &mut eng.ctx)
         .map_err(|e| LowerError::verifier(e.to_string()))?;
+    dump_asm_if_requested(start_rip, eng.ctx.compiled_code());
     eng.module.clear_context(&mut eng.ctx);
     eng.module
         .finalize_definitions()
@@ -2000,6 +2011,29 @@ pub(super) fn dump_ir_if_requested(
     text.push('\n');
     // Append: concurrent compiles write the same file, and each record is a
     // single `write` call, so interleaving cannot corrupt a line.
+    let _appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()));
+}
+
+/// Append the block's AArch64 listing to the `WIE_JIT_DUMP_IR` file.
+///
+/// CLIF op counts do not predict machine code, so a lowering change is judged on
+/// this listing. Only blocks inside `WIE_JIT_DUMP_IR_RIP` are written.
+pub(super) fn dump_asm_if_requested(
+    start_rip: u64,
+    code: Option<&cranelift_codegen::CompiledCode>,
+) {
+    let Some(path) = crate::jit::config::JitConfig::get().ir_dump_path() else {
+        return;
+    };
+    let wanted = ir_dump_rip_filter().is_some_and(|(lo, hi)| (lo..=hi).contains(&start_rip));
+    let Some(asm) = code.filter(|_| wanted).and_then(|c| c.vcode.as_deref()) else {
+        return;
+    };
+    let text = format!("; asm rip={start_rip:#x}\n{asm}\n");
     let _appended = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

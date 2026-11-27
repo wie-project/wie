@@ -148,7 +148,7 @@ use super::emit::{MemEnv, TripCounter, emit_chain_or_exit, exit_args, writeback_
 use super::err::{LowerError, noted};
 use super::flags::{FlagState, decompose_packed, iconst_u64, pack_once};
 use super::insn::{PendingFlags, flush_pending_deferred, lower_insn};
-use super::mem::{hoist_pin_slot, hoist_refill};
+use super::mem::{attach_homes, block_homes, hoist_pin_slot, hoist_refill};
 use super::region::{
     GuestInsn, LoopRegion, RegionLimits, RegionRefusal, form_loop_region, form_self_loop_region,
 };
@@ -995,34 +995,16 @@ pub(in crate::jit) fn try_compile_region(
     }
 }
 
-/// Count of region events logged loudly so far, so a guest that is *not* a loop
-/// never turns on the log into a per-block flood.
-static REGION_REJECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// How many region refusals are logged at `WARN` before the rest go to `DEBUG`.
-const REGION_WARN_MAX: u64 = 8;
-
-/// Report one region refusal, loudly for the first few.
+/// Report one region refusal.
 ///
-/// Same shape and the same reason as the block path's rejection counter: refusals
-/// are routine on real guests (most hot RIPs are not loop headers, which is the
-/// normal outcome), so an unthrottled `WARN` per block would be noise while a
-/// silent `DEBUG` would make "why is this loop still hopping?" unanswerable.
+/// `DEBUG` only: regions are on by default and most hot RIPs are not loop
+/// headers, so a refusal is the normal outcome and not worth a user's console.
 fn note_region_event(what: &'static str, rip: u64, why: &dyn std::fmt::Display) {
-    let n = REGION_REJECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n < REGION_WARN_MAX {
-        tracing::warn!(
-            start = format_args!("{rip:#x}"),
-            reason = %why,
-            "jit loop region {what} — falling back to the per-block path"
-        );
-    } else {
-        tracing::debug!(
-            start = format_args!("{rip:#x}"),
-            reason = %why,
-            "jit loop region {what} — falling back to the per-block path"
-        );
-    }
+    tracing::debug!(
+        start = format_args!("{rip:#x}"),
+        reason = %why,
+        "jit loop region {what} — falling back to the per-block path"
+    );
 }
 
 /// Emit one Cranelift function for `region` and finalize it.
@@ -1192,7 +1174,20 @@ pub(super) fn compile_region(
             (None, Vec::new(), None)
         };
 
+        // This is the region's entry block, so homes and sites declared here
+        // are loop-invariant and loop-carried respectively.
+        let guest: Vec<crate::jit::block::DecodedInsn> = region
+            .insns()
+            .iter()
+            .map(|i| crate::jit::block::DecodedInsn { instr: i.insn })
+            .collect();
+        let refill = attach_homes(&refill, block_homes(&mut bcx, stack_pin, &guest, true));
+        let sites = refill
+            .is_some()
+            .then(|| super::site_homes::SiteHomes::declare(&mut bcx));
+
         let mut mem_env = MemEnv {
+            sites,
             ctx_ptr,
             load_ref,
             store_ref,
@@ -1354,9 +1349,15 @@ pub(super) fn compile_region(
 
     dump_ir_if_requested("region", region.entry(), region.insn_count(), &eng.ctx.func);
 
+    eng.ctx.set_disasm(
+        crate::jit::config::JitConfig::get()
+            .ir_dump_path()
+            .is_some(),
+    );
     eng.module
         .define_function(func_id, &mut eng.ctx)
         .map_err(|e| LowerError::verifier(e.to_string()))?;
+    super::dump_asm_if_requested(region.entry(), eng.ctx.compiled_code());
     eng.module.clear_context(&mut eng.ctx);
     eng.module
         .finalize_definitions()

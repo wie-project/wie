@@ -301,6 +301,7 @@ mod tests {
         let exit = bcx.create_block();
         let flags = MemFlagsData::trusted();
         let mut env = MemEnv {
+            sites: None,
             ctx_ptr,
             load_ref: None,
             store_ref: None,
