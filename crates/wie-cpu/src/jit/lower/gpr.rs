@@ -315,11 +315,25 @@ pub(super) fn effective_addr(
     let index = instr.memory_index();
     if index != Register::None {
         let idx = read_gpr(gpr, index)?;
-        let scale = u64::from(instr.memory_index_scale());
+        let scale = instr.memory_index_scale();
         let scaled = if scale <= 1 {
             idx
+        } else if scale.is_power_of_two() {
+            // `ishl`, not `imul`. Both compute the same address — x86's SIB scale
+            // is 1/2/4/8 and multiplication by a power of two is exactly a left
+            // shift modulo 2^64 — but only the shift is foldable: Cranelift's
+            // aarch64 addressing-mode matcher turns `iadd(base, ishl(idx, k))`
+            // into `[base, index, lsl #k]`, so the scale costs *nothing* at run
+            // time and the scale constant never materialises. `imul` by the same
+            // constant matched nothing: it kept an `iconst` and emitted a `mul`,
+            // which is what the G0 census saw as `imul v106, v111` on the hot
+            // path of every scaled guest access.
+            let k = i64::from(scale.trailing_zeros());
+            bcx.ins().ishl_imm(idx, k)
         } else {
-            let s = iconst_u64(bcx, scale);
+            // Unreachable for x86 SIB, kept so a future caller cannot get a
+            // silently wrong address from a non-power-of-two scale.
+            let s = iconst_u64(bcx, u64::from(scale));
             bcx.ins().imul(idx, s)
         };
         addr = bcx.ins().iadd(addr, scaled);
