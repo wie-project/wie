@@ -5,3 +5,7 @@
 # micro-exes/out/ -- tracked for test reproducibility
 .slim/deepwork/
 
+
+# Local agent tool state and Python caches.
+.omo/
+__pycache__/
