@@ -522,18 +522,56 @@ pub(super) fn exec_sse_shufpd(
     let src1 = regs.read_xmm(dst)?;
     let src2 = read_sse_op(mem, regs, instr, 1, 16)?;
     let imm8 = instr.immediate(2) as u8;
-    let low = if imm8 & 1 == 0 {
-        src1 & u128::from(u64::MAX)
-    } else {
-        src2 & u128::from(u64::MAX)
-    };
-    let high = if imm8 & 2 == 0 {
-        src1 & !u128::from(u64::MAX)
-    } else {
-        src2 & !u128::from(u64::MAX)
-    };
-    regs.write_xmm(dst, low | high)?;
+    // Bit 0 picks a half of the destination for the low result, bit 1 a half
+    // of the source for the high result.
+    let low = (src1 >> (u32::from(imm8 & 1) * 64)) as u64;
+    let high = (src2 >> (u32::from((imm8 >> 1) & 1) * 64)) as u64;
+    regs.write_xmm(dst, u128::from(low) | (u128::from(high) << 64))?;
     Ok(())
+}
+
+/// `PMINUB/PMAXUB/PMINSW/PMAXSW/PAVGB/PAVGW`, `UNPCKLPS/UNPCKHPS` and
+/// `SHUFPS`. Interpreter only: the JIT ends its block and steps them here.
+pub(super) fn exec_sse_misc(
+    mem: &GuestMemory,
+    regs: &mut RegFile,
+    instr: &Instruction,
+) -> Result<(), StepExecError> {
+    let a = read_sse_op(mem, regs, instr, 0, XMM_BYTES)?;
+    let b = read_sse_op(mem, regs, instr, 1, XMM_BYTES)?;
+    let result = sse_misc_u128(instr.mnemonic(), a, b, instr);
+    write_sse_op(mem, regs, instr, 0, result, XMM_BYTES, false)
+}
+
+fn sse_misc_u128(mnemonic: Mnemonic, a: u128, b: u128, instr: &Instruction) -> u128 {
+    let lanes = |bits: u32, f: &dyn Fn(u64, u64) -> u64| {
+        let lo = sse_lane_binop(a as u64, b as u64, bits, f);
+        let hi = sse_lane_binop((a >> 64) as u64, (b >> 64) as u64, bits, f);
+        u128::from(lo) | (u128::from(hi) << 64)
+    };
+    let dword = |v: u128, i: u8| (v >> (u32::from(i & 3) * 32)) & 0xffff_ffff;
+    let pack = |d: [u128; 4]| d[0] | (d[1] << 32) | (d[2] << 64) | (d[3] << 96);
+    let signed = |x: u64| sign_extend_bits(x, WORD_BITS);
+    match mnemonic {
+        Mnemonic::Pminub => lanes(8, &|x, y| x.min(y)),
+        Mnemonic::Pmaxub => lanes(8, &|x, y| x.max(y)),
+        Mnemonic::Pminsw => lanes(16, &|x, y| if signed(x) < signed(y) { x } else { y }),
+        Mnemonic::Pmaxsw => lanes(16, &|x, y| if signed(x) > signed(y) { x } else { y }),
+        Mnemonic::Pavgb => lanes(8, &|x, y| (x + y + 1) >> 1),
+        Mnemonic::Pavgw => lanes(16, &|x, y| (x + y + 1) >> 1),
+        Mnemonic::Unpcklps => pack([dword(a, 0), dword(b, 0), dword(a, 1), dword(b, 1)]),
+        Mnemonic::Unpckhps => pack([dword(a, 2), dword(b, 2), dword(a, 3), dword(b, 3)]),
+        // SHUFPS: two destination dwords, then two source dwords.
+        _ => {
+            let imm = instr.immediate(2) as u8;
+            pack([
+                dword(a, imm),
+                dword(a, imm >> 2),
+                dword(b, imm >> 4),
+                dword(b, imm >> 6),
+            ])
+        }
+    }
 }
 
 /// `PSHUFLW` / `PSHUFHW` — shuffle the low/high 16-bit lanes of an XMM register.
@@ -729,7 +767,17 @@ pub(super) fn exec_sse_shift(
             };
             u128::from(splat) | (u128::from(splat) << 64)
         }
-        _ => read_sse_op(mem, regs, instr, 1, XMM_BYTES)?,
+        // A register or memory count is one number, the low 64 bits, applied
+        // to every lane. Anything past 255 behaves like 255.
+        _ => {
+            let c = (read_sse_op(mem, regs, instr, 1, XMM_BYTES)? as u64).min(0xff);
+            let splat = match op {
+                SseShiftOp::Psllw | SseShiftOp::Psrlw | SseShiftOp::Psraw => c * SPLAT_WORD,
+                SseShiftOp::Pslld | SseShiftOp::Psrld | SseShiftOp::Psrad => c * SPLAT_DWORD,
+                SseShiftOp::Psllq | SseShiftOp::Psrlq => c,
+            };
+            u128::from(splat) | (u128::from(splat) << 64)
+        }
     };
     write_sse_op(
         mem,
@@ -1324,19 +1372,13 @@ pub(crate) fn sse_shift_half(op: SseShiftOp, a: u64, count: u64) -> u64 {
                 x.wrapping_shr(c as u32)
             }
         }),
+        // An arithmetic shift past the width fills the lane with the sign.
         SseShiftOp::Psraw => sse_lane_shift(a, count, WORD_BITS, |x, c| {
-            if c >= u64::from(WORD_BITS) {
-                0
-            } else {
-                (sign_extend_bits(x, WORD_BITS) >> c) as u64
-            }
+            (sign_extend_bits(x, WORD_BITS) >> c.min(u64::from(WORD_BITS - 1))) as u64
         }),
+        // An arithmetic shift past the width fills the lane with the sign.
         SseShiftOp::Psrad => sse_lane_shift(a, count, DWORD_BITS, |x, c| {
-            if c >= u64::from(DWORD_BITS) {
-                0
-            } else {
-                (sign_extend_bits(x, DWORD_BITS) >> c) as u64
-            }
+            (sign_extend_bits(x, DWORD_BITS) >> c.min(u64::from(DWORD_BITS - 1))) as u64
         }),
     }
 }
@@ -1567,8 +1609,10 @@ pub(crate) fn sse_cvt(op: SseCvtOp, a: u64) -> u64 {
 
 /// Full 128-bit packed integer binop (interpreter path).
 fn sse_int_binop_u128(op: SseIntOp, a: u128, b: u128) -> u128 {
-    u128::from(sse_int_binop_half(op, a as u64, b as u64))
-        | (u128::from(sse_int_binop_half(op, (a >> 64) as u64, (b >> 64) as u64)) << 64)
+    let (a_lo, a_hi, b_lo, b_hi) =
+        op.half_operands(a as u64, (a >> 64) as u64, b as u64, (b >> 64) as u64);
+    u128::from(sse_int_binop_half(op, a_lo, b_lo))
+        | (u128::from(sse_int_binop_half(op, a_hi, b_hi)) << 64)
 }
 
 /// Full 128-bit packed shift (interpreter path). For the imm forms the caller

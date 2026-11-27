@@ -119,6 +119,23 @@ impl TryFrom<u64> for SseIntOp {
     }
 }
 
+impl SseIntOp {
+    /// Order the four operand halves for the two half-wide evaluations.
+    ///
+    /// Callers compute `lo = op(a_lo, b_lo)` and `hi = op(a_hi, b_hi)`. That
+    /// is right for lane-wise ops and wrong for the packs, whose low result
+    /// half narrows **both halves of the destination** and whose high half
+    /// narrows both halves of the source. Takes and returns
+    /// `(a_lo, a_hi, b_lo, b_hi)`.
+    pub(crate) fn half_operands<T>(self, a_lo: T, a_hi: T, b_lo: T, b_hi: T) -> (T, T, T, T) {
+        if matches!(self, Self::Packsswb | Self::Packssdw | Self::Packuswb) {
+            (a_lo, b_lo, a_hi, b_hi)
+        } else {
+            (a_lo, a_hi, b_lo, b_hi)
+        }
+    }
+}
+
 /// ABI-stable packed-shift opcode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SseShiftOp {

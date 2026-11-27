@@ -35,10 +35,10 @@ use sse::{
     exec_sse_bitwise, exec_sse_byte_shift, exec_sse_cmp_fp, exec_sse_comis, exec_sse_cvt_fp_to_gpr,
     exec_sse_cvt_gpr_to_fp, exec_sse_cvt_packed, exec_sse_cvtdq2pd, exec_sse_cvtpd2dq,
     exec_sse_cvtpd2ps, exec_sse_cvtps2pd, exec_sse_cvtsd2ss, exec_sse_cvtss2sd, exec_sse_cvttpd2dq,
-    exec_sse_int_binop, exec_sse_minmax_packed, exec_sse_minmax_scalar, exec_sse_mov,
-    exec_sse_movd, exec_sse_movhlps, exec_sse_movhps, exec_sse_movlpd, exec_sse_movmsk,
-    exec_sse_movq, exec_sse_packed_fp, exec_sse_pmovmskb, exec_sse_psadbw, exec_sse_pshufb,
-    exec_sse_pshufd, exec_sse_pshuflw_hw, exec_sse_punpck, exec_sse_punpck_lanes,
+    exec_sse_int_binop, exec_sse_minmax_packed, exec_sse_minmax_scalar, exec_sse_misc,
+    exec_sse_mov, exec_sse_movd, exec_sse_movhlps, exec_sse_movhps, exec_sse_movlpd,
+    exec_sse_movmsk, exec_sse_movq, exec_sse_packed_fp, exec_sse_pmovmskb, exec_sse_psadbw,
+    exec_sse_pshufb, exec_sse_pshufd, exec_sse_pshuflw_hw, exec_sse_punpck, exec_sse_punpck_lanes,
     exec_sse_rcp_rsqrt, exec_sse_scalar_fp, exec_sse_shift, exec_sse_shufpd, exec_sse_sqrt_packed,
     exec_sse_sqrt_scalar, is_sse_movsd, sse_int_op, sse_shift_op,
 };
@@ -98,15 +98,12 @@ pub(crate) enum StepResult {
     InvalidMemory(InvalidMem),
 }
 
-// ── Wave 4: degrade-not-die fallback ─────────────────────────────────────
+// ── Unimplemented mnemonics ──────────────────────────────────────────────
 //
-// An unimplemented mnemonic no longer stops the session. The fallback
-// executes the instruction PARTIALLY: RIP advances past it and register /
-// memory state is left untouched (the documented approximation — a guest
-// sees a no-op where real silicon would have produced a value). The first
-// occurrence of each mnemonic is traced once, every occurrence is counted
-// (the Wave 4 coverage metric surfaces it in the profile report), and
-// `WIE_DEGRADE=0` restores the hard stop for bisect.
+// An unimplemented mnemonic stops the run, naming the instruction and its
+// address. Skipping it instead leaves registers and memory untouched, which
+// turns a missing instruction into silently wrong guest data.
+// `WIE_DEGRADE=1` opts into skipping, to see how far a guest would get.
 
 /// Decode + execute one instruction at `regs.rip`.
 ///
@@ -114,11 +111,11 @@ pub(crate) enum StepResult {
 /// it is logged once at `info` level (opt-in: `WIE_EXEC_TRACE=1`).  Run with
 /// `WIE_EXEC_TRACE=1 7za …` to discover which instructions keep code in the
 /// interpreter rather than the JIT.
-/// Degrade-not-die gate (default on; `WIE_DEGRADE=0`/`false`/`off` disables).
+/// Skip unimplemented mnemonics instead of stopping (`WIE_DEGRADE=1`/`true`/`on`).
 static DEGRADE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    !matches!(
+    matches!(
         std::env::var("WIE_DEGRADE"),
-        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
     )
 });
 
@@ -574,6 +571,15 @@ fn execute_one(
         // SHUFPD shuffles 64-bit lanes between two sources (the UCRT wcscpy
         // fast path and similar 128-bit copies use it).
         Mnemonic::Shufpd => exec_sse_shufpd(mem, regs, instr),
+        Mnemonic::Pminub
+        | Mnemonic::Pmaxub
+        | Mnemonic::Pminsw
+        | Mnemonic::Pmaxsw
+        | Mnemonic::Pavgb
+        | Mnemonic::Pavgw
+        | Mnemonic::Unpcklps
+        | Mnemonic::Unpckhps
+        | Mnemonic::Shufps => exec_sse_misc(mem, regs, instr),
         // Packed integer arithmetic / compare / pack (SSE2 integer family).
         Mnemonic::Paddb
         | Mnemonic::Paddw
@@ -790,10 +796,8 @@ fn execute_one(
     }
 }
 
-/// Degrade-not-die (Wave 4): trace once per mnemonic, count the execution,
-/// and continue with partial state (RIP already advanced, no register/memory
-/// effects) instead of stopping the session. `WIE_DEGRADE=0` restores the
-/// hard stop for bisect.
+/// Stop on an unimplemented mnemonic. Under `WIE_DEGRADE=1`, instead trace it
+/// once, count it, and continue with no register or memory effects.
 fn degrade_fallback(instr: &Instruction, other: Mnemonic) -> Result<(), StepExecError> {
     if *DEGRADE_ENABLED {
         DEGRADED_INSNS.fetch_add(1, Ordering::Relaxed);
@@ -802,8 +806,7 @@ fn degrade_fallback(instr: &Instruction, other: Mnemonic) -> Result<(), StepExec
                 target: "wiecpu",
                 ip = format_args!("{:#x}", instr.ip()),
                 mnemonic = format!("{other:?}"),
-                "unimplemented mnemonic — executing as partial no-op \
-                 (degrade-not-die; WIE_DEGRADE=0 restores the stop)"
+                "unimplemented mnemonic skipped (WIE_DEGRADE=1): guest results may be wrong"
             );
         }
         Ok(())
