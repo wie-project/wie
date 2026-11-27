@@ -1316,3 +1316,66 @@ fn a_fault_inside_a_self_loop_region_matches_the_interpreter() {
          interpreter (interpreter vs JIT)"
     );
 }
+
+/// A loop's site caches remember a page within one execution only. After a
+/// re-protect, the next execution of the same compiled region must refuse the
+/// store rather than serve it from what the site remembered.
+#[test]
+fn a_region_store_site_does_not_outlive_a_reprotect() {
+    const ENTRY: u64 = 0x10ba_0000;
+    const DATA: u64 = 0x10bb_0000;
+    // top: test ecx,1 · jz +1 · nop · mov [rdx],rax · add rdx,8 · dec ecx · jnz top
+    // then ud2.
+    const LOOP: [u8; 22] = [
+        0xf7, 0xc1, 0x01, 0x00, 0x00, 0x00, 0x74, 0x01, 0x90, 0x48, 0x89, 0x02, 0x48, 0x83, 0xc2,
+        0x08, 0xff, 0xc9, 0x75, 0xec, 0x0f, 0x0b,
+    ];
+    const EXIT: u64 = ENTRY + 20;
+    let mut cpu = jit_with(ENTRY, &LOOP, true);
+    cpu.virtual_alloc(
+        DATA,
+        0x1000,
+        MEM_RESERVE | MEM_COMMIT,
+        protect::PAGE_READWRITE,
+    )
+    .expect("map the data page");
+    let region = compile_and_install(cpu.as_mut(), ENTRY);
+    assert!(
+        region.guest_end >= EXIT,
+        "precondition: one region covers the loop"
+    );
+
+    let run = |cpu: &mut JitCpu, value: u64| -> bool {
+        let mut ctx = cpu.snapshot_thread_context();
+        ctx.gpr[0] = value; // rax
+        ctx.gpr[1] = 8; // rcx
+        ctx.gpr[2] = DATA; // rdx
+        ctx.rip = ENTRY;
+        cpu.restore_thread_context(&ctx);
+        for _ in 0..64 {
+            match cpu.step_one() {
+                Ok((StepResult::Continue, _)) => {}
+                _ => return false,
+            }
+            if cpu.read_rip().expect("rip") == EXIT {
+                return true;
+            }
+        }
+        false
+    };
+    let read = |cpu: &mut JitCpu| {
+        let mut bytes = [0_u8; 8];
+        cpu.mem_read(DATA, &mut bytes).expect("read data");
+        u64::from_le_bytes(bytes)
+    };
+
+    assert!(run(cpu.as_mut(), 0x11), "the writable run must finish");
+    assert_eq!(read(cpu.as_mut()), 0x11);
+    cpu.virtual_protect(DATA, 0x1000, protect::PAGE_READONLY)
+        .expect("re-protect read-only");
+    assert!(
+        !run(cpu.as_mut(), 0x22),
+        "a read-only store must not finish"
+    );
+    assert_eq!(read(cpu.as_mut()), 0x11, "and must not land");
+}
