@@ -131,8 +131,7 @@ fn inv_guard_self_loop_exits_on_foreign_invalidation() {
     // mov eax, 0x00c0ffee ; nop filler ; ud2 stops linear decode.
     // `decode_pure_gpr_block` EXCLUDES the non-lowerable ud2, so the fresh
     // block covers [loop_va, loop_va + 6) and exits with RIP at the ud2;
-    // the ud2 itself then executes as a degrade-not-die partial no-op
-    // (Wave 4: RIP advances, no state change), so the runner lands PAST it.
+    // stepping the ud2 itself then stops the runner with an error.
     const DONE_MARK: u64 = 0x00c0_ffee;
     const UD2_OFFSET: u64 = 6;
     let new_code: [u8; 7] = [0xb8, 0xee, 0xff, 0xc0, 0x00, 0x90, 0x0f];
@@ -209,6 +208,6 @@ fn inv_guard_self_loop_exits_on_foreign_invalidation() {
     assert!(
         rip >= loop_va.saturating_add(UD2_OFFSET),
         "runner must have exited the loop head into the fresh block \
-         (degrade-not-die steps past the ud2; got rip {rip:#x})"
+         (got rip {rip:#x})"
     );
 }
